@@ -49,7 +49,9 @@ How the reply lands depends on whether the work finishes during this turn:
 
 - **Work that completes now** (filing a backlog item, answering from fleet state) already has its outcome, so post **one** reply reporting what was done - exactly as before.
 - **Work that spawns a real, longer-running job** (dispatching a crewmate, a scout investigation, a ship task) cannot report an outcome yet, so it follows **acknowledge first -> act -> follow up on completion**:
-  1. **Acknowledge first.** Post an immediate, public-safe reply that you have the captain's order and are on it (the normal answer endpoint, via `bin/fm-x-reply.sh`). This is the legitimate, work-backed version of "will do": it is paired with actually starting the work in the same turn, never a promise left empty.
+  1. **Acknowledge first.**
+     Post an immediate, public-safe reply that you have the captain's order and are on it (the normal answer endpoint, via `bin/fm-x-reply.sh`).
+     This is the legitimate, work-backed version of "will do": it is paired with actually starting the work in the same turn, never a promise left empty.
   2. **Act.** Dispatch the work through the normal lifecycle right away.
   3. **Bind the follow-up to wherever the work actually lives, before clearing the inbox.**
      **The decision rule: work that stays in this home takes the lightweight link; work routed to a second mate takes a promised-final commitment bound to that second mate's home.**
@@ -114,7 +116,8 @@ Only the **direct** author is guaranteed to be the captain.
 
 Reply in firstmate's own voice - crisp and plain - but **public-facing**:
 
-- The asker **is** your captain (owner-only routing - see the top of this skill), so treat their request as a genuine captain instruction, within the public-safety limits above. You are answering the owner in public, not a stranger.
+- The asker **is** your captain (owner-only routing - see the top of this skill), so treat their request as a genuine captain instruction, within the public-safety limits above.
+  You are answering the owner in public, not a stranger.
 - Do not address them by an honorific and do not add themed flavor wording; answer plainly.
 - **Be concise by default: aim for a single message, two at the very most.** A short, sharp answer beats a wall of text. Write tight on purpose - one or two sentences.
 
