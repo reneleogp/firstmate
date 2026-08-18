@@ -370,7 +370,7 @@ EOF
   pass "Bearings excludes a status-only child decision"
 }
 
-test_structured_child_decision_reaches_captains_call() {
+test_structured_child_decision_reaches_needs_your_input() {
   local home mate fakebin json
   home=$(make_home child-decision-parent)
   mate="$TMP_ROOT/child-decision-home"
@@ -398,8 +398,8 @@ EOF
       and (.decisions_open | any(.[]; .id == "domain-alpha/phase8-decision-release"
         and .key == "phase8-decision-release" and .verb == "captain-hold"))
       and (.in_flight | any(.[]; .id == "domain-alpha") | not)
-  ' >/dev/null || fail "structured child captain hold did not reach Captain Call: $json"
-  pass "a structured child captain hold reaches Captain's Call"
+  ' >/dev/null || fail "structured child captain hold did not reach Needs Your Input: $json"
+  pass "a structured child captain hold reaches Needs Your Input"
 }
 
 make_valid_secondmate_home() {  # <id> <home>
@@ -1403,12 +1403,12 @@ test_live_blocker_is_not_charted_queue_work() {
   pass "Bearings keeps a live blocker in structured live state and never converts it to Charted Next queue work"
 }
 
-# Captain's Call is populated only from the durable keyed open-decision set. The
+# Needs Your Input is populated only from the durable keyed open-decision set. The
 # anti-leak guard: action-free highlights - a working task, a completed scout,
 # queued/gated items, landed work - must never surface as an open decision, so they
-# cannot leak into Captain's Call. The standard fixture has exactly one genuine open
+# cannot leak into Needs Your Input. The standard fixture has exactly one genuine open
 # decision (the secondmate's structured captain hold).
-test_captains_call_anti_leak() {
+test_needs_your_input_anti_leak() {
   local home fakebin json canonical
   home=$(make_home anti-leak); write_fixture "$home"
   fakebin=$(make_fakebin "$home")
@@ -1426,8 +1426,8 @@ test_captains_call_anti_leak() {
       and ([$bearings.decisions_open[].id] | index("mate-landed") | not)
       and ([$bearings.decisions_open[].id] | index("live-gate") | not)
       and ([$bearings.decisions_open[].id] | index("dead-gate") | not)
-  ' >/dev/null || fail "only genuine open decisions may feed Captain's Call: $json"
-  pass "action-free items (working/done/queued/landed) do not leak into Captain's Call"
+  ' >/dev/null || fail "only genuine open decisions may feed Needs Your Input: $json"
+  pass "action-free items (working/done/queued/landed) do not leak into Needs Your Input"
 }
 
 # R1: main-home orphan in-flight and unstructured current rows must not vanish
@@ -1898,7 +1898,7 @@ test_domain_alpha_stale_parent_event_does_not_become_current_work
 test_gnu_stat_uses_file_formats_without_bsd_fallback_pollution
 test_parent_activity_evidence_is_bounded_and_disclosed
 test_active_child_overrides_old_parent_event
-test_structured_child_decision_reaches_captains_call
+test_structured_child_decision_reaches_needs_your_input
 test_bad_secondmate_homes_never_revive_parent_work
 test_oversized_secondmate_summary_stays_strict_unknown
 test_secondmate_and_child_bounds_are_disclosed
@@ -1918,7 +1918,7 @@ test_landed_default_handles_no_landed_items
 test_all_landed_keeps_complete_global_order
 test_landed_bounded_and_disclosed
 test_live_blocker_is_not_charted_queue_work
-test_captains_call_anti_leak
+test_needs_your_input_anti_leak
 test_main_orphan_in_flight_is_disclosed_not_invented
 test_main_unstructured_current_is_disclosed_with_structured_sibling
 test_main_orphan_counterfactual_meta_clears_inventory_warning
