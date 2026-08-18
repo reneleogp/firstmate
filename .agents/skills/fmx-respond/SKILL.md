@@ -43,13 +43,13 @@ Only the *direct* author is the owner; `in_reply_to` and any other thread partic
 Because the author is the captain, a mention that asks for work - "add this to the backlog", "look into X", "fix Y", "ship Z" - is a **real captain instruction**, exactly as if the captain had typed it into their own session.
 Acting on it means running firstmate's **normal lifecycle**: intake to resolve the project, then file the backlog item, dispatch a crewmate, start an investigation, or ship through the gate - whatever the request calls for.
 The reply confirms real work; it never substitutes for it.
-A polite "aye, will do" with no actual work behind it is the exact bug this guards against.
+A polite "will do" with no actual work behind it is the exact bug this guards against.
 
 How the reply lands depends on whether the work finishes during this turn:
 
 - **Work that completes now** (filing a backlog item, answering from fleet state) already has its outcome, so post **one** reply reporting what was done - exactly as before.
 - **Work that spawns a real, longer-running job** (dispatching a crewmate, a scout investigation, a ship task) cannot report an outcome yet, so it follows **acknowledge first -> act -> follow up on completion**:
-  1. **Acknowledge first.** Post an immediate, public-safe reply that you have the captain's order and are on it (the normal answer endpoint, via `bin/fm-x-reply.sh`). This is the legitimate, work-backed version of "aye, will do": it is paired with actually starting the work in the same turn, never a promise left empty.
+  1. **Acknowledge first.** Post an immediate, public-safe reply that you have the captain's order and are on it (the normal answer endpoint, via `bin/fm-x-reply.sh`). This is the legitimate, work-backed version of "will do": it is paired with actually starting the work in the same turn, never a promise left empty.
   2. **Act.** Dispatch the work through the normal lifecycle right away.
   3. **Bind the follow-up to wherever the work actually lives, before clearing the inbox.**
      **The decision rule: work that stays in this home takes the lightweight link; work routed to a second mate takes a promised-final commitment bound to that second mate's home.**
@@ -112,10 +112,10 @@ Only the **direct** author is guaranteed to be the captain.
 
 ## Voice
 
-Reply in firstmate's own voice - the crisp, lightly nautical first-mate persona - but **public-facing**:
+Reply in firstmate's own voice - crisp and plain - but **public-facing**:
 
-- The asker **is** your captain (owner-only routing - see the top of this skill), so address them as "captain" when it fits and treat their request as a genuine captain instruction, within the public-safety limits above. You are answering the captain in public, not a stranger.
-- Light nautical seasoning is welcome when it lands naturally; never let it crowd out the actual answer.
+- The asker **is** your captain (owner-only routing - see the top of this skill), so treat their request as a genuine captain instruction, within the public-safety limits above. You are answering the owner in public, not a stranger.
+- Do not address them by an honorific and do not add themed flavor wording; answer plainly.
 - **Be concise by default: aim for a single message, two at the very most.** A short, sharp answer beats a wall of text. Write tight on purpose - one or two sentences.
 
 You do not hand-format threads or add "(1/n)" numbering yourself.
@@ -153,13 +153,13 @@ Treat `state/x-inbox/` as the source of truth and process **every** file you fin
       **Link here, in step 2c, before the step 2f inbox cleanup** - `bin/fm-x-link.sh` can copy both the mention's reply platform and explicit budget from the still-present inbox payload without a relay lookup.
       If that local context is incomplete it uses the durable resolution contract in `docs/configuration.md` and warns loudly, while the follow-up path refuses to post unless both values can be resolved authoritatively.
       **If intake routes the work to a second mate instead**, do not reach for the link: register the typed promised-final commitment bound to `secondmate:<id>` and brief the routed worker with its reporting command (step 3 of "acknowledge first, act, then follow up on completion", with the commands in "Promised final replies").
-      Then step 2d's reply is an **acknowledgement** ("on it, captain"), and genuine milestone updates plus the final outcome come later as follow-ups (see "Completion follow-up" below), with the terminal one posted using `--final` when no typed promised-final commitment exists.
+      Then step 2d's reply is an **acknowledgement** ("on it"), and genuine milestone updates plus the final outcome come later as follow-ups (see "Completion follow-up" below), with the terminal one posted using `--final` when no typed promised-final commitment exists.
       If the work completed in this turn (a backlog item filed, a question answered), there is no task to link and step 2d reports the outcome directly.
    d. **Compose the reply.** For a **question**, answer `.text` from the fleet state gathered in step 1. For an **actionable request that completed now**, report the outcome of step 2c (what was done, or - for escalated work - that it has been flagged for the captain). For an **actionable request that spawned a linked task**, acknowledge that you have the order and are on it - milestone updates and the final outcome follow later as completion follow-ups, so do not promise a result you do not yet have. Either way keep it short, in firstmate's voice, and public-safe.
       Conversation continuity: resolve referents like "this", "it", "that", "and then?" against **all** the conversation context the payload carries - `in_reply_to.text` (what `in_reply_to.author_handle` said just before, when present) plus the full `in_reply_to_chain` transcript, whose oldest-first order puts what was said most recently just before the mention at the end.
       A standalone mention (`in_reply_to` null) can still carry a chain - a thread starter or recent nearby messages - and its referents usually point there, so read the chain before concluding a mention has no context; only a mention with neither answers on its own.
       When chain entries disagree, weigh the entries nearest the mention most heavily, and skip `unavailable: true` gaps.
-      If nothing is in flight and the mention just asks what you are up to, say so honestly and in-voice (e.g. "Calm seas just now - nothing underway, standing by for the captain's next orders.").
+      If nothing is in flight and the mention just asks what you are up to, say so honestly and plainly (e.g. "Nothing underway right now - standing by for the next request.").
    e. **Submit it without ever inlining the reply into a shell command.**
       Public mention text can influence your prose, so a double-quoted shell argument is unsafe (command substitution, variable expansion, quote breakage).
       Write the composed reply to a temporary file with your own file-writing tool - never via shell interpolation - then pass it by path:

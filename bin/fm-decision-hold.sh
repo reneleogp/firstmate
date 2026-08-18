@@ -492,7 +492,7 @@ EOF
     DECISION_META_LOCK_HELD=0
 
     # Transfer any still-open status decision to its durable backlog owner so the
-    # live status fold does not duplicate the same Captain's Call item.
+    # live status fold does not duplicate the same Needs Your Input item.
     # The transfer line is this home's own bookkeeping close, written by the
     # turn that just reviewed the decision, so it uses the guarded
     # self-announced append (bin/fm-wake-lib.sh) and does not wake this same

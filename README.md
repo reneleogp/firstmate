@@ -116,13 +116,13 @@ The preference persists for the effective Firstmate home, and toggling it off re
 ### Talk to it
 
 ```sh
-> ahoy! look at my github project xyz, then fix the flaky login test and add dark mode
+> hey, look at my github project xyz, then fix the flaky login test and add dark mode
 
 # firstmate checks its toolchain (asking your consent before installing anything),
 # clones the project under projects/ and spawns two isolated workers in the active backend.
 # Minutes later:
 
-  PR ready for review, captain: https://github.com/you/xyz/pull/42
+  PR ready for review: https://github.com/you/xyz/pull/42
   (fix flaky login test - risk: low - CI green)
 
 > alright merge it

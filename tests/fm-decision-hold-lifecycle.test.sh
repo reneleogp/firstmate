@@ -380,7 +380,7 @@ test_visual_review_uses_shared_completion_owner() {
   json=$(run_bearings "$home") || fail "Bearings failed after the ended visual review"
   printf '%s' "$json" | jq -e --arg hold "$hold" '
     .decisions_open | any(.id == $hold and .verb == "captain-hold")
-  ' >/dev/null || fail "ended visual review did not leave its durable Captain Call: $json"
+  ' >/dev/null || fail "ended visual review did not leave its durable Needs Your Input item: $json"
   [ ! -e "$home/data/visual-review-decisions.json" ] \
     || fail "visual review created a second decision database"
   pass "ended visual review follows the same decision-hold completion owner"
@@ -633,7 +633,7 @@ test_declined_decision_closes_without_routed_work() {
   json=$(run_bearings "$home") || fail "Bearings failed after a declined decision"
   printf '%s' "$json" | jq -e --arg hold "$hold" '
     (.decisions_open | any(.id == $hold) | not)
-  ' >/dev/null || fail "a declined decision remained an open Captain's Call: $json"
+  ' >/dev/null || fail "a declined decision remained an open Needs Your Input item: $json"
 
   routed_hold=$(run_decisions "$home" hold "$id" upstream \
     --title "Choose the sample upstream target" --reason "captain upstream choice pending" --repo sample) \
