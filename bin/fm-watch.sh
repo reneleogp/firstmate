@@ -552,14 +552,14 @@ telegram_surface_queued() {
   while IFS= read -r key; do
     case "$key" in telegram:*) ;; *) continue ;; esac
     [ -e "$(telegram_surfaced_marker "$key")" ] && continue
-    TELEGRAM_SURFACED="$TELEGRAM_SURFACED $key"
+    TELEGRAM_SURFACED=$key
+    break
   done < <(fm_wake_queued_keys_locked check)
   if [ -z "$TELEGRAM_SURFACED" ]; then
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
     return 0
   fi
-  reason="check: telegram"
-  for key in $TELEGRAM_SURFACED; do reason="$reason ${key#telegram:}"; done
+  reason="check: telegram ${TELEGRAM_SURFACED#telegram:}"
   # shellcheck disable=SC2034 # Consumed by wake() in the separately linted transition owner.
   FM_WAKE_POST_OUTPUT_ACTION=telegram_surface_after_output
   wake "$reason"

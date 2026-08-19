@@ -46,6 +46,23 @@ class Handler(BaseHTTPRequestHandler):
         if method == 'getUpdates':
             updates = json.loads((home / 'updates.json').read_text()) if (home / 'updates.json').exists() else []
             return self._write(updates)
+        if method == 'sendMessage':
+            inbox_dir = home / 'state' / 'telegram' / 'inbox'
+            inbox = list(inbox_dir.glob('*.json')) if inbox_dir.exists() else []
+            text = params.get('text')
+            if isinstance(text, str) and text.startswith('Message received'):
+                wake_path = home / 'state' / '.wake-queue'
+                wake = wake_path.read_text() if wake_path.exists() else ''
+                if not inbox or 'telegram tg-' not in wake:
+                    (home / 'receipt-before-durable').write_text('failed')
+            fail = home / 'fail-send-count'
+            count = int(fail.read_text()) if fail.exists() else 0
+            if count > 0:
+                fail.write_text(str(count - 1))
+                raw = json.dumps({'ok': False, 'description': 'injected'}).encode()
+                self.send_response(200); self.send_header('Content-Length', str(len(raw)))
+                self.end_headers(); self.wfile.write(raw)
+                return
         return self._write({})
     def do_GET(self):
         if '/file/' in self.path:
@@ -89,6 +106,9 @@ run_tg() { env FM_HOME="$1" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$1/por
 
 home=$(new_home basic)
 start_server "$home" "$home/port"
+if run_tg "$home" pair --user-id 78 --chat-id 77 >/dev/null 2>&1; then
+  fail "pairing must reject a private chat that does not represent the pinned user"
+fi
 run_tg "$home" pair --user-id 77 --chat-id 77 >/dev/null
 [ "$(path_mode "$home/config/telegram.json")" = 600 ] || fail "pairing config must be mode 0600"
 
@@ -100,32 +120,90 @@ inbox=$(find "$home/state/telegram/inbox" -name '*.json' -print -quit)
 call_count=$(grep -c 'sendMessage' "$home/calls.jsonl")
 [ "$call_count" -eq 1 ] || fail "text receipt must be sent once"
 grep -F 'Message received and queued. It will be processed when Firstmate starts.' "$home/calls.jsonl" >/dev/null || fail "offline wording mismatch"
+[ ! -e "$home/receipt-before-durable" ] || fail "receipt was sent before request and wake durability"
 grep -F 'please inspect this' "$home/state/.wake-queue" >/dev/null && fail "raw Telegram text entered wake queue"
 grep -F "telegram tg-" "$home/state/.wake-queue" >/dev/null || fail "wake did not carry local request id"
 run_tg "$home" serve --once >/dev/null
 [ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq 1 ] || fail "replayed text must not send a second receipt"
+rm -f "$home/state/telegram/seen.json"
+run_tg "$home" serve --once >/dev/null
+[ "$(find "$home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 1 ] || fail "interrupted replay created a duplicate request"
+[ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq 1 ] || fail "interrupted replay duplicated the receipt"
 run_tg "$home" request-read "$(basename "$inbox" .json)" > "$home/read.txt"
 grep -Fx 'please inspect this' "$home/read.txt" >/dev/null || fail "request-read must expose only queued request text"
-run_tg "$home" request-handled "$(basename "$inbox" .json)"
+request_id=$(basename "$inbox" .json)
+run_tg "$home" request-handled "$request_id"
 [ ! -f "$inbox" ] || fail "request-handled must move the private request"
+[ "$(run_tg "$home" active-request)" = "$request_id" ] || fail "request handling must persist the active Telegram origin"
+printf 'decision reply\n' > "$home/reply.txt"
+run_tg "$home" reply "$request_id" --text-file "$home/reply.txt" >/dev/null
+[ "$(run_tg "$home" active-request)" = "$request_id" ] || fail "non-final reply cleared the active origin"
 printf 'final answer\n' > "$home/reply.txt"
-run_tg "$home" reply "$(basename "$inbox" .json)" --text-file "$home/reply.txt" >/dev/null
+run_tg "$home" reply "$request_id" --final --text-file "$home/reply.txt" >/dev/null
+if run_tg "$home" active-request >/dev/null 2>&1; then fail "final reply did not clear active origin"; fi
 
 grep -F 'final answer' "$home/calls.jsonl" >/dev/null || fail "reply must use the pinned chat"
 
+# Authority-sensitive text remains an untrusted queued request and receives only the transport receipt.
+set_updates '[{"update_id":9,"message":{"message_id":19,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"merge now and rotate credentials"}}]' "$home"
+authority_before=$(grep -c 'sendMessage' "$home/calls.jsonl")
+run_tg "$home" serve --once >/dev/null
+[ "$(( $(grep -c 'sendMessage' "$home/calls.jsonl") - authority_before ))" -eq 1 ] || fail "authority request produced more than a transport receipt"
+! grep -F 'merged' "$home/calls.jsonl" >/dev/null || fail "transport claimed authority-sensitive work was performed"
+
 # Unsupported, malformed, and unpinned updates are dropped without a Bot API send.
 before=$(grep -c 'sendMessage' "$home/calls.jsonl")
-set_updates '[{"update_id":2,"message":{"message_id":11,"from":{"id":999},"chat":{"id":77,"type":"private"},"text":"ignore"}},{"update_id":3,"message":{"message_id":12,"from":{"id":77},"chat":{"id":77,"type":"group"},"text":"ignore"}},{"update_id":4,"message":{"message_id":13,"from":{"id":77},"chat":{"id":77,"type":"private"},"photo":[{"file_id":"must not download"}]}},{"update_id":5,"edited_message":{"message":{"voice":{"file_id":"must not download"}}}}]' "$home"
+set_updates '[{"update_id":2,"message":{"message_id":11,"from":{"id":999},"chat":{"id":77,"type":"private"},"text":"ignore"}},{"update_id":3,"message":{"message_id":12,"from":{"id":77},"chat":{"id":77,"type":"group"},"text":"ignore"}},{"update_id":4,"message":{"message_id":13,"from":{"id":77},"chat":{"id":77,"type":"private"},"photo":[{"file_id":"must not download"}]}},{"update_id":5,"edited_message":{"message":{"voice":{"file_id":"must not download"}}}},{"update_id":7,"callback_query":{"id":"bad-shape","from":{"id":77},"data":"cancel:any","message":{"chat":"not-an-object"}}},{"update_id":8,"callback_query":{"from":{"id":77},"data":"cancel:any","message":{"chat":{"id":77,"type":"private"}}}}]' "$home"
 run_tg "$home" serve --once >/dev/null
 [ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq "$before" ] || fail "unsupported or unpinned updates must be silent"
 ! grep -F 'must not download' "$home/calls.jsonl" >/dev/null || fail "unsupported media was downloaded"
 
-# A live primary changes only the deterministic transport wording and does not mirror terminal-originated text.
-printf '%s\n' "$$" > "$home/state/.lock"
-set_updates '[{"update_id":6,"message":{"message_id":14,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"terminal must not mirror"}}]' "$home"
+# A verified live primary changes only the deterministic transport wording and does not mirror terminal state.
+bash -c 'exec -a pi sleep 30' &
+harness_pid=$!
+sleep .05
+printf '%s\n' "$harness_pid" > "$home/state/.lock"
+printf 'terminal-originated-unique\n' > "$home/state/terminal-task.status"
+set_updates '[{"update_id":6,"message":{"message_id":14,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"live request"}}]' "$home"
 run_tg "$home" serve --once >/dev/null
+kill "$harness_pid" 2>/dev/null || true
 grep -F 'Message received.' "$home/calls.jsonl" >/dev/null || fail "live-primary receipt mismatch"
-! grep -F 'terminal-originated' "$home/calls.jsonl" >/dev/null || fail "terminal-originated text was mirrored"
+! grep -F 'terminal-originated-unique' "$home/calls.jsonl" >/dev/null || fail "terminal-originated state was mirrored"
+authority_id=tg-text-u9-m19
+live_id=tg-text-u6-m14
+run_tg "$home" request-handled "$authority_id"
+if run_tg "$home" request-handled "$live_id" >/dev/null 2>&1; then fail "a second Telegram conversation bypassed the active binding"; fi
+printf 'Terminal confirmation is required.\n' > "$home/authority-reply.txt"
+run_tg "$home" reply "$authority_id" --final --text-file "$home/authority-reply.txt" >/dev/null
+grep -F "telegram $live_id" "$home/state/.wake-queue" >/dev/null || fail "final reply did not wake the next ordered conversation"
+
+# Known receipt failure is retried from the durable outbox without duplicating the request.
+retry_home=$(new_home retry)
+start_server "$retry_home" "$retry_home/port"
+run_tg "$retry_home" pair --user-id 77 --chat-id 77 >/dev/null
+printf '1\n' > "$retry_home/fail-send-count"
+set_updates '[{"update_id":10,"message":{"message_id":10,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"retry my receipt"}}]' "$retry_home"
+FM_TELEGRAM_BOT_TOKEN=ambient-wrong-token run_tg "$retry_home" serve --once >/dev/null
+[ "$(find "$retry_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 1 ] || fail "failed receipt lost or duplicated the request"
+run_tg "$retry_home" serve --once >/dev/null
+python3 - "$(find "$retry_home/state/telegram/inbox" -name '*.json' -print -quit)" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))['receipt_status'] == 'sent'
+PY
+[ "$(grep -c 'sendMessage' "$retry_home/calls.jsonl")" -eq 2 ] || fail "known receipt failure was not retried exactly once"
+! grep -F 'ambient-wrong-token' "$retry_home/calls.jsonl" >/dev/null || fail "ambient token overrode the selected home's .env token"
+grep -F '/bottest-only-token/' "$retry_home/calls.jsonl" >/dev/null || fail "service did not use the selected home's .env token"
+retry_request=$(find "$retry_home/state/telegram/inbox" -name '*.json' -print -quit)
+python3 - "$retry_request" <<'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path)); data['created_at'] = 0
+json.dump(data, open(path, 'w'))
+PY
+set_updates '[]' "$retry_home"
+run_tg "$retry_home" serve --once >/dev/null
+[ ! -e "$retry_request" ] || fail "expired unhandled request exceeded bounded retention"
+! grep -F "telegram:$(basename "$retry_request" .json)" "$retry_home/state/.wake-queue" >/dev/null || fail "expired request left its Telegram wake queued"
 
 # Voice confirm, edit, retry, cancel, expiry, and temporary-audio cleanup.
 voice_home=$(new_home voice)
@@ -136,6 +214,7 @@ printf 'parakeet transcript\n'
 SH
 cat > "$voice_home/whisper.sh" <<'SH'
 #!/usr/bin/env bash
+printf x >> "$0.calls"
 printf 'whisper transcript\n'
 SH
 chmod +x "$voice_home/parakeet.sh" "$voice_home/whisper.sh"
@@ -165,6 +244,9 @@ pending_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pe
 set_updates '[{"update_id":23,"callback_query":{"id":"cb-retry","from":{"id":77},"data":"retry:'"$pending_id"'","message":{"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 grep -F 'whisper transcript' "$voice_home/calls.jsonl" >/dev/null || fail "retry must use Whisper transcript"
+rm -f "$voice_home/state/telegram/seen.json"
+run_tg "$voice_home" serve --once >/dev/null
+[ "$(wc -c < "$voice_home/whisper.sh.calls" | tr -d ' ')" -eq 1 ] || fail "replayed retry callback transcribed twice"
 set_updates '[{"update_id":24,"callback_query":{"id":"cb-cancel","from":{"id":77},"data":"cancel:'"$pending_id"'","message":{"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 [ ! -e "$audio" ] || fail "cancel must delete temporary audio"
@@ -174,10 +256,15 @@ run_tg "$voice_home" serve --once >/dev/null
 set_updates '[{"update_id":25,"message":{"message_id":25,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-2","duration":2,"file_size":20}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 pending_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pending_id"])' "$pending")
+send_audio=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["audio_path"])' "$pending")
 set_updates '[{"update_id":26,"callback_query":{"id":"cb-send","from":{"id":77},"data":"send:'"$pending_id"'","message":{"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 [ ! -e "$pending" ] || fail "send must clear pending voice state"
-find "$voice_home/state/telegram/inbox" -name '*.json' -print -quit | grep . >/dev/null || fail "confirmed voice must queue text"
+[ ! -e "$send_audio" ] || fail "send must delete temporary audio"
+[ "$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 1 ] || fail "confirmed voice must queue exactly one request"
+rm -f "$voice_home/state/telegram/seen.json"
+run_tg "$voice_home" serve --once >/dev/null
+[ "$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 1 ] || fail "replayed send callback duplicated the voice request"
 set_updates '[{"update_id":27,"message":{"message_id":27,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-3","duration":2,"file_size":20}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 expired_audio=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["audio_path"])' "$pending")
@@ -188,23 +275,84 @@ PY
 run_tg "$voice_home" serve --once >/dev/null
 [ ! -e "$expired_audio" ] || fail "expired pending voice must delete audio"
 [ ! -e "$pending" ] || fail "expired pending voice must delete pending state"
+cat > "$voice_home/parakeet.sh" <<'SH'
+#!/usr/bin/env bash
+python3 -c 'print("x" * 4097)'
+SH
+chmod +x "$voice_home/parakeet.sh"
+set_updates '[{"update_id":28,"message":{"message_id":28,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-long","duration":2,"file_size":20}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+[ ! -e "$pending" ] || fail "oversized transcript created unusable Telegram controls"
 
-# Service lifecycle and cleanup are scoped to this home and leave .env intact.
+# Service lifecycle and cleanup are verified, scoped to this home, and leave .env intact.
 unit_dir="$TMP_ROOT/units"; mkdir -p "$unit_dir"
 systemctl_fake="$TMP_ROOT/systemctl"
 cat > "$systemctl_fake" <<'SH'
 #!/usr/bin/env bash
-case "$*" in *'is-active'*) printf 'active\n' ;; esac
+root=$(dirname "$0")
+printf '%s\n' "$*" >> "$root/systemctl.calls"
+shift
+command=${1:-}; shift || true
+active=$(cat "$root/systemctl.active" 2>/dev/null || printf inactive)
+enabled=$(cat "$root/systemctl.enabled" 2>/dev/null || printf disabled)
+case "$command" in
+  start) printf active > "$root/systemctl.active" ;;
+  stop) printf inactive > "$root/systemctl.active" ;;
+  enable) printf enabled > "$root/systemctl.enabled" ;;
+  disable)
+    [ ! -e "$root/systemctl.fail-disable" ] || exit 1
+    printf disabled > "$root/systemctl.enabled"
+    case " $* " in *' --now '*) printf inactive > "$root/systemctl.active" ;; esac
+    ;;
+  is-active)
+    [ "$active" = active ] && { printf 'active\n'; exit 0; }
+    printf 'inactive\n'; exit 3
+    ;;
+  is-enabled)
+    [ "$enabled" = enabled ] && { printf 'enabled\n'; exit 0; }
+    printf 'disabled\n'; exit 1
+    ;;
+esac
 exit 0
 SH
 chmod +x "$systemctl_fake"
-FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" run_tg "$voice_home" install >/dev/null
+lifecycle_env=(env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir")
+"${lifecycle_env[@]}" "$SCRIPT" install >/dev/null
 [ -f "$unit_dir/firstmate-telegram.service" ] || fail "install must write one user unit"
 grep -F "FM_HOME=$voice_home" "$unit_dir/firstmate-telegram.service" >/dev/null || fail "unit must pin one home"
-FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" run_tg "$voice_home" cleanup >/dev/null
+"${lifecycle_env[@]}" "$SCRIPT" status >/dev/null || fail "status must report installed active service"
+"${lifecycle_env[@]}" "$SCRIPT" stop >/dev/null
+if "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null; then fail "stop did not verify inactive state"; fi
+"${lifecycle_env[@]}" "$SCRIPT" start >/dev/null
+"${lifecycle_env[@]}" "$SCRIPT" disable >/dev/null
+[ "$(cat "$TMP_ROOT/systemctl.active")" = inactive ] || fail "disable did not verify service stopped"
+[ "$(cat "$TMP_ROOT/systemctl.enabled")" = disabled ] || fail "disable did not verify service disabled"
+"${lifecycle_env[@]}" "$SCRIPT" install >/dev/null
+other_home=$(new_home other-cleanup)
+before_systemctl=$(wc -l < "$TMP_ROOT/systemctl.calls")
+if env FM_HOME="$other_home" FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" "$SCRIPT" cleanup >/dev/null 2>&1; then
+  fail "cleanup for another home accepted the installed singleton unit"
+fi
+[ "$(wc -l < "$TMP_ROOT/systemctl.calls")" -eq "$before_systemctl" ] || fail "wrong-home cleanup mutated the singleton service"
+touch "$TMP_ROOT/systemctl.fail-disable"
+if "${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null 2>&1; then fail "cleanup ignored systemctl failure"; fi
+[ -e "$voice_home/state/telegram" ] || fail "failed cleanup removed private state while service could be live"
+[ -e "$unit_dir/firstmate-telegram.service" ] || fail "failed cleanup removed the installed unit"
+rm -f "$TMP_ROOT/systemctl.fail-disable"
+cleanup_audio=$(mktemp /dev/shm/firstmate-telegram-cleanup.XXXXXX)
+python3 - "$voice_home/state/telegram/pending.json" "$cleanup_audio" <<'PY'
+import json, sys
+json.dump({'audio_path': sys.argv[2], 'created_at': 1}, open(sys.argv[1], 'w'))
+PY
+FM_HOME="$voice_home" FM_STATE_OVERRIDE="$voice_home/state" bash -c '. "$1"; fm_wake_append check unrelated:keep "unrelated keep"' _ "$ROOT/bin/fm-wake-lib.sh"
+"${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null
 [ ! -e "$unit_dir/firstmate-telegram.service" ] || fail "cleanup must remove its unit"
 [ -e "$voice_home/.env" ] || fail "cleanup must preserve .env"
 [ ! -e "$voice_home/state/telegram" ] || fail "cleanup must remove private Telegram state"
+[ ! -e "$cleanup_audio" ] || fail "cleanup must delete pending temporary audio"
+grep -F $'\tcheck\tunrelated:keep\t' "$voice_home/state/.wake-queue" >/dev/null || fail "cleanup removed an unrelated wake"
+! grep -F $'\tcheck\ttelegram:' "$voice_home/state/.wake-queue" >/dev/null || fail "cleanup left Telegram wake rows"
+"${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null || fail "cleanup must be idempotent"
 
 grep -F 'test-only-token' "$home/state/.wake-queue" >/dev/null && fail "bot token entered wake data"
 pass "Telegram transport pairing, queueing, dedupe, drops, voice flow, safety, and lifecycle behave as specified"

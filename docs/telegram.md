@@ -32,7 +32,7 @@ Cleanup never edits `.env` or unrelated home records.
 Pinned private text is durably stored in the home's private Telegram inbox before the transport reply is sent.
 A running primary receives `Message received.` and an offline primary receives `Message received and queued. It will be processed when Firstmate starts.`
 The reply means queued, not started or completed.
-Telegram update and message identifiers are deduplicated in a bounded private record, so a replay produces no second request or reply.
+Telegram update and message identifiers are deduplicated in a bounded private record, and deterministic local request identifiers let interrupted processing reconcile the same queued request and receipt instead of creating another request.
 Unknown, malformed, unpinned, and unsupported updates are silently dropped.
 Only private text and Telegram voice notes are accepted, and other media is not downloaded.
 
@@ -44,8 +44,10 @@ Callback actions are idempotent.
 
 The service writes only a private request record and a safe wake containing its local request identifier.
 Raw Telegram text and audio never enter wake records, status logs, shell arguments, unit files, diagnostics, or tracked files.
-The primary reads a request in its terminal with `bin/fm-telegram.py request-read <local-request-id>` and marks it handled with `request-handled <local-request-id>`.
+The primary reads a request in its terminal with `bin/fm-telegram.py request-read <local-request-id>` and claims it with `request-handled <local-request-id>`.
+That claim persists the one active Telegram origin binding so `active-request` can recover it after compaction or restart.
 Replies use the pinned chat without a recipient argument, for example `bin/fm-telegram.py reply <local-request-id> --text-file reply.txt`.
+The terminal reply adds `--final` to clear the active binding and wake the next queued conversation.
 Telegram-originated work can receive decision, blocker, terminal-confirmation, PR-ready, and final replies through this command, while routine progress and milestone chatter stay terminal-only.
 Requests that start in the terminal remain terminal-only.
 
@@ -55,8 +57,10 @@ The transport has no model or action authority and does not interpret the reques
 
 ## Operations and privacy
 
-`request-read`, `request-handled`, `send`, and `reply` are the small operator surface; text is read from a file or standard input rather than a shell argument.
+`request-read`, `request-handled`, `active-request`, `send`, and `reply` are the small operator surface; text is read from a file or standard input rather than a shell argument.
 Private inbox, handled-request, deduplication, and pending voice records are bounded and stored under the home state directory with private permissions.
+Queued requests older than the retention window or beyond the fixed queue cap are removed oldest-first, including their Telegram wake records, so an unattended offline home does not retain message bodies indefinitely.
+The executable's `--help` reports the current numeric retention limits.
 Temporary audio is deleted after confirmation, cancellation, expiry, or a failed transcription.
 
 Telegram bot chats are not end-to-end encrypted.
