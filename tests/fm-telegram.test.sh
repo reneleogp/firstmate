@@ -440,6 +440,28 @@ run_tg "$home" serve --once >/dev/null
 [ "$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")" -eq "$callbacks_before" ] || fail "malformed callback received an acknowledgement"
 [ "$(grep -c 'getFile' "$home/calls.jsonl")" -eq "$files_before" ] || fail "malformed voice metadata triggered a download"
 ! grep -F 'must not download' "$home/calls.jsonl" >/dev/null || fail "unsupported media was downloaded"
+python3 - "$home/updates.json" <<'PY' || fail "oversized identifier fixture failed"
+import json, sys
+oversized = 1 << 52
+json.dump([
+    {'update_id': oversized, 'message': {
+        'message_id': 90, 'from': {'id': 77},
+        'chat': {'id': 77, 'type': 'private'}, 'text': 'oversized update'}},
+    {'update_id': 90, 'message': {
+        'message_id': oversized, 'from': {'id': 77},
+        'chat': {'id': 77, 'type': 'private'}, 'text': 'oversized message'}},
+    {'update_id': 91, 'callback_query': {
+        'id': 'x' * 257, 'from': {'id': 77}, 'data': 'cancel:any:1',
+        'message': {'message_id': 91, 'chat': {'id': 77, 'type': 'private'}}}},
+    {'update_id': 92, 'callback_query': {
+        'id': 'oversized-callback-message', 'from': {'id': 77}, 'data': 'cancel:any:1',
+        'message': {'message_id': oversized, 'chat': {'id': 77, 'type': 'private'}}}},
+], open(sys.argv[1], 'w', encoding='utf-8'))
+PY
+run_tg "$home" serve --once >/dev/null || fail "oversized identifiers stopped the transport"
+[ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq "$before" ] || fail "oversized identifiers received a reply"
+[ "$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")" -eq "$callbacks_before" ] || fail "oversized callback identifiers were acknowledged"
+! find "$home/state/telegram/inbox" -name '*4503599627370496*' -print -quit | grep . >/dev/null || fail "oversized identifiers reached request paths"
 
 # Locked admission retains only the newest 256 queued requests for text and confirmed voice.
 capacity_home=$(new_home capacity)
@@ -709,6 +731,10 @@ run_tg "$order_home" serve --once >/dev/null
 [ "$(cat "$order_home/state/.wake-queue.seq")" = "$order_wake_sequence" ] || fail "unchanged wake head was re-emitted during reconciliation"
 [ -e "$order_home/state/.seen-telegram-$order_a" ] || fail "unchanged surfaced wake marker was cleared during reconciliation"
 [ "$(grep -c "telegram:$order_a" "$order_home/state/.wake-queue")" -eq 1 ] || fail "unchanged surfaced wake was duplicated during reconciliation"
+if run_tg "$order_home" request-handled "$order_b" >/dev/null 2>&1; then
+  fail "request handling claimed a later conversation ahead of the ordered head"
+fi
+[ ! -e "$order_home/state/telegram/active.json" ] || fail "out-of-order claim created an active conversation"
 run_tg "$order_home" request-handled "$order_a" >/dev/null
 run_tg "$order_home" request-bind "$order_a" order-work >/dev/null
 printf 'endpoint_task_id=order-work\n' > "$order_home/state/order-work.meta"
@@ -1202,6 +1228,10 @@ wait "$locked_cleanup_pid" || locked_cleanup_status=$?
 grep -F $'\tcheck\tunrelated:keep\t' "$voice_home/state/.wake-queue" >/dev/null || fail "cleanup removed an unrelated wake"
 ! grep -F $'\tcheck\ttelegram:' "$voice_home/state/.wake-queue" >/dev/null || fail "cleanup left Telegram wake rows"
 "${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null || fail "cleanup must be idempotent"
+if "${lifecycle_env[@]}" "$SCRIPT" request-handled missing-request >/dev/null 2>&1; then
+  fail "request handling remained available after cleanup"
+fi
+[ ! -e "$voice_home/state/telegram" ] || fail "a failed post-cleanup request recreated private Telegram state"
 
 "${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null
 set_updates '[]' "$voice_home"

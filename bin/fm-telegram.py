@@ -32,6 +32,8 @@ MAX_HANDLED = 4096
 MAX_INBOX = 256
 MAX_TEXT = 12000
 MAX_TRANSCRIPT_UNITS = 4096
+MAX_TELEGRAM_NUMERIC_ID = (1 << 52) - 1
+MAX_CALLBACK_ID_BYTES = 256
 MAX_VOICE_BYTES = 10 * 1024 * 1024
 MAX_VOICE_SECONDS = 120
 INBOX_TTL = 7 * 24 * 60 * 60
@@ -206,9 +208,7 @@ def config_path(home: Path) -> Path:
 
 
 def state_dir(home: Path) -> Path:
-    path = home / "state" / "telegram"
-    private_dir(path)
-    return path
+    return home / "state" / "telegram"
 
 
 def load_config(home: Path) -> Dict[str, Any]:
@@ -217,7 +217,7 @@ def load_config(home: Path) -> Dict[str, Any]:
     if not isinstance(config, dict):
         raise TelegramError("Telegram pairing is not configured")
     for key in ("user_id", "chat_id", "bot_id"):
-        if not strict_int(config.get(key)):
+        if not telegram_numeric_id(config.get(key), positive=True):
             raise TelegramError("Telegram pairing is incomplete")
     try:
         mode = path.stat().st_mode & 0o777
@@ -288,7 +288,8 @@ def verified_token_for(home: Path, config: Optional[Dict[str, Any]] = None) -> s
             ) from exc
         raise
     if (not isinstance(result, dict) or result.get("is_bot") is not True
-            or not strict_int(result.get("id")) or result.get("id") != expected):
+            or not telegram_numeric_id(result.get("id"), positive=True)
+            or result.get("id") != expected):
         raise PermanentConfigurationError(
             "Telegram bot token does not match the verified pairing; pair again"
         )
@@ -375,12 +376,27 @@ def strict_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def request_dirs(home: Path) -> Tuple[Path, Path]:
+def telegram_numeric_id(value: Any, positive: bool = False) -> bool:
+    minimum = 1 if positive else 0
+    return strict_int(value) and minimum <= value <= MAX_TELEGRAM_NUMERIC_ID
+
+
+def callback_query_id(value: Any) -> bool:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= MAX_CALLBACK_ID_BYTES
+    except UnicodeEncodeError:
+        return False
+
+
+def request_dirs(home: Path, create: bool = True) -> Tuple[Path, Path]:
     root = state_dir(home)
     inbox = root / "inbox"
     handled = root / "handled"
-    private_dir(inbox)
-    private_dir(handled)
+    if create:
+        private_dir(inbox)
+        private_dir(handled)
     return inbox, handled
 
 
@@ -391,7 +407,7 @@ def safe_id(value: str) -> bool:
 def request_path(home: Path, request_id: str) -> Optional[Path]:
     if not safe_id(request_id):
         return None
-    inbox, handled = request_dirs(home)
+    inbox, handled = request_dirs(home, create=False)
     for directory in (inbox, handled):
         path = directory / f"{request_id}.json"
         if path.is_file() and not path.is_symlink():
@@ -409,6 +425,15 @@ def lifecycle_lock(home: Path) -> Path:
 
 def service_lock(home: Path) -> Path:
     return home / "state" / ".telegram-service.lock"
+
+
+def state_tombstone(home: Path) -> Path:
+    return home / "state" / ".telegram-cleaned"
+
+
+def require_state_available_locked(home: Path) -> None:
+    if state_tombstone(home).is_file() or not config_path(home).is_file():
+        raise TelegramError("Telegram private state is not initialized; pair this home first")
 
 
 def unit_lock() -> Path:
@@ -632,7 +657,7 @@ def next_admission_sequence_locked(home: Path) -> int:
     return sequence
 
 
-def _sync_request_wakes_locked(home: Path) -> None:
+def _desired_request_id_locked(home: Path) -> Optional[str]:
     inbox, handled = request_dirs(home)
     paths = list(inbox.glob("*.json"))
     active = active_request_id(home)
@@ -656,7 +681,11 @@ def _sync_request_wakes_locked(home: Path) -> None:
                 routed_paths.append(path)
         paths = routed_paths
     paths.sort(key=request_order_key)
-    desired = paths[0].stem if paths else None
+    return paths[0].stem if paths else None
+
+
+def _sync_request_wakes_locked(home: Path) -> None:
+    desired = _desired_request_id_locked(home)
     queued = queued_safe_wake_ids(home)
     if desired is not None and queued == [desired]:
         return
@@ -667,11 +696,13 @@ def _sync_request_wakes_locked(home: Path) -> None:
 
 def sync_request_wakes(home: Path) -> None:
     with FileLock(state_lock(home)):
+        require_state_available_locked(home)
         _sync_request_wakes_locked(home)
 
 
 def bounded_cleanup(home: Path) -> None:
     with FileLock(state_lock(home)):
+        require_state_available_locked(home)
         inbox, handled = request_dirs(home)
         active = active_request_id(home)
         cutoff = now() - INBOX_TTL
@@ -707,7 +738,9 @@ def bounded_cleanup(home: Path) -> None:
 
 
 def deterministic_request_id(source: str, update_id: int, message_id: int) -> str:
-    if source not in {"text", "voice"} or update_id < 0 or message_id < 0:
+    if (source not in {"text", "voice"}
+            or not telegram_numeric_id(update_id)
+            or not telegram_numeric_id(message_id)):
         raise TelegramError("request identifiers are invalid")
     return f"tg-{source}-u{update_id}-m{message_id}"
 
@@ -717,7 +750,7 @@ def _queue_request_locked(home: Path, text: str, chat_id: int, message_id: int,
                           attach_to_active: bool) -> str:
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
         raise TelegramError("request text is empty or too long")
-    if not strict_int(update_id) or not strict_int(message_id):
+    if not telegram_numeric_id(update_id) or not telegram_numeric_id(message_id):
         raise TelegramError("request identifiers are invalid")
     request_id = deterministic_request_id(source, update_id, message_id)
     inbox, handled = request_dirs(home)
@@ -767,6 +800,7 @@ def queue_request(home: Path, text: str, chat_id: int, message_id: int,
                   update_id: Optional[int], source: str = "text",
                   confirmed: bool = False, attach_to_active: bool = False) -> str:
     with FileLock(state_lock(home)):
+        require_state_available_locked(home)
         return _queue_request_locked(
             home, text, chat_id, message_id, update_id, source, confirmed, attach_to_active
         )
@@ -787,11 +821,13 @@ def _update_request_record_locked(home: Path, request_id: str,
 
 def update_request_record(home: Path, request_id: str, **changes: Any) -> Dict[str, Any]:
     with FileLock(state_lock(home)):
+        require_state_available_locked(home)
         return _update_request_record_locked(home, request_id, **changes)
 
 
-def reconcile_request(home: Path, request_id: str) -> bool:
+def reconcile_request(home: Path, request_id: str, sync_wakes: bool = True) -> bool:
     with FileLock(state_lock(home)):
+        require_state_available_locked(home)
         path = request_path(home, request_id)
         if path is None:
             return False
@@ -799,7 +835,8 @@ def reconcile_request(home: Path, request_id: str) -> bool:
         if not isinstance(record, dict) or record.get("origin") != "telegram":
             return False
         if path.parent.name == "inbox":
-            _sync_request_wakes_locked(home)
+            if sync_wakes:
+                _sync_request_wakes_locked(home)
             if record.get("wake_recorded") is not True:
                 record = _update_request_record_locked(home, request_id, wake_recorded=True)
         receipt_status = record.get("receipt_status")
@@ -873,14 +910,19 @@ def reconcile_request(home: Path, request_id: str) -> bool:
 
 
 def reconcile_requests(home: Path) -> None:
-    inbox, handled = request_dirs(home)
-    paths = list(inbox.glob("*.json")) + list(handled.glob("*.json"))
-    for path in sorted(paths, key=request_order_key):
-        record = read_json(path)
-        if not isinstance(record, dict) or not isinstance(record.get("request_id"), str):
-            continue
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        inbox, handled = request_dirs(home)
+        paths = list(inbox.glob("*.json")) + list(handled.glob("*.json"))
+        request_ids = []
+        for path in sorted(paths, key=request_order_key):
+            record = read_json(path)
+            if isinstance(record, dict) and isinstance(record.get("request_id"), str):
+                request_ids.append(str(record["request_id"]))
+        _sync_request_wakes_locked(home)
+    for request_id in request_ids:
         try:
-            reconcile_request(home, str(record["request_id"]))
+            reconcile_request(home, request_id, sync_wakes=False)
         except TelegramError:
             continue
 
@@ -1154,12 +1196,12 @@ def pinned_message(config: Dict[str, Any], message: Any) -> Optional[Tuple[Dict[
         return None
     chat_id = chat.get("id")
     sender_id = sender.get("id")
-    if (chat.get("type") != "private" or not strict_int(chat_id)
+    if (chat.get("type") != "private" or not telegram_numeric_id(chat_id, positive=True)
             or chat_id != config.get("chat_id")):
         return None
-    if not strict_int(sender_id) or sender_id != config.get("user_id"):
+    if not telegram_numeric_id(sender_id, positive=True) or sender_id != config.get("user_id"):
         return None
-    if not strict_int(message.get("message_id")):
+    if not telegram_numeric_id(message.get("message_id")):
         return None
     return message, chat
 
@@ -1281,20 +1323,24 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
     callback_id = query.get("id")
     sender = query.get("from")
     message = query.get("message")
-    if not isinstance(callback_id, str) or not callback_id:
+    if not callback_query_id(callback_id):
         return False
-    if (not isinstance(sender, dict) or not strict_int(sender.get("id"))
+    if (not isinstance(sender, dict)
+            or not telegram_numeric_id(sender.get("id"), positive=True)
             or sender.get("id") != config.get("user_id")):
         return False
-    if (not isinstance(message, dict) or not strict_int(message.get("message_id"))
+    if (not isinstance(message, dict)
+            or not telegram_numeric_id(message.get("message_id"))
             or not set(message).issubset(CALLBACK_MESSAGE_FIELDS)):
         return False
     chat = message.get("chat")
     if (not isinstance(chat, dict) or chat.get("type") != "private"
-            or not strict_int(chat.get("id")) or chat.get("id") != config.get("chat_id")):
+            or not telegram_numeric_id(chat.get("id"), positive=True)
+            or chat.get("id") != config.get("chat_id")):
         return False
     callback_data = query.get("data")
-    if not isinstance(callback_data, str):
+    if (not isinstance(callback_data, str)
+            or len(callback_data.encode("utf-8", errors="surrogatepass")) > 64):
         return False
     parts = callback_data.split(":")
     if len(parts) != 3:
@@ -1399,11 +1445,9 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
 
 
 def process_update(home: Path, config: Dict[str, Any], update: Any) -> None:
-    if not isinstance(update, dict) or not strict_int(update.get("update_id")):
+    if not isinstance(update, dict) or not telegram_numeric_id(update.get("update_id")):
         return
     update_id = int(update["update_id"])
-    if update_id < 0:
-        return
     has_callback = "callback_query" in update
     has_message = "message" in update
     if has_callback == has_message:
@@ -1438,8 +1482,6 @@ def process_update(home: Path, config: Dict[str, Any], update: Any) -> None:
     if pinned is None:
         return
     message_id = int(message["message_id"])
-    if message_id < 0:
-        return
     with FileLock(state_lock(home)):
         if has_seen(home, update_id, message_id):
             return
@@ -1543,7 +1585,7 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> i
                     if not isinstance(updates, list):
                         updates = []
                     for update in updates:
-                        if isinstance(update, dict) and strict_int(update.get("update_id")):
+                        if isinstance(update, dict) and telegram_numeric_id(update.get("update_id")):
                             offset = max(offset, int(update["update_id"]) + 1)
                         process_update(home, config, update)
                     reconcile_requests(home)
@@ -1596,6 +1638,9 @@ def identity_bound_state_exists(home: Path) -> bool:
 
 
 def pair(home: Path, user_id: int, chat_id: int) -> int:
+    if (not telegram_numeric_id(user_id, positive=True)
+            or not telegram_numeric_id(chat_id, positive=True)):
+        raise TelegramError("user and chat ids must be positive Telegram identifiers")
     with FileLock(lifecycle_lock(home)):
         require_pairing_service_inactive(home)
         config_existing = read_json(config_path(home), {})
@@ -1603,14 +1648,13 @@ def pair(home: Path, user_id: int, chat_id: int) -> int:
         token = token_for(home)
         result = raw_api_call(home, token, "getMe", {}, config)
         if (not isinstance(result, dict) or result.get("is_bot") is not True
-                or not strict_int(result.get("id"))):
+                or not telegram_numeric_id(result.get("id"), positive=True)):
             raise TelegramError("bot identity could not be verified")
         chat = raw_api_call(home, token, "getChat", {"chat_id": chat_id}, config)
         if (not isinstance(chat, dict) or chat.get("type") != "private"
-                or not strict_int(chat.get("id")) or chat.get("id") != chat_id):
+                or not telegram_numeric_id(chat.get("id"), positive=True)
+                or chat.get("id") != chat_id):
             raise TelegramError("pairing requires the pinned private bot DM")
-        if user_id <= 0 or chat_id <= 0:
-            raise TelegramError("user and chat ids must be positive integers")
         if user_id != chat_id:
             raise TelegramError("the pinned private chat must belong to the pinned user")
         endpoint = api_base(home, config)
@@ -1631,6 +1675,7 @@ def pair(home: Path, user_id: int, chat_id: int) -> int:
             config.update({"user_id": user_id, "chat_id": chat_id,
                            "bot_id": int(result["id"]), "api_base": endpoint})
             atomic_json(config_path(home), config)
+            durable_unlink(state_tombstone(home))
     print("Telegram pairing verified.")
     return 0
 
@@ -1642,25 +1687,28 @@ def text_from_file(path: str) -> str:
 
 
 def request_read(home: Path, request_id: str) -> int:
-    path = request_path(home, request_id)
-    if path is None:
-        return die("request not found")
-    record = read_json(path)
-    if not isinstance(record, dict) or record.get("origin") != "telegram":
-        return die("request is not a Telegram request")
-    text = record.get("text")
-    if not isinstance(text, str):
-        return die("request is malformed")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        path = request_path(home, request_id)
+        if path is None:
+            return die("request not found")
+        record = read_json(path)
+        if not isinstance(record, dict) or record.get("origin") != "telegram":
+            return die("request is not a Telegram request")
+        text = record.get("text")
+        if not isinstance(text, str):
+            return die("request is malformed")
     print(text)
     return 0
 
 
 def request_handled(home: Path, request_id: str) -> int:
     reconcile_closing(home)
-    inbox, handled = request_dirs(home)
-    source = inbox / f"{request_id}.json"
-    target = handled / f"{request_id}.json"
     with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        inbox, handled = request_dirs(home)
+        source = inbox / f"{request_id}.json"
+        target = handled / f"{request_id}.json"
         active = active_request_id(home)
         record = read_json(source)
         if not source.is_file() or source.is_symlink():
@@ -1686,6 +1734,8 @@ def request_handled(home: Path, request_id: str) -> int:
         if not isinstance(record, dict) or record.get("request_id") != request_id:
             return die("request is malformed")
         continuation_of = record.get("continuation_of")
+        if _desired_request_id_locked(home) != request_id:
+            return die("request is not the ordered Telegram queue head")
         if active is not None and active != request_id and continuation_of != active:
             return die("another Telegram conversation is active")
         if active is None:
@@ -1707,6 +1757,7 @@ def request_bind(home: Path, request_id: str, work_id: str) -> int:
     if not safe_id(work_id):
         return die("work identifier is invalid")
     with FileLock(state_lock(home)):
+        require_state_available_locked(home)
         active = active_record(home)
         if active is None or active.get("request_id") != request_id:
             return die("request is not the active Telegram conversation")
@@ -1729,6 +1780,7 @@ def request_bind(home: Path, request_id: str, work_id: str) -> int:
 
 def request_routed(home: Path, request_id: str) -> int:
     with FileLock(state_lock(home)):
+        require_state_available_locked(home)
         active = active_record(home)
         if active is None or active.get("request_id") != request_id:
             return die("request is not the active Telegram conversation")
@@ -1750,6 +1802,7 @@ def request_active(home: Path, work_id: Optional[str] = None,
                    claimed_request: Optional[str] = None) -> int:
     reconcile_closing(home)
     with FileLock(state_lock(home)):
+        require_state_available_locked(home)
         active = active_record(home)
         if active is None:
             return 1
@@ -1783,6 +1836,7 @@ def request_active(home: Path, work_id: Optional[str] = None,
 
 def continuation_handled(home: Path, claimed_request: str) -> int:
     with FileLock(state_lock(home)):
+        require_state_available_locked(home)
         path = request_path(home, claimed_request)
         if path is None or path.parent.name != "handled":
             return die("continuation request not found")
@@ -1813,6 +1867,7 @@ def wake_next_request(home: Path) -> None:
 
 def reconcile_closing(home: Path) -> None:
     with FileLock(state_lock(home)):
+        require_state_available_locked(home)
         closing = read_json(closing_path(home))
         if not isinstance(closing, dict):
             return
@@ -2063,6 +2118,7 @@ def _cleanup_locked(home: Path) -> int:
             durable_unlink(path)
             systemctl("daemon-reload")
         with FileLock(state_lock(home)):
+            atomic_bytes(state_tombstone(home), b"cleaned\n")
             if telegram_state.is_dir() and not telegram_state.is_symlink():
                 pending = read_json(telegram_state / "pending.json")
                 if isinstance(pending, dict):
