@@ -151,6 +151,12 @@ def require_path_kind(path: Path, expected: str) -> None:
 def validate_home_storage(home: Path) -> None:
     if not home.is_dir() or home.is_symlink():
         raise TelegramError(f"Telegram home must be an existing directory: {home}")
+    try:
+        (home / ".fm-secondmate-home").lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise TelegramError("Telegram is available only for the primary Firstmate home")
     state = home / "state"
     config = home / "config"
     telegram = state / "telegram"
@@ -230,10 +236,24 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 def env_value(home: Path, key: str) -> Optional[str]:
     dotenv = home / ".env"
+    descriptor = -1
     try:
-        lines = dotenv.read_text(encoding="utf-8").splitlines()
-    except OSError:
+        descriptor = os.open(dotenv, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise TelegramError("Telegram .env must be a readable regular non-symlink file") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise TelegramError("Telegram .env must be a regular non-symlink file")
+        with os.fdopen(descriptor, encoding="utf-8") as stream:
+            descriptor = -1
+            lines = stream.read().splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise TelegramError("Telegram .env must be a readable UTF-8 regular file") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     for line in lines:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -458,6 +478,29 @@ def request_dirs(home: Path, create: bool = True) -> Tuple[Path, Path]:
 
 def safe_id(value: str) -> bool:
     return bool(value) and all(ch.isalnum() or ch in "._-" for ch in value)
+
+
+def lifecycle_task_id_valid(value: str) -> bool:
+    validator = Path(__file__).resolve().with_name("fm-pr-lib.sh")
+    try:
+        result = subprocess.run(
+            ["bash", "-c", '. "$1"; fm_task_id_creation_valid "$2"',
+             "_", str(validator), value],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return False
+    return result.returncode == 0
+
+
+def unicode_text_units(value: str) -> Optional[int]:
+    try:
+        return len(value.encode("utf-16-le")) // 2
+    except UnicodeEncodeError:
+        return None
 
 
 def request_path(home: Path, request_id: str) -> Optional[Path]:
@@ -899,8 +942,9 @@ def deterministic_request_id(source: str, update_id: int, message_id: int) -> st
 def _queue_request_locked(home: Path, text: str, chat_id: int, message_id: int,
                           update_id: Optional[int], source: str, confirmed: bool,
                           attach_to_active: bool) -> str:
-    if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
-        raise TelegramError("request text is empty or too long")
+    if (not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT
+            or unicode_text_units(text) is None):
+        raise TelegramError("request text is empty, too long, or malformed")
     if (not telegram_numeric_id(update_id)
             or not telegram_numeric_id(message_id, positive=True)):
         raise TelegramError("request identifiers are invalid")
@@ -1223,8 +1267,9 @@ def show_confirmation(home: Path, config: Dict[str, Any], pending: Dict[str, Any
             return
         snapshot = dict(current)
     text = str(snapshot["text"])
-    if len(text.encode("utf-16-le")) // 2 > MAX_TRANSCRIPT_UNITS:
-        raise TelegramError("voice transcript exceeds Telegram's message limit")
+    text_units = unicode_text_units(text)
+    if text_units is None or text_units > MAX_TRANSCRIPT_UNITS:
+        raise TelegramError("voice transcript is malformed or exceeds Telegram's message limit")
     if snapshot.get("heading_sent") is not True:
         send_text(home, int(snapshot["chat_id"]), "I heard this:")
         with FileLock(state_lock(home)):
@@ -1401,7 +1446,8 @@ def pinned_message(config: Dict[str, Any], message: Any) -> Optional[Tuple[Dict[
 def handle_text(home: Path, config: Dict[str, Any], message: Dict[str, Any], update_id: int) -> bool:
     text = message.get("text")
     message_id = message.get("message_id")
-    if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
+    if (not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT
+            or unicode_text_units(text) is None):
         return False
     pending = read_json(pending_path(home))
     if isinstance(pending, dict):
@@ -1411,7 +1457,8 @@ def handle_text(home: Path, config: Dict[str, Any], message: Dict[str, Any], upd
             reconcile_pending(home, config)
             return True
         if pending.get("mode") == "edit":
-            if len(text.encode("utf-16-le")) // 2 > MAX_TRANSCRIPT_UNITS:
+            text_units = unicode_text_units(text)
+            if text_units is None or text_units > MAX_TRANSCRIPT_UNITS:
                 return False
             revision = pending.get("revision")
             if not strict_int(revision) or revision <= 0:
@@ -1993,7 +2040,7 @@ def request_handled(home: Path, request_id: str) -> int:
 
 
 def request_bind(home: Path, request_id: str, work_id: str) -> int:
-    if not safe_id(work_id):
+    if not lifecycle_task_id_valid(work_id):
         return die("work identifier is invalid")
     with FileLock(state_lock(home)):
         require_state_available_locked(home)

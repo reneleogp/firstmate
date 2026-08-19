@@ -190,6 +190,22 @@ fi
 run_tg "$home" pair --user-id 77 --chat-id 77 >/dev/null
 [ "$(path_mode "$home/config/telegram.json")" = 600 ] || fail "pairing config must be mode 0600"
 
+# Telegram is confined to a primary home's own regular credential file.
+boundary_home=$(new_home primary-boundary)
+start_server "$boundary_home" "$boundary_home/port"
+printf 'secondmate-id\n' > "$boundary_home/.fm-secondmate-home"
+if run_tg "$boundary_home" pair --user-id 77 --chat-id 77 >/dev/null 2>&1; then
+  fail "pairing accepted a marked secondmate home"
+fi
+[ ! -e "$boundary_home/calls.jsonl" ] || fail "secondmate home validation reached Telegram"
+rm "$boundary_home/.fm-secondmate-home" "$boundary_home/.env"
+printf 'FM_TELEGRAM_BOT_TOKEN=test-only-token\n' > "$TMP_ROOT/external-telegram.env"
+ln -s "$TMP_ROOT/external-telegram.env" "$boundary_home/.env"
+if run_tg "$boundary_home" pair --user-id 77 --chat-id 77 >/dev/null 2>&1; then
+  fail "pairing accepted a symlinked home token file"
+fi
+[ ! -e "$boundary_home/calls.jsonl" ] || fail "symlinked home token was used for Telegram authentication"
+
 # Home-owned storage components cannot redirect pairing or state outside the selected home.
 unsafe_home=$(new_home unsafe-storage)
 unsafe_target="$TMP_ROOT/unsafe-storage-target"
@@ -415,6 +431,13 @@ import json, sys
 assert json.load(open(sys.argv[1], encoding='utf-8'))['wake_recorded'] is True
 PY
 [ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$request_id" ] || fail "replayed initial claim lost its conversation route"
+long_work_id=$(printf 'a%.0s' $(seq 1 65))
+for invalid_work_id in .hidden 'unicode-é' "$long_work_id"; do
+  if run_tg "$home" request-bind "$request_id" "$invalid_work_id" >/dev/null 2>&1; then
+    fail "request-bind accepted a work id rejected by fm-spawn"
+  fi
+done
+[ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$request_id" ] || fail "invalid work binding changed the active route"
 printf 'endpoint_task_id=terminal-work\n' > "$home/state/terminal-work.meta"
 if run_tg "$home" request-bind "$request_id" terminal-work >/dev/null 2>&1; then
   fail "Telegram request bound to a pre-existing terminal work record"
@@ -915,6 +938,13 @@ set_updates '[{"update_id":211,"callback_query":{"id":"cb-stale-send","from":{"i
 run_tg "$voice_home" serve --once >/dev/null
 [ "$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 0 ] || fail "stale Send control queued text while an edit was pending"
 [ "$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")" -eq "$stale_send_answers" ] || fail "stale Send control was acknowledged while an edit was pending"
+malformed_edit_sends=$(grep -c 'sendMessage' "$voice_home/calls.jsonl")
+malformed_edit_inbox=$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')
+set_updates '[{"update_id":212,"message":{"message_id":212,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"\ud800"}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mode"])' "$pending")" = edit ] || fail "malformed corrected text changed pending voice state"
+[ "$(grep -c 'sendMessage' "$voice_home/calls.jsonl")" -eq "$malformed_edit_sends" ] || fail "malformed corrected text received a reply"
+[ "$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq "$malformed_edit_inbox" ] || fail "malformed corrected text entered the request queue"
 set_updates '[{"update_id":22,"message":{"message_id":22,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"corrected voice text"}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 grep -F 'corrected voice text' "$voice_home/calls.jsonl" >/dev/null || fail "edit must reconfirm corrected text"
