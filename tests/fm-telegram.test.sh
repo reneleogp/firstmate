@@ -503,6 +503,14 @@ fi
 rm -f "$home/hold-task-creation-lock"
 wait "$task_lock_pid" || fail "task creation lock fixture failed"
 run_tg "$home" request-bind "$request_id" telegram-work >/dev/null
+FM_HOME="$home" "$ROOT/bin/fm-spawn.sh" telegram-work --relaunch \
+  >"$home/telegram-relaunch.out" 2>"$home/telegram-relaunch.err" || true
+if grep -F 'reserved for an authenticated Telegram-origin spawn' \
+    "$home/telegram-relaunch.err" >/dev/null; then
+  fail "Telegram reservation blocked adoption by a lifecycle relaunch"
+fi
+grep -F -- '--relaunch needs an existing task record' \
+  "$home/telegram-relaunch.err" >/dev/null || fail "Telegram relaunch did not reach normal metadata adoption"
 if FM_TELEGRAM_REQUEST_ID="$request_id" FM_HOME="$home" \
     "$ROOT/bin/fm-spawn.sh" telegram-work "$home" --secondmate \
     >"$home/telegram-secondmate.out" 2>"$home/telegram-secondmate.err"; then
@@ -1007,6 +1015,13 @@ run_tg "$voice_home" serve --once >/dev/null
 [ -f "$audio" ] || fail "a subsequent voice note deleted the active confirmation audio"
 [ "$(grep -c 'getFile' "$voice_home/calls.jsonl")" -eq "$get_file_calls" ] || fail "a subsequent voice note was downloaded during an active confirmation"
 [ "$(grep -c 'I heard this:' "$voice_home/calls.jsonl")" -eq "$confirmation_calls" ] || fail "a subsequent voice note created a concurrent confirmation"
+voice_queue="$voice_home/state/telegram/pending-voice-queue.json"
+python3 - "$voice_queue" <<'PY' || fail "a subsequent voice note was not durably serialized"
+import json, sys
+records = json.load(open(sys.argv[1], encoding='utf-8'))
+assert [record['pending_id'] for record in records] == ['voice-u2000-m2000']
+PY
+[ "$(path_mode "$voice_queue")" = 600 ] || fail "pending voice queue was not private"
 
 edit_data=$(callback_data "$voice_home" edit)
 stale_send_data=$(callback_data "$voice_home" send)
@@ -1114,6 +1129,8 @@ with open(path, 'w', encoding='utf-8') as stream:
     json.dump(pending, stream)
 PY
 chmod 500 "$cancel_audio_dir"
+queued_get_file_before=$(grep -c 'getFile' "$voice_home/calls.jsonl")
+queued_confirmation_before=$(grep -c 'I heard this:' "$voice_home/calls.jsonl")
 set_updates '[{"update_id":24,"callback_query":{"id":"cb-cancel","from":{"id":77},"data":"'"$cancel_data"'","message":{"message_id":203,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 if run_tg "$voice_home" serve --once >/dev/null 2>&1; then
   fail "cancel unexpectedly completed while temporary audio deletion was blocked"
@@ -1125,7 +1142,21 @@ PY
 chmod 700 "$cancel_audio_dir"
 run_tg "$voice_home" serve --once >/dev/null
 [ ! -e "$cancel_audio" ] || fail "recovered cancel must delete temporary audio"
-[ ! -e "$pending" ] || fail "recovered cancel must delete pending state"
+python3 - "$pending" <<'PY' || fail "cancel did not advance the next serialized voice"
+import json, sys
+pending = json.load(open(sys.argv[1], encoding='utf-8'))
+assert pending['pending_id'] == 'voice-u2000-m2000'
+assert pending['mode'] == 'confirm'
+PY
+[ ! -e "$voice_queue" ] || fail "advanced voice remained duplicated in the pending queue"
+queued_audio=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["audio_path"])' "$pending")
+[ -f "$queued_audio" ] || fail "advanced voice did not retain its bounded confirmation audio"
+[ "$(grep -c 'getFile' "$voice_home/calls.jsonl")" -eq "$((queued_get_file_before + 1))" ] || fail "serialized voice was not downloaded on advancement"
+[ "$(grep -c 'I heard this:' "$voice_home/calls.jsonl")" -eq "$((queued_confirmation_before + 1))" ] || fail "serialized voice did not enter confirmation after cancellation"
+queued_cancel_data=$(callback_data "$voice_home" cancel)
+set_updates '[{"update_id":241,"callback_query":{"id":"cb-cancel-queued","from":{"id":77},"data":"'"$queued_cancel_data"'","message":{"message_id":241,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+[ ! -e "$pending" ] && [ ! -e "$queued_audio" ] || fail "serialized voice cancellation retained pending state"
 rmdir "$cancel_audio_dir"
 cancel_answers=$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")
 set_updates '[{"update_id":240,"callback_query":{"id":"cb-cancel-completed","from":{"id":77},"data":"'"$cancel_data"'","message":{"message_id":203,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"

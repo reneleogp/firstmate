@@ -32,6 +32,7 @@ CONFIG_NAME = "telegram.json"
 MAX_SEEN = 4096
 MAX_HANDLED = 4096
 MAX_INBOX = 256
+MAX_PENDING_VOICES = 64
 MAX_ATOMIC_TEMPS = 256
 MAX_TEXT = 12000
 MAX_TRANSCRIPT_UNITS = 4096
@@ -64,7 +65,7 @@ CALLBACK_QUERY_FIELDS = frozenset({"chat_instance", "data", "from", "id", "messa
 CALLBACK_MESSAGE_FIELDS = TEXT_MESSAGE_FIELDS
 ATOMIC_STATE_TARGETS = frozenset({
     "active.json", "admission-sequence.json", "callback-actions.json", "closing.json",
-    "enabled", "pending.json", "seen.json",
+    "enabled", "pending.json", "pending-voice-queue.json", "seen.json",
 })
 _PROCESS_TOKENS: Dict[Path, str] = {}
 _VERIFIED_BOT_IDS: Dict[Path, int] = {}
@@ -937,9 +938,15 @@ def bounded_cleanup(home: Path) -> None:
             expired = True
         if expired:
             if isinstance(data, dict):
+                pending_id = data.get("pending_id")
                 finalize_pending_cleanup_locked(home, data)
+                if isinstance(pending_id, str):
+                    remove_pending_voice_locked(home, pending_id)
             else:
                 remove_pending(home)
+        queued_voices, queue_changed = load_pending_voice_queue_locked(home)
+        if queue_changed:
+            save_pending_voice_queue_locked(home, queued_voices)
         _sync_request_wakes_locked(home)
 
 
@@ -1160,6 +1167,67 @@ def pending_path(home: Path) -> Path:
     return state_dir(home) / "pending.json"
 
 
+def pending_voice_queue_path(home: Path) -> Path:
+    return state_dir(home) / "pending-voice-queue.json"
+
+
+def valid_pending_voice_record(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+            "pending_id", "file_id", "duration", "size", "chat_id",
+            "message_id", "update_id", "queued_at"}:
+        return False
+    pending_id = value.get("pending_id")
+    file_id = value.get("file_id")
+    duration = value.get("duration")
+    size = value.get("size")
+    chat_id = value.get("chat_id")
+    message_id = value.get("message_id")
+    update_id = value.get("update_id")
+    queued_at = value.get("queued_at")
+    if (not isinstance(file_id, str) or not file_id.strip() or "\x00" in file_id
+            or unicode_text_units(file_id) is None):
+        return False
+    if (not strict_int(duration) or duration < 0 or duration > MAX_VOICE_SECONDS
+            or not strict_int(size) or size < 0 or size > MAX_VOICE_BYTES
+            or not telegram_numeric_id(chat_id, positive=True)
+            or not telegram_numeric_id(message_id, positive=True)
+            or not telegram_numeric_id(update_id)
+            or not strict_int(queued_at) or queued_at <= 0):
+        return False
+    return pending_id == f"voice-u{update_id}-m{message_id}"
+
+
+def load_pending_voice_queue_locked(home: Path) -> Tuple[List[Dict[str, Any]], bool]:
+    raw = read_json(pending_voice_queue_path(home), [])
+    values = raw if isinstance(raw, list) else []
+    cutoff = now() - INBOX_TTL
+    records: List[Dict[str, Any]] = []
+    identifiers = set()
+    for value in values:
+        if (not valid_pending_voice_record(value)
+                or int(value["queued_at"]) < cutoff
+                or value["pending_id"] in identifiers):
+            continue
+        identifiers.add(value["pending_id"])
+        records.append(dict(value))
+        if len(records) >= MAX_PENDING_VOICES:
+            break
+    return records, raw != records
+
+
+def save_pending_voice_queue_locked(home: Path, records: List[Dict[str, Any]]) -> None:
+    if records:
+        atomic_json(pending_voice_queue_path(home), records[:MAX_PENDING_VOICES])
+    else:
+        durable_unlink(pending_voice_queue_path(home))
+
+
+def remove_pending_voice_locked(home: Path, pending_id: str) -> None:
+    records, _ = load_pending_voice_queue_locked(home)
+    retained = [record for record in records if record.get("pending_id") != pending_id]
+    save_pending_voice_queue_locked(home, retained)
+
+
 def callback_history_path(home: Path) -> Path:
     return state_dir(home) / "callback-actions.json"
 
@@ -1343,6 +1411,67 @@ def show_confirmation(home: Path, config: Dict[str, Any], pending: Dict[str, Any
     )
 
 
+def complete_initial_transcription(home: Path, config: Dict[str, Any],
+                                   pending: Dict[str, Any]) -> bool:
+    pending_id = pending.get("pending_id")
+    audio_value = pending.get("audio_path")
+    file_id = pending.get("file_id")
+    if (not isinstance(pending_id, str) or not isinstance(audio_value, str)
+            or not isinstance(file_id, str)):
+        with FileLock(state_lock(home)):
+            current = read_json(pending_path(home))
+            if isinstance(current, dict) and current.get("pending_id") == pending_id:
+                finalize_pending_cleanup_locked(home, current)
+                if isinstance(pending_id, str):
+                    remove_pending_voice_locked(home, pending_id)
+        return False
+    audio = Path(audio_value)
+    try:
+        remove_audio(pending)
+        result = api_call(home, "getFile", {"file_id": file_id}, config)
+        if not isinstance(result, dict) or not isinstance(result.get("file_path"), str):
+            raise TelegramError("Telegram returned no voice file")
+        descriptor = os.open(audio, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(descriptor)
+        download_file(home, str(result["file_path"]), audio, config)
+        transcript = transcribe(home, config, audio, "parakeet")
+        with FileLock(state_lock(home)):
+            current = read_json(pending_path(home))
+            if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                    or current.get("mode") != "transcribing"):
+                remove_audio(pending)
+                return False
+            current.update({
+                "mode": "confirm",
+                "text": transcript,
+                "heading_sent": False,
+                "transcript_sent": False,
+            })
+            current.pop("file_id", None)
+            remove_pending_voice_locked(home, pending_id)
+            save_pending(home, current)
+            confirmed = dict(current)
+    except (TelegramError, OSError):
+        with FileLock(state_lock(home)):
+            current = read_json(pending_path(home))
+            if (isinstance(current, dict) and current.get("pending_id") == pending_id
+                    and current.get("mode") == "transcribing"):
+                finalize_pending_cleanup_locked(home, current)
+                remove_pending_voice_locked(home, pending_id)
+            else:
+                remove_audio(pending)
+        try:
+            send_text(home, int(config["chat_id"]), "I couldn't transcribe that voice note.")
+        except TelegramError:
+            pass
+        return False
+    try:
+        show_confirmation(home, config, confirmed)
+    except (TelegramError, OSError, KeyError, TypeError, ValueError):
+        pass
+    return True
+
+
 def complete_retry(home: Path, config: Dict[str, Any], pending: Dict[str, Any]) -> bool:
     pending_id = pending.get("pending_id")
     retry_token = pending.get("retry_token")
@@ -1450,7 +1579,7 @@ def reconcile_pending(home: Path, config: Dict[str, Any]) -> None:
         return
     try:
         if pending.get("mode") == "transcribing":
-            remove_pending(home, pending)
+            complete_initial_transcription(home, config, pending)
         elif pending.get("mode") == "retry":
             complete_retry(home, config, pending)
         elif pending.get("mode") == "sending":
@@ -1549,61 +1678,73 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any], up
         return False
     if duration < 0 or duration > MAX_VOICE_SECONDS or size < 0 or size > MAX_VOICE_BYTES:
         return False
-    pending_id = f"voice-u{update_id}-m{int(message['message_id'])}"
-    pending = read_json(pending_path(home))
-    if isinstance(pending, dict) and pending.get("pending_id") == pending_id:
-        reconcile_pending(home, config)
-        return True
-    if isinstance(pending, dict):
-        return False
-    audio: Optional[Path] = None
-    pending: Optional[Dict[str, Any]] = None
-    journaled = False
-    saved = False
-    try:
-        result = api_call(home, "getFile", {"file_id": file_id}, config)
-        if not isinstance(result, dict) or not isinstance(result.get("file_path"), str):
-            raise TelegramError("Telegram returned no voice file")
-        audio = Path("/dev/shm") / f"firstmate-telegram-{secrets.token_hex(16)}.oga"
-        pending = {
+    message_id = int(message["message_id"])
+    pending_id = f"voice-u{update_id}-m{message_id}"
+    with FileLock(state_lock(home)):
+        pending = read_json(pending_path(home))
+        if isinstance(pending, dict) and pending.get("pending_id") == pending_id:
+            return True
+        records, changed = load_pending_voice_queue_locked(home)
+        if any(record.get("pending_id") == pending_id for record in records):
+            if changed:
+                save_pending_voice_queue_locked(home, records)
+            return True
+        if len(records) >= MAX_PENDING_VOICES:
+            return False
+        records.append({
             "pending_id": pending_id,
-            "mode": "transcribing",
-            "audio_path": str(audio),
+            "file_id": file_id,
+            "duration": duration,
+            "size": size,
             "chat_id": int(config["chat_id"]),
-            "message_id": int(message["message_id"]),
+            "message_id": message_id,
             "update_id": update_id,
-            "created_at": now(),
-            "revision": 1,
-            "completed_actions": [],
-        }
-        save_pending(home, pending)
-        journaled = True
-        descriptor = os.open(audio, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        os.close(descriptor)
-        download_file(home, str(result["file_path"]), audio, config)
-        transcript = transcribe(home, config, audio, "parakeet")
-        pending.update({
-            "mode": "confirm",
-            "text": transcript,
-            "heading_sent": False,
-            "transcript_sent": False,
+            "queued_at": now(),
         })
-        save_pending(home, pending)
-        saved = True
-        audio = None
-        reconcile_pending(home, config)
-        return True
-    except (TelegramError, OSError):
-        if not saved:
-            if journaled and pending is not None:
-                remove_pending(home, pending)
-            elif audio is not None:
-                remove_audio({"audio_path": str(audio)})
-            try:
-                send_text(home, int(config["chat_id"]), "I couldn't transcribe that voice note.")
-            except TelegramError:
-                pass
-        return saved
+        save_pending_voice_queue_locked(home, records)
+    return True
+
+
+def advance_pending_voice(home: Path, config: Dict[str, Any]) -> None:
+    while True:
+        with FileLock(state_lock(home)):
+            pending = read_json(pending_path(home))
+            records, changed = load_pending_voice_queue_locked(home)
+            if isinstance(pending, dict):
+                retained = [
+                    record for record in records
+                    if record.get("pending_id") != pending.get("pending_id")
+                ]
+                if retained != records:
+                    records = retained
+                    changed = True
+                if changed:
+                    save_pending_voice_queue_locked(home, records)
+                return
+            if not records:
+                if changed:
+                    save_pending_voice_queue_locked(home, records)
+                return
+            record = records[0]
+            pending = {
+                "pending_id": record["pending_id"],
+                "mode": "transcribing",
+                "audio_path": str(
+                    Path("/dev/shm") / f"firstmate-telegram-{secrets.token_hex(16)}.oga"
+                ),
+                "file_id": record["file_id"],
+                "chat_id": record["chat_id"],
+                "message_id": record["message_id"],
+                "update_id": record["update_id"],
+                "created_at": now(),
+                "queued_at": record["queued_at"],
+                "revision": 1,
+                "completed_actions": [],
+            }
+            save_pending(home, pending)
+            save_pending_voice_queue_locked(home, records[1:])
+        if complete_initial_transcription(home, config, pending):
+            return
 
 
 def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], update_id: int) -> bool:
@@ -1861,7 +2002,10 @@ def expire_pending(home: Path) -> None:
             except (TypeError, ValueError):
                 still_expired = True
             if still_expired:
+                pending_id = current.get("pending_id")
                 finalize_pending_cleanup_locked(home, current)
+                if isinstance(pending_id, str):
+                    remove_pending_voice_locked(home, pending_id)
 
 
 def clear_stopped_transport_state(home: Path) -> None:
@@ -1869,6 +2013,7 @@ def clear_stopped_transport_state(home: Path) -> None:
         pending = read_json(pending_path(home))
         if isinstance(pending, dict):
             finalize_pending_cleanup_locked(home, pending)
+        durable_unlink(pending_voice_queue_path(home))
     set_telegram_enabled(home, False)
 
 
@@ -1922,6 +2067,7 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
                 bounded_cleanup(home)
                 reconcile_requests(home)
                 reconcile_pending(home, config)
+                advance_pending_voice(home, config)
                 try:
                     updates = api_call(home, "getUpdates", {"offset": offset, "timeout": poll_timeout,
                                                                "allowed_updates": ["message", "callback_query"]}, config)
@@ -1931,6 +2077,7 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
                         if isinstance(update, dict) and telegram_numeric_id(update.get("update_id")):
                             offset = max(offset, int(update["update_id"]) + 1)
                         process_update(home, config, update)
+                        advance_pending_voice(home, config)
                     reconcile_requests(home)
                 except TelegramError as exc:
                     if permanent_auth_failure(exc):
@@ -1963,7 +2110,8 @@ def require_pairing_service_inactive(home: Path) -> None:
 
 def identity_bound_state_exists(home: Path) -> bool:
     root = home / "state" / "telegram"
-    for name in ("active.json", "callback-actions.json", "closing.json", "pending.json", "seen.json"):
+    for name in ("active.json", "callback-actions.json", "closing.json", "pending.json",
+                 "pending-voice-queue.json", "seen.json"):
         path = root / name
         if path.exists() or path.is_symlink():
             return True
@@ -2580,6 +2728,7 @@ def stop_service(home: Path) -> int:
                     pending = read_json(pending_path(home))
                     if isinstance(pending, dict):
                         finalize_pending_cleanup_locked(home, pending)
+                    durable_unlink(pending_voice_queue_path(home))
                 durable_unlink(service_activation_path(home))
                 set_telegram_enabled(home, False)
                 verify_transport_marker(home, False)
@@ -2606,6 +2755,7 @@ def disable_service(home: Path) -> int:
                     pending = read_json(pending_path(home))
                     if isinstance(pending, dict):
                         finalize_pending_cleanup_locked(home, pending)
+                    durable_unlink(pending_voice_queue_path(home))
                 durable_unlink(service_activation_path(home))
                 set_telegram_enabled(home, False)
                 verify_transport_marker(home, False)
@@ -2664,7 +2814,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=("Commands: pair, serve, request-read, request-handled, request-bind, request-routed, active-request, continuation-handled, send, reply, install, start, stop, status, disable, cleanup.\n"
                 "Retention limits: 256 queued requests for 7 days and 4096 handled requests.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
-                "Voice limits: 10 MiB, 120 seconds, and a 4096-unit transcript. Temporary audio is restricted to /dev/shm.\n"
+                "Voice limits: 10 MiB, 120 seconds, a 4096-unit transcript, and 64 waiting notes. Temporary audio is restricted to /dev/shm.\n"
                 "FM_TELEGRAM_PARAKEET_CMD and FM_TELEGRAM_WHISPER_CMD override the local transcription commands.\n"
                 "Text for send and reply is read with --text-file or stdin (-); no recipient argument is accepted."),
         formatter_class=argparse.RawDescriptionHelpFormatter,

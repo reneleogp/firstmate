@@ -990,7 +990,7 @@ if [ -n "${FM_TELEGRAM_REQUEST_ID:-}" ]; then
   fi
   TELEGRAM_REQUEST_ID=$FM_TELEGRAM_REQUEST_ID
   unset FM_TELEGRAM_REQUEST_ID
-elif FM_HOME="$FM_HOME" "$FM_ROOT/bin/fm-telegram.py" publication-reserved "$ID" \
+elif [ "$RELAUNCH" -eq 0 ] && FM_HOME="$FM_HOME" "$FM_ROOT/bin/fm-telegram.py" publication-reserved "$ID" \
     >/dev/null 2>&1; then
   echo "error: task $ID is reserved for an authenticated Telegram-origin spawn" >&2
   exit 1

@@ -44,6 +44,7 @@ Unknown, malformed, unpinned, and unsupported updates are silently dropped.
 Only private text and Telegram voice notes are accepted, and other media is not downloaded.
 
 Voice notes are bounded by the service's size and duration limits, downloaded only after pin verification into `/dev/shm`, and transcribed locally with the configured Parakeet v3 CLI.
+Additional valid voice notes wait in private admission order behind the one active confirmation and are downloaded only when their confirmation becomes active.
 The service shows an `I heard this:` message and a separate transcript message with `Send to Firstmate`, `Edit`, `Retry with Whisper`, and `Cancel` controls.
 Editing waits for corrected text and shows a fresh confirmation.
 Sending queues only confirmed text, retrying uses Whisper Small Q8 on the same temporary audio, and cancel or expiry removes the audio and pending record.
