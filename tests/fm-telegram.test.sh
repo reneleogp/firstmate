@@ -40,7 +40,12 @@ class Handler(BaseHTTPRequestHandler):
         with calls.open('a', encoding='utf-8') as out:
             out.write(json.dumps({'path': self.path, 'params': params}) + '\n')
         method = self.path.rsplit('/', 1)[-1]
-        if method == 'getMe': return self._write({'id': 9901, 'is_bot': True})
+        if method == 'getMe':
+            if (home / 'replace-token-on-getme').exists():
+                (home / 'replace-token-on-getme').unlink()
+                (home / '.env').write_text('FM_TELEGRAM_BOT_TOKEN=replacement-token\n')
+            bot_id = 9902 if '/botreplacement-token/' in self.path else 9901
+            return self._write({'id': bot_id, 'is_bot': True})
         if method == 'getChat': return self._write({'id': int(params.get('chat_id', 0)), 'type': 'private'})
         if method == 'getFile': return self._write({'file_path': 'voice/test.oga'})
         if method == 'getUpdates':
@@ -148,6 +153,33 @@ fi
 run_tg "$home" pair --user-id 77 --chat-id 77 >/dev/null
 [ "$(path_mode "$home/config/telegram.json")" = 600 ] || fail "pairing config must be mode 0600"
 
+# One process pins its verified token, while a later process rejects a changed bot until re-pairing.
+pin_home=$(new_home bot-pinning)
+start_server "$pin_home" "$pin_home/port"
+run_tg "$pin_home" pair --user-id 77 --chat-id 77 >/dev/null
+touch "$pin_home/replace-token-on-getme"
+set_updates '[{"update_id":90,"message":{"message_id":90,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"stay with the verified bot"}}]' "$pin_home"
+run_tg "$pin_home" serve --once >/dev/null
+[ "$(cat "$pin_home/.env")" = 'FM_TELEGRAM_BOT_TOKEN=replacement-token' ] || fail "fake token replacement did not occur"
+! grep -F '/botreplacement-token/' "$pin_home/calls.jsonl" >/dev/null || fail "running service switched tokens after verification"
+pin_updates_before=$(grep -c 'getUpdates' "$pin_home/calls.jsonl")
+pin_sends_before=$(grep -c 'sendMessage' "$pin_home/calls.jsonl")
+if run_tg "$pin_home" serve --once >/dev/null 2>&1; then
+  fail "changed bot token was accepted without re-pairing"
+fi
+printf 'must not send\n' > "$pin_home/send.txt"
+if run_tg "$pin_home" send --text-file "$pin_home/send.txt" >/dev/null 2>&1; then
+  fail "send accepted a bot token that did not match the pairing"
+fi
+[ "$(grep -c 'getUpdates' "$pin_home/calls.jsonl")" -eq "$pin_updates_before" ] || fail "mismatched bot token polled for updates"
+[ "$(grep -c 'sendMessage' "$pin_home/calls.jsonl")" -eq "$pin_sends_before" ] || fail "mismatched bot token sent a message"
+run_tg "$pin_home" pair --user-id 77 --chat-id 77 >/dev/null
+set_updates '[{"update_id":91,"message":{"message_id":91,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"accepted after explicit repair"}}]' "$pin_home"
+run_tg "$pin_home" serve --once >/dev/null
+[ "$(find "$pin_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || fail "explicit re-pairing did not authorize the replacement bot"
+
+rm -f "$home/port"
+start_server "$home" "$home/port"
 set_updates '[{"update_id":1,"message":{"message_id":10,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"please inspect this"}}]' "$home"
 run_tg "$home" serve --once >/dev/null
 inbox=$(find "$home/state/telegram/inbox" -name '*.json' -print -quit)

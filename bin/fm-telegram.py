@@ -45,6 +45,9 @@ UNSUPPORTED_UPDATE_FIELDS = frozenset({
     "message_reaction", "message_reaction_count", "my_chat_member", "poll", "poll_answer",
     "pre_checkout_query", "purchased_paid_media", "removed_chat_boost", "shipping_query",
 })
+_PROCESS_TOKENS: Dict[Path, str] = {}
+_VERIFIED_BOT_IDS: Dict[Path, int] = {}
+
 UNSUPPORTED_MESSAGE_CONTENT_FIELDS = frozenset({
     "animation", "audio", "boost_added", "caption", "caption_entities", "channel_chat_created",
     "chat_background_set", "chat_shared", "checklist", "checklist_tasks_added",
@@ -140,9 +143,14 @@ def env_value(home: Path, key: str) -> Optional[str]:
 
 
 def token_for(home: Path) -> str:
+    key = home.resolve()
+    pinned = _PROCESS_TOKENS.get(key)
+    if pinned is not None:
+        return pinned
     token = env_value(home, "FM_TELEGRAM_BOT_TOKEN")
     if not token:
         raise TelegramError("FM_TELEGRAM_BOT_TOKEN is not configured in this home")
+    _PROCESS_TOKENS[key] = token
     return token
 
 
@@ -180,9 +188,9 @@ def api_base(home: Path, config: Optional[Dict[str, Any]] = None) -> str:
     return (value or "https://api.telegram.org").rstrip("/")
 
 
-def api_call(home: Path, method: str, params: Optional[Dict[str, Any]] = None,
-             config: Optional[Dict[str, Any]] = None) -> Any:
-    token = token_for(home)
+def raw_api_call(home: Path, token: str, method: str,
+                 params: Optional[Dict[str, Any]] = None,
+                 config: Optional[Dict[str, Any]] = None) -> Any:
     body = json.dumps(params or {}, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(
         f"{api_base(home, config)}/bot{token}/{method}",
@@ -206,10 +214,33 @@ def api_call(home: Path, method: str, params: Optional[Dict[str, Any]] = None,
     return envelope.get("result")
 
 
+def verified_token_for(home: Path, config: Optional[Dict[str, Any]] = None) -> str:
+    pairing = config if isinstance(config, dict) else load_config(home)
+    expected = pairing.get("bot_id")
+    if not strict_int(expected):
+        raise TelegramError("Telegram pairing is incomplete")
+    key = home.resolve()
+    token = token_for(home)
+    if _VERIFIED_BOT_IDS.get(key) == expected:
+        return token
+    result = raw_api_call(home, token, "getMe", {}, pairing)
+    if (not isinstance(result, dict) or result.get("is_bot") is not True
+            or not strict_int(result.get("id")) or result.get("id") != expected):
+        raise TelegramError("Telegram bot token does not match the verified pairing; pair again")
+    _VERIFIED_BOT_IDS[key] = expected
+    return token
+
+
+def api_call(home: Path, method: str, params: Optional[Dict[str, Any]] = None,
+             config: Optional[Dict[str, Any]] = None) -> Any:
+    token = verified_token_for(home, config)
+    return raw_api_call(home, token, method, params, config)
+
+
 def download_file(home: Path, file_path: str, target: Path, config: Dict[str, Any]) -> None:
     if not isinstance(file_path, str) or not file_path or "\x00" in file_path:
         raise TelegramError("Telegram returned an invalid audio path")
-    token = token_for(home)
+    token = verified_token_for(home, config)
     request = urllib.request.Request(
         f"{api_base(home, config)}/file/bot{token}/{file_path}", method="GET"
     )
@@ -1302,6 +1333,7 @@ def expire_pending(home: Path) -> None:
 
 def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> int:
     config = load_config(home)
+    verified_token_for(home, config)
     offset = 0
     stop = False
 
@@ -1349,10 +1381,12 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> i
 def pair(home: Path, user_id: int, chat_id: int) -> int:
     config_existing = read_json(config_path(home), {})
     config = config_existing if isinstance(config_existing, dict) else {}
-    result = api_call(home, "getMe", {}, config)
-    if not isinstance(result, dict) or not strict_int(result.get("id")):
+    token = token_for(home)
+    result = raw_api_call(home, token, "getMe", {}, config)
+    if (not isinstance(result, dict) or result.get("is_bot") is not True
+            or not strict_int(result.get("id"))):
         raise TelegramError("bot identity could not be verified")
-    chat = api_call(home, "getChat", {"chat_id": chat_id}, config)
+    chat = raw_api_call(home, token, "getChat", {"chat_id": chat_id}, config)
     if (not isinstance(chat, dict) or chat.get("type") != "private"
             or not strict_int(chat.get("id")) or chat.get("id") != chat_id):
         raise TelegramError("pairing requires the pinned private bot DM")
@@ -1654,8 +1688,8 @@ def verify_transport_marker(home: Path, expected: bool) -> None:
 
 
 def install(home: Path) -> int:
-    load_config(home)
-    token_for(home)
+    config = load_config(home)
+    verified_token_for(home, config)
     path = unit_path()
     if (path.exists() or path.is_symlink()) and not unit_owned_by(home):
         raise TelegramError("Telegram service unit belongs to another home or installation")
@@ -1671,7 +1705,8 @@ def install(home: Path) -> int:
 
 
 def start_service(home: Path) -> int:
-    load_config(home)
+    config = load_config(home)
+    verified_token_for(home, config)
     require_unit_owner(home)
     prepare_transport_activation(home)
     systemctl("start", SERVICE_NAME)
