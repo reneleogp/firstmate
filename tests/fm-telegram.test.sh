@@ -466,11 +466,16 @@ run_tg "$home" serve --once >/dev/null
 direct_id=tg-text-u103-m112
 run_tg "$home" request-handled "$direct_id"
 run_tg "$home" request-bind "$direct_id" direct-work >/dev/null
+if run_tg "$home" request-routed "$direct_id" >/dev/null 2>&1; then
+  fail "direct route was acknowledged without durable lifecycle context"
+fi
+grep -F "telegram:$direct_id" "$home/state/.wake-queue" >/dev/null || fail "refused direct route lost its recovery wake"
+printf 'endpoint_task_id=direct-work\n' > "$home/state/direct-work.meta"
 printf 'Which option?\n' > "$home/reply.txt"
 run_tg "$home" reply "$direct_id" --text-file "$home/reply.txt" >/dev/null
 run_tg "$home" request-routed "$direct_id" >/dev/null
-! grep -F "telegram:$direct_id" "$home/state/.wake-queue" >/dev/null || fail "acknowledged direct route retained its initial recovery wake"
-[ "$(run_tg "$home" active-request --claimed-request "$direct_id")" = "$(printf '%s\t%s' "$direct_id" direct-work)" ] || fail "direct route acknowledgement lost its work binding"
+! grep -F "telegram:$direct_id" "$home/state/.wake-queue" >/dev/null || fail "acknowledged lifecycle route retained its initial recovery wake"
+[ "$(run_tg "$home" active-request --claimed-request "$direct_id")" = "$(printf '%s\t%s' "$direct_id" direct-work)" ] || fail "lifecycle route acknowledgement lost its work binding"
 set_updates '[{"update_id":104,"message":{"message_id":113,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"direct option two"}}]' "$home"
 run_tg "$home" serve --once >/dev/null
 direct_continuation=tg-text-u104-m113
@@ -1016,6 +1021,19 @@ set_updates '[]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 [ ! -e "$expired_audio" ] || fail "expired pending voice must delete audio"
 [ ! -e "$pending" ] || fail "expired pending voice must delete pending state"
+set_updates '[{"update_id":271,"message":{"message_id":271,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-expired-callback","duration":2,"file_size":20}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+expired_action_audio=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["audio_path"])' "$pending")
+expired_action_data=$(callback_data "$voice_home" send)
+expired_action_answers=$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")
+touch "$voice_home/expire-pending-during-poll"
+set_updates '[{"update_id":272,"callback_query":{"id":"cb-recognized-expired","from":{"id":77},"data":"'"$expired_action_data"'","message":{"message_id":272,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+[ ! -e "$expired_action_audio" ] && [ ! -e "$pending" ] || fail "recognized expired callback retained pending voice state"
+[ "$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")" -eq "$((expired_action_answers + 1))" ] || fail "recognized expired callback was not acknowledged"
+set_updates '[{"update_id":273,"callback_query":{"id":"cb-recognized-expired-replay","from":{"id":77},"data":"'"$expired_action_data"'","message":{"message_id":273,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+[ "$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")" -eq "$((expired_action_answers + 2))" ] || fail "expired callback completion was not durable across replay"
 cat > "$voice_home/parakeet.sh" <<'SH'
 #!/usr/bin/env bash
 python3 -c 'print("x" * 4097)'
@@ -1199,6 +1217,9 @@ rm -f "$TMP_ROOT/systemctl.fail-start"
 [ -f "$unit_dir/firstmate-telegram.service" ] || fail "install must write one user unit"
 supervision_needs "$voice_home" || fail "installed Telegram transport did not keep supervision armed"
 "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null || fail "status must report installed active service"
+install_start_calls=$(grep -c -- '--user start firstmate-telegram.service' "$TMP_ROOT/systemctl.calls" || true)
+"${lifecycle_env[@]}" "$SCRIPT" install >/dev/null || fail "repeat install rejected the exact active owned service"
+[ "$(grep -c -- '--user start firstmate-telegram.service' "$TMP_ROOT/systemctl.calls" || true)" -eq "$install_start_calls" ] || fail "repeat install restarted the exact active owned service"
 singleton_other_home=$(new_home singleton-other-home)
 singleton_api="http://127.0.0.1:$(cat "$voice_home/port")"
 printf 'FM_TELEGRAM_BOT_TOKEN=replacement-token\n' > "$singleton_other_home/.env"

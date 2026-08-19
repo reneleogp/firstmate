@@ -881,7 +881,10 @@ def bounded_cleanup(home: Path) -> None:
         except (TypeError, ValueError):
             expired = True
         if expired:
-            remove_pending(home, data if isinstance(data, dict) else None)
+            if isinstance(data, dict):
+                finalize_pending_cleanup_locked(home, data)
+            else:
+                remove_pending(home)
         _sync_request_wakes_locked(home)
 
 
@@ -1143,6 +1146,24 @@ def remove_pending(home: Path, data: Optional[Dict[str, Any]] = None) -> None:
     if isinstance(data, dict):
         remove_audio(data)
     durable_unlink(pending_path(home))
+
+
+def finalize_pending_cleanup_locked(home: Path, data: Dict[str, Any],
+                                    accepted_token: Optional[str] = None) -> None:
+    pending_id = data.get("pending_id")
+    if isinstance(pending_id, str) and safe_id(pending_id):
+        tokens = data.get("completed_actions", [])
+        values = ([value for value in tokens if isinstance(value, str)]
+                  if isinstance(tokens, list) else [])
+        for key in ("send_token", "cancel_token", "retry_token"):
+            value = data.get(key)
+            if isinstance(value, str):
+                values.append(value)
+        if isinstance(accepted_token, str):
+            values.append(accepted_token)
+        for token in dict.fromkeys(values):
+            remember_callback_locked(home, pending_id, token)
+    remove_pending(home, data)
 
 
 def save_pending(home: Path, data: Dict[str, Any]) -> None:
@@ -1564,7 +1585,7 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
                 operation = "cancel"
                 pending_snapshot = dict(pending)
             elif expired:
-                remove_pending(home, pending)
+                finalize_pending_cleanup_locked(home, pending, token)
                 operation = "acknowledge"
             elif sending:
                 operation = "send"
@@ -1715,23 +1736,35 @@ def seen_update(home: Path, update_id: Optional[int], message_id: Optional[int])
 
 def expire_pending(home: Path) -> None:
     pending = read_json(pending_path(home))
-    if isinstance(pending, dict):
-        try:
-            expired = now() - int(pending.get("created_at", 0)) >= PENDING_TTL
-        except (TypeError, ValueError):
-            expired = True
-        if expired:
-            with FileLock(state_lock(home)):
-                current = read_json(pending_path(home))
-                if isinstance(current, dict):
-                    remove_pending(home, current)
+    if not isinstance(pending, dict):
+        return
+    try:
+        expired = now() - int(pending.get("created_at", 0)) >= PENDING_TTL
+    except (TypeError, ValueError):
+        expired = True
+    if not expired:
+        return
+    if pending.get("mode") == "sending":
+        complete_send(home, pending)
+    elif pending.get("mode") == "canceling":
+        complete_cancel(home, pending)
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if (isinstance(current, dict)
+                and current.get("pending_id") == pending.get("pending_id")):
+            try:
+                still_expired = now() - int(current.get("created_at", 0)) >= PENDING_TTL
+            except (TypeError, ValueError):
+                still_expired = True
+            if still_expired:
+                finalize_pending_cleanup_locked(home, current)
 
 
 def clear_stopped_transport_state(home: Path) -> None:
     with FileLock(state_lock(home)):
         pending = read_json(pending_path(home))
         if isinstance(pending, dict):
-            remove_pending(home, pending)
+            finalize_pending_cleanup_locked(home, pending)
     set_telegram_enabled(home, False)
 
 
@@ -1995,6 +2028,9 @@ def request_routed(home: Path, request_id: str) -> int:
             return die("request is not a handled Telegram request")
         if not isinstance(active.get("work_id"), str):
             return die("active Telegram conversation is not bound to work")
+        active = latch_work_publication_locked(home, active)
+        if active.get("work_published") is not True:
+            return die("active Telegram work has no durable lifecycle record")
         if active.get("initial_routing_consumed") is not True:
             active["initial_routing_consumed"] = True
             active["initial_routing_consumed_at"] = now()
@@ -2276,6 +2312,15 @@ def install(home: Path) -> int:
         activation_reserved = False
         try:
             with FileLock(lifecycle_lock(home)):
+                if unit_owned_by(home):
+                    active_result = systemctl("is-active", SERVICE_NAME, check=False)
+                    enabled_result = systemctl("is-enabled", SERVICE_NAME, check=False)
+                    if (active_result.returncode == 0 and active_result.stdout.strip() == "active"
+                            and enabled_result.returncode == 0
+                            and enabled_result.stdout.strip() == "enabled"):
+                        verify_transport_marker(home, True)
+                        print("Telegram service installed and active.")
+                        return 0
                 require_service_runtime_inactive(home)
                 config = load_config(home)
                 verified_token_for(home, config)
@@ -2347,7 +2392,7 @@ def stop_service(home: Path) -> int:
                 with FileLock(state_lock(home)):
                     pending = read_json(pending_path(home))
                     if isinstance(pending, dict):
-                        remove_pending(home, pending)
+                        finalize_pending_cleanup_locked(home, pending)
                 durable_unlink(service_activation_path(home))
                 set_telegram_enabled(home, False)
                 verify_transport_marker(home, False)
@@ -2373,7 +2418,7 @@ def disable_service(home: Path) -> int:
                 with FileLock(state_lock(home)):
                     pending = read_json(pending_path(home))
                     if isinstance(pending, dict):
-                        remove_pending(home, pending)
+                        finalize_pending_cleanup_locked(home, pending)
                 durable_unlink(service_activation_path(home))
                 set_telegram_enabled(home, False)
                 verify_transport_marker(home, False)

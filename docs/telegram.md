@@ -57,7 +57,8 @@ An initial claim remains durably wakeable after interruption until the bound wor
 Binding refuses a lifecycle identifier that already has a work record, so terminal-originated work cannot acquire a Telegram origin after the fact.
 Binding before launch is safe because `active-request --claimed-request <local-request-id>` exposes the already selected work identifier on recovery and the wake remains until that publication boundary.
 Once publication is observed, its Telegram-origin acknowledgement remains latched even if lifecycle cleanup later removes the work record.
-Directly handled work that sends a non-final question acknowledges the initial route with `request-routed <local-request-id>` only after delivering that response, which preserves interruption recovery while allowing its continuation to surface.
+Work that can receive a later decision or blocker answer must publish its normal durable lifecycle record before sending the non-final question.
+`request-routed <local-request-id>` refuses a direct-only route without that record and acknowledges the initial route only after durable lifecycle publication, which preserves enough work context across interruption while allowing its continuation to surface.
 Lifecycle routing uses `active-request --work-id <work-id>` and refuses unrelated terminal work.
 Replies use the pinned chat without a recipient argument, for example `bin/fm-telegram.py reply <local-request-id> --text-file reply.txt`.
 The terminal reply adds `--final` to clear the active binding and wake the next queued conversation.
