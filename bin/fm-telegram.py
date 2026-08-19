@@ -483,6 +483,10 @@ def service_lock(home: Path) -> Path:
     return home / "state" / ".telegram-service.lock"
 
 
+def global_service_lock() -> Path:
+    return unit_path().parent / ".firstmate-telegram-service.lock"
+
+
 def service_activation_path(home: Path) -> Path:
     return home / "state" / ".telegram-service-activation"
 
@@ -532,20 +536,27 @@ class FileLock:
         self.stream.close()
 
 
-def service_runtime_owned(home: Path) -> bool:
+def lock_owned(path: Path) -> bool:
     try:
-        with FileLock(service_lock(home), blocking=False):
+        with FileLock(path, blocking=False):
             return False
     except ServiceRuntimeOwnedError:
         return True
 
 
+def service_runtime_owned(home: Path) -> bool:
+    return lock_owned(service_lock(home))
+
+
 def require_service_runtime_inactive(home: Path) -> None:
-    if service_runtime_owned(home):
+    if lock_owned(global_service_lock()) or service_runtime_owned(home):
         raise ServiceRuntimeOwnedError("Telegram service is already running")
 
 
 def systemd_runtime_reserved(home: Path) -> bool:
+    path = unit_path()
+    if (path.exists() or path.is_symlink()) and not unit_owned_by(home):
+        return True
     if not unit_owned_by(home):
         return False
     result = systemctl("is-enabled", SERVICE_NAME, check=False)
@@ -1265,6 +1276,26 @@ def complete_retry(home: Path, config: Dict[str, Any], pending: Dict[str, Any]) 
     return True
 
 
+def complete_cancel(home: Path, pending: Dict[str, Any]) -> bool:
+    pending_id = pending.get("pending_id")
+    cancel_token = pending.get("cancel_token")
+    revision = pending.get("revision")
+    if (not isinstance(pending_id, str) or not isinstance(cancel_token, str)
+            or not strict_int(revision)):
+        return False
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if not isinstance(current, dict):
+            return completed_callback_locked(home, pending_id, cancel_token)
+        if (current.get("pending_id") != pending_id or current.get("mode") != "canceling"
+                or current.get("cancel_token") != cancel_token
+                or current.get("revision") != revision):
+            return False
+        remember_callback_locked(home, pending_id, cancel_token)
+        remove_pending(home, current)
+    return True
+
+
 def complete_send(home: Path, pending: Dict[str, Any]) -> bool:
     pending_id = pending.get("pending_id")
     send_token = pending.get("send_token")
@@ -1306,6 +1337,8 @@ def reconcile_pending(home: Path, config: Dict[str, Any]) -> None:
             complete_retry(home, config, pending)
         elif pending.get("mode") == "sending":
             complete_send(home, pending)
+        elif pending.get("mode") == "canceling":
+            complete_cancel(home, pending)
         elif pending.get("mode") == "confirm":
             show_confirmation(home, config, pending)
         elif pending.get("mode") == "edit" and pending.get("edit_prompt_sent") is not True:
@@ -1510,8 +1543,11 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
             sending = (pending.get("mode") == "sending"
                        and pending.get("send_token") == token
                        and pending.get("revision") == revision)
+            canceling = (pending.get("mode") == "canceling"
+                         and pending.get("cancel_token") == token
+                         and pending.get("revision") == revision)
             already_completed = token in completed or callback_completed
-            if not sending and not already_completed:
+            if not sending and not canceling and not already_completed:
                 if pending.get("revision") != revision:
                     return False
                 mode = pending.get("mode")
@@ -1524,7 +1560,10 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
                 expired = now() - int(pending.get("created_at", 0)) >= PENDING_TTL
             except (TypeError, ValueError):
                 expired = True
-            if expired:
+            if canceling:
+                operation = "cancel"
+                pending_snapshot = dict(pending)
+            elif expired:
                 remove_pending(home, pending)
                 operation = "acknowledge"
             elif sending:
@@ -1533,41 +1572,49 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
             elif already_completed:
                 operation = "acknowledge"
             else:
-                pending["completed_actions"] = [
-                    value for value in completed if isinstance(value, str)
-                ][-31:] + [token]
                 if action == "cancel":
-                    remove_pending(home, pending)
-                    remember_callback_locked(home, pending_id, token)
-                    operation = "acknowledge"
-                elif action == "edit":
-                    pending["mode"] = "edit"
-                    pending["edit_prompt_sent"] = False
+                    pending["mode"] = "canceling"
+                    pending["cancel_token"] = token
                     save_pending(home, pending)
-                    remember_callback_locked(home, pending_id, token)
-                    operation = "edit"
-                elif action == "retry":
-                    pending["mode"] = "retry"
-                    pending["retry_token"] = token
-                    save_pending(home, pending)
-                    operation = "retry"
+                    operation = "cancel"
                     pending_snapshot = dict(pending)
                 else:
-                    try:
-                        request_id = _queue_request_locked(
-                            home, str(pending["text"]), int(pending["chat_id"]),
-                            int(pending["message_id"]), int(pending["update_id"]),
-                            "voice", True, True,
-                        )
-                    except (TelegramError, KeyError, TypeError, ValueError):
-                        return False
-                    pending["mode"] = "sending"
-                    pending["send_token"] = token
-                    pending["request_id"] = request_id
-                    save_pending(home, pending)
-                    operation = "send"
-                    pending_snapshot = dict(pending)
+                    pending["completed_actions"] = [
+                        value for value in completed if isinstance(value, str)
+                    ][-31:] + [token]
+                    if action == "edit":
+                        pending["mode"] = "edit"
+                        pending["edit_prompt_sent"] = False
+                        save_pending(home, pending)
+                        remember_callback_locked(home, pending_id, token)
+                        operation = "edit"
+                    elif action == "retry":
+                        pending["mode"] = "retry"
+                        pending["retry_token"] = token
+                        save_pending(home, pending)
+                        operation = "retry"
+                        pending_snapshot = dict(pending)
+                    else:
+                        try:
+                            request_id = _queue_request_locked(
+                                home, str(pending["text"]), int(pending["chat_id"]),
+                                int(pending["message_id"]), int(pending["update_id"]),
+                                "voice", True, True,
+                            )
+                        except (TelegramError, KeyError, TypeError, ValueError):
+                            return False
+                        pending["mode"] = "sending"
+                        pending["send_token"] = token
+                        pending["request_id"] = request_id
+                        save_pending(home, pending)
+                        operation = "send"
+                        pending_snapshot = dict(pending)
     if operation == "acknowledge":
+        answer_callback(home, callback_id)
+        return True
+    if operation == "cancel" and pending_snapshot is not None:
+        if not complete_cancel(home, pending_snapshot):
+            return False
         answer_callback(home, callback_id)
         return True
     if operation == "edit":
@@ -1691,31 +1738,36 @@ def clear_stopped_transport_state(home: Path) -> None:
 def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
           systemd_service: bool = False) -> int:
     with contextlib.ExitStack() as runtime:
-        with FileLock(lifecycle_lock(home)):
-            if not systemd_service and systemd_runtime_reserved(home):
-                raise ServiceRuntimeOwnedError("Telegram systemd service owns this home")
-            if service_activation_path(home).is_file() and not systemd_service:
-                raise ServiceRuntimeOwnedError("Telegram systemd service activation is in progress")
-            runtime.enter_context(FileLock(service_lock(home), blocking=False))
-            try:
-                config = load_config(home)
-                token_for(home)
-            except TelegramError as exc:
-                clear_stopped_transport_state(home)
-                raise PermanentConfigurationError(str(exc)) from exc
-            try:
-                verified_token_for(home, config)
-            except PermanentConfigurationError:
-                clear_stopped_transport_state(home)
-                raise
-            try:
-                prepare_transport_activation(home)
-            except WatcherPreconditionError:
-                if systemd_service and service_activation_path(home).is_file():
-                    atomic_bytes(service_activation_path(home), b"watcher-precondition\n")
-                raise
-            if systemd_service:
-                durable_unlink(service_activation_path(home))
+        unit_guard = contextlib.nullcontext() if systemd_service else FileLock(unit_lock())
+        with unit_guard:
+            with FileLock(lifecycle_lock(home)):
+                if systemd_service:
+                    require_unit_owner(home)
+                elif systemd_runtime_reserved(home):
+                    raise ServiceRuntimeOwnedError("Telegram systemd service owns the singleton transport")
+                if service_activation_path(home).is_file() and not systemd_service:
+                    raise ServiceRuntimeOwnedError("Telegram systemd service activation is in progress")
+                runtime.enter_context(FileLock(global_service_lock(), blocking=False))
+                runtime.enter_context(FileLock(service_lock(home), blocking=False))
+                try:
+                    config = load_config(home)
+                    token_for(home)
+                except TelegramError as exc:
+                    clear_stopped_transport_state(home)
+                    raise PermanentConfigurationError(str(exc)) from exc
+                try:
+                    verified_token_for(home, config)
+                except PermanentConfigurationError:
+                    clear_stopped_transport_state(home)
+                    raise
+                try:
+                    prepare_transport_activation(home)
+                except WatcherPreconditionError:
+                    if systemd_service and service_activation_path(home).is_file():
+                        atomic_bytes(service_activation_path(home), b"watcher-precondition\n")
+                    raise
+                if systemd_service:
+                    durable_unlink(service_activation_path(home))
         offset = 0
         stop = False
         permanent_failure = False

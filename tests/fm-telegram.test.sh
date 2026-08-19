@@ -8,6 +8,7 @@ set -u
 TMP_ROOT=$(fm_test_tmproot fm-telegram-tests)
 PYTHON=${PYTHON:-python3}
 SCRIPT="$ROOT/bin/fm-telegram.py"
+export FM_TELEGRAM_UNIT_DIR="$TMP_ROOT/default-systemd-user"
 
 path_mode() {
   if [ "$(uname)" = Darwin ]; then stat -f %Lp "$1"; else stat -c %a "$1"; fi
@@ -930,15 +931,37 @@ set_updates '[{"update_id":230,"callback_query":{"id":"cb-retry-second-tap","fro
 run_tg "$voice_home" serve --once >/dev/null
 [ "$(wc -c < "$voice_home/whisper.sh.calls" | tr -d ' ')" -eq 1 ] || fail "a second retry tap transcribed twice"
 cancel_data=$(callback_data "$voice_home" cancel)
+cancel_audio_dir=$(mktemp -d /dev/shm/firstmate-telegram-cancel-hold.XXXXXX)
+cancel_audio="$cancel_audio_dir/firstmate-telegram-cancel-audio"
+mv "$audio" "$cancel_audio"
+python3 - "$pending" "$cancel_audio" <<'PY' || fail "cancel recovery setup failed"
+import json, sys
+path, audio = sys.argv[1:]
+with open(path, encoding='utf-8') as stream:
+    pending = json.load(stream)
+pending['audio_path'] = audio
+with open(path, 'w', encoding='utf-8') as stream:
+    json.dump(pending, stream)
+PY
+chmod 500 "$cancel_audio_dir"
 set_updates '[{"update_id":24,"callback_query":{"id":"cb-cancel","from":{"id":77},"data":"'"$cancel_data"'","message":{"message_id":203,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+if run_tg "$voice_home" serve --once >/dev/null 2>&1; then
+  fail "cancel unexpectedly completed while temporary audio deletion was blocked"
+fi
+python3 - "$pending" <<'PY' || fail "cancel was not journaled before destructive cleanup"
+import json, sys
+assert json.load(open(sys.argv[1], encoding='utf-8'))['mode'] == 'canceling'
+PY
+chmod 700 "$cancel_audio_dir"
 run_tg "$voice_home" serve --once >/dev/null
-[ ! -e "$audio" ] || fail "cancel must delete temporary audio"
-[ ! -e "$pending" ] || fail "cancel must delete pending state"
+[ ! -e "$cancel_audio" ] || fail "recovered cancel must delete temporary audio"
+[ ! -e "$pending" ] || fail "recovered cancel must delete pending state"
+rmdir "$cancel_audio_dir"
 cancel_answers=$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")
 set_updates '[{"update_id":240,"callback_query":{"id":"cb-cancel-completed","from":{"id":77},"data":"'"$cancel_data"'","message":{"message_id":203,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 [ "$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")" -eq "$((cancel_answers + 1))" ] || fail "durably completed callback was not recognized idempotently"
-[ ! -e "$pending" ] && [ ! -e "$audio" ] || fail "completed cancel callback recreated pending voice state"
+[ ! -e "$pending" ] && [ ! -e "$cancel_audio" ] || fail "completed cancel callback recreated pending voice state"
 
 # Confirmed voice queues text, while an expired pending record deletes its audio.
 set_updates '[{"update_id":25,"message":{"message_id":25,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-2","duration":2,"file_size":20}}}]' "$voice_home"
@@ -1176,6 +1199,26 @@ rm -f "$TMP_ROOT/systemctl.fail-start"
 [ -f "$unit_dir/firstmate-telegram.service" ] || fail "install must write one user unit"
 supervision_needs "$voice_home" || fail "installed Telegram transport did not keep supervision armed"
 "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null || fail "status must report installed active service"
+singleton_other_home=$(new_home singleton-other-home)
+singleton_api="http://127.0.0.1:$(cat "$voice_home/port")"
+printf 'FM_TELEGRAM_BOT_TOKEN=replacement-token\n' > "$singleton_other_home/.env"
+env FM_HOME="$singleton_other_home" FM_TELEGRAM_API_BASE="$singleton_api" \
+  "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null
+singleton_polls_before=$(grep -c '/botreplacement-token/getUpdates' "$voice_home/calls.jsonl" || true)
+if env FM_HOME="$singleton_other_home" FM_TELEGRAM_API_BASE="$singleton_api" \
+  FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" \
+  FM_TELEGRAM_EXPECT_HOME="$voice_home" FM_TELEGRAM_SERVICE_SCRIPT="$SCRIPT" \
+  "$SCRIPT" serve --once >/dev/null 2>&1; then
+  fail "another home entered beside the installed singleton service"
+fi
+if env FM_HOME="$singleton_other_home" FM_TELEGRAM_API_BASE="$singleton_api" \
+  FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" \
+  FM_TELEGRAM_EXPECT_HOME="$voice_home" FM_TELEGRAM_SERVICE_SCRIPT="$SCRIPT" \
+  "$SCRIPT" serve --once --systemd-service >/dev/null 2>&1; then
+  fail "hidden systemd entry accepted a home that does not own the singleton unit"
+fi
+[ "$(grep -c '/botreplacement-token/getUpdates' "$voice_home/calls.jsonl" || true)" -eq "$singleton_polls_before" ] || fail "refused singleton home polled Telegram"
+[ ! -e "$singleton_other_home/state/telegram/enabled" ] || fail "refused singleton home published supervision state"
 cp "$voice_home/config/telegram.json" "$voice_home/pairing-before-active-repair.json"
 if "${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null 2>&1; then
   fail "pairing changed while the owned Telegram service was active"
