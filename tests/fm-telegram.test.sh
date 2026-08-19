@@ -956,13 +956,58 @@ if "${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null 2>&1; then fail "cleanup i
 [ -e "$voice_home/state/telegram" ] || fail "failed cleanup removed private state while service could be live"
 [ -e "$unit_dir/firstmate-telegram.service" ] || fail "failed cleanup removed the installed unit"
 rm -f "$TMP_ROOT/systemctl.fail-disable"
+"${lifecycle_env[@]}" "$SCRIPT" stop >/dev/null
 cleanup_audio=$(mktemp /dev/shm/firstmate-telegram-cleanup.XXXXXX)
 python3 - "$voice_home/state/telegram/pending.json" "$cleanup_audio" <<'PY'
 import json, sys, time
 json.dump({'audio_path': sys.argv[2], 'created_at': int(time.time())}, open(sys.argv[1], 'w'))
 PY
 FM_HOME="$voice_home" FM_STATE_OVERRIDE="$voice_home/state" bash -c '. "$1"; fm_wake_append check unrelated:keep "unrelated keep"' _ "$ROOT/bin/fm-wake-lib.sh"
-"${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null
+state_lock_ready="$voice_home/state-lock-ready"
+state_lock_release="$voice_home/state-lock-release"
+"$PYTHON" - "$voice_home/state/.telegram-state.lock" "$state_lock_ready" "$state_lock_release" <<'PY' &
+import fcntl, os, sys, time
+lock_path, ready_path, release_path = sys.argv[1:]
+with open(lock_path, 'a+', encoding='utf-8') as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with open(ready_path, 'w', encoding='utf-8') as ready:
+        ready.write('ready\n')
+        ready.flush()
+        os.fsync(ready.fileno())
+    while not os.path.exists(release_path):
+        time.sleep(.01)
+PY
+state_lock_holder=$!
+state_lock_ready_seen=0
+for _ in $(seq 1 100); do
+  if [ -e "$state_lock_ready" ]; then state_lock_ready_seen=1; break; fi
+  sleep .02
+done
+[ "$state_lock_ready_seen" -eq 1 ] || fail "state lock holder did not become ready"
+"${lifecycle_env[@]}" "$SCRIPT" request-handled missing-request >/dev/null 2>&1 &
+blocked_handler_pid=$!
+sleep .1
+handler_waited=0
+if kill -0 "$blocked_handler_pid" 2>/dev/null; then handler_waited=1; fi
+kill "$blocked_handler_pid" 2>/dev/null || true
+wait "$blocked_handler_pid" 2>/dev/null || true
+"${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null &
+locked_cleanup_pid=$!
+cleanup_disabled_service=0
+for _ in $(seq 1 100); do
+  if [ "$(cat "$TMP_ROOT/systemctl.enabled" 2>/dev/null)" = disabled ]; then cleanup_disabled_service=1; break; fi
+  sleep .02
+done
+cleanup_waited=0
+if kill -0 "$locked_cleanup_pid" 2>/dev/null; then cleanup_waited=1; fi
+touch "$state_lock_release"
+wait "$state_lock_holder" || fail "state lock holder failed"
+locked_cleanup_status=0
+wait "$locked_cleanup_pid" || locked_cleanup_status=$?
+[ "$handler_waited" -eq 1 ] || fail "request handling bypassed the stable Telegram state lock"
+[ "$cleanup_disabled_service" -eq 1 ] || fail "cleanup did not disable the service before waiting for private state"
+[ "$cleanup_waited" -eq 1 ] || fail "cleanup deleted private state while a Telegram state transition was active"
+[ "$locked_cleanup_status" -eq 0 ] || fail "serialized cleanup failed"
 [ ! -e "$unit_dir/firstmate-telegram.service" ] || fail "cleanup must remove its unit"
 [ -e "$voice_home/.env" ] || fail "cleanup must preserve .env"
 [ ! -e "$voice_home/state/telegram" ] || fail "cleanup must remove private Telegram state"
@@ -1016,7 +1061,8 @@ wait "$serialized_cleanup_pid" || fail "serialized cleanup failed"
 [ ! -e "$voice_home/state/telegram" ] || fail "serialized cleanup retained private Telegram state"
 [ ! -e "$voice_home/config/telegram.json" ] || fail "serialized cleanup retained pairing config"
 [ -f "$voice_home/state/.telegram-lifecycle.lock" ] || fail "cleanup removed the stable lifecycle lock"
-"${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null || fail "cleanup with the retained lifecycle lock was not idempotent"
+[ -f "$voice_home/state/.telegram-state.lock" ] || fail "cleanup removed the stable state lock"
+"${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null || fail "cleanup with retained stable locks was not idempotent"
 
 grep -F 'test-only-token' "$home/state/.wake-queue" >/dev/null && fail "bot token entered wake data"
 pass "Telegram transport pairing, queueing, dedupe, drops, voice flow, safety, and lifecycle behave as specified"

@@ -397,7 +397,7 @@ def request_path(home: Path, request_id: str) -> Optional[Path]:
 
 
 def state_lock(home: Path) -> Path:
-    return state_dir(home) / ".lock"
+    return home / "state" / ".telegram-state.lock"
 
 
 def lifecycle_lock(home: Path) -> Path:
@@ -1943,30 +1943,24 @@ def _cleanup_locked(home: Path) -> int:
     if not owned and (unit_present or not safely_inactive or not safely_disabled):
         raise TelegramError("Telegram service ownership could not be verified")
     telegram_state = home / "state" / "telegram"
-    pending_records = []
-    if telegram_state.is_dir() and not telegram_state.is_symlink():
-        pending = read_json(telegram_state / "pending.json")
-        if isinstance(pending, dict):
-            pending_records.append(pending)
     if owned:
         systemctl("disable", "--now", SERVICE_NAME)
         verify_service(active=False, enabled=False)
         durable_unlink(path)
         systemctl("daemon-reload")
-    if telegram_state.is_dir() and not telegram_state.is_symlink():
-        pending = read_json(telegram_state / "pending.json")
-        if isinstance(pending, dict):
-            pending_records.append(pending)
-    for pending in pending_records:
-        remove_audio(pending)
-    consume_safe_wakes(home)
-    if telegram_state.is_symlink() or telegram_state.is_file():
-        durable_unlink(telegram_state)
-    elif telegram_state.is_dir():
-        durable_rmtree(telegram_state)
-    config = config_path(home)
-    if config.is_symlink() or config.is_file():
-        durable_unlink(config)
+    with FileLock(state_lock(home)):
+        if telegram_state.is_dir() and not telegram_state.is_symlink():
+            pending = read_json(telegram_state / "pending.json")
+            if isinstance(pending, dict):
+                remove_audio(pending)
+        consume_safe_wakes(home)
+        if telegram_state.is_symlink() or telegram_state.is_file():
+            durable_unlink(telegram_state)
+        elif telegram_state.is_dir():
+            durable_rmtree(telegram_state)
+        config = config_path(home)
+        if config.is_symlink() or config.is_file():
+            durable_unlink(config)
     print("Telegram service and private Telegram state cleaned up.")
     return 0
 
