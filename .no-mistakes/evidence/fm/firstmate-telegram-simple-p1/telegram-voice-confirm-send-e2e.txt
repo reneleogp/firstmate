@@ -1,0 +1,10 @@
+End-user simulation: pinned private Telegram voice note, local Parakeet transcript, then inline Send to Firstmate callback.
+telegram_bubbles=I heard this: | parakeet evidence transcript | Message received and queued. It will be processed when Firstmate starts.
+inline_controls=Send to Firstmate, Edit, Retry with Whisper, Cancel
+temporary_audio_present_while_awaiting_confirmation=true
+queued_request_count=1
+local_request_id=tg-voice-u2001-m601
+operator_request_read=parakeet evidence transcript
+temporary_audio_present_after_send=false
+callback_acknowledgements=1
+Result: only the confirmed transcript was queued, the user saw the required two-bubble confirmation and controls, and temporary audio was deleted after Send.

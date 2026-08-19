@@ -1,0 +1,11 @@
+End-user simulation: pinned private text while Firstmate is offline; replay the same Telegram update once.
+pairing_config_mode=0600
+queued_request_count=1
+local_request_id=tg-text-u1001-m501
+operator_request_read=Please summarize the open work.
+wake_contains_local_id=True
+wake_contains_raw_text=False
+telegram_send_count=1
+telegram_reply=Message received and queued. It will be processed when Firstmate starts.
+bot_api_methods=getMe,getChat,getMe,getUpdates,sendMessage,getMe,getUpdates
+Result: request remained one durable queue entry after replay, and Telegram received one offline queue receipt only after the safe local-ID wake existed.
