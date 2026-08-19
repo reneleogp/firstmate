@@ -479,16 +479,15 @@ if run_tg "$home" request-bind "$request_id" terminal-work >/dev/null 2>&1; then
 fi
 [ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$request_id" ] || fail "rejected terminal work binding changed the active route"
 touch "$home/hold-task-creation-lock"
-(
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" ROOT="$ROOT" bash -c '
   # shellcheck source=bin/fm-wake-lib.sh
   . "$ROOT/bin/fm-wake-lib.sh"
-  STATE="$home/state"
   task_lock="$STATE/.spawn-telegram-work.lock"
   fm_lock_try_acquire "$task_lock" || exit 1
-  touch "$home/task-creation-lock-held"
-  while [ -e "$home/hold-task-creation-lock" ]; do sleep .01; done
+  touch "$FM_HOME/task-creation-lock-held"
+  while [ -e "$FM_HOME/hold-task-creation-lock" ]; do sleep .01; done
   fm_lock_release "$task_lock"
-) &
+' &
 task_lock_pid=$!
 for _ in $(seq 1 100); do
   [ -e "$home/task-creation-lock-held" ] && break

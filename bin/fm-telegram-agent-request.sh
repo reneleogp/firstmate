@@ -11,7 +11,7 @@ usage() {
 [ -n "${FM_HOME:-}" ] || usage
 case $1 in ''|*[!A-Za-z0-9._-]*) usage ;; esac
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 request=$(
   "$SCRIPT_DIR/fm-telegram.py" request-read "$1" |
     python3 -c 'import json, sys; print(json.dumps(sys.stdin.read(), ensure_ascii=False))'
