@@ -328,6 +328,35 @@ wait "$runtime_pid" 2>/dev/null || true
 [ ! -e "$runtime_home/state/telegram/enabled" ] || fail "runtime owner did not clear supervision at shutdown"
 [ -f "$runtime_home/state/.telegram-service.lock" ] || fail "runtime ownership lock was not stable outside removable state"
 
+atomic_home=$(new_home atomic-retention)
+start_server "$atomic_home" "$atomic_home/port"
+run_tg "$atomic_home" pair --user-id 77 --chat-id 77 >/dev/null
+atomic_inbox="$atomic_home/state/telegram/inbox"
+mkdir -p "$atomic_inbox"
+old_atomic="$atomic_inbox/.tg-text-u1000-m1000.json.abcdefgh"
+unrelated_atomic="$atomic_inbox/.operator-note.abcdefgh"
+printf 'old private payload\n' > "$old_atomic"
+printf 'unrelated sentinel\n' > "$unrelated_atomic"
+python3 - "$old_atomic" <<'PY'
+import os, sys, time
+old = time.time() - 1200
+os.utime(sys.argv[1], (old, old))
+PY
+for index in $(seq 1 260); do
+  suffix=$(printf '%08d' "$index")
+  printf 'bounded private payload %s\n' "$index" > "$atomic_inbox/.tg-text-u$((2000 + index))-m$((2000 + index)).json.$suffix"
+done
+fresh_atomic="$atomic_inbox/.tg-voice-u5000-m5000.json.fresh123"
+printf 'fresh private payload\n' > "$fresh_atomic"
+chmod 644 "$old_atomic" "$fresh_atomic"
+run_tg "$atomic_home" serve --once >/dev/null
+[ ! -e "$old_atomic" ] || fail "bounded cleanup retained an expired Telegram atomic payload"
+[ -e "$unrelated_atomic" ] || fail "bounded cleanup removed an unrelated hidden file"
+[ -e "$fresh_atomic" ] || fail "bounded cleanup removed the newest bounded Telegram atomic payload"
+[ "$(path_mode "$fresh_atomic")" = 600 ] || fail "bounded cleanup did not restore private atomic payload permissions"
+atomic_count=$(find "$atomic_inbox" -maxdepth 1 -type f \( -name '.tg-text-*.json.*' -o -name '.tg-voice-*.json.*' \) | wc -l | tr -d ' ')
+[ "$atomic_count" -le 256 ] || fail "bounded cleanup retained too many Telegram atomic payloads"
+
 rm -f "$home/port"
 start_server "$home" "$home/port"
 set_updates '[{"update_id":1,"message":{"message_id":10,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"please inspect this"}}]' "$home"
@@ -1180,6 +1209,15 @@ for _ in $(seq 1 100); do
   sleep .02
 done
 [ "$direct_lifecycle_started" -eq 1 ] || fail "direct lifecycle runtime did not acquire service ownership"
+if "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null 2>&1; then
+  fail "start activated a second service runtime"
+fi
+if "${lifecycle_env[@]}" "$SCRIPT" install >/dev/null 2>&1; then
+  fail "install activated a second service runtime"
+fi
+kill -0 "$direct_lifecycle_pid" 2>/dev/null || fail "refused activation terminated the direct runtime"
+[ "$(cat "$TMP_ROOT/systemctl.active")" = inactive ] || fail "refused activation changed systemd service state"
+supervision_needs "$voice_home" || fail "refused activation cleared direct runtime supervision"
 if "${lifecycle_env[@]}" "$SCRIPT" stop >/dev/null 2>&1; then
   fail "stop cleared state while a direct runtime owned the service lock"
 fi

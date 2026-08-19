@@ -31,6 +31,7 @@ CONFIG_NAME = "telegram.json"
 MAX_SEEN = 4096
 MAX_HANDLED = 4096
 MAX_INBOX = 256
+MAX_ATOMIC_TEMPS = 256
 MAX_TEXT = 12000
 MAX_TRANSCRIPT_UNITS = 4096
 MAX_TELEGRAM_NUMERIC_ID = (1 << 52) - 1
@@ -39,6 +40,7 @@ MAX_VOICE_BYTES = 10 * 1024 * 1024
 MAX_VOICE_SECONDS = 120
 INBOX_TTL = 7 * 24 * 60 * 60
 PENDING_TTL = 10 * 60
+ATOMIC_TEMP_TTL = 10 * 60
 POLL_TIMEOUT = 30
 RECEIPT_RETRY_DELAYS = (30, 120, 300)
 PERMANENT_CONFIG_EXIT = 78
@@ -57,6 +59,10 @@ TEXT_MESSAGE_FIELDS = MESSAGE_ENVELOPE_FIELDS | frozenset({
 VOICE_MESSAGE_FIELDS = MESSAGE_ENVELOPE_FIELDS | frozenset({"voice"})
 CALLBACK_QUERY_FIELDS = frozenset({"chat_instance", "data", "from", "id", "message"})
 CALLBACK_MESSAGE_FIELDS = TEXT_MESSAGE_FIELDS
+ATOMIC_STATE_TARGETS = frozenset({
+    "active.json", "admission-sequence.json", "callback-actions.json", "closing.json",
+    "enabled", "pending.json", "seen.json",
+})
 _PROCESS_TOKENS: Dict[Path, str] = {}
 _VERIFIED_BOT_IDS: Dict[Path, int] = {}
 
@@ -74,6 +80,10 @@ class PermanentConfigurationError(TelegramError):
 
 
 class WatcherPreconditionError(TelegramError):
+    pass
+
+
+class ServiceRuntimeOwnedError(TelegramError):
     pass
 
 
@@ -507,13 +517,26 @@ class FileLock:
                 if time.monotonic() >= deadline:
                     self.stream.close()
                     self.stream = None
-                    raise TelegramError("Telegram service is already running") from exc
+                    raise ServiceRuntimeOwnedError("Telegram service is already running") from exc
                 time.sleep(0.02)
 
     def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
         assert self.stream is not None
         fcntl.flock(self.stream.fileno(), fcntl.LOCK_UN)
         self.stream.close()
+
+
+def service_runtime_owned(home: Path) -> bool:
+    try:
+        with FileLock(service_lock(home), blocking=False):
+            return False
+    except ServiceRuntimeOwnedError:
+        return True
+
+
+def require_service_runtime_inactive(home: Path) -> None:
+    if service_runtime_owned(home):
+        raise ServiceRuntimeOwnedError("Telegram service is already running")
 
 
 def seen_path(home: Path) -> Path:
@@ -744,10 +767,67 @@ def sync_request_wakes(home: Path) -> None:
         _sync_request_wakes_locked(home)
 
 
+def owned_atomic_temp(home: Path, path: Path) -> bool:
+    name = path.name
+    if not name.startswith(".") or "." not in name[1:]:
+        return False
+    target, suffix = name[1:].rsplit(".", 1)
+    if (len(suffix) != 8
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_"
+                   for character in suffix)):
+        return False
+    root = state_dir(home)
+    if path.parent == root:
+        return target in ATOMIC_STATE_TARGETS
+    if path.parent not in {root / "inbox", root / "handled"} or not target.endswith(".json"):
+        return False
+    request_id = target[:-5]
+    for source in ("text", "voice"):
+        prefix = f"tg-{source}-u"
+        if not request_id.startswith(prefix):
+            continue
+        identifiers = request_id[len(prefix):].split("-m", 1)
+        if len(identifiers) != 2 or not all(value.isdigit() for value in identifiers):
+            return False
+        update_id, message_id = (int(value) for value in identifiers)
+        return (telegram_numeric_id(update_id)
+                and telegram_numeric_id(message_id, positive=True)
+                and request_id == deterministic_request_id(source, update_id, message_id))
+    return False
+
+
+def cleanup_atomic_temps_locked(home: Path) -> None:
+    root = state_dir(home)
+    paths = []
+    for directory in (root, root / "inbox", root / "handled"):
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        for path in directory.iterdir():
+            if not owned_atomic_temp(home, path):
+                continue
+            try:
+                details = path.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(details.st_mode):
+                paths.append((details.st_mtime, path))
+    paths.sort(key=lambda item: item[0], reverse=True)
+    cutoff = time.time() - ATOMIC_TEMP_TTL
+    for index, (modified, path) in enumerate(paths):
+        try:
+            if index >= MAX_ATOMIC_TEMPS or modified < cutoff:
+                durable_unlink(path)
+            else:
+                private_file(path)
+        except OSError:
+            pass
+
+
 def bounded_cleanup(home: Path) -> None:
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
         inbox, handled = request_dirs(home)
+        cleanup_atomic_temps_locked(home)
         active = active_request_id(home)
         cutoff = now() - INBOX_TTL
         inbox_files = sorted(inbox.glob("*.json"), key=request_order_key, reverse=True)
@@ -2067,6 +2147,8 @@ def verify_transport_marker(home: Path, expected: bool) -> None:
 
 def reconcile_failed_activation(home: Path, disable_new_install: bool = False,
                                 preserve_supervision: bool = False) -> None:
+    if service_runtime_owned(home):
+        return
     active_result = systemctl("is-active", SERVICE_NAME, check=False)
     if active_result.stdout.strip() not in {"inactive", "failed", "unknown", "not-found"}:
         return
@@ -2083,6 +2165,7 @@ def reconcile_failed_activation(home: Path, disable_new_install: bool = False,
 def install(home: Path) -> int:
     with FileLock(unit_lock()):
         with FileLock(lifecycle_lock(home)):
+            require_service_runtime_inactive(home)
             enabled_by_install = False
             try:
                 config = load_config(home)
@@ -2115,6 +2198,7 @@ def install(home: Path) -> int:
 def start_service(home: Path) -> int:
     with FileLock(unit_lock()):
         with FileLock(lifecycle_lock(home)):
+            require_service_runtime_inactive(home)
             try:
                 config = load_config(home)
                 verified_token_for(home, config)
