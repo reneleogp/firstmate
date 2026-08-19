@@ -41,6 +41,9 @@ class Handler(BaseHTTPRequestHandler):
             out.write(json.dumps({'path': self.path, 'params': params}) + '\n')
         method = self.path.rsplit('/', 1)[-1]
         if method == 'getMe':
+            if (home / 'block-getme').exists():
+                (home / 'getme-entered').write_text('entered')
+                while (home / 'block-getme').exists(): time.sleep(.01)
             if (home / 'replace-token-on-getme').exists():
                 (home / 'replace-token-on-getme').unlink()
                 (home / '.env').write_text('FM_TELEGRAM_BOT_TOKEN=replacement-token\n')
@@ -1048,11 +1051,25 @@ PY
       printf 'entered\n' > "$FM_TELEGRAM_START_HOLD.entered"
       while [ ! -e "$FM_TELEGRAM_START_HOLD.release" ]; do sleep .01; done
     fi
+    if [ -e "$root/systemctl.hold-child-getme" ] || [ -e "$root/systemctl.partial-fail-start" ]; then
+      rm -f "$root/systemctl.hold-child-getme"
+      rm -f "$FM_TELEGRAM_EXPECT_HOME/getme-entered"
+      touch "$FM_TELEGRAM_EXPECT_HOME/block-getme"
+    fi
     if [ ! -s "$root/systemctl.service.pid" ]; then
       env FM_HOME="$FM_TELEGRAM_EXPECT_HOME" FM_TELEGRAM_API_BASE="$FM_TELEGRAM_API_BASE" \
         "$FM_TELEGRAM_SERVICE_SCRIPT" --home "$FM_TELEGRAM_EXPECT_HOME" serve --systemd-service --poll-timeout 1 \
         >"$root/systemctl.service.log" 2>&1 &
       printf '%s\n' "$!" > "$root/systemctl.service.pid"
+    fi
+    if [ -e "$root/systemctl.partial-fail-start" ]; then
+      rm -f "$root/systemctl.partial-fail-start"
+      for _ in $(seq 1 100); do
+        [ -e "$FM_TELEGRAM_EXPECT_HOME/getme-entered" ] && break
+        sleep .02
+      done
+      [ -e "$FM_TELEGRAM_EXPECT_HOME/getme-entered" ] || exit 1
+      exit 1
     fi
     for _ in $(seq 1 100); do
       [ -e "$FM_TELEGRAM_EXPECT_HOME/state/telegram/enabled" ] && break
@@ -1166,33 +1183,39 @@ fi
 [ "$(cat "$TMP_ROOT/systemctl.enabled")" = enabled ] || fail "failed start disabled the installed service"
 rm -f "$TMP_ROOT/systemctl.fail-start"
 set_updates '[]' "$voice_home"
-activation_hold="$TMP_ROOT/service-activation"
-rm -f "$activation_hold.entered" "$activation_hold.release"
-FM_TELEGRAM_START_HOLD="$activation_hold" "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null &
+touch "$TMP_ROOT/systemctl.partial-fail-start"
+if "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null 2>&1; then
+  fail "partial systemd activation failure was accepted"
+fi
+rm -f "$voice_home/block-getme"
+[ ! -e "$voice_home/state/.telegram-service-activation" ] || fail "failed activation retained its reservation after the child stopped"
+[ ! -e "$voice_home/state/telegram/enabled" ] || fail "failed activation retained Telegram supervision"
+[ ! -e "$TMP_ROOT/systemctl.service.pid" ] || fail "failed activation left its systemd child running"
+"${lifecycle_env[@]}" "$SCRIPT" serve --once --poll-timeout 0 >/dev/null || fail "failed activation left runtime ownership reserved"
+rm -f "$voice_home/getme-entered"
+touch "$TMP_ROOT/systemctl.hold-child-getme"
+"${lifecycle_env[@]}" "$SCRIPT" start >/dev/null &
 reserved_start_pid=$!
-activation_entered=0
+child_verifying=0
 for _ in $(seq 1 100); do
-  if [ -e "$activation_hold.entered" ]; then activation_entered=1; break; fi
+  if [ -e "$voice_home/getme-entered" ]; then child_verifying=1; break; fi
   sleep .02
 done
-[ "$activation_entered" -eq 1 ] || fail "service activation did not reach its reserved start transition"
+[ "$child_verifying" -eq 1 ] || fail "systemd child did not reach token verification"
+[ -e "$voice_home/state/.telegram-service-activation" ] || fail "systemd child released its reservation before verification"
 "${lifecycle_env[@]}" "$SCRIPT" serve --once --poll-timeout 0 >/dev/null 2>&1 &
 racing_direct_pid=$!
 sleep .1
-kill -0 "$racing_direct_pid" 2>/dev/null || fail "direct runtime did not wait for the activation lifecycle boundary"
-touch "$activation_hold.release"
+kill -0 "$racing_direct_pid" 2>/dev/null || fail "direct runtime was not excluded during systemd verification"
+kill -0 "$reserved_start_pid" 2>/dev/null || fail "activation parent did not wait for child readiness"
+rm -f "$voice_home/block-getme"
 wait "$reserved_start_pid" || fail "reserved systemd activation failed"
 if wait "$racing_direct_pid"; then
-  fail "direct runtime entered during reserved systemd activation"
+  fail "waiting direct runtime entered after systemd readiness"
 fi
 service_pid=$(cat "$TMP_ROOT/systemctl.service.pid")
-reservation_consumed=0
-for _ in $(seq 1 100); do
-  if [ ! -e "$voice_home/state/.telegram-service-activation" ]; then reservation_consumed=1; break; fi
-  sleep .02
-done
 kill -0 "$service_pid" 2>/dev/null || fail "reserved activation did not leave the systemd runtime owning service"
-[ "$reservation_consumed" -eq 1 ] || fail "systemd runtime did not consume its activation reservation"
+[ ! -e "$voice_home/state/.telegram-service-activation" ] || fail "ready systemd runtime did not consume its activation reservation"
 "${lifecycle_env[@]}" "$SCRIPT" stop >/dev/null || fail "reserved systemd runtime did not stop cleanly"
 cp "$voice_home/config/telegram.json" "$voice_home/pairing-before-identity-change.json"
 if "${lifecycle_env[@]}" "$SCRIPT" pair --user-id 88 --chat-id 88 >/dev/null 2>&1; then

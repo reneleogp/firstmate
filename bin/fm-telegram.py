@@ -1685,8 +1685,6 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
             if service_activation_path(home).is_file() and not systemd_service:
                 raise ServiceRuntimeOwnedError("Telegram systemd service activation is in progress")
             runtime.enter_context(FileLock(service_lock(home), blocking=False))
-            if systemd_service:
-                durable_unlink(service_activation_path(home))
             try:
                 config = load_config(home)
                 token_for(home)
@@ -1699,6 +1697,8 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
                 clear_stopped_transport_state(home)
                 raise
             prepare_transport_activation(home)
+            if systemd_service:
+                durable_unlink(service_activation_path(home))
         offset = 0
         stop = False
         permanent_failure = False
@@ -2159,30 +2159,49 @@ def verify_transport_marker(home: Path, expected: bool) -> None:
         raise TelegramError("Telegram supervision state did not converge")
 
 
+def wait_for_systemd_runtime_ready(home: Path) -> None:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if (not service_activation_path(home).is_file()
+                and telegram_enabled_path(home).is_file()):
+            return
+        time.sleep(0.02)
+    raise TelegramError("Telegram systemd service did not become ready")
+
+
 def reconcile_failed_activation(home: Path, disable_new_install: bool = False,
-                                preserve_supervision: bool = False) -> None:
-    if service_runtime_owned(home):
-        return
-    active_result = systemctl("is-active", SERVICE_NAME, check=False)
-    if active_result.stdout.strip() not in {"inactive", "failed", "unknown", "not-found"}:
-        return
-    durable_unlink(service_activation_path(home))
-    if preserve_supervision:
-        verify_transport_marker(home, True)
-    else:
-        set_telegram_enabled(home, False)
-        verify_transport_marker(home, False)
-    if disable_new_install:
-        systemctl("disable", SERVICE_NAME)
-        verify_service(enabled=False)
+                                preserve_supervision: bool = False,
+                                activation_reserved: bool = False) -> None:
+    if activation_reserved:
+        systemctl("stop", SERVICE_NAME, check=False)
+        verify_service(active=False)
+    with FileLock(lifecycle_lock(home)):
+        if not activation_reserved and service_runtime_owned(home):
+            return
+        runtime_guard = (FileLock(service_lock(home), blocking=False, timeout=3)
+                         if activation_reserved else contextlib.nullcontext())
+        with runtime_guard:
+            active_result = systemctl("is-active", SERVICE_NAME, check=False)
+            if active_result.stdout.strip() not in {"inactive", "failed", "unknown", "not-found"}:
+                return
+            durable_unlink(service_activation_path(home))
+            if preserve_supervision:
+                verify_transport_marker(home, True)
+            else:
+                set_telegram_enabled(home, False)
+                verify_transport_marker(home, False)
+            if disable_new_install:
+                systemctl("disable", SERVICE_NAME)
+                verify_service(enabled=False)
 
 
 def install(home: Path) -> int:
     with FileLock(unit_lock()):
-        with FileLock(lifecycle_lock(home)):
-            require_service_runtime_inactive(home)
-            enabled_by_install = False
-            try:
+        enabled_by_install = False
+        activation_reserved = False
+        try:
+            with FileLock(lifecycle_lock(home)):
+                require_service_runtime_inactive(home)
                 config = load_config(home)
                 verified_token_for(home, config)
                 path = unit_path()
@@ -2197,39 +2216,48 @@ def install(home: Path) -> int:
                 enabled_by_install = not was_enabled
                 prepare_transport_activation(home)
                 atomic_bytes(service_activation_path(home), b"systemd\n")
-                systemctl("start", SERVICE_NAME)
+                activation_reserved = True
+            systemctl("start", SERVICE_NAME)
+            wait_for_systemd_runtime_ready(home)
+            with FileLock(lifecycle_lock(home)):
                 require_unit_owner(home)
                 verify_service(active=True, enabled=True)
                 verify_transport_marker(home, True)
-            except (TelegramError, OSError, ValueError) as exc:
-                reconcile_failed_activation(
-                    home, enabled_by_install,
-                    preserve_supervision=isinstance(exc, WatcherPreconditionError),
-                )
-                raise
+        except (TelegramError, OSError, ValueError) as exc:
+            reconcile_failed_activation(
+                home, enabled_by_install,
+                preserve_supervision=isinstance(exc, WatcherPreconditionError),
+                activation_reserved=activation_reserved,
+            )
+            raise
     print("Telegram service installed and active.")
     return 0
 
 
 def start_service(home: Path) -> int:
     with FileLock(unit_lock()):
-        with FileLock(lifecycle_lock(home)):
-            require_service_runtime_inactive(home)
-            try:
+        activation_reserved = False
+        try:
+            with FileLock(lifecycle_lock(home)):
+                require_service_runtime_inactive(home)
                 config = load_config(home)
                 verified_token_for(home, config)
                 require_unit_owner(home)
                 prepare_transport_activation(home)
                 atomic_bytes(service_activation_path(home), b"systemd\n")
-                systemctl("start", SERVICE_NAME)
+                activation_reserved = True
+            systemctl("start", SERVICE_NAME)
+            wait_for_systemd_runtime_ready(home)
+            with FileLock(lifecycle_lock(home)):
                 require_unit_owner(home)
                 verify_service(active=True)
                 verify_transport_marker(home, True)
-            except (TelegramError, OSError, ValueError) as exc:
-                reconcile_failed_activation(
-                    home, preserve_supervision=isinstance(exc, WatcherPreconditionError)
-                )
-                raise
+        except (TelegramError, OSError, ValueError) as exc:
+            reconcile_failed_activation(
+                home, preserve_supervision=isinstance(exc, WatcherPreconditionError),
+                activation_reserved=activation_reserved,
+            )
+            raise
     print("Telegram service active.")
     return 0
 
