@@ -198,24 +198,34 @@ if run_tg "$pin_home" send --text-file "$pin_home/send.txt" >/dev/null 2>&1; the
 fi
 [ "$(grep -c 'getUpdates' "$pin_home/calls.jsonl")" -eq "$pin_updates_before" ] || fail "mismatched bot token polled for updates"
 [ "$(grep -c 'sendMessage' "$pin_home/calls.jsonl")" -eq "$pin_sends_before" ] || fail "mismatched bot token sent a message"
-run_tg "$pin_home" pair --user-id 77 --chat-id 77 >/dev/null
-set_updates '[{"update_id":91,"message":{"message_id":91,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"accepted after explicit repair"}}]' "$pin_home"
-touch "$pin_home/disconnect-next-getme"
-run_tg "$pin_home" serve --once >/dev/null 2>&1
+cp "$pin_home/config/telegram.json" "$pin_home/pairing-before-stateful-repair.json"
+if run_tg "$pin_home" pair --user-id 77 --chat-id 77 >/dev/null 2>&1; then
+  fail "pairing replaced the bot identity while old identity-bound requests remained"
+fi
+cmp -s "$pin_home/config/telegram.json" "$pin_home/pairing-before-stateful-repair.json" || fail "refused bot replacement changed the pairing"
+
+repair_home=$(new_home bot-repair)
+start_server "$repair_home" "$repair_home/port"
+run_tg "$repair_home" pair --user-id 77 --chat-id 77 >/dev/null
+printf 'FM_TELEGRAM_BOT_TOKEN=replacement-token\n' > "$repair_home/.env"
+run_tg "$repair_home" pair --user-id 77 --chat-id 77 >/dev/null
+set_updates '[{"update_id":91,"message":{"message_id":91,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"accepted after explicit repair"}}]' "$repair_home"
+touch "$repair_home/disconnect-next-getme"
+run_tg "$repair_home" serve --once >/dev/null 2>&1
 [ "$?" -eq 1 ] || fail "transient bot verification failure used the permanent configuration exit"
-run_tg "$pin_home" serve --once >/dev/null
-[ "$(find "$pin_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || fail "explicit re-pairing did not authorize the replacement bot"
-touch "$pin_home/unauthorized-next-getme" "$pin_home/state/telegram/enabled"
-run_tg "$pin_home" serve --once >/dev/null 2>&1
+run_tg "$repair_home" serve --once >/dev/null
+[ "$(find "$repair_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 1 ] || fail "state-free re-pairing did not authorize the replacement bot"
+touch "$repair_home/unauthorized-next-getme" "$repair_home/state/telegram/enabled"
+run_tg "$repair_home" serve --once >/dev/null 2>&1
 [ "$?" -eq 78 ] || fail "definitive bot authentication failure did not use the permanent configuration exit"
-[ ! -e "$pin_home/state/telegram/enabled" ] || fail "authentication failure left transport supervision active"
-touch "$pin_home/server-error-next-updates"
-run_tg "$pin_home" serve --once >/dev/null 2>&1
+[ ! -e "$repair_home/state/telegram/enabled" ] || fail "authentication failure left transport supervision active"
+touch "$repair_home/server-error-next-updates"
+run_tg "$repair_home" serve --once >/dev/null 2>&1
 [ "$?" -eq 1 ] || fail "transient polling failure used the permanent configuration exit"
-touch "$pin_home/unauthorized-next-updates" "$pin_home/state/telegram/enabled"
-run_tg "$pin_home" serve --once >/dev/null 2>&1
+touch "$repair_home/unauthorized-next-updates" "$repair_home/state/telegram/enabled"
+run_tg "$repair_home" serve --once >/dev/null 2>&1
 [ "$?" -eq 78 ] || fail "polling authentication failure did not use the permanent configuration exit"
-[ ! -e "$pin_home/state/telegram/enabled" ] || fail "polling authentication failure left transport supervision active"
+[ ! -e "$repair_home/state/telegram/enabled" ] || fail "polling authentication failure left transport supervision active"
 
 rm -f "$home/port"
 start_server "$home" "$home/port"
@@ -874,9 +884,19 @@ PY
 [ ! -e "$voice_home/state/telegram/pending.json" ] || fail "stop retained pending voice state"
 if supervision_needs "$voice_home"; then fail "stopped Telegram transport still required supervision"; fi
 if "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null; then fail "stop did not verify inactive state"; fi
+cp "$voice_home/config/telegram.json" "$voice_home/pairing-before-identity-change.json"
+if "${lifecycle_env[@]}" "$SCRIPT" pair --user-id 88 --chat-id 88 >/dev/null 2>&1; then
+  fail "pairing replaced the pinned user while old identity-bound state remained"
+fi
+cmp -s "$voice_home/config/telegram.json" "$voice_home/pairing-before-identity-change.json" || fail "refused identity replacement changed the pairing"
+set_updates '[]' "$voice_home"
+"${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null
+"${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null
+"${lifecycle_env[@]}" "$SCRIPT" install >/dev/null
+"${lifecycle_env[@]}" "$SCRIPT" stop >/dev/null
 race_inbox_before=$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')
 set_updates '[{"update_id":290,"message":{"message_id":290,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"old pairing must not survive replacement"}}]' "$voice_home"
-rm -f "$TMP_ROOT/systemctl.race-pair-count"
+rm -f "$TMP_ROOT/systemctl.race-pair-count" "$TMP_ROOT/systemctl.race-service.status"
 touch "$TMP_ROOT/systemctl.race-pair"
 "${lifecycle_env[@]}" "$SCRIPT" pair --user-id 88 --chat-id 88 >/dev/null || fail "serialized inactive pairing replacement failed"
 race_service_done=0
@@ -889,7 +909,7 @@ done
 [ "$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq "$race_inbox_before" ] || fail "racing startup accepted the replaced pairing"
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["user_id"])' "$voice_home/config/telegram.json")" -eq 88 ] || fail "serialized replacement did not persist the new pairing"
 set_updates '[]' "$voice_home"
-"${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null || fail "inactive owned service refused explicit re-pairing"
+"${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null || fail "state-free inactive service refused explicit re-pairing"
 "${lifecycle_env[@]}" "$systemctl_fake" --user start firstmate-telegram.service
 supervision_needs "$voice_home" || fail "direct enabled-service restart did not restore supervision"
 direct_stop_audio=$(mktemp /dev/shm/firstmate-telegram-direct-stop.XXXXXX)

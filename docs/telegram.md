@@ -16,6 +16,7 @@ bin/fm-telegram.py --home "$FM_HOME" pair --user-id <private-user-id> --chat-id 
 
 The pairing command verifies the bot identity and private chat, then writes the pinned user, chat, and bot identifiers to `config/telegram.json` with mode `0600`.
 Stop an installed service before replacing its pairing; the command refuses to change an owned service's pairing while that service is active.
+Changing the pinned user, DM, or bot identity is also refused while private Telegram request, conversation, deduplication, callback, or voice state remains, so run `cleanup` before pairing the replacement identity.
 The service accepts updates only when both the pinned user and pinned private chat match.
 Install and start the one user service after pairing:
 

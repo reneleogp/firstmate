@@ -99,6 +99,11 @@ def atomic_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
             os.fsync(stream.fileno())
         os.replace(temporary, path)
         private_file(path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         try:
             os.unlink(temporary)
@@ -1445,6 +1450,25 @@ def require_pairing_service_inactive(home: Path) -> None:
         raise TelegramError("stop the Telegram service before changing its pairing")
 
 
+def identity_bound_state_exists(home: Path) -> bool:
+    root = home / "state" / "telegram"
+    for name in ("active.json", "callback-actions.json", "closing.json", "pending.json", "seen.json"):
+        path = root / name
+        if path.exists() or path.is_symlink():
+            return True
+    for name in ("inbox", "handled"):
+        path = root / name
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            return True
+        if path.is_dir():
+            try:
+                if next(path.iterdir(), None) is not None:
+                    return True
+            except OSError:
+                return True
+    return False
+
+
 def pair(home: Path, user_id: int, chat_id: int) -> int:
     require_pairing_service_inactive(home)
     config_existing = read_json(config_path(home), {})
@@ -1463,13 +1487,25 @@ def pair(home: Path, user_id: int, chat_id: int) -> int:
     if user_id != chat_id:
         raise TelegramError("the pinned private chat must belong to the pinned user")
     endpoint = api_base(home, config)
+    new_identity = (user_id, chat_id, int(result["id"]))
     with FileLock(lifecycle_lock(home)):
         require_pairing_service_inactive(home)
-        current = read_json(config_path(home), {})
-        config = current if isinstance(current, dict) else {}
-        config.update({"user_id": user_id, "chat_id": chat_id, "bot_id": int(result["id"]),
-                       "api_base": endpoint})
-        atomic_json(config_path(home), config)
+        with FileLock(state_lock(home)):
+            current = read_json(config_path(home), {})
+            config = current if isinstance(current, dict) else {}
+            identity_values = (
+                config.get("user_id"), config.get("chat_id"), config.get("bot_id")
+            )
+            current_identity = (
+                identity_values if all(strict_int(value) for value in identity_values) else None
+            )
+            if current_identity != new_identity and identity_bound_state_exists(home):
+                raise TelegramError(
+                    "clean up private Telegram state before changing its pairing"
+                )
+            config.update({"user_id": user_id, "chat_id": chat_id,
+                           "bot_id": int(result["id"]), "api_base": endpoint})
+            atomic_json(config_path(home), config)
     print("Telegram pairing verified.")
     return 0
 
