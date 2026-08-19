@@ -1664,7 +1664,8 @@ def handle_text(home: Path, config: Dict[str, Any], message: Dict[str, Any], upd
     return isinstance(record, dict) and record.get("wake_recorded") is True
 
 
-def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any], update_id: int) -> bool:
+def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any],
+                 update_id: int) -> Optional[bool]:
     voice = message.get("voice")
     if not isinstance(voice, dict):
         return False
@@ -1690,7 +1691,7 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any], up
                 save_pending_voice_queue_locked(home, records)
             return True
         if len(records) >= MAX_PENDING_VOICES:
-            return False
+            return None
         records.append({
             "pending_id": pending_id,
             "file_id": file_id,
@@ -1898,55 +1899,58 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
     return False
 
 
-def process_update(home: Path, config: Dict[str, Any], update: Any) -> None:
+def process_update(home: Path, config: Dict[str, Any], update: Any) -> bool:
     if not isinstance(update, dict) or not telegram_numeric_id(update.get("update_id")):
-        return
+        return True
     update_id = int(update["update_id"])
     has_callback = "callback_query" in update
     has_message = "message" in update
     if has_callback == has_message:
-        return
+        return True
     expected_update_fields = {
         "update_id", "callback_query" if has_callback else "message"
     }
     if set(update) != expected_update_fields:
-        return
+        return True
     if has_callback:
         query = update.get("callback_query")
         if not isinstance(query, dict):
-            return
+            return True
         with FileLock(state_lock(home)):
             if has_seen(home, update_id, None):
-                return
+                return True
         if handle_callback(home, config, query, update_id):
             with FileLock(state_lock(home)):
                 seen_update(home, update_id, None)
-        return
+        return True
     if not isinstance(update.get("message"), dict):
-        return
+        return True
     message = update["message"]
     has_text = "text" in message
     has_voice = "voice" in message
     if has_text == has_voice:
-        return
+        return True
     allowed_message_fields = TEXT_MESSAGE_FIELDS if has_text else VOICE_MESSAGE_FIELDS
     if not set(message).issubset(allowed_message_fields):
-        return
+        return True
     pinned = pinned_message(config, message)
     if pinned is None:
-        return
+        return True
     message_id = int(message["message_id"])
     with FileLock(state_lock(home)):
         if has_seen(home, update_id, message_id):
-            return
+            return True
     handled = False
     if has_text:
         handled = handle_text(home, config, message, update_id)
     else:
         handled = handle_voice(home, config, message, update_id)
+        if handled is None:
+            return False
     if handled:
         with FileLock(state_lock(home)):
             seen_update(home, update_id, message_id)
+    return True
 
 
 def has_seen(home: Path, update_id: int, message_id: Optional[int]) -> bool:
@@ -2074,9 +2078,10 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
                     if not isinstance(updates, list):
                         updates = []
                     for update in updates:
+                        if not process_update(home, config, update):
+                            break
                         if isinstance(update, dict) and telegram_numeric_id(update.get("update_id")):
                             offset = max(offset, int(update["update_id"]) + 1)
-                        process_update(home, config, update)
                         advance_pending_voice(home, config)
                     reconcile_requests(home)
                 except TelegramError as exc:

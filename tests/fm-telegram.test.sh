@@ -975,6 +975,75 @@ printf 'B final\n' > "$order_home/reply.txt"
 run_tg "$order_home" reply "$order_b" --final --text-file "$order_home/reply.txt" >/dev/null
 [ "$(grep -c "telegram:$order_c" "$order_home/state/.wake-queue")" -eq 1 ] || fail "ordered queue did not advance to its final head"
 
+# A full voice queue leaves the next valid voice unconfirmed and pauses its batch.
+overflow_home=$(new_home voice-overflow)
+start_server "$overflow_home" "$overflow_home/port"
+run_tg "$overflow_home" pair --user-id 77 --chat-id 77 >/dev/null
+mkdir -p "$overflow_home/state/telegram"
+chmod 700 "$overflow_home/state" "$overflow_home/state/telegram"
+python3 - "$overflow_home/state/telegram/pending.json" \
+  "$overflow_home/state/telegram/pending-voice-queue.json" <<'PY'
+import json, sys, time
+pending_path, queue_path = sys.argv[1:]
+created_at = int(time.time())
+pending = {
+    'pending_id': 'voice-u3000-m3000',
+    'mode': 'confirm',
+    'audio_path': '/dev/shm/firstmate-telegram-overflow-fixture.oga',
+    'chat_id': 77,
+    'message_id': 3000,
+    'update_id': 3000,
+    'created_at': created_at,
+    'revision': 1,
+    'completed_actions': [],
+    'text': 'active confirmation',
+    'heading_sent': True,
+    'transcript_sent': True,
+}
+records = [{
+    'pending_id': f'voice-u{3100 + index}-m{3100 + index}',
+    'file_id': f'queued-{index}',
+    'duration': 2,
+    'size': 20,
+    'chat_id': 77,
+    'message_id': 3100 + index,
+    'update_id': 3100 + index,
+    'queued_at': created_at,
+} for index in range(64)]
+for path, value in ((pending_path, pending), (queue_path, records)):
+    with open(path, 'w', encoding='utf-8') as stream:
+        json.dump(value, stream)
+PY
+chmod 600 "$overflow_home/state/telegram/pending.json" \
+  "$overflow_home/state/telegram/pending-voice-queue.json"
+set_updates '[{"update_id":4000,"message":{"message_id":4000,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-over-capacity","duration":2,"file_size":20}}},{"update_id":4001,"message":{"message_id":4001,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"must wait behind full voice queue"}}]' "$overflow_home"
+run_tg "$overflow_home" serve --once >/dev/null
+[ ! -e "$overflow_home/state/telegram/inbox/tg-text-u4001-m4001.json" ] || fail "full voice queue processed a later update from the blocked batch"
+python3 - "$overflow_home/state/telegram/pending-voice-queue.json" \
+  "$overflow_home/state/telegram/seen.json" <<'PY' || fail "full voice queue confirmed or discarded its blocked update"
+import json, os, sys
+records = json.load(open(sys.argv[1], encoding='utf-8'))
+seen = json.load(open(sys.argv[2], encoding='utf-8')) if os.path.exists(sys.argv[2]) else {}
+assert len(records) == 64
+assert 'voice-u4000-m4000' not in [record['pending_id'] for record in records]
+assert 4000 not in seen.get('updates', [])
+PY
+python3 - "$overflow_home/state/telegram/pending-voice-queue.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+records = json.load(open(path, encoding='utf-8'))
+with open(path, 'w', encoding='utf-8') as stream:
+    json.dump(records[:-1], stream)
+PY
+run_tg "$overflow_home" serve --once >/dev/null
+[ -e "$overflow_home/state/telegram/inbox/tg-text-u4001-m4001.json" ] || fail "released voice capacity did not resume the paused update batch"
+python3 - "$overflow_home/state/telegram/pending-voice-queue.json" <<'PY' || fail "blocked voice was not retried after capacity became available"
+import json, sys
+records = json.load(open(sys.argv[1], encoding='utf-8'))
+assert len(records) == 64
+assert records[-1]['pending_id'] == 'voice-u4000-m4000'
+PY
+
 # Voice confirm, edit, retry, cancel, expiry, and temporary-audio cleanup.
 voice_home=$(new_home 'voice home % dollar$ quote"')
 start_server "$voice_home" "$voice_home/port"
