@@ -1029,7 +1029,7 @@ command = words(value('ExecStart'))
 assert environment == ['FM_HOME=' + expected]
 assert command[0] == ':/usr/bin/python3'
 assert command[1].endswith('/bin/fm-telegram.py')
-assert command[2:] == ['--home', expected, 'serve']
+assert command[2:] == ['--home', expected, 'serve', '--systemd-service']
 assert value('Restart') == 'on-failure'
 assert words(value('RestartPreventExitStatus')) == ['78']
 PY
@@ -1044,9 +1044,13 @@ PY
       printf inactive > "$root/systemctl.active"
       exit 1
     fi
+    if [ -n "${FM_TELEGRAM_START_HOLD:-}" ]; then
+      printf 'entered\n' > "$FM_TELEGRAM_START_HOLD.entered"
+      while [ ! -e "$FM_TELEGRAM_START_HOLD.release" ]; do sleep .01; done
+    fi
     if [ ! -s "$root/systemctl.service.pid" ]; then
       env FM_HOME="$FM_TELEGRAM_EXPECT_HOME" FM_TELEGRAM_API_BASE="$FM_TELEGRAM_API_BASE" \
-        "$FM_TELEGRAM_SERVICE_SCRIPT" --home "$FM_TELEGRAM_EXPECT_HOME" serve --poll-timeout 1 \
+        "$FM_TELEGRAM_SERVICE_SCRIPT" --home "$FM_TELEGRAM_EXPECT_HOME" serve --systemd-service --poll-timeout 1 \
         >"$root/systemctl.service.log" 2>&1 &
       printf '%s\n' "$!" > "$root/systemctl.service.pid"
     fi
@@ -1161,6 +1165,35 @@ fi
 [ ! -e "$voice_home/state/telegram/enabled" ] || fail "failed start retained Telegram supervision"
 [ "$(cat "$TMP_ROOT/systemctl.enabled")" = enabled ] || fail "failed start disabled the installed service"
 rm -f "$TMP_ROOT/systemctl.fail-start"
+set_updates '[]' "$voice_home"
+activation_hold="$TMP_ROOT/service-activation"
+rm -f "$activation_hold.entered" "$activation_hold.release"
+FM_TELEGRAM_START_HOLD="$activation_hold" "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null &
+reserved_start_pid=$!
+activation_entered=0
+for _ in $(seq 1 100); do
+  if [ -e "$activation_hold.entered" ]; then activation_entered=1; break; fi
+  sleep .02
+done
+[ "$activation_entered" -eq 1 ] || fail "service activation did not reach its reserved start transition"
+"${lifecycle_env[@]}" "$SCRIPT" serve --once --poll-timeout 0 >/dev/null 2>&1 &
+racing_direct_pid=$!
+sleep .1
+kill -0 "$racing_direct_pid" 2>/dev/null || fail "direct runtime did not wait for the activation lifecycle boundary"
+touch "$activation_hold.release"
+wait "$reserved_start_pid" || fail "reserved systemd activation failed"
+if wait "$racing_direct_pid"; then
+  fail "direct runtime entered during reserved systemd activation"
+fi
+service_pid=$(cat "$TMP_ROOT/systemctl.service.pid")
+reservation_consumed=0
+for _ in $(seq 1 100); do
+  if [ ! -e "$voice_home/state/.telegram-service-activation" ]; then reservation_consumed=1; break; fi
+  sleep .02
+done
+kill -0 "$service_pid" 2>/dev/null || fail "reserved activation did not leave the systemd runtime owning service"
+[ "$reservation_consumed" -eq 1 ] || fail "systemd runtime did not consume its activation reservation"
+"${lifecycle_env[@]}" "$SCRIPT" stop >/dev/null || fail "reserved systemd runtime did not stop cleanly"
 cp "$voice_home/config/telegram.json" "$voice_home/pairing-before-identity-change.json"
 if "${lifecycle_env[@]}" "$SCRIPT" pair --user-id 88 --chat-id 88 >/dev/null 2>&1; then
   fail "pairing replaced the pinned user while old identity-bound state remained"

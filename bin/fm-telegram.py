@@ -7,6 +7,7 @@ interpret requests, choose actions, or authorize Firstmate operations.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import fcntl
 import json
@@ -159,6 +160,7 @@ def validate_home_storage(home: Path) -> None:
         config / CONFIG_NAME,
         state / ".telegram-cleaned",
         state / ".telegram-lifecycle.lock",
+        state / ".telegram-service-activation",
         state / ".telegram-service.lock",
         state / ".telegram-state.lock",
     ):
@@ -479,6 +481,10 @@ def lifecycle_lock(home: Path) -> Path:
 
 def service_lock(home: Path) -> Path:
     return home / "state" / ".telegram-service.lock"
+
+
+def service_activation_path(home: Path) -> Path:
+    return home / "state" / ".telegram-service-activation"
 
 
 def state_tombstone(home: Path) -> Path:
@@ -1672,9 +1678,15 @@ def clear_stopped_transport_state(home: Path) -> None:
     set_telegram_enabled(home, False)
 
 
-def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> int:
-    with FileLock(service_lock(home), blocking=False):
+def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
+          systemd_service: bool = False) -> int:
+    with contextlib.ExitStack() as runtime:
         with FileLock(lifecycle_lock(home)):
+            if service_activation_path(home).is_file() and not systemd_service:
+                raise ServiceRuntimeOwnedError("Telegram systemd service activation is in progress")
+            runtime.enter_context(FileLock(service_lock(home), blocking=False))
+            if systemd_service:
+                durable_unlink(service_activation_path(home))
             try:
                 config = load_config(home)
                 token_for(home)
@@ -2100,7 +2112,9 @@ def systemd_quote(value: str) -> str:
 
 def unit_contents(home: Path) -> str:
     script = Path(__file__).resolve()
-    arguments = " ".join(systemd_quote(value) for value in (str(script), "--home", str(home), "serve"))
+    arguments = " ".join(systemd_quote(value) for value in (
+        str(script), "--home", str(home), "serve", "--systemd-service"
+    ))
     return ("[Unit]\nDescription=Firstmate Telegram transport\nAfter=network-online.target\n\n"
             "[Service]\nType=simple\n"
             f"Environment={systemd_quote('FM_HOME=' + str(home))}\n"
@@ -2152,6 +2166,7 @@ def reconcile_failed_activation(home: Path, disable_new_install: bool = False,
     active_result = systemctl("is-active", SERVICE_NAME, check=False)
     if active_result.stdout.strip() not in {"inactive", "failed", "unknown", "not-found"}:
         return
+    durable_unlink(service_activation_path(home))
     if preserve_supervision:
         verify_transport_marker(home, True)
     else:
@@ -2181,6 +2196,7 @@ def install(home: Path) -> int:
                 systemctl("enable", SERVICE_NAME)
                 enabled_by_install = not was_enabled
                 prepare_transport_activation(home)
+                atomic_bytes(service_activation_path(home), b"systemd\n")
                 systemctl("start", SERVICE_NAME)
                 require_unit_owner(home)
                 verify_service(active=True, enabled=True)
@@ -2204,6 +2220,7 @@ def start_service(home: Path) -> int:
                 verified_token_for(home, config)
                 require_unit_owner(home)
                 prepare_transport_activation(home)
+                atomic_bytes(service_activation_path(home), b"systemd\n")
                 systemctl("start", SERVICE_NAME)
                 require_unit_owner(home)
                 verify_service(active=True)
@@ -2228,6 +2245,7 @@ def stop_service(home: Path) -> int:
                     pending = read_json(pending_path(home))
                     if isinstance(pending, dict):
                         remove_pending(home, pending)
+                durable_unlink(service_activation_path(home))
                 set_telegram_enabled(home, False)
                 verify_transport_marker(home, False)
     print("Telegram service stopped.")
@@ -2253,6 +2271,7 @@ def disable_service(home: Path) -> int:
                     pending = read_json(pending_path(home))
                     if isinstance(pending, dict):
                         remove_pending(home, pending)
+                durable_unlink(service_activation_path(home))
                 set_telegram_enabled(home, False)
                 verify_transport_marker(home, False)
     print("Telegram service disabled.")
@@ -2276,6 +2295,7 @@ def _cleanup_locked(home: Path) -> int:
         systemctl("disable", "--now", SERVICE_NAME)
         verify_service(active=False, enabled=False)
     with FileLock(service_lock(home), blocking=False, timeout=1):
+        durable_unlink(service_activation_path(home))
         if owned:
             durable_unlink(path)
             systemctl("daemon-reload")
@@ -2328,6 +2348,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_home(serve_parser)
     serve_parser.add_argument("--once", action="store_true")
     serve_parser.add_argument("--poll-timeout", type=int, default=POLL_TIMEOUT)
+    serve_parser.add_argument("--systemd-service", action="store_true", help=argparse.SUPPRESS)
     read_parser = sub.add_parser("request-read", help="print one queued Telegram request")
     add_home(read_parser)
     read_parser.add_argument("request_id")
@@ -2382,7 +2403,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if args.command == "pair":
             return pair(home, args.user_id, args.chat_id)
         if args.command == "serve":
-            return serve(home, args.once, max(0, min(args.poll_timeout, 50)))
+            return serve(
+                home, args.once, max(0, min(args.poll_timeout, 50)), args.systemd_service
+            )
         if args.command == "request-read":
             return request_read(home, args.request_id)
         if args.command == "request-handled":
