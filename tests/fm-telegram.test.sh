@@ -323,6 +323,38 @@ run_tg "$identity_home" serve --once >/dev/null
 [ "$(grep -c 'answerCallbackQuery' "$identity_home/calls.jsonl")" -eq 0 ] || fail "boolean callback identity was acknowledged"
 [ "$(find "$identity_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 0 ] || fail "boolean identity aliased the pinned integer identity"
 
+# Only the immutable-order head is woken, and a queued continuation keeps its predecessor.
+order_home=$(new_home order)
+start_server "$order_home" "$order_home/port"
+run_tg "$order_home" pair --user-id 77 --chat-id 77 >/dev/null
+set_updates '[{"update_id":30,"message":{"message_id":30,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"conversation A"}},{"update_id":31,"message":{"message_id":31,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"conversation B"}},{"update_id":32,"message":{"message_id":32,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"conversation C"}}]' "$order_home"
+run_tg "$order_home" serve --once >/dev/null
+order_a=tg-text-u30-m30
+order_b=tg-text-u31-m31
+order_c=tg-text-u32-m32
+[ "$(grep -c "telegram:$order_a" "$order_home/state/.wake-queue")" -eq 1 ] || fail "ordered queue did not publish its first head exactly once"
+! grep -F "telegram:$order_b" "$order_home/state/.wake-queue" >/dev/null || fail "ordered queue published its second request early"
+! grep -F "telegram:$order_c" "$order_home/state/.wake-queue" >/dev/null || fail "ordered queue published its third request early"
+run_tg "$order_home" request-handled "$order_a" >/dev/null
+run_tg "$order_home" request-bind "$order_a" order-work >/dev/null
+set_updates '[{"update_id":33,"message":{"message_id":33,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"late answer for A"}}]' "$order_home"
+run_tg "$order_home" serve --once >/dev/null
+order_continuation=tg-text-u33-m33
+[ "$(grep -c "telegram:$order_continuation" "$order_home/state/.wake-queue")" -eq 1 ] || fail "active conversation continuation was not the sole wake head"
+printf 'A final\n' > "$order_home/reply.txt"
+run_tg "$order_home" reply "$order_a" --final --text-file "$order_home/reply.txt" >/dev/null
+[ "$(run_tg "$order_home" active-request --work-id order-work)" = "$order_a" ] || fail "queued continuation lost its active predecessor during finalization"
+run_tg "$order_home" request-handled "$order_continuation" >/dev/null
+if next_active=$(run_tg "$order_home" active-request 2>/dev/null); then
+  [ "$next_active" != "$order_continuation" ] || fail "continuation was promoted to unrelated active work"
+fi
+[ "$(grep -c "telegram:$order_b" "$order_home/state/.wake-queue")" -eq 1 ] || fail "closing did not publish the immutable-order next head"
+! grep -F "telegram:$order_c" "$order_home/state/.wake-queue" >/dev/null || fail "closing published a later request ahead of the head"
+run_tg "$order_home" request-handled "$order_b" >/dev/null
+printf 'B final\n' > "$order_home/reply.txt"
+run_tg "$order_home" reply "$order_b" --final --text-file "$order_home/reply.txt" >/dev/null
+[ "$(grep -c "telegram:$order_c" "$order_home/state/.wake-queue")" -eq 1 ] || fail "ordered queue did not advance to its final head"
+
 # Voice confirm, edit, retry, cancel, expiry, and temporary-audio cleanup.
 voice_home=$(new_home 'voice home % dollar$ quote"')
 start_server "$voice_home" "$voice_home/port"
@@ -513,7 +545,14 @@ supervision_needs() {
 [ -f "$unit_dir/firstmate-telegram.service" ] || fail "install must write one user unit"
 supervision_needs "$voice_home" || fail "installed Telegram transport did not keep supervision armed"
 "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null || fail "status must report installed active service"
+stop_audio=$(mktemp /dev/shm/firstmate-telegram-stop.XXXXXX)
+python3 - "$voice_home/state/telegram/pending.json" "$stop_audio" <<'PY'
+import json, sys, time
+json.dump({'audio_path': sys.argv[2], 'created_at': int(time.time()), 'mode': 'parked'}, open(sys.argv[1], 'w'))
+PY
 "${lifecycle_env[@]}" "$SCRIPT" stop >/dev/null
+[ ! -e "$stop_audio" ] || fail "stop retained pending temporary audio"
+[ ! -e "$voice_home/state/telegram/pending.json" ] || fail "stop retained pending voice state"
 if supervision_needs "$voice_home"; then fail "stopped Telegram transport still required supervision"; fi
 if "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null; then fail "stop did not verify inactive state"; fi
 "${lifecycle_env[@]}" "$systemctl_fake" --user start firstmate-telegram.service
@@ -522,7 +561,14 @@ supervision_needs "$voice_home" || fail "direct enabled-service restart did not 
 if supervision_needs "$voice_home"; then fail "direct service stop did not release supervision"; fi
 "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null
 supervision_needs "$voice_home" || fail "restarted Telegram transport did not restore supervision"
+disable_audio=$(mktemp /dev/shm/firstmate-telegram-disable.XXXXXX)
+python3 - "$voice_home/state/telegram/pending.json" "$disable_audio" <<'PY'
+import json, sys, time
+json.dump({'audio_path': sys.argv[2], 'created_at': int(time.time()), 'mode': 'parked'}, open(sys.argv[1], 'w'))
+PY
 "${lifecycle_env[@]}" "$SCRIPT" disable >/dev/null
+[ ! -e "$disable_audio" ] || fail "disable retained pending temporary audio"
+[ ! -e "$voice_home/state/telegram/pending.json" ] || fail "disable retained pending voice state"
 if supervision_needs "$voice_home"; then fail "disabled Telegram transport still required supervision"; fi
 [ "$(cat "$TMP_ROOT/systemctl.active")" = inactive ] || fail "disable did not verify service stopped"
 [ "$(cat "$TMP_ROOT/systemctl.enabled")" = disabled ] || fail "disable did not verify service disabled"

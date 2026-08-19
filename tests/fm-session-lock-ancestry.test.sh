@@ -235,15 +235,16 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "$field" in
-  stat=) printf '%s\n' 'Z+' ;;
+  stat=) : > "$FM_TEST_ZOMBIE_STAT_SEEN"; printf '%s\n' 'Z+' ;;
   comm=) printf '%s\n' pi ;;
   args=) printf '%s\n' pi ;;
 esac
 SH
   chmod +x "$fakebin/ps"
-  if lib_eval "$fakebin" 'fm_harness_pid_alive 777'; then
+  if FM_TEST_ZOMBIE_STAT_SEEN="$dir/stat-seen" lib_eval "$fakebin" 'fm_harness_pid_alive 777'; then
     fail "a zombie harness process was classified as a running primary"
   fi
+  [ -e "$dir/stat-seen" ] || fail "the zombie fixture did not reach process-state classification"
   pass "session-lock: a zombie harness does not hold a live primary lock"
 }
 

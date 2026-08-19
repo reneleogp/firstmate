@@ -396,37 +396,61 @@ def request_order_key(path: Path) -> Tuple[int, int, int, str]:
     )
 
 
-def bounded_cleanup(home: Path) -> None:
-    inbox, handled = request_dirs(home)
+def _sync_request_wakes_locked(home: Path) -> None:
+    inbox, _handled = request_dirs(home)
+    paths = sorted(inbox.glob("*.json"), key=request_order_key)
     active = active_request_id(home)
-    cutoff = now() - INBOX_TTL
-    inbox_files = sorted(inbox.glob("*.json"), key=request_order_key, reverse=True)
-    for index, path in enumerate(inbox_files):
-        record = read_json(path, {})
-        created = record.get("created_at", 0) if isinstance(record, dict) else 0
-        if index >= MAX_INBOX or not strict_int(created) or created < cutoff:
+    if active is not None:
+        continuation_paths = []
+        for path in paths:
+            record = read_json(path, {})
+            if isinstance(record, dict) and record.get("continuation_of") == active:
+                continuation_paths.append(path)
+        paths = continuation_paths
+    consume_safe_wakes(home)
+    if paths:
+        append_safe_wake(home, paths[0].stem)
+
+
+def sync_request_wakes(home: Path) -> None:
+    with FileLock(state_lock(home)):
+        _sync_request_wakes_locked(home)
+
+
+def bounded_cleanup(home: Path) -> None:
+    with FileLock(state_lock(home)):
+        inbox, handled = request_dirs(home)
+        active = active_request_id(home)
+        cutoff = now() - INBOX_TTL
+        inbox_files = sorted(inbox.glob("*.json"), key=request_order_key, reverse=True)
+        for index, path in enumerate(inbox_files):
+            record = read_json(path, {})
+            created = record.get("created_at", 0) if isinstance(record, dict) else 0
+            if index >= MAX_INBOX or not strict_int(created) or created < cutoff:
+                try:
+                    consume_safe_wakes(home, [path.stem])
+                    path.unlink()
+                except (OSError, TelegramError):
+                    pass
+        handled_files = sorted(
+            (path for path in handled.glob("*.json") if path.stem != active),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        for path in handled_files[MAX_HANDLED:]:
             try:
-                consume_safe_wakes(home, [path.stem])
                 path.unlink()
-            except (OSError, TelegramError):
+            except OSError:
                 pass
-    handled_files = sorted(
-        (path for path in handled.glob("*.json") if path.stem != active),
-        key=lambda p: p.stat().st_mtime, reverse=True,
-    )
-    for path in handled_files[MAX_HANDLED:]:
+        pending = state_dir(home) / "pending.json"
+        data = read_json(pending)
         try:
-            path.unlink()
-        except OSError:
-            pass
-    pending = state_dir(home) / "pending.json"
-    data = read_json(pending)
-    try:
-        expired = isinstance(data, dict) and now() - int(data.get("created_at", 0)) >= PENDING_TTL
-    except (TypeError, ValueError):
-        expired = True
-    if expired:
-        remove_pending(home, data if isinstance(data, dict) else None)
+            expired = (isinstance(data, dict)
+                       and now() - int(data.get("created_at", 0)) >= PENDING_TTL)
+        except (TypeError, ValueError):
+            expired = True
+        if expired:
+            remove_pending(home, data if isinstance(data, dict) else None)
+        _sync_request_wakes_locked(home)
 
 
 def deterministic_request_id(source: str, update_id: int, message_id: int) -> str:
@@ -435,16 +459,13 @@ def deterministic_request_id(source: str, update_id: int, message_id: int) -> st
     return f"tg-{source}-u{update_id}-m{message_id}"
 
 
-def queue_request(home: Path, text: str, chat_id: int, message_id: int,
-                  update_id: Optional[int], source: str = "text",
-                  confirmed: bool = False,
-                  continuation_of: Optional[str] = None) -> str:
+def _queue_request_locked(home: Path, text: str, chat_id: int, message_id: int,
+                          update_id: Optional[int], source: str, confirmed: bool,
+                          attach_to_active: bool) -> str:
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
         raise TelegramError("request text is empty or too long")
     if not strict_int(update_id) or not strict_int(message_id):
         raise TelegramError("request identifiers are invalid")
-    if continuation_of is not None and not safe_id(continuation_of):
-        raise TelegramError("continuation identifier is invalid")
     request_id = deterministic_request_id(source, update_id, message_id)
     inbox, handled = request_dirs(home)
     path = inbox / f"{request_id}.json"
@@ -454,6 +475,14 @@ def queue_request(home: Path, text: str, chat_id: int, message_id: int,
         if existing.get("request_id") != request_id or existing.get("origin") != "telegram":
             raise TelegramError("request identifier collision")
         return request_id
+    continuation_of = None
+    if attach_to_active:
+        active = active_record(home)
+        closing = read_json(closing_path(home), {})
+        if (active is not None
+                and (not isinstance(closing, dict)
+                     or closing.get("request_id") != active.get("request_id"))):
+            continuation_of = str(active["request_id"])
     record = {
         "request_id": request_id,
         "origin": "telegram",
@@ -475,7 +504,17 @@ def queue_request(home: Path, text: str, chat_id: int, message_id: int,
     return request_id
 
 
-def update_request_record(home: Path, request_id: str, **changes: Any) -> Dict[str, Any]:
+def queue_request(home: Path, text: str, chat_id: int, message_id: int,
+                  update_id: Optional[int], source: str = "text",
+                  confirmed: bool = False, attach_to_active: bool = False) -> str:
+    with FileLock(state_lock(home)):
+        return _queue_request_locked(
+            home, text, chat_id, message_id, update_id, source, confirmed, attach_to_active
+        )
+
+
+def _update_request_record_locked(home: Path, request_id: str,
+                                  **changes: Any) -> Dict[str, Any]:
     path = request_path(home, request_id)
     if path is None:
         raise TelegramError("request not found during reconciliation")
@@ -487,18 +526,26 @@ def update_request_record(home: Path, request_id: str, **changes: Any) -> Dict[s
     return record
 
 
+def update_request_record(home: Path, request_id: str, **changes: Any) -> Dict[str, Any]:
+    with FileLock(state_lock(home)):
+        return _update_request_record_locked(home, request_id, **changes)
+
+
 def reconcile_request(home: Path, request_id: str) -> bool:
-    path = request_path(home, request_id)
-    if path is None:
-        return False
-    record = read_json(path)
-    if not isinstance(record, dict) or record.get("origin") != "telegram":
-        return False
-    if path.parent.name == "inbox" and record.get("wake_recorded") is not True:
-        append_safe_wake(home, request_id)
-        record = update_request_record(home, request_id, wake_recorded=True)
-    receipt_status = record.get("receipt_status")
-    if receipt_status != "sent":
+    with FileLock(state_lock(home)):
+        path = request_path(home, request_id)
+        if path is None:
+            return False
+        record = read_json(path)
+        if not isinstance(record, dict) or record.get("origin") != "telegram":
+            return False
+        if path.parent.name == "inbox":
+            _sync_request_wakes_locked(home)
+            if record.get("wake_recorded") is not True:
+                record = _update_request_record_locked(home, request_id, wake_recorded=True)
+        receipt_status = record.get("receipt_status")
+        if receipt_status == "sent":
+            return True
         receipt = record.get("receipt_text")
         chat_id = record.get("chat_id")
         attempts = record.get("receipt_attempts", 0)
@@ -506,20 +553,20 @@ def reconcile_request(home: Path, request_id: str) -> bool:
                 or not isinstance(receipt, str) or not strict_int(chat_id)
                 or not strict_int(attempts) or attempts < 0):
             raise TelegramError("request receipt state is malformed")
-        update_request_record(
+        _update_request_record_locked(
             home,
             request_id,
             receipt_status="delivery_unknown",
             receipt_attempts=min(attempts + 1, 65535),
             receipt_attempted_at=now(),
         )
-        try:
-            send_text(home, chat_id, receipt)
-        except TelegramError as exc:
-            if not exc.delivery_unknown:
-                update_request_record(home, request_id, receipt_status="pending")
-            return False
-        update_request_record(home, request_id, receipt_status="sent", receipt_sent_at=now())
+    try:
+        send_text(home, chat_id, receipt)
+    except TelegramError as exc:
+        if not exc.delivery_unknown:
+            update_request_record(home, request_id, receipt_status="pending")
+        return False
+    update_request_record(home, request_id, receipt_status="sent", receipt_sent_at=now())
     return True
 
 
@@ -744,11 +791,9 @@ def handle_text(home: Path, config: Dict[str, Any], message: Dict[str, Any], upd
             save_pending(home, pending)
             reconcile_pending(home, config)
             return True
-    active = active_record(home)
-    continuation_of = str(active["request_id"]) if active is not None else None
     request_id = queue_request(home, text, int(config["chat_id"]),
                                int(message_id), update_id,
-                               continuation_of=continuation_of)
+                               attach_to_active=True)
     reconcile_request(home, request_id)
     record = read_json(request_path(home, request_id))
     return isinstance(record, dict) and record.get("wake_recorded") is True
@@ -891,22 +936,28 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
             return complete_retry(home, config, pending)
         if action == "send":
             try:
-                active = active_record(home)
-                continuation_of = str(active["request_id"]) if active is not None else None
-                request_id = queue_request(
+                request_id = _queue_request_locked(
                     home, str(pending["text"]), int(pending["chat_id"]),
                     int(pending["message_id"]), int(pending["update_id"]),
-                    source="voice", confirmed=True,
-                    continuation_of=continuation_of,
+                    "voice", True, True,
                 )
-                reconcile_request(home, request_id)
-                record = read_json(request_path(home, request_id))
-                if not isinstance(record, dict) or record.get("wake_recorded") is not True:
-                    return False
-                remove_pending(home, pending)
-                return True
             except (TelegramError, KeyError, TypeError, ValueError):
                 return False
+    if action == "send":
+        try:
+            reconcile_request(home, request_id)
+            record = read_json(request_path(home, request_id))
+            if not isinstance(record, dict) or record.get("wake_recorded") is not True:
+                return False
+            with FileLock(state_lock(home)):
+                current = read_json(pending_path(home))
+                if (isinstance(current, dict)
+                        and current.get("pending_id") == pending_id
+                        and current.get("revision") == revision):
+                    remove_pending(home, current)
+            return True
+        except (TelegramError, KeyError, TypeError, ValueError):
+            return False
     return False
 
 
@@ -1093,9 +1144,12 @@ def request_handled(home: Path, request_id: str) -> int:
         if active is not None and active != request_id and continuation_of != active:
             return die("another Telegram conversation is active")
         if active is None:
+            if isinstance(continuation_of, str):
+                return die("continuation predecessor is no longer active")
             atomic_json(active_path(home), {"request_id": request_id, "claimed_at": now()})
         os.replace(source, target)
         private_file(target)
+        _sync_request_wakes_locked(home)
     bounded_cleanup(home)
     return 0
 
@@ -1135,13 +1189,7 @@ def request_active(home: Path, work_id: Optional[str] = None) -> int:
 
 
 def wake_next_request(home: Path) -> None:
-    inbox, _handled = request_dirs(home)
-    paths = sorted(inbox.glob("*.json"), key=request_order_key)
-    if not paths:
-        return
-    request_id = paths[0].stem
-    consume_safe_wakes(home, [request_id])
-    append_safe_wake(home, request_id)
+    sync_request_wakes(home)
 
 
 def reconcile_closing(home: Path) -> None:
@@ -1153,11 +1201,17 @@ def reconcile_closing(home: Path) -> None:
         if not isinstance(request_id, str) or not safe_id(request_id):
             raise TelegramError("Telegram closing transition is malformed")
         active = active_record(home)
+        if active is not None and active.get("request_id") != request_id:
+            raise TelegramError("Telegram closing transition conflicts with active work")
+        inbox, _handled = request_dirs(home)
+        for path in inbox.glob("*.json"):
+            record = read_json(path, {})
+            if isinstance(record, dict) and record.get("continuation_of") == request_id:
+                _sync_request_wakes_locked(home)
+                return
         if active is not None:
-            if active.get("request_id") != request_id:
-                raise TelegramError("Telegram closing transition conflicts with active work")
             active_path(home).unlink()
-        wake_next_request(home)
+        _sync_request_wakes_locked(home)
         try:
             closing_path(home).unlink()
         except FileNotFoundError:
@@ -1194,9 +1248,8 @@ def send_command(home: Path, text: str, request_id: Optional[str] = None,
             current = active_record(home)
             if current is None or current.get("request_id") != request_id:
                 raise TelegramError("active Telegram conversation changed during final reply")
-            update_request_record(home, request_id, final_sent=True, final_sent_at=now())
+            _update_request_record_locked(home, request_id, final_sent=True, final_sent_at=now())
             atomic_json(closing_path(home), {"request_id": request_id, "created_at": now()})
-            active_path(home).unlink()
         reconcile_closing(home)
     print("Telegram reply sent.")
     return 0
@@ -1307,6 +1360,10 @@ def stop_service(home: Path) -> int:
     require_unit_owner(home)
     systemctl("stop", SERVICE_NAME)
     verify_service(active=False)
+    with FileLock(state_lock(home)):
+        pending = read_json(pending_path(home))
+        if isinstance(pending, dict):
+            remove_pending(home, pending)
     set_telegram_enabled(home, False)
     verify_transport_marker(home, False)
     print("Telegram service stopped.")
@@ -1324,6 +1381,10 @@ def disable_service(home: Path) -> int:
     require_unit_owner(home)
     systemctl("disable", "--now", SERVICE_NAME)
     verify_service(active=False, enabled=False)
+    with FileLock(state_lock(home)):
+        pending = read_json(pending_path(home))
+        if isinstance(pending, dict):
+            remove_pending(home, pending)
     set_telegram_enabled(home, False)
     verify_transport_marker(home, False)
     print("Telegram service disabled.")
