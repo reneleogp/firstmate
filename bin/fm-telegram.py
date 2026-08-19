@@ -292,11 +292,45 @@ def state_dir(home: Path) -> Path:
     return home / "state" / "telegram"
 
 
+def normalize_transcriber_command(value: Any, kind: str) -> str:
+    label = "Parakeet" if kind == "parakeet" else "Whisper"
+    if not isinstance(value, str) or not value.strip():
+        raise TelegramError(f"configured {label} command is missing or unsafe")
+    try:
+        parts = ([value] if value.startswith("/") else shlex.split(value))
+    except ValueError as exc:
+        raise TelegramError(f"configured {label} command is missing or unsafe") from exc
+    if len(parts) != 1:
+        raise TelegramError(f"configured {label} command is missing or unsafe")
+    command = parts[0]
+    path = Path(command)
+    if (not path.is_absolute()
+            or any(ord(character) < 32 or ord(character) == 127 for character in command)):
+        raise TelegramError(f"configured {label} command is missing or unsafe")
+    try:
+        details = path.lstat()
+    except OSError as exc:
+        raise TelegramError(f"configured {label} command is missing or unsafe") from exc
+    if (stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode)
+            or not os.access(path, os.X_OK)):
+        raise TelegramError(f"configured {label} command is missing or unsafe")
+    return command
+
+
+def validate_transcriber_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    validated = dict(config)
+    for kind, key in (("parakeet", "parakeet_command"), ("whisper", "whisper_command")):
+        if key in validated:
+            validated[key] = normalize_transcriber_command(validated[key], kind)
+    return validated
+
+
 def load_config(home: Path) -> Dict[str, Any]:
     path = config_path(home)
     config = read_json(path)
     if not isinstance(config, dict):
         raise TelegramError("Telegram pairing is not configured")
+    config = validate_transcriber_config(config)
     for key in ("user_id", "chat_id", "bot_id"):
         if not telegram_numeric_id(config.get(key), positive=True):
             raise TelegramError("Telegram pairing is incomplete")
@@ -813,12 +847,20 @@ def _desired_request_id_locked(home: Path) -> Optional[str]:
     active = active_request_id(home)
     if active is not None:
         active_state = active_record(home)
+        closing = read_json(closing_path(home))
+        direct_closing = (
+            active_state is not None
+            and active_state.get("work_id") is None
+            and isinstance(closing, dict)
+            and closing.get("request_id") == active
+        )
         routed_paths = []
         for path in paths + list(handled.glob("*.json")):
             record = read_json(path, {})
             if not isinstance(record, dict):
                 continue
             if (record.get("request_id") == active
+                    and not direct_closing
                     and active_state is not None
                     and active_state.get("work_published") is not True
                     and active_state.get("initial_routing_consumed") is not True):
@@ -1145,8 +1187,8 @@ def reconcile_requests(home: Path) -> None:
 
 def transport_reply(home: Path) -> str:
     if primary_running(home):
-        return "Message received."
-    return "Message received and queued. It will be processed when Firstmate starts."
+        return "Bot · Message received."
+    return "Bot · Message received and queued. It will be processed when Firstmate starts."
 
 
 def send_text(home: Path, chat_id: int, text: str, markup: Optional[Dict[str, Any]] = None) -> Any:
@@ -1306,7 +1348,8 @@ def command_for(config: Dict[str, Any], kind: str) -> str:
 
 
 def transcribe(home: Path, config: Dict[str, Any], audio: Path, kind: str) -> str:
-    parts = shlex.split(command_for(config, kind))
+    command = command_for(config, kind)
+    parts = [command] if command.startswith("/") else shlex.split(command)
     if not parts:
         raise TelegramError("voice transcription command is empty")
     if any("{audio}" in part for part in parts):
@@ -2134,14 +2177,27 @@ def identity_bound_state_exists(home: Path) -> bool:
     return False
 
 
-def pair(home: Path, user_id: int, chat_id: int) -> int:
+def pair(home: Path, user_id: int, chat_id: int,
+         parakeet_command: Optional[str] = None,
+         whisper_command: Optional[str] = None) -> int:
     if (not telegram_numeric_id(user_id, positive=True)
             or not telegram_numeric_id(chat_id, positive=True)):
         raise TelegramError("user and chat ids must be positive Telegram identifiers")
+    if (parakeet_command is None) != (whisper_command is None):
+        raise TelegramError("configure both voice transcription commands together")
+    configured_commands = None
+    if parakeet_command is not None and whisper_command is not None:
+        configured_commands = {
+            "parakeet_command": normalize_transcriber_command(parakeet_command, "parakeet"),
+            "whisper_command": normalize_transcriber_command(whisper_command, "whisper"),
+        }
     with FileLock(lifecycle_lock(home)):
         require_pairing_service_inactive(home)
         config_existing = read_json(config_path(home), {})
         config = config_existing if isinstance(config_existing, dict) else {}
+        config = validate_transcriber_config(config)
+        if configured_commands is not None:
+            config.update(configured_commands)
         token = token_for(home)
         result = raw_api_call(home, token, "getMe", {}, config)
         if (not isinstance(result, dict) or result.get("is_bot") is not True
@@ -2158,6 +2214,9 @@ def pair(home: Path, user_id: int, chat_id: int) -> int:
         with FileLock(state_lock(home)):
             current = read_json(config_path(home), {})
             config = current if isinstance(current, dict) else {}
+            config = validate_transcriber_config(config)
+            if configured_commands is not None:
+                config.update(configured_commands)
             identity_values = (
                 config.get("user_id"), config.get("chat_id"), config.get("bot_id")
             )
@@ -2226,6 +2285,7 @@ def request_handled(home: Path, request_id: str) -> int:
                     if target_record.get("wake_recorded") is not True:
                         target_record["wake_recorded"] = True
                         atomic_json(target, target_record)
+                    _sync_request_wakes_locked(home)
                     return 0
             return die("request not found")
         if not isinstance(record, dict) or record.get("request_id") != request_id:
@@ -2409,10 +2469,14 @@ def request_active(home: Path, work_id: Optional[str] = None,
             else:
                 bound_work = active.get("work_id")
                 if (value.get("continuation_of") != request_id
-                        or value.get("continuation_routing") != "pending"
-                        or not isinstance(bound_work, str) or not safe_id(bound_work)):
+                        or value.get("continuation_routing") != "pending"):
                     return 1
-                route = f"{request_id}\t{bound_work}"
+                if isinstance(bound_work, str) and safe_id(bound_work):
+                    route = f"{request_id}\t{bound_work}"
+                elif bound_work is None:
+                    route = request_id
+                else:
+                    return 1
     print(route, flush=True)
     return 0
 
@@ -2431,15 +2495,19 @@ def continuation_handled(home: Path, claimed_request: str) -> int:
         if not isinstance(predecessor, str) or not safe_id(predecessor):
             return die("request is not a Telegram continuation")
         if routing == "routed":
-            return 0
+            _sync_request_wakes_locked(home)
+            already_routed = True
+        else:
+            already_routed = False
         active = active_record(home)
-        if (routing != "pending" or active is None
-                or active.get("request_id") != predecessor):
-            return die("continuation predecessor is no longer active")
-        record["continuation_routing"] = "routed"
-        record["continuation_routed_at"] = now()
-        atomic_json(path, record)
-        _sync_request_wakes_locked(home)
+        if not already_routed:
+            if (routing != "pending" or active is None
+                    or active.get("request_id") != predecessor):
+                return die("continuation predecessor is no longer active")
+            record["continuation_routing"] = "routed"
+            record["continuation_routed_at"] = now()
+            atomic_json(path, record)
+            _sync_request_wakes_locked(home)
     reconcile_closing(home)
     return 0
 
@@ -2492,13 +2560,13 @@ def _send_command_locked(home: Path, text: str, request_id: Optional[str] = None
         if active_request_id(home) != request_id:
             if final and record.get("final_sent") is True:
                 reconcile_closing(home)
-                print("Telegram reply sent.")
+                print("Firstmate · " + text, end="" if text.endswith("\n") else "\n")
                 return 0
             return die("request is not the active Telegram conversation")
         chat_id = int(record["chat_id"])
     final_already_sent = bool(final and record is not None and record.get("final_sent") is True)
     if not final_already_sent:
-        send_text(home, chat_id, text)
+        send_text(home, chat_id, "Firstmate · " + text)
     if final and request_id is not None:
         with FileLock(state_lock(home)):
             current = active_record(home)
@@ -2510,9 +2578,9 @@ def _send_command_locked(home: Path, text: str, request_id: Optional[str] = None
         with FileLock(state_lock(home)):
             closing = read_json(closing_path(home))
             if isinstance(closing, dict) and closing.get("request_id") == request_id:
-                print("Telegram final reply sent; continuation handling remains pending.")
+                print("Firstmate · " + text, end="" if text.endswith("\n") else "\n")
                 return FINAL_CONTINUATION_PENDING_EXIT
-    print("Telegram reply sent.")
+    print("Firstmate · " + text, end="" if text.endswith("\n") else "\n")
     return 0
 
 
@@ -2821,7 +2889,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "Retention limits: 256 queued requests for 7 days and 4096 handled requests.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
                 "Voice limits: 10 MiB, 120 seconds, a 4096-unit transcript, and 64 waiting notes. Temporary audio is restricted to /dev/shm.\n"
-                "FM_TELEGRAM_PARAKEET_CMD and FM_TELEGRAM_WHISPER_CMD override the local transcription commands.\n"
+                "Pairing accepts --parakeet-command and --whisper-command as absolute executable paths; configured paths must be regular executable files.\n"
+                "FM_TELEGRAM_PARAKEET_CMD and FM_TELEGRAM_WHISPER_CMD override the local transcription commands for one process.\n"
                 "Text for send and reply is read with --text-file or stdin (-); no recipient argument is accepted."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2836,6 +2905,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_home(pair_parser)
     pair_parser.add_argument("--user-id", type=int, required=True)
     pair_parser.add_argument("--chat-id", type=int, required=True)
+    pair_parser.add_argument(
+        "--parakeet-command",
+        help="absolute executable for Parakeet v3; configure with --whisper-command too",
+    )
+    pair_parser.add_argument(
+        "--whisper-command",
+        help="absolute executable for Whisper Small Q8; configure with --parakeet-command too",
+    )
     serve_parser = sub.add_parser("serve", help="run the outbound Bot API long-poll service")
     add_home(serve_parser)
     serve_parser.add_argument("--once", action="store_true")
@@ -2911,7 +2988,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             home, args.test_api_base or os.environ.get("FM_TELEGRAM_TEST_API_BASE")
         )
         if args.command == "pair":
-            return pair(home, args.user_id, args.chat_id)
+            return pair(
+                home, args.user_id, args.chat_id,
+                args.parakeet_command, args.whisper_command,
+            )
         if args.command == "serve":
             return serve(
                 home, args.once, max(0, min(args.poll_timeout, 50)), args.systemd_service

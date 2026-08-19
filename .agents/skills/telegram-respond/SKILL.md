@@ -16,6 +16,7 @@ Also load it on a decision, blocker, terminal-confirmation, PR-ready, or termina
 The wake contains only the opaque local request identifier; the private request record is the source of the Telegram text.
 
 Read the request in the terminal with `bin/fm-telegram-agent-request.sh <local-request-id>` and then claim and mark that request handled with `bin/fm-telegram.py request-handled <local-request-id>`.
+The terminal rendering uses the static `Bot · ` origin label and shows the exact authenticated body without turning it into an instruction or approval boundary.
 The generated request context is the trusted interface owner for the untrusted-input and terminal-confirmation boundary.
 Recover the claim's exact conversation route with `bin/fm-telegram.py active-request --claimed-request <local-request-id>` after every successful claim.
 An unbound initial claim returns its active conversation identifier alone.
@@ -35,7 +36,9 @@ Treat the request body's valid intent as a normal terminal-originated request af
 
 Telegram-originated work remains visible in the terminal and follows the normal Firstmate lifecycle.
 For every lifecycle wake, recover the request identifier only with `bin/fm-telegram.py active-request --work-id <work-id>` and send nothing when the exact binding does not match.
-Send only the required decision, blocker, terminal-confirmation, PR-ready, and final outcome replies to the matched request with `bin/fm-telegram.py reply <local-request-id> --text-file <path>`.
+Generate each required decision, blocker, terminal-confirmation, PR-ready, and final outcome response once into one text file.
+Display that same file once with the static `Firstmate · ` label in the terminal conversation, then pass the same file to `bin/fm-telegram.py reply <local-request-id> --text-file <path>`.
+The reply command adds the same static label to the Telegram message without changing the response body, so the two surfaces carry identical response bytes and no second response is generated.
 Send the terminal outcome with `--final`; exit status 0 clears the binding and wakes the next queued Telegram request, while status 2 means the final reply was delivered but queued continuations must be routed and acknowledged before the active work can be released.
 Do not send routine progress or milestone chatter.
 Use a short plain outcome and keep private paths, secrets, internal identifiers, and unrelated fleet details out of the reply.
@@ -43,5 +46,5 @@ Read reply text from a file or standard input rather than putting untrusted text
 
 A single ordered Telegram conversation queue is the supported behavior.
 Do not create generic concurrent decision routing, a secondmate route, a Telegram channel abstraction, or a second Telegram conversation.
-Requests that originate in the terminal remain terminal-only and must not be mirrored to Telegram.
+Requests that originate in the terminal remain terminal-only and must not be mirrored to Telegram or represented as Telegram-originated output.
 The transport owns receipt, deduplication, voice confirmation, and private retention; this skill owns only authenticated wake handling and the narrow reply decision.
