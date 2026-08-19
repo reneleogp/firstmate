@@ -64,6 +64,13 @@ class Handler(BaseHTTPRequestHandler):
         if method == 'getFile': return self._write({'file_path': 'voice/test.oga'})
         if method == 'getUpdates':
             if (home / 'hold-updates').exists(): time.sleep(.05)
+            expire_during_poll = home / 'expire-pending-during-poll'
+            if expire_during_poll.exists():
+                expire_during_poll.unlink()
+                pending_path = home / 'state' / 'telegram' / 'pending.json'
+                pending = json.loads(pending_path.read_text())
+                pending['created_at'] = 0
+                pending_path.write_text(json.dumps(pending))
             if (home / 'block-updates').exists():
                 (home / 'updates-entered').write_text('entered')
                 while (home / 'block-updates').exists(): time.sleep(.01)
@@ -968,10 +975,21 @@ run_tg "$voice_home" serve --once >/dev/null
 set_updates '[{"update_id":27,"message":{"message_id":27,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-3","duration":2,"file_size":20}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 expired_audio=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["audio_path"])' "$pending")
-python3 - "$pending" <<'PY'
-import json, sys
-data=json.load(open(sys.argv[1])); data['created_at']=0; json.dump(data, open(sys.argv[1], 'w'))
+expired_send_data=$(callback_data "$voice_home" send)
+unknown_expired_data=$(python3 - "$expired_send_data" <<'PY'
+import sys
+parts = sys.argv[1].split(':')
+parts[-1] = str(int(parts[-1]) + 1)
+print(':'.join(parts))
 PY
+)
+expired_callback_answers=$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")
+touch "$voice_home/expire-pending-during-poll"
+set_updates '[{"update_id":270,"callback_query":{"id":"cb-unknown-expired","from":{"id":77},"data":"'"$unknown_expired_data"'","message":{"message_id":270,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+[ "$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")" -eq "$expired_callback_answers" ] || fail "unknown expired callback received an acknowledgement"
+[ -e "$expired_audio" ] && [ -e "$pending" ] || fail "unknown expired callback mutated pending voice state"
+set_updates '[]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 [ ! -e "$expired_audio" ] || fail "expired pending voice must delete audio"
 [ ! -e "$pending" ] || fail "expired pending voice must delete pending state"
@@ -1006,6 +1024,11 @@ stop_transport() {
       sleep .02
     done
     rm -f "$root/systemctl.service.pid"
+  fi
+  if [ -s "$root/systemctl.child-primary.pid" ]; then
+    pid=$(cat "$root/systemctl.child-primary.pid")
+    kill "$pid" 2>/dev/null || true
+    rm -f "$root/systemctl.child-primary.pid" "$FM_TELEGRAM_EXPECT_HOME/state/.lock"
   fi
 }
 case "$command" in
@@ -1056,6 +1079,12 @@ PY
       rm -f "$FM_TELEGRAM_EXPECT_HOME/getme-entered"
       touch "$FM_TELEGRAM_EXPECT_HOME/block-getme"
     fi
+    if [ -e "$root/systemctl.child-watcher-fail" ]; then
+      rm -f "$root/systemctl.child-watcher-fail"
+      bash -c 'exec -a pi sleep 30' &
+      printf '%s\n' "$!" > "$root/systemctl.child-primary.pid"
+      printf '%s\n' "$!" > "$FM_TELEGRAM_EXPECT_HOME/state/.lock"
+    fi
     if [ ! -s "$root/systemctl.service.pid" ]; then
       env FM_HOME="$FM_TELEGRAM_EXPECT_HOME" FM_TELEGRAM_API_BASE="$FM_TELEGRAM_API_BASE" \
         "$FM_TELEGRAM_SERVICE_SCRIPT" --home "$FM_TELEGRAM_EXPECT_HOME" serve --systemd-service --poll-timeout 1 \
@@ -1099,7 +1128,7 @@ PY
         rm -f "$root/systemctl.race-pair"
         (
           env FM_HOME="$FM_TELEGRAM_EXPECT_HOME" FM_TELEGRAM_API_BASE="$FM_TELEGRAM_API_BASE" \
-            "$FM_TELEGRAM_SERVICE_SCRIPT" --home "$FM_TELEGRAM_EXPECT_HOME" serve --once \
+            "$FM_TELEGRAM_SERVICE_SCRIPT" --home "$FM_TELEGRAM_EXPECT_HOME" serve --once --systemd-service \
             >"$root/systemctl.race-service.log" 2>&1
           printf '%s\n' "$?" > "$root/systemctl.race-service.status"
         ) </dev/null >/dev/null 2>&1 &
@@ -1153,6 +1182,16 @@ if "${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null 2>&
 fi
 cmp -s "$voice_home/config/telegram.json" "$voice_home/pairing-before-active-repair.json" || fail "active pairing attempt changed the pinned identity"
 [ "$(cat "$TMP_ROOT/systemctl.active")" = active ] || fail "active pairing attempt stopped the service"
+service_pid=$(cat "$TMP_ROOT/systemctl.service.pid")
+kill -9 "$service_pid" 2>/dev/null || true
+wait "$service_pid" 2>/dev/null || true
+rm -f "$TMP_ROOT/systemctl.service.pid"
+printf inactive > "$TMP_ROOT/systemctl.active"
+if "${lifecycle_env[@]}" "$SCRIPT" serve --once --poll-timeout 0 >/dev/null 2>&1; then
+  fail "direct runtime entered an enabled systemd restart gap"
+fi
+supervision_needs "$voice_home" || fail "systemd restart gap lost Telegram supervision"
+"${lifecycle_env[@]}" "$SCRIPT" start >/dev/null || fail "systemd runtime did not recover after its restart gap"
 stop_audio=$(mktemp /dev/shm/firstmate-telegram-stop.XXXXXX)
 python3 - "$voice_home/state/telegram/pending.json" "$stop_audio" <<'PY'
 import json, sys, time
@@ -1182,6 +1221,13 @@ fi
 [ ! -e "$voice_home/state/telegram/enabled" ] || fail "failed start retained Telegram supervision"
 [ "$(cat "$TMP_ROOT/systemctl.enabled")" = enabled ] || fail "failed start disabled the installed service"
 rm -f "$TMP_ROOT/systemctl.fail-start"
+touch "$TMP_ROOT/systemctl.child-watcher-fail"
+if "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null 2>&1; then
+  fail "start ignored a watcher precondition lost in the systemd child"
+fi
+[ -e "$voice_home/state/telegram/enabled" ] || fail "child watcher failure discarded the durable Telegram supervision need"
+[ "$(cat "$TMP_ROOT/systemctl.active")" = inactive ] || fail "child watcher failure left the service active"
+[ ! -e "$voice_home/state/.lock" ] || fail "child watcher failure retained its fake primary"
 set_updates '[]' "$voice_home"
 touch "$TMP_ROOT/systemctl.partial-fail-start"
 if "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null 2>&1; then
@@ -1191,7 +1237,9 @@ rm -f "$voice_home/block-getme"
 [ ! -e "$voice_home/state/.telegram-service-activation" ] || fail "failed activation retained its reservation after the child stopped"
 [ ! -e "$voice_home/state/telegram/enabled" ] || fail "failed activation retained Telegram supervision"
 [ ! -e "$TMP_ROOT/systemctl.service.pid" ] || fail "failed activation left its systemd child running"
-"${lifecycle_env[@]}" "$SCRIPT" serve --once --poll-timeout 0 >/dev/null || fail "failed activation left runtime ownership reserved"
+if "${lifecycle_env[@]}" "$SCRIPT" serve --once --poll-timeout 0 >/dev/null 2>&1; then
+  fail "direct runtime entered while the installed systemd service remained enabled"
+fi
 rm -f "$voice_home/getme-entered"
 touch "$TMP_ROOT/systemctl.hold-child-getme"
 "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null &
@@ -1254,6 +1302,7 @@ PY
 [ ! -e "$direct_stop_audio" ] || fail "graceful direct service stop retained temporary audio"
 [ ! -e "$voice_home/state/telegram/pending.json" ] || fail "graceful direct service stop retained pending voice state"
 if supervision_needs "$voice_home"; then fail "direct service stop did not release supervision"; fi
+"${lifecycle_env[@]}" "$SCRIPT" disable >/dev/null
 set_updates '[]' "$voice_home"
 touch "$voice_home/block-updates"
 rm -f "$voice_home/updates-entered"
