@@ -147,7 +147,8 @@ EOF
 fm_harness_pid_alive() {
   local pid=$1 comm args stat
   kill -0 "$pid" 2>/dev/null || return 1
-  stat=$(ps -o stat= -p "$pid" 2>/dev/null) || return 1
+  # Reject an explicit zombie, but retain the identity checks when a ps implementation cannot report state.
+  stat=$(ps -o stat= -p "$pid" 2>/dev/null || true)
   case "$stat" in *Z*) return 1 ;; esac
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
   args=$(ps -o args= -p "$pid" 2>/dev/null)
