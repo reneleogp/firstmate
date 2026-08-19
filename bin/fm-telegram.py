@@ -456,13 +456,15 @@ def _sync_request_wakes_locked(home: Path) -> None:
     paths = list(inbox.glob("*.json"))
     active = active_request_id(home)
     if active is not None:
+        active_state = active_record(home)
         routed_paths = []
         for path in paths + list(handled.glob("*.json")):
             record = read_json(path, {})
             if not isinstance(record, dict):
                 continue
             if (record.get("request_id") == active
-                    and record.get("initial_routing") == "pending"):
+                    and active_state is not None
+                    and active_state.get("work_id") is None):
                 routed_paths.append(path)
             elif (record.get("continuation_of") == active
                   and (path.parent == inbox
@@ -613,21 +615,24 @@ def reconcile_request(home: Path, request_id: str) -> bool:
         receipt_status = record.get("receipt_status")
         if receipt_status == "sent":
             return True
-        if receipt_status == "delivery_unknown_terminal":
+        if receipt_status in {"delivery_unknown_terminal", "rejected_terminal"}:
             return False
         receipt = record.get("receipt_text")
         chat_id = record.get("chat_id")
         attempts = record.get("receipt_attempts", 0)
         unknown_attempts = record.get("receipt_unknown_attempts", 0)
-        if (receipt_status not in {"pending", "delivery_unknown"}
+        if (receipt_status not in {"pending", "delivery_unknown", "rejected"}
                 or not isinstance(receipt, str) or not strict_int(chat_id)
                 or not strict_int(attempts) or attempts < 0
                 or not strict_int(unknown_attempts) or unknown_attempts < 0):
             raise TelegramError("request receipt state is malformed")
-        if receipt_status == "delivery_unknown":
-            if unknown_attempts >= len(RECEIPT_RETRY_DELAYS):
+        if receipt_status != "pending":
+            if attempts >= len(RECEIPT_RETRY_DELAYS):
                 _update_request_record_locked(
-                    home, request_id, receipt_status="delivery_unknown_terminal",
+                    home, request_id,
+                    receipt_status=("delivery_unknown_terminal"
+                                    if receipt_status == "delivery_unknown"
+                                    else "rejected_terminal"),
                     receipt_terminal_at=now(),
                 )
                 return False
@@ -636,34 +641,43 @@ def reconcile_request(home: Path, request_id: str) -> bool:
                 raise TelegramError("request receipt retry state is malformed")
             if now() < retry_at:
                 return False
+        if attempts >= len(RECEIPT_RETRY_DELAYS):
+            _update_request_record_locked(
+                home, request_id, receipt_status="rejected_terminal", receipt_terminal_at=now()
+            )
+            return False
         attempted_at = now()
+        next_attempts = attempts + 1
         next_unknown_attempts = unknown_attempts + 1
         _update_request_record_locked(
             home,
             request_id,
             receipt_status="delivery_unknown",
-            receipt_attempts=min(attempts + 1, 65535),
+            receipt_attempts=next_attempts,
             receipt_unknown_attempts=next_unknown_attempts,
             receipt_attempted_at=attempted_at,
-            receipt_retry_at=attempted_at + RECEIPT_RETRY_DELAYS[next_unknown_attempts - 1],
+            receipt_retry_at=attempted_at + RECEIPT_RETRY_DELAYS[next_attempts - 1],
         )
     try:
         send_text(home, chat_id, receipt)
     except TelegramError as exc:
-        if exc.delivery_unknown:
-            if next_unknown_attempts >= len(RECEIPT_RETRY_DELAYS):
-                update_request_record(
-                    home, request_id, receipt_status="delivery_unknown_terminal",
-                    receipt_terminal_at=now(),
-                )
-        else:
+        if next_attempts >= len(RECEIPT_RETRY_DELAYS):
+            status = "delivery_unknown_terminal" if exc.delivery_unknown else "rejected_terminal"
             update_request_record(
-                home, request_id, receipt_status="pending",
-                receipt_unknown_attempts=unknown_attempts, receipt_retry_at=None,
+                home, request_id, receipt_status=status,
+                receipt_unknown_attempts=(next_unknown_attempts
+                                          if exc.delivery_unknown else unknown_attempts),
+                receipt_terminal_at=now(),
+            )
+        elif not exc.delivery_unknown:
+            update_request_record(
+                home, request_id, receipt_status="rejected",
+                receipt_unknown_attempts=unknown_attempts,
             )
         return False
     update_request_record(
-        home, request_id, receipt_status="sent", receipt_sent_at=now(), receipt_retry_at=None
+        home, request_id, receipt_status="sent", receipt_unknown_attempts=unknown_attempts,
+        receipt_sent_at=now(), receipt_retry_at=None
     )
     return True
 
@@ -1384,9 +1398,9 @@ def request_handled(home: Path, request_id: str) -> int:
         if not source.is_file() or source.is_symlink():
             if target.is_file():
                 target_record = read_json(target)
+                active_state = active_record(home)
                 if active == request_id:
-                    if (isinstance(target_record, dict)
-                            and target_record.get("initial_routing") == "pending"):
+                    if active_state is not None and active_state.get("work_id") is None:
                         return 0
                     return die("request is already routed")
                 if (isinstance(target_record, dict)
@@ -1401,8 +1415,6 @@ def request_handled(home: Path, request_id: str) -> int:
         if active is None:
             if isinstance(continuation_of, str):
                 return die("continuation predecessor is no longer active")
-            record["initial_routing"] = "pending"
-            atomic_json(source, record)
             atomic_json(active_path(home), {"request_id": request_id, "claimed_at": now()})
         elif continuation_of == active:
             record["continuation_routing"] = "pending"
@@ -1430,14 +1442,6 @@ def request_bind(home: Path, request_id: str, work_id: str) -> int:
             active["work_id"] = work_id
             active["bound_at"] = now()
             atomic_json(active_path(home), active)
-        path = request_path(home, request_id)
-        record = read_json(path) if path is not None else None
-        if not isinstance(record, dict) or record.get("request_id") != request_id:
-            return die("request is malformed")
-        if record.get("initial_routing") == "pending":
-            record["initial_routing"] = "routed"
-            record["initial_routed_at"] = now()
-            atomic_json(path, record)
         _sync_request_wakes_locked(home)
     print("Telegram work binding recorded.")
     return 0
@@ -1461,9 +1465,11 @@ def request_active(home: Path, work_id: Optional[str] = None,
         value = read_json(claimed_path)
         if not isinstance(value, dict) or value.get("request_id") != claimed_request:
             return 1
-        if (claimed_request != request_id
-                and (value.get("continuation_of") != request_id
-                     or value.get("continuation_routing") != "pending")):
+        if claimed_request == request_id:
+            if active.get("work_id") is not None:
+                return 1
+        elif (value.get("continuation_of") != request_id
+              or value.get("continuation_routing") != "pending"):
             return 1
     print(request_id, flush=True)
     return 0
@@ -1756,7 +1762,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Private one-home Telegram transport for Firstmate.",
         epilog=("Commands: pair, serve, request-read, request-handled, request-bind, active-request, continuation-handled, send, reply, install, start, stop, status, disable, cleanup.\n"
                 "Retention limits: 256 queued requests for 7 days and 4096 handled requests.\n"
-                "Delivery-unknown receipt recovery makes at most 3 attempts with bounded backoff.\n"
+                "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
                 "Voice limits: 10 MiB, 120 seconds, and a 4096-unit transcript. Temporary audio is restricted to /dev/shm.\n"
                 "FM_TELEGRAM_PARAKEET_CMD and FM_TELEGRAM_WHISPER_CMD override the local transcription commands.\n"
                 "Text for send and reply is read with --text-file or stdin (-); no recipient argument is accepted."),

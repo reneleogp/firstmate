@@ -176,7 +176,15 @@ run_tg "$home" request-handled "$request_id" || fail "replayed initial claim was
 [ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$request_id" ] || fail "replayed initial claim lost its conversation route"
 run_tg "$home" request-bind "$request_id" telegram-work >/dev/null
 ! grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "bound initial claim retained its recovery wake"
-if run_tg "$home" request-handled "$request_id" >/dev/null 2>&1; then fail "bound initial claim was routed twice"; fi
+python3 - "$home/state/telegram/handled/$request_id.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+record = json.load(open(path, encoding='utf-8'))
+record['initial_routing'] = 'pending'
+json.dump(record, open(path, 'w', encoding='utf-8'))
+PY
+if run_tg "$home" request-handled "$request_id" >/dev/null 2>&1; then fail "stale request state reopened an atomic work binding"; fi
+if run_tg "$home" active-request --claimed-request "$request_id" >/dev/null 2>&1; then fail "bound work was exposed as an unrouted initial claim"; fi
 [ "$(run_tg "$home" active-request --work-id telegram-work)" = "$request_id" ] || fail "matching lifecycle work did not resolve its Telegram origin"
 routing_before=$(grep -c 'sendMessage' "$home/calls.jsonl")
 if run_tg "$home" active-request --work-id terminal-work >/dev/null 2>&1; then
@@ -385,6 +393,45 @@ assert json.load(open(sys.argv[1]))['receipt_status'] == 'delivery_unknown_termi
 PY
 run_tg "$terminal_home" serve --once >/dev/null
 [ "$(grep -c 'sendMessage' "$terminal_home/calls.jsonl")" -eq 3 ] || fail "terminal delivery-unknown receipt retried beyond its bound"
+
+rejected_home=$(new_home rejected-receipt)
+start_server "$rejected_home" "$rejected_home/port"
+run_tg "$rejected_home" pair --user-id 77 --chat-id 77 >/dev/null
+printf '4\n' > "$rejected_home/fail-send-count"
+set_updates '[{"update_id":17,"message":{"message_id":17,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"bound rejected receipt retries"}}]' "$rejected_home"
+run_tg "$rejected_home" serve --once >/dev/null
+rejected_request="$rejected_home/state/telegram/inbox/tg-text-u17-m17.json"
+python3 - "$rejected_request" <<'PY'
+import json, sys
+record = json.load(open(sys.argv[1], encoding='utf-8'))
+assert record['receipt_status'] == 'rejected'
+assert record['receipt_attempts'] == 1
+assert record['receipt_retry_at'] > record['receipt_attempted_at']
+PY
+run_tg "$rejected_home" serve --once >/dev/null
+[ "$(grep -c 'sendMessage' "$rejected_home/calls.jsonl")" -eq 1 ] || fail "rejected receipt ignored its retry backoff"
+for expected in 2 3; do
+  python3 - "$rejected_request" <<'PY'
+import json, sys
+path = sys.argv[1]
+record = json.load(open(path, encoding='utf-8'))
+record['receipt_retry_at'] = 0
+json.dump(record, open(path, 'w', encoding='utf-8'))
+PY
+  run_tg "$rejected_home" serve --once >/dev/null
+  python3 - "$rejected_request" "$expected" <<'PY'
+import json, sys
+record = json.load(open(sys.argv[1], encoding='utf-8'))
+assert record['receipt_attempts'] == int(sys.argv[2])
+PY
+done
+python3 - "$rejected_request" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1], encoding='utf-8'))['receipt_status'] == 'rejected_terminal'
+PY
+run_tg "$rejected_home" serve --once >/dev/null
+[ "$(grep -c 'sendMessage' "$rejected_home/calls.jsonl")" -eq 3 ] || fail "terminal rejected receipt retried beyond its bound"
+
 expiry_home=$(new_home expiry)
 start_server "$expiry_home" "$expiry_home/port"
 run_tg "$expiry_home" pair --user-id 77 --chat-id 77 >/dev/null
