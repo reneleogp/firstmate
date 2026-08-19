@@ -340,7 +340,7 @@ PY
 before=$(grep -c 'sendMessage' "$home/calls.jsonl")
 callbacks_before=$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")
 files_before=$(grep -c 'getFile' "$home/calls.jsonl")
-set_updates '[{"update_id":2,"message":{"message_id":11,"from":{"id":999},"chat":{"id":77,"type":"private"},"text":"ignore"}},{"update_id":3,"message":{"message_id":12,"from":{"id":77},"chat":{"id":77,"type":"group"},"text":"ignore"}},{"update_id":4,"message":{"message_id":13,"from":{"id":77},"chat":{"id":77,"type":"private"},"photo":[{"file_id":"must not download"}]}},{"update_id":5,"edited_message":{"message":{"voice":{"file_id":"must not download"}}}},{"update_id":7,"callback_query":{"id":"bad-shape","from":{"id":77},"data":"cancel:any:1","message":{"message_id":70,"chat":"not-an-object"}}},{"update_id":8,"callback_query":{"from":{"id":77},"data":"cancel:any:1","message":{"message_id":80,"chat":{"id":77,"type":"private"}}}},{"update_id":true,"message":{"message_id":81,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"boolean update"}},{"update_id":81,"message":{"message_id":true,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"boolean message"}},{"update_id":82,"message":{"message_id":82,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"","duration":2,"file_size":20}}},{"update_id":83,"message":{"message_id":83,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-bool-duration","duration":true,"file_size":20}}},{"update_id":84,"message":{"message_id":84,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-bool-size","duration":2,"file_size":true}}},{"update_id":85,"message":{"message_id":85,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"conflicting text","photo":[{"file_id":"must not download"}]}},{"update_id":86,"message":{"message_id":86,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"must not download","duration":2,"file_size":20},"sticker":{"file_id":"must not download"}}},{"update_id":87,"message":{"message_id":87,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"conflicting update"},"edited_message":{"message_id":88,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"must not parse"}}]' "$home"
+set_updates '[{"update_id":2,"message":{"message_id":11,"from":{"id":999},"chat":{"id":77,"type":"private"},"text":"ignore"}},{"update_id":3,"message":{"message_id":12,"from":{"id":77},"chat":{"id":77,"type":"group"},"text":"ignore"}},{"update_id":4,"message":{"message_id":13,"from":{"id":77},"chat":{"id":77,"type":"private"},"photo":[{"file_id":"must not download"}]}},{"update_id":5,"edited_message":{"message":{"voice":{"file_id":"must not download"}}}},{"update_id":7,"callback_query":{"id":"bad-shape","from":{"id":77},"data":"cancel:any:1","message":{"message_id":70,"chat":"not-an-object"}}},{"update_id":8,"callback_query":{"from":{"id":77},"data":"cancel:any:1","message":{"message_id":80,"chat":{"id":77,"type":"private"}}}},{"update_id":true,"message":{"message_id":81,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"boolean update"}},{"update_id":81,"message":{"message_id":true,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"boolean message"}},{"update_id":82,"message":{"message_id":82,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"","duration":2,"file_size":20}}},{"update_id":83,"message":{"message_id":83,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-bool-duration","duration":true,"file_size":20}}},{"update_id":84,"message":{"message_id":84,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-bool-size","duration":2,"file_size":true}}},{"update_id":85,"message":{"message_id":85,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"conflicting text","photo":[{"file_id":"must not download"}]}},{"update_id":86,"message":{"message_id":86,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"must not download","duration":2,"file_size":20},"sticker":{"file_id":"must not download"}}},{"update_id":87,"message":{"message_id":87,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"conflicting update"},"edited_message":{"message_id":88,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"must not parse"}},{"update_id":88,"message":{"message_id":88,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"unknown update companion"},"future_update":{"opaque":"must not parse"}},{"update_id":89,"message":{"message_id":89,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"unknown message content","future_content":{"opaque":"must not parse"}}}]' "$home"
 run_tg "$home" serve --once >/dev/null
 [ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq "$before" ] || fail "unsupported or unpinned updates must be silent"
 [ "$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")" -eq "$callbacks_before" ] || fail "malformed callback received an acknowledgement"
@@ -821,6 +821,24 @@ PY
     esac
     ;;
   is-active)
+    if [ -e "$root/systemctl.race-pair" ]; then
+      count=$(cat "$root/systemctl.race-pair-count" 2>/dev/null || printf 0)
+      count=$((count + 1))
+      printf '%s\n' "$count" > "$root/systemctl.race-pair-count"
+      if [ "$count" -eq 2 ]; then
+        rm -f "$root/systemctl.race-pair"
+        (
+          env FM_HOME="$FM_TELEGRAM_EXPECT_HOME" FM_TELEGRAM_API_BASE="$FM_TELEGRAM_API_BASE" \
+            "$FM_TELEGRAM_SERVICE_SCRIPT" --home "$FM_TELEGRAM_EXPECT_HOME" serve --once \
+            >"$root/systemctl.race-service.log" 2>&1
+          printf '%s\n' "$?" > "$root/systemctl.race-service.status"
+        ) </dev/null >/dev/null 2>&1 &
+        for _ in $(seq 1 100); do
+          [ -e "$FM_TELEGRAM_EXPECT_HOME/state/telegram/enabled" ] && break
+          sleep .01
+        done
+      fi
+    fi
     [ "$active" = active ] && { printf 'active\n'; exit 0; }
     printf 'inactive\n'; exit 3
     ;;
@@ -856,6 +874,21 @@ PY
 [ ! -e "$voice_home/state/telegram/pending.json" ] || fail "stop retained pending voice state"
 if supervision_needs "$voice_home"; then fail "stopped Telegram transport still required supervision"; fi
 if "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null; then fail "stop did not verify inactive state"; fi
+race_inbox_before=$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')
+set_updates '[{"update_id":290,"message":{"message_id":290,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"old pairing must not survive replacement"}}]' "$voice_home"
+rm -f "$TMP_ROOT/systemctl.race-pair-count"
+touch "$TMP_ROOT/systemctl.race-pair"
+"${lifecycle_env[@]}" "$SCRIPT" pair --user-id 88 --chat-id 88 >/dev/null || fail "serialized inactive pairing replacement failed"
+race_service_done=0
+for _ in $(seq 1 200); do
+  if [ -s "$TMP_ROOT/systemctl.race-service.status" ]; then race_service_done=1; break; fi
+  sleep .01
+done
+[ "$race_service_done" -eq 1 ] || fail "service racing pairing replacement did not finish"
+[ "$(cat "$TMP_ROOT/systemctl.race-service.status")" -eq 0 ] || fail "service racing pairing replacement failed"
+[ "$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq "$race_inbox_before" ] || fail "racing startup accepted the replaced pairing"
+[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["user_id"])' "$voice_home/config/telegram.json")" -eq 88 ] || fail "serialized replacement did not persist the new pairing"
+set_updates '[]' "$voice_home"
 "${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null || fail "inactive owned service refused explicit re-pairing"
 "${lifecycle_env[@]}" "$systemctl_fake" --user start firstmate-telegram.service
 supervision_needs "$voice_home" || fail "direct enabled-service restart did not restore supervision"

@@ -39,32 +39,20 @@ PENDING_TTL = 10 * 60
 POLL_TIMEOUT = 30
 RECEIPT_RETRY_DELAYS = (30, 120, 300)
 PERMANENT_CONFIG_EXIT = 78
-UNSUPPORTED_UPDATE_FIELDS = frozenset({
-    "business_connection", "business_message", "channel_post", "chat_boost",
-    "chat_join_request", "chat_member", "chosen_inline_result", "deleted_business_messages",
-    "edited_business_message", "edited_channel_post", "edited_message", "inline_query",
-    "message_reaction", "message_reaction_count", "my_chat_member", "poll", "poll_answer",
-    "pre_checkout_query", "purchased_paid_media", "removed_chat_boost", "shipping_query",
+MESSAGE_ENVELOPE_FIELDS = frozenset({
+    "author_signature", "business_connection_id", "chat", "date", "direct_messages_topic",
+    "edit_date", "effect_id", "external_reply", "forward_origin", "from",
+    "has_protected_content", "is_automatic_forward", "is_from_offline", "is_paid_post",
+    "is_topic_message", "media_group_id", "message_id", "message_thread_id", "paid_star_count",
+    "quote", "reply_markup", "reply_to_checklist_task_id", "reply_to_message", "reply_to_story",
+    "sender_boost_count", "sender_business_bot", "sender_chat", "via_bot",
 })
+TEXT_MESSAGE_FIELDS = MESSAGE_ENVELOPE_FIELDS | frozenset({
+    "entities", "link_preview_options", "suggested_post_info", "text",
+})
+VOICE_MESSAGE_FIELDS = MESSAGE_ENVELOPE_FIELDS | frozenset({"voice"})
 _PROCESS_TOKENS: Dict[Path, str] = {}
 _VERIFIED_BOT_IDS: Dict[Path, int] = {}
-
-UNSUPPORTED_MESSAGE_CONTENT_FIELDS = frozenset({
-    "animation", "audio", "boost_added", "caption", "caption_entities", "channel_chat_created",
-    "chat_background_set", "chat_shared", "checklist", "checklist_tasks_added",
-    "checklist_tasks_done", "contact", "delete_chat_photo", "dice", "direct_message_price_changed",
-    "document", "forum_topic_closed", "forum_topic_created", "forum_topic_edited",
-    "forum_topic_reopened", "game", "general_forum_topic_hidden",
-    "general_forum_topic_unhidden", "gift", "giveaway", "giveaway_completed",
-    "giveaway_created", "giveaway_winners", "group_chat_created", "invoice",
-    "left_chat_member", "location", "message_auto_delete_timer_changed", "migrate_from_chat_id",
-    "migrate_to_chat_id", "new_chat_members", "new_chat_photo", "new_chat_title", "paid_media",
-    "paid_message_price_changed", "passport_data", "photo", "pinned_message", "poll",
-    "proximity_alert_triggered", "refunded_payment", "sticker", "story", "successful_payment",
-    "supergroup_chat_created", "users_shared", "venue", "video", "video_chat_ended",
-    "video_chat_participants_invited", "video_chat_scheduled", "video_chat_started", "video_note",
-    "web_app_data", "write_access_allowed",
-})
 
 
 class TelegramError(RuntimeError):
@@ -360,11 +348,11 @@ def request_path(home: Path, request_id: str) -> Optional[Path]:
 
 
 def state_lock(home: Path) -> Path:
-    path = state_dir(home) / ".lock"
-    if not path.exists():
-        atomic_bytes(path, b"", 0o600)
-    private_file(path)
-    return path
+    return state_dir(home) / ".lock"
+
+
+def lifecycle_lock(home: Path) -> Path:
+    return state_dir(home) / ".lifecycle.lock"
 
 
 class FileLock:
@@ -1294,11 +1282,16 @@ def process_update(home: Path, config: Dict[str, Any], update: Any) -> None:
     if not isinstance(update, dict) or not strict_int(update.get("update_id")):
         return
     update_id = int(update["update_id"])
-    if update_id < 0 or any(field in update for field in UNSUPPORTED_UPDATE_FIELDS):
+    if update_id < 0:
         return
     has_callback = "callback_query" in update
     has_message = "message" in update
     if has_callback == has_message:
+        return
+    expected_update_fields = {
+        "update_id", "callback_query" if has_callback else "message"
+    }
+    if set(update) != expected_update_fields:
         return
     if has_callback:
         query = update.get("callback_query")
@@ -1314,6 +1307,13 @@ def process_update(home: Path, config: Dict[str, Any], update: Any) -> None:
     if not isinstance(update.get("message"), dict):
         return
     message = update["message"]
+    has_text = "text" in message
+    has_voice = "voice" in message
+    if has_text == has_voice:
+        return
+    allowed_message_fields = TEXT_MESSAGE_FIELDS if has_text else VOICE_MESSAGE_FIELDS
+    if not set(message).issubset(allowed_message_fields):
+        return
     pinned = pinned_message(config, message)
     if pinned is None:
         return
@@ -1323,12 +1323,6 @@ def process_update(home: Path, config: Dict[str, Any], update: Any) -> None:
     with FileLock(state_lock(home)):
         if has_seen(home, update_id, message_id):
             return
-    if any(field in message for field in UNSUPPORTED_MESSAGE_CONTENT_FIELDS):
-        return
-    has_text = "text" in message
-    has_voice = "voice" in message
-    if has_text == has_voice:
-        return
     handled = False
     if has_text:
         handled = handle_text(home, config, message, update_id)
@@ -1384,12 +1378,14 @@ def expire_pending(home: Path) -> None:
 
 
 def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> int:
-    config = load_config(home)
-    try:
-        verified_token_for(home, config)
-    except PermanentConfigurationError:
-        set_telegram_enabled(home, False)
-        raise
+    with FileLock(lifecycle_lock(home)):
+        config = load_config(home)
+        try:
+            verified_token_for(home, config)
+        except PermanentConfigurationError:
+            set_telegram_enabled(home, False)
+            raise
+        prepare_transport_activation(home)
     offset = 0
     stop = False
     permanent_failure = False
@@ -1400,7 +1396,6 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> i
 
     signal.signal(signal.SIGTERM, stop_service)
     signal.signal(signal.SIGINT, stop_service)
-    prepare_transport_activation(home)
     try:
         while not stop:
             reconcile_closing(home)
@@ -1467,10 +1462,14 @@ def pair(home: Path, user_id: int, chat_id: int) -> int:
         raise TelegramError("user and chat ids must be positive integers")
     if user_id != chat_id:
         raise TelegramError("the pinned private chat must belong to the pinned user")
-    config.update({"user_id": user_id, "chat_id": chat_id, "bot_id": int(result["id"]),
-                   "api_base": api_base(home, config)})
-    require_pairing_service_inactive(home)
-    atomic_json(config_path(home), config)
+    endpoint = api_base(home, config)
+    with FileLock(lifecycle_lock(home)):
+        require_pairing_service_inactive(home)
+        current = read_json(config_path(home), {})
+        config = current if isinstance(current, dict) else {}
+        config.update({"user_id": user_id, "chat_id": chat_id, "bot_id": int(result["id"]),
+                       "api_base": endpoint})
+        atomic_json(config_path(home), config)
     print("Telegram pairing verified.")
     return 0
 
@@ -1782,30 +1781,32 @@ def verify_transport_marker(home: Path, expected: bool) -> None:
 
 
 def install(home: Path) -> int:
-    config = load_config(home)
-    verified_token_for(home, config)
-    path = unit_path()
-    if (path.exists() or path.is_symlink()) and not unit_owned_by(home):
-        raise TelegramError("Telegram service unit belongs to another home or installation")
-    atomic_bytes(path, unit_contents(home).encode())
-    systemctl("daemon-reload")
-    systemctl("enable", SERVICE_NAME)
-    prepare_transport_activation(home)
-    systemctl("start", SERVICE_NAME)
-    verify_service(active=True, enabled=True)
-    verify_transport_marker(home, True)
+    with FileLock(lifecycle_lock(home)):
+        config = load_config(home)
+        verified_token_for(home, config)
+        path = unit_path()
+        if (path.exists() or path.is_symlink()) and not unit_owned_by(home):
+            raise TelegramError("Telegram service unit belongs to another home or installation")
+        atomic_bytes(path, unit_contents(home).encode())
+        systemctl("daemon-reload")
+        systemctl("enable", SERVICE_NAME)
+        prepare_transport_activation(home)
+        systemctl("start", SERVICE_NAME)
+        verify_service(active=True, enabled=True)
+        verify_transport_marker(home, True)
     print("Telegram service installed and active.")
     return 0
 
 
 def start_service(home: Path) -> int:
-    config = load_config(home)
-    verified_token_for(home, config)
-    require_unit_owner(home)
-    prepare_transport_activation(home)
-    systemctl("start", SERVICE_NAME)
-    verify_service(active=True)
-    verify_transport_marker(home, True)
+    with FileLock(lifecycle_lock(home)):
+        config = load_config(home)
+        verified_token_for(home, config)
+        require_unit_owner(home)
+        prepare_transport_activation(home)
+        systemctl("start", SERVICE_NAME)
+        verify_service(active=True)
+        verify_transport_marker(home, True)
     print("Telegram service active.")
     return 0
 
