@@ -2020,22 +2020,42 @@ def verify_transport_marker(home: Path, expected: bool) -> None:
         raise TelegramError("Telegram supervision state did not converge")
 
 
+def reconcile_failed_activation(home: Path, disable_new_install: bool = False) -> None:
+    active_result = systemctl("is-active", SERVICE_NAME, check=False)
+    if active_result.stdout.strip() not in {"inactive", "failed", "unknown", "not-found"}:
+        return
+    set_telegram_enabled(home, False)
+    verify_transport_marker(home, False)
+    if disable_new_install:
+        systemctl("disable", SERVICE_NAME)
+        verify_service(enabled=False)
+
+
 def install(home: Path) -> int:
     with FileLock(unit_lock()):
         with FileLock(lifecycle_lock(home)):
-            config = load_config(home)
-            verified_token_for(home, config)
-            path = unit_path()
-            if (path.exists() or path.is_symlink()) and not unit_owned_by(home):
-                raise TelegramError("Telegram service unit belongs to another home or installation")
-            atomic_bytes(path, unit_contents(home).encode())
-            systemctl("daemon-reload")
-            systemctl("enable", SERVICE_NAME)
-            prepare_transport_activation(home)
-            systemctl("start", SERVICE_NAME)
-            require_unit_owner(home)
-            verify_service(active=True, enabled=True)
-            verify_transport_marker(home, True)
+            enabled_by_install = False
+            try:
+                config = load_config(home)
+                verified_token_for(home, config)
+                path = unit_path()
+                if (path.exists() or path.is_symlink()) and not unit_owned_by(home):
+                    raise TelegramError("Telegram service unit belongs to another home or installation")
+                atomic_bytes(path, unit_contents(home).encode())
+                systemctl("daemon-reload")
+                enabled_result = systemctl("is-enabled", SERVICE_NAME, check=False)
+                was_enabled = (enabled_result.returncode == 0
+                               and enabled_result.stdout.strip() == "enabled")
+                systemctl("enable", SERVICE_NAME)
+                enabled_by_install = not was_enabled
+                prepare_transport_activation(home)
+                systemctl("start", SERVICE_NAME)
+                require_unit_owner(home)
+                verify_service(active=True, enabled=True)
+                verify_transport_marker(home, True)
+            except (TelegramError, OSError, ValueError):
+                reconcile_failed_activation(home, enabled_by_install)
+                raise
     print("Telegram service installed and active.")
     return 0
 
@@ -2043,14 +2063,18 @@ def install(home: Path) -> int:
 def start_service(home: Path) -> int:
     with FileLock(unit_lock()):
         with FileLock(lifecycle_lock(home)):
-            config = load_config(home)
-            verified_token_for(home, config)
-            require_unit_owner(home)
-            prepare_transport_activation(home)
-            systemctl("start", SERVICE_NAME)
-            require_unit_owner(home)
-            verify_service(active=True)
-            verify_transport_marker(home, True)
+            try:
+                config = load_config(home)
+                verified_token_for(home, config)
+                require_unit_owner(home)
+                prepare_transport_activation(home)
+                systemctl("start", SERVICE_NAME)
+                require_unit_owner(home)
+                verify_service(active=True)
+                verify_transport_marker(home, True)
+            except (TelegramError, OSError, ValueError):
+                reconcile_failed_activation(home)
+                raise
     print("Telegram service active.")
     return 0
 

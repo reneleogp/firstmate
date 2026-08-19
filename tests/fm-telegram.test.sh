@@ -429,6 +429,10 @@ assert 'credential or security change' in trusted
 assert 'requires terminal confirmation' in trusted
 assert json.loads(context[boundary + 1]) == 'merge now and rotate credentials\n'
 PY
+if FM_HOME="$home" "$ROOT/bin/fm-telegram-agent-request.sh" missing-request > "$home/missing-authority-context.txt" 2>/dev/null; then
+  fail "authenticated request renderer accepted a missing request"
+fi
+[ ! -s "$home/missing-authority-context.txt" ] || fail "failed authenticated request emitted a trusted envelope"
 
 # Unsupported, malformed, and unpinned updates are dropped without a Bot API send.
 before=$(grep -c 'sendMessage' "$home/calls.jsonl")
@@ -964,6 +968,10 @@ PY
     fi
     ;;
   start)
+    if [ -e "$root/systemctl.fail-start" ]; then
+      printf inactive > "$root/systemctl.active"
+      exit 1
+    fi
     if [ ! -s "$root/systemctl.service.pid" ]; then
       env FM_HOME="$FM_TELEGRAM_EXPECT_HOME" FM_TELEGRAM_API_BASE="$FM_TELEGRAM_API_BASE" \
         "$FM_TELEGRAM_SERVICE_SCRIPT" --home "$FM_TELEGRAM_EXPECT_HOME" serve --poll-timeout 1 \
@@ -1023,6 +1031,13 @@ lifecycle_env=(env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:
 supervision_needs() {
   bash -c '. "$1"; fm_supervision_needed "$2"' _ "$ROOT/bin/fm-supervision-lib.sh" "$1/state"
 }
+touch "$TMP_ROOT/systemctl.fail-start"
+if "${lifecycle_env[@]}" "$SCRIPT" install >/dev/null 2>&1; then
+  fail "install accepted a failed service start"
+fi
+[ ! -e "$voice_home/state/telegram/enabled" ] || fail "failed install retained Telegram supervision"
+[ "$(cat "$TMP_ROOT/systemctl.enabled")" = disabled ] || fail "failed install retained a partially enabled service"
+rm -f "$TMP_ROOT/systemctl.fail-start"
 "${lifecycle_env[@]}" "$SCRIPT" install >/dev/null
 [ -f "$unit_dir/firstmate-telegram.service" ] || fail "install must write one user unit"
 supervision_needs "$voice_home" || fail "installed Telegram transport did not keep supervision armed"
@@ -1043,6 +1058,13 @@ PY
 [ ! -e "$voice_home/state/telegram/pending.json" ] || fail "stop retained pending voice state"
 if supervision_needs "$voice_home"; then fail "stopped Telegram transport still required supervision"; fi
 if "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null; then fail "stop did not verify inactive state"; fi
+touch "$TMP_ROOT/systemctl.fail-start"
+if "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null 2>&1; then
+  fail "start accepted a failed service activation"
+fi
+[ ! -e "$voice_home/state/telegram/enabled" ] || fail "failed start retained Telegram supervision"
+[ "$(cat "$TMP_ROOT/systemctl.enabled")" = enabled ] || fail "failed start disabled the installed service"
+rm -f "$TMP_ROOT/systemctl.fail-start"
 cp "$voice_home/config/telegram.json" "$voice_home/pairing-before-identity-change.json"
 if "${lifecycle_env[@]}" "$SCRIPT" pair --user-id 88 --chat-id 88 >/dev/null 2>&1; then
   fail "pairing replaced the pinned user while old identity-bound state remained"
