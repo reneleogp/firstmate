@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Small, private Telegram transport for one Firstmate home.
 
-The service deliberately owns transport and queue durability only.  It does not
-interpret requests, choose actions, or authorize Firstmate operations.
+The service deliberately owns transport, private queue durability, and origin
+binding only.  It does not interpret requests, choose actions, or authorize
+Firstmate operations.
 """
 from __future__ import annotations
 
