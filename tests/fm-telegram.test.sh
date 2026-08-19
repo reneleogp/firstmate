@@ -59,6 +59,10 @@ class Handler(BaseHTTPRequestHandler):
                     (home / 'receipt-before-durable').write_text('failed')
                 if inbox and 'telegram tg-' not in wake:
                     (home / 'receipt-before-durable').write_text('failed')
+            hold = home / 'hold-send'
+            if hold.exists():
+                (home / 'send-entered').write_text('entered')
+                while hold.exists(): time.sleep(.01)
             disconnect = home / 'disconnect-after-send-count'
             disconnect_count = int(disconnect.read_text()) if disconnect.exists() else 0
             if disconnect_count > 0:
@@ -183,6 +187,10 @@ continuation_id=tg-text-u101-m110
 [ "$(run_tg "$home" request-read "$continuation_id")" = "the answer is option two" ] || fail "active conversation answer was not durably readable"
 run_tg "$home" request-handled "$continuation_id"
 [ "$(run_tg "$home" active-request --claimed-request "$continuation_id")" = "$request_id" ] || fail "continuation claim lost its active Telegram predecessor"
+[ "$(run_tg "$home" active-request --claimed-request "$continuation_id")" = "$request_id" ] || fail "unacknowledged continuation route was not recoverable"
+grep -F "telegram:$continuation_id" "$home/state/.wake-queue" >/dev/null || fail "unacknowledged continuation lost its durable wake"
+run_tg "$home" continuation-handled "$continuation_id"
+! grep -F "telegram:$continuation_id" "$home/state/.wake-queue" >/dev/null || fail "acknowledged continuation retained its durable wake"
 [ "$(run_tg "$home" active-request --work-id telegram-work)" = "$request_id" ] || fail "continuation answer replaced the active Telegram work"
 printf 'final answer\n' > "$home/reply.txt"
 run_tg "$home" reply "$request_id" --final --text-file "$home/reply.txt" >/dev/null
@@ -376,6 +384,8 @@ run_tg "$order_home" reply "$order_a" --final --text-file "$order_home/reply.txt
 [ "$(run_tg "$order_home" active-request --work-id order-work)" = "$order_a" ] || fail "queued continuation lost its active predecessor during finalization"
 run_tg "$order_home" request-handled "$order_continuation" >/dev/null
 [ "$(run_tg "$order_home" active-request --claimed-request "$order_continuation")" = "$order_a" ] || fail "claimed continuation lost its predecessor during finalization"
+[ "$(run_tg "$order_home" active-request --claimed-request "$order_continuation")" = "$order_a" ] || fail "claimed continuation route was consumed before acknowledgement"
+run_tg "$order_home" continuation-handled "$order_continuation"
 if next_active=$(run_tg "$order_home" active-request 2>/dev/null); then
   [ "$next_active" != "$order_continuation" ] || fail "continuation was promoted to unrelated active work"
 fi
@@ -396,6 +406,8 @@ SH
 cat > "$voice_home/whisper.sh" <<'SH'
 #!/usr/bin/env bash
 printf x >> "$0.calls"
+touch "$0.entered"
+while [ -e "$0.hold" ]; do sleep .01; done
 printf 'whisper transcript\n'
 SH
 chmod +x "$voice_home/parakeet.sh" "$voice_home/whisper.sh"
@@ -417,6 +429,7 @@ grep -F 'Send to Firstmate' "$voice_home/calls.jsonl" >/dev/null || fail "voice 
 
 pending_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pending_id"])' "$pending")
 edit_data=$(callback_data "$voice_home" edit)
+stale_send_data=$(callback_data "$voice_home" send)
 set_updates '[{"update_id":21,"callback_query":{"id":"cb-edit","from":{"id":77},"data":"'"$edit_data"'","message":{"message_id":201,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 prompt_count=$(grep -c 'Reply with the corrected text.' "$voice_home/calls.jsonl")
@@ -424,6 +437,11 @@ prompt_count=$(grep -c 'Reply with the corrected text.' "$voice_home/calls.jsonl
 set_updates '[{"update_id":210,"callback_query":{"id":"cb-edit-second-tap","from":{"id":77},"data":"'"$edit_data"'","message":{"message_id":201,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 [ "$(grep -c 'Reply with the corrected text.' "$voice_home/calls.jsonl")" -eq "$prompt_count" ] || fail "a second edit tap repeated the prompt"
+stale_send_answers=$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")
+set_updates '[{"update_id":211,"callback_query":{"id":"cb-stale-send","from":{"id":77},"data":"'"$stale_send_data"'","message":{"message_id":201,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+[ "$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 0 ] || fail "stale Send control queued text while an edit was pending"
+[ "$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")" -eq "$stale_send_answers" ] || fail "stale Send control was acknowledged while an edit was pending"
 set_updates '[{"update_id":22,"message":{"message_id":22,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"corrected voice text"}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 grep -F 'corrected voice text' "$voice_home/calls.jsonl" >/dev/null || fail "edit must reconfirm corrected text"
@@ -433,8 +451,22 @@ run_tg "$voice_home" serve --once >/dev/null
 [ "$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq "$edit_inbox_before" ] || fail "replayed edited text bypassed voice confirmation"
 
 retry_data=$(callback_data "$voice_home" retry)
+touch "$voice_home/whisper.sh.hold"
+rm -f "$voice_home/whisper.sh.entered"
 set_updates '[{"update_id":23,"callback_query":{"id":"cb-retry","from":{"id":77},"data":"'"$retry_data"'","message":{"message_id":202,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
-run_tg "$voice_home" serve --once >/dev/null
+env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" "$SCRIPT" serve --once >/dev/null &
+retry_pid=$!
+retry_entered=0
+for _ in $(seq 1 100); do
+  if [ -e "$voice_home/whisper.sh.entered" ]; then retry_entered=1; break; fi
+  sleep .02
+done
+[ "$retry_entered" -eq 1 ] || fail "Whisper retry did not start"
+timeout 2 env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" "$SCRIPT" active-request >/dev/null 2>&1
+retry_lock_status=$?
+[ "$retry_lock_status" -ne 124 ] || fail "Whisper retry held the Telegram state lock"
+rm -f "$voice_home/whisper.sh.hold"
+wait "$retry_pid"
 grep -F 'whisper transcript' "$voice_home/calls.jsonl" >/dev/null || fail "retry must use Whisper transcript"
 set_updates '[{"update_id":230,"callback_query":{"id":"cb-retry-second-tap","from":{"id":77},"data":"'"$retry_data"'","message":{"message_id":202,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
@@ -456,10 +488,28 @@ run_tg "$voice_home" serve --once >/dev/null
 pending_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pending_id"])' "$pending")
 send_audio=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["audio_path"])' "$pending")
 send_data=$(callback_data "$voice_home" send)
+touch "$voice_home/hold-send"
+rm -f "$voice_home/send-entered"
 set_updates '[{"update_id":26,"callback_query":{"id":"cb-send","from":{"id":77},"data":"'"$send_data"'","message":{"message_id":204,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" "$SCRIPT" serve --once >/dev/null &
+send_pid=$!
+send_entered=0
+for _ in $(seq 1 100); do
+  if [ -e "$voice_home/send-entered" ]; then send_entered=1; break; fi
+  sleep .02
+done
+[ "$send_entered" -eq 1 ] || fail "voice Send did not reach its journaled reconciliation"
+kill -9 "$send_pid" 2>/dev/null || true
+rm -f "$voice_home/hold-send"
+wait "$send_pid" 2>/dev/null || true
+python3 - "$pending" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1], encoding='utf-8'))['mode'] == 'sending'
+PY
+[ -e "$send_audio" ] || fail "interrupted Send lost audio before recovery completed"
 run_tg "$voice_home" serve --once >/dev/null
-[ ! -e "$pending" ] || fail "send must clear pending voice state"
-[ ! -e "$send_audio" ] || fail "send must delete temporary audio"
+[ ! -e "$pending" ] || fail "recovered send must clear pending voice state"
+[ ! -e "$send_audio" ] || fail "recovered send must delete temporary audio"
 [ "$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 1 ] || fail "confirmed voice must queue exactly one request"
 rm -f "$voice_home/state/telegram/seen.json"
 run_tg "$voice_home" serve --once >/dev/null

@@ -412,16 +412,19 @@ def request_order_key(path: Path) -> Tuple[int, int, int, str]:
 
 
 def _sync_request_wakes_locked(home: Path) -> None:
-    inbox, _handled = request_dirs(home)
-    paths = sorted(inbox.glob("*.json"), key=request_order_key)
+    inbox, handled = request_dirs(home)
+    paths = list(inbox.glob("*.json"))
     active = active_request_id(home)
     if active is not None:
         continuation_paths = []
-        for path in paths:
+        for path in paths + list(handled.glob("*.json")):
             record = read_json(path, {})
-            if isinstance(record, dict) and record.get("continuation_of") == active:
+            if (isinstance(record, dict) and record.get("continuation_of") == active
+                    and (path.parent == inbox
+                         or record.get("continuation_routing") == "pending")):
                 continuation_paths.append(path)
         paths = continuation_paths
+    paths.sort(key=request_order_key)
     consume_safe_wakes(home)
     if paths:
         append_safe_wake(home, paths[0].stem)
@@ -719,49 +722,119 @@ def confirmation_markup(request_id: str, revision: int) -> Dict[str, Any]:
 
 
 def show_confirmation(home: Path, config: Dict[str, Any], pending: Dict[str, Any]) -> None:
-    text = str(pending["text"])
+    pending_id = pending.get("pending_id")
     revision = pending.get("revision")
-    if not strict_int(revision) or revision <= 0:
+    if not isinstance(pending_id, str) or not strict_int(revision) or revision <= 0:
         raise TelegramError("voice confirmation revision is invalid")
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                or current.get("mode") != "confirm" or current.get("revision") != revision):
+            return
+        snapshot = dict(current)
+    text = str(snapshot["text"])
     if len(text.encode("utf-16-le")) // 2 > MAX_TRANSCRIPT_UNITS:
         raise TelegramError("voice transcript exceeds Telegram's message limit")
-    if pending.get("heading_sent") is not True:
-        send_text(home, int(pending["chat_id"]), "I heard this:")
-        pending["heading_sent"] = True
-        save_pending(home, pending)
-    if pending.get("transcript_sent") is not True:
-        send_text(home, int(pending["chat_id"]), text,
-                  confirmation_markup(str(pending["pending_id"]), revision))
-        pending["transcript_sent"] = True
-        save_pending(home, pending)
+    if snapshot.get("heading_sent") is not True:
+        send_text(home, int(snapshot["chat_id"]), "I heard this:")
+        with FileLock(state_lock(home)):
+            current = read_json(pending_path(home))
+            if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                    or current.get("mode") != "confirm"
+                    or current.get("revision") != revision):
+                return
+            current["heading_sent"] = True
+            save_pending(home, current)
+            snapshot = dict(current)
+    if snapshot.get("transcript_sent") is not True:
+        send_text(home, int(snapshot["chat_id"]), text,
+                  confirmation_markup(pending_id, revision))
+        with FileLock(state_lock(home)):
+            current = read_json(pending_path(home))
+            if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                    or current.get("mode") != "confirm"
+                    or current.get("revision") != revision):
+                return
+            current["transcript_sent"] = True
+            save_pending(home, current)
 
 
 def complete_retry(home: Path, config: Dict[str, Any], pending: Dict[str, Any]) -> bool:
+    pending_id = pending.get("pending_id")
+    retry_token = pending.get("retry_token")
+    revision = pending.get("revision")
+    if (not isinstance(pending_id, str) or not isinstance(retry_token, str)
+            or not strict_int(revision) or revision <= 0):
+        return False
     try:
         transcript = transcribe(home, config, Path(str(pending["audio_path"])), "whisper")
-        revision = pending.get("revision")
-        if not strict_int(revision) or revision <= 0:
-            raise TelegramError("voice confirmation revision is invalid")
-        pending["text"] = transcript
-        pending["mode"] = "confirm"
-        pending["revision"] = revision + 1
-        pending["heading_sent"] = False
-        pending["transcript_sent"] = False
-        retry_token = pending.pop("retry_token", None)
-        save_pending(home, pending)
-        if isinstance(retry_token, str) and isinstance(pending.get("pending_id"), str):
-            remember_callback_locked(home, str(pending["pending_id"]), retry_token)
-        show_confirmation(home, config, pending)
-        return True
     except (TelegramError, OSError, KeyError, TypeError, ValueError):
-        pending["mode"] = "confirm"
-        completed = pending.get("completed_actions", [])
-        token = pending.get("retry_token")
-        if isinstance(completed, list) and isinstance(token, str):
-            pending["completed_actions"] = [value for value in completed if value != token]
-        pending.pop("retry_token", None)
-        save_pending(home, pending)
+        with FileLock(state_lock(home)):
+            current = read_json(pending_path(home))
+            if (isinstance(current, dict) and current.get("pending_id") == pending_id
+                    and current.get("mode") == "retry"
+                    and current.get("retry_token") == retry_token
+                    and current.get("revision") == revision):
+                current["mode"] = "confirm"
+                completed = current.get("completed_actions", [])
+                if isinstance(completed, list):
+                    current["completed_actions"] = [
+                        value for value in completed if value != retry_token
+                    ]
+                current.pop("retry_token", None)
+                save_pending(home, current)
         return False
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                or current.get("mode") != "retry"
+                or current.get("retry_token") != retry_token
+                or current.get("revision") != revision):
+            return False
+        current["text"] = transcript
+        current["mode"] = "confirm"
+        current["revision"] = revision + 1
+        current["heading_sent"] = False
+        current["transcript_sent"] = False
+        current.pop("retry_token", None)
+        save_pending(home, current)
+        remember_callback_locked(home, pending_id, retry_token)
+        confirmed = dict(current)
+    try:
+        show_confirmation(home, config, confirmed)
+    except (TelegramError, OSError, KeyError, TypeError, ValueError):
+        pass
+    return True
+
+
+def complete_send(home: Path, pending: Dict[str, Any]) -> bool:
+    pending_id = pending.get("pending_id")
+    send_token = pending.get("send_token")
+    request_id = pending.get("request_id")
+    revision = pending.get("revision")
+    if (not isinstance(pending_id, str) or not isinstance(send_token, str)
+            or not isinstance(request_id, str) or not strict_int(revision)):
+        return False
+    try:
+        reconcile_request(home, request_id)
+        path = request_path(home, request_id)
+        record = read_json(path) if path is not None else None
+        if not isinstance(record, dict) or record.get("wake_recorded") is not True:
+            return False
+    except (TelegramError, OSError, KeyError, TypeError, ValueError):
+        return False
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                or current.get("mode") != "sending"
+                or current.get("send_token") != send_token
+                or current.get("request_id") != request_id
+                or current.get("revision") != revision):
+            return completed_callback_locked(home, pending_id, send_token)
+        remove_audio(current)
+        remember_callback_locked(home, pending_id, send_token)
+        remove_pending(home, current)
+    return True
 
 
 def reconcile_pending(home: Path, config: Dict[str, Any]) -> None:
@@ -773,12 +846,23 @@ def reconcile_pending(home: Path, config: Dict[str, Any]) -> None:
             remove_pending(home, pending)
         elif pending.get("mode") == "retry":
             complete_retry(home, config, pending)
+        elif pending.get("mode") == "sending":
+            complete_send(home, pending)
         elif pending.get("mode") == "confirm":
             show_confirmation(home, config, pending)
         elif pending.get("mode") == "edit" and pending.get("edit_prompt_sent") is not True:
+            pending_id = pending.get("pending_id")
+            revision = pending.get("revision")
+            if not isinstance(pending_id, str) or not strict_int(revision):
+                return
             send_text(home, int(config["chat_id"]), "Reply with the corrected text.")
-            pending["edit_prompt_sent"] = True
-            save_pending(home, pending)
+            with FileLock(state_lock(home)):
+                current = read_json(pending_path(home))
+                if (isinstance(current, dict) and current.get("pending_id") == pending_id
+                        and current.get("mode") == "edit"
+                        and current.get("revision") == revision):
+                    current["edit_prompt_sent"] = True
+                    save_pending(home, current)
     except (TelegramError, KeyError, TypeError, ValueError):
         return
 
@@ -940,77 +1024,92 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
     if revision <= 0 or str(revision) != raw_revision:
         return False
     token = f"{action}:{revision}"
+    operation = ""
+    pending_snapshot: Optional[Dict[str, Any]] = None
     with FileLock(state_lock(home)):
         pending = read_json(pending_path(home))
         if not isinstance(pending, dict) or pending.get("pending_id") != pending_id:
             if completed_callback_locked(home, pending_id, token):
-                answer_callback(home, callback_id)
-                return True
-            return False
-        try:
-            expired = now() - int(pending.get("created_at", 0)) >= PENDING_TTL
-        except (TypeError, ValueError):
-            expired = True
-        if expired:
-            remove_pending(home, pending)
-            answer_callback(home, callback_id)
-            return True
-        completed = pending.get("completed_actions", [])
-        if not isinstance(completed, list):
-            return False
-        if token in completed or completed_callback_locked(home, pending_id, token):
-            answer_callback(home, callback_id)
-            return True
-        if pending.get("revision") != revision:
-            return False
-        pending["completed_actions"] = [
-            value for value in completed if isinstance(value, str)
-        ][-31:] + [token]
-        if action == "cancel":
-            remove_pending(home, pending)
-            remember_callback_locked(home, pending_id, token)
-            answer_callback(home, callback_id)
-            return True
-        if action == "edit":
-            pending["mode"] = "edit"
-            pending["edit_prompt_sent"] = False
-            save_pending(home, pending)
-            remember_callback_locked(home, pending_id, token)
-            answer_callback(home, callback_id)
-            reconcile_pending(home, config)
-            return True
-        if action == "retry":
-            pending["mode"] = "retry"
-            pending["retry_token"] = token
-            save_pending(home, pending)
-            answer_callback(home, callback_id)
-            return complete_retry(home, config, pending)
-        if action == "send":
+                operation = "acknowledge"
+            else:
+                return False
+        else:
             try:
-                request_id = _queue_request_locked(
-                    home, str(pending["text"]), int(pending["chat_id"]),
-                    int(pending["message_id"]), int(pending["update_id"]),
-                    "voice", True, True,
-                )
-                remember_callback_locked(home, pending_id, token)
-                answer_callback(home, callback_id)
-            except (TelegramError, KeyError, TypeError, ValueError):
-                return False
-    if action == "send":
-        try:
-            reconcile_request(home, request_id)
-            record = read_json(request_path(home, request_id))
-            if not isinstance(record, dict) or record.get("wake_recorded") is not True:
-                return False
-            with FileLock(state_lock(home)):
-                current = read_json(pending_path(home))
-                if (isinstance(current, dict)
-                        and current.get("pending_id") == pending_id
-                        and current.get("revision") == revision):
-                    remove_pending(home, current)
-            return True
-        except (TelegramError, KeyError, TypeError, ValueError):
+                expired = now() - int(pending.get("created_at", 0)) >= PENDING_TTL
+            except (TypeError, ValueError):
+                expired = True
+            if expired:
+                remove_pending(home, pending)
+                operation = "acknowledge"
+            else:
+                completed = pending.get("completed_actions", [])
+                if not isinstance(completed, list):
+                    return False
+                callback_completed = completed_callback_locked(home, pending_id, token)
+                if (pending.get("mode") == "sending" and pending.get("send_token") == token
+                        and pending.get("revision") == revision):
+                    operation = "send"
+                    pending_snapshot = dict(pending)
+                elif token in completed or callback_completed:
+                    operation = "acknowledge"
+                elif pending.get("revision") != revision:
+                    return False
+                else:
+                    mode = pending.get("mode")
+                    if action == "cancel":
+                        if mode not in {"confirm", "edit"}:
+                            return False
+                    elif mode != "confirm":
+                        return False
+                    pending["completed_actions"] = [
+                        value for value in completed if isinstance(value, str)
+                    ][-31:] + [token]
+                    if action == "cancel":
+                        remove_pending(home, pending)
+                        remember_callback_locked(home, pending_id, token)
+                        operation = "acknowledge"
+                    elif action == "edit":
+                        pending["mode"] = "edit"
+                        pending["edit_prompt_sent"] = False
+                        save_pending(home, pending)
+                        remember_callback_locked(home, pending_id, token)
+                        operation = "edit"
+                    elif action == "retry":
+                        pending["mode"] = "retry"
+                        pending["retry_token"] = token
+                        save_pending(home, pending)
+                        operation = "retry"
+                        pending_snapshot = dict(pending)
+                    else:
+                        try:
+                            request_id = _queue_request_locked(
+                                home, str(pending["text"]), int(pending["chat_id"]),
+                                int(pending["message_id"]), int(pending["update_id"]),
+                                "voice", True, True,
+                            )
+                        except (TelegramError, KeyError, TypeError, ValueError):
+                            return False
+                        pending["mode"] = "sending"
+                        pending["send_token"] = token
+                        pending["request_id"] = request_id
+                        save_pending(home, pending)
+                        operation = "send"
+                        pending_snapshot = dict(pending)
+    if operation == "acknowledge":
+        answer_callback(home, callback_id)
+        return True
+    if operation == "edit":
+        answer_callback(home, callback_id)
+        reconcile_pending(home, config)
+        return True
+    if operation == "retry" and pending_snapshot is not None:
+        answer_callback(home, callback_id)
+        return complete_retry(home, config, pending_snapshot)
+    if operation == "send" and pending_snapshot is not None:
+        if not complete_send(home, pending_snapshot):
             return False
+        answer_callback(home, callback_id)
+        return True
     return False
 
 
@@ -1247,7 +1346,6 @@ def request_active(home: Path, work_id: Optional[str] = None,
         return 1
     if work_id is not None and active.get("work_id") != work_id:
         return 1
-    claimed_record: Optional[Dict[str, Any]] = None
     if claimed_request is not None:
         claimed_path = request_path(home, claimed_request)
         if claimed_path is None or claimed_path.parent.name != "handled":
@@ -1255,23 +1353,37 @@ def request_active(home: Path, work_id: Optional[str] = None,
         value = read_json(claimed_path)
         if not isinstance(value, dict) or value.get("request_id") != claimed_request:
             return 1
-        if claimed_request != request_id:
-            if (value.get("continuation_of") != request_id
-                    or value.get("continuation_routing") != "pending"):
-                return 1
-            claimed_record = value
+        if (claimed_request != request_id
+                and (value.get("continuation_of") != request_id
+                     or value.get("continuation_routing") != "pending")):
+            return 1
     print(request_id, flush=True)
-    if claimed_record is not None and claimed_request is not None:
-        with FileLock(state_lock(home)):
-            path = request_path(home, claimed_request)
-            current = read_json(path) if path is not None else None
-            if (isinstance(current, dict)
-                    and current.get("continuation_of") == request_id
-                    and current.get("continuation_routing") == "pending"):
-                current["continuation_routing"] = "routed"
-                current["continuation_routed_at"] = now()
-                atomic_json(path, current)
-        reconcile_closing(home)
+    return 0
+
+
+def continuation_handled(home: Path, claimed_request: str) -> int:
+    with FileLock(state_lock(home)):
+        path = request_path(home, claimed_request)
+        if path is None or path.parent.name != "handled":
+            return die("continuation request not found")
+        record = read_json(path)
+        if not isinstance(record, dict) or record.get("request_id") != claimed_request:
+            return die("continuation request is malformed")
+        predecessor = record.get("continuation_of")
+        routing = record.get("continuation_routing")
+        if not isinstance(predecessor, str) or not safe_id(predecessor):
+            return die("request is not a Telegram continuation")
+        if routing == "routed":
+            return 0
+        active = active_record(home)
+        if (routing != "pending" or active is None
+                or active.get("request_id") != predecessor):
+            return die("continuation predecessor is no longer active")
+        record["continuation_routing"] = "routed"
+        record["continuation_routed_at"] = now()
+        atomic_json(path, record)
+        _sync_request_wakes_locked(home)
+    reconcile_closing(home)
     return 0
 
 
@@ -1534,7 +1646,7 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, request-read, request-handled, request-bind, active-request, send, reply, install, start, stop, status, disable, cleanup.\n"
+        epilog=("Commands: pair, serve, request-read, request-handled, request-bind, active-request, continuation-handled, send, reply, install, start, stop, status, disable, cleanup.\n"
                 "Retention limits: 256 queued requests for 7 days and 4096 handled requests.\n"
                 "Voice limits: 10 MiB, 120 seconds, and a 4096-unit transcript. Temporary audio is restricted to /dev/shm.\n"
                 "FM_TELEGRAM_PARAKEET_CMD and FM_TELEGRAM_WHISPER_CMD override the local transcription commands.\n"
@@ -1567,7 +1679,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_home(active_parser)
     active_group = active_parser.add_mutually_exclusive_group()
     active_group.add_argument("--work-id", help="require an exact lifecycle work binding")
-    active_group.add_argument("--claimed-request", help="consume routing for this handled request")
+    active_group.add_argument("--claimed-request", help="require a recoverably pending handled request route")
+    continuation_parser = sub.add_parser(
+        "continuation-handled", help="acknowledge a handled continuation after its route is consumed"
+    )
+    add_home(continuation_parser)
+    continuation_parser.add_argument("request_id")
     for name, help_text in (("send", "send to the paired private chat"), ("reply", "reply to one Telegram request")):
         command = sub.add_parser(name, help=help_text)
         add_home(command)
@@ -1600,6 +1717,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return request_bind(home, args.request_id, args.work_id)
         if args.command == "active-request":
             return request_active(home, args.work_id, args.claimed_request)
+        if args.command == "continuation-handled":
+            return continuation_handled(home, args.request_id)
         if args.command == "send":
             return send_command(home, text_from_file(args.text_file))
         if args.command == "reply":
