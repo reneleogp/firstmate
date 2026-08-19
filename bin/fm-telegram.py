@@ -1454,7 +1454,7 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any], up
         reconcile_pending(home, config)
         return True
     if isinstance(pending, dict):
-        remove_pending(home, pending)
+        return False
     audio: Optional[Path] = None
     pending: Optional[Dict[str, Any]] = None
     journaled = False

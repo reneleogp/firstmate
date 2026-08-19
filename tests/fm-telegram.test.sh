@@ -886,6 +886,15 @@ grep -F 'I heard this:' "$voice_home/calls.jsonl" >/dev/null || fail "voice conf
 grep -F 'Send to Firstmate' "$voice_home/calls.jsonl" >/dev/null || fail "voice controls missing"
 
 pending_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pending_id"])' "$pending")
+get_file_calls=$(grep -c 'getFile' "$voice_home/calls.jsonl")
+confirmation_calls=$(grep -c 'I heard this:' "$voice_home/calls.jsonl")
+set_updates '[{"update_id":2000,"message":{"message_id":2000,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-must-wait","duration":2,"file_size":20}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pending_id"])' "$pending")" = "$pending_id" ] || fail "a subsequent voice note replaced the active confirmation"
+[ -f "$audio" ] || fail "a subsequent voice note deleted the active confirmation audio"
+[ "$(grep -c 'getFile' "$voice_home/calls.jsonl")" -eq "$get_file_calls" ] || fail "a subsequent voice note was downloaded during an active confirmation"
+[ "$(grep -c 'I heard this:' "$voice_home/calls.jsonl")" -eq "$confirmation_calls" ] || fail "a subsequent voice note created a concurrent confirmation"
+
 edit_data=$(callback_data "$voice_home" edit)
 stale_send_data=$(callback_data "$voice_home" send)
 malformed_callback_answers=$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")
