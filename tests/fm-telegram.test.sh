@@ -264,6 +264,11 @@ import json, sys
 assert json.load(open(sys.argv[1], encoding='utf-8'))['wake_recorded'] is True
 PY
 [ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$request_id" ] || fail "replayed initial claim lost its conversation route"
+printf 'endpoint_task_id=terminal-work\n' > "$home/state/terminal-work.meta"
+if run_tg "$home" request-bind "$request_id" terminal-work >/dev/null 2>&1; then
+  fail "Telegram request bound to a pre-existing terminal work record"
+fi
+[ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$request_id" ] || fail "rejected terminal work binding changed the active route"
 run_tg "$home" request-bind "$request_id" telegram-work >/dev/null
 grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "bind-before-launch lost the initial recovery wake"
 bound_initial_route=$(printf '%s\t%s' "$request_id" telegram-work)
@@ -275,6 +280,10 @@ run_tg "$home" serve --once >/dev/null
 ! grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "published work retained its initial recovery wake"
 [ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$bound_initial_route" ] || fail "published work binding was not recoverable from a stale claim"
 [ "$(run_tg "$home" active-request --work-id telegram-work)" = "$request_id" ] || fail "matching lifecycle work did not resolve its Telegram origin"
+rm -f "$home/state/telegram-work.meta"
+run_tg "$home" serve --once >/dev/null
+! grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "removing published work reopened the initial recovery wake"
+[ "$(run_tg "$home" active-request --work-id telegram-work)" = "$request_id" ] || fail "published Telegram origin depended on an ephemeral work record"
 routing_before=$(grep -c 'sendMessage' "$home/calls.jsonl")
 if run_tg "$home" active-request --work-id terminal-work >/dev/null 2>&1; then
   fail "unrelated terminal work matched the active Telegram origin"
@@ -831,6 +840,12 @@ supervision_needs() {
 [ -f "$unit_dir/firstmate-telegram.service" ] || fail "install must write one user unit"
 supervision_needs "$voice_home" || fail "installed Telegram transport did not keep supervision armed"
 "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null || fail "status must report installed active service"
+cp "$voice_home/config/telegram.json" "$voice_home/pairing-before-active-repair.json"
+if "${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null 2>&1; then
+  fail "pairing changed while the owned Telegram service was active"
+fi
+cmp -s "$voice_home/config/telegram.json" "$voice_home/pairing-before-active-repair.json" || fail "active pairing attempt changed the pinned identity"
+[ "$(cat "$TMP_ROOT/systemctl.active")" = active ] || fail "active pairing attempt stopped the service"
 stop_audio=$(mktemp /dev/shm/firstmate-telegram-stop.XXXXXX)
 python3 - "$voice_home/state/telegram/pending.json" "$stop_audio" <<'PY'
 import json, sys, time
@@ -841,6 +856,7 @@ PY
 [ ! -e "$voice_home/state/telegram/pending.json" ] || fail "stop retained pending voice state"
 if supervision_needs "$voice_home"; then fail "stopped Telegram transport still required supervision"; fi
 if "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null; then fail "stop did not verify inactive state"; fi
+"${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null || fail "inactive owned service refused explicit re-pairing"
 "${lifecycle_env[@]}" "$systemctl_fake" --user start firstmate-telegram.service
 supervision_needs "$voice_home" || fail "direct enabled-service restart did not restore supervision"
 direct_stop_audio=$(mktemp /dev/shm/firstmate-telegram-direct-stop.XXXXXX)

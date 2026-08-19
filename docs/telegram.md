@@ -15,6 +15,7 @@ bin/fm-telegram.py --home "$FM_HOME" pair --user-id <private-user-id> --chat-id 
 ```
 
 The pairing command verifies the bot identity and private chat, then writes the pinned user, chat, and bot identifiers to `config/telegram.json` with mode `0600`.
+Stop an installed service before replacing its pairing; the command refuses to change an owned service's pairing while that service is active.
 The service accepts updates only when both the pinned user and pinned private chat match.
 Install and start the one user service after pairing:
 
@@ -52,7 +53,9 @@ Raw Telegram text and audio never enter wake records, status logs, shell argumen
 The primary receives the request through `bin/fm-telegram-agent-request.sh <local-request-id>`, whose generated context preserves the trusted authority boundary around the untrusted body, and claims it with `request-handled <local-request-id>`.
 The operator can inspect only the stored body with `bin/fm-telegram.py request-read <local-request-id>`.
 An initial claim remains durably wakeable after interruption until the bound work's durable `fm-spawn.sh` record is published.
+Binding refuses a lifecycle identifier that already has a work record, so terminal-originated work cannot acquire a Telegram origin after the fact.
 Binding before launch is safe because `active-request --claimed-request <local-request-id>` exposes the already selected work identifier on recovery and the wake remains until that publication boundary.
+Once publication is observed, its Telegram-origin acknowledgement remains latched even if lifecycle cleanup later removes the work record.
 Lifecycle routing uses `active-request --work-id <work-id>` and refuses unrelated terminal work.
 Replies use the pinned chat without a recipient argument, for example `bin/fm-telegram.py reply <local-request-id> --text-file reply.txt`.
 The terminal reply adds `--final` to clear the active binding and wake the next queued conversation.

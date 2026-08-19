@@ -487,11 +487,29 @@ def active_request_id(home: Path) -> Optional[str]:
     return str(active["request_id"]) if active is not None else None
 
 
-def work_record_published(home: Path, work_id: Any) -> bool:
+def work_record_path(home: Path, work_id: Any) -> Optional[Path]:
     if not isinstance(work_id, str) or not safe_id(work_id):
-        return False
-    path = home / "state" / f"{work_id}.meta"
-    return path.is_file() and not path.is_symlink()
+        return None
+    return home / "state" / f"{work_id}.meta"
+
+
+def work_record_exists(home: Path, work_id: Any) -> bool:
+    path = work_record_path(home, work_id)
+    return path is not None and (path.exists() or path.is_symlink())
+
+
+def latch_work_publication_locked(home: Path,
+                                  active: Dict[str, Any]) -> Dict[str, Any]:
+    if active.get("work_published") is True:
+        return active
+    path = work_record_path(home, active.get("work_id"))
+    if path is None or not path.is_file() or path.is_symlink():
+        return active
+    updated = dict(active)
+    updated["work_published"] = True
+    updated["work_published_at"] = now()
+    atomic_json(active_path(home), updated)
+    return updated
 
 
 def closing_path(home: Path) -> Path:
@@ -520,6 +538,8 @@ def _sync_request_wakes_locked(home: Path) -> None:
     active = active_request_id(home)
     if active is not None:
         active_state = active_record(home)
+        if active_state is not None:
+            active_state = latch_work_publication_locked(home, active_state)
         routed_paths = []
         for path in paths + list(handled.glob("*.json")):
             record = read_json(path, {})
@@ -527,7 +547,7 @@ def _sync_request_wakes_locked(home: Path) -> None:
                 continue
             if (record.get("request_id") == active
                     and active_state is not None
-                    and not work_record_published(home, active_state.get("work_id"))):
+                    and active_state.get("work_published") is not True):
                 routed_paths.append(path)
             elif (record.get("continuation_of") == active
                   and (path.parent == inbox
@@ -1420,7 +1440,18 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> i
             set_telegram_enabled(home, False)
 
 
+def require_pairing_service_inactive(home: Path) -> None:
+    if telegram_enabled_path(home).is_file():
+        raise TelegramError("stop the Telegram service before changing its pairing")
+    if not unit_owned_by(home):
+        return
+    result = systemctl("is-active", SERVICE_NAME, check=False)
+    if result.stdout.strip() not in {"inactive", "failed"}:
+        raise TelegramError("stop the Telegram service before changing its pairing")
+
+
 def pair(home: Path, user_id: int, chat_id: int) -> int:
+    require_pairing_service_inactive(home)
     config_existing = read_json(config_path(home), {})
     config = config_existing if isinstance(config_existing, dict) else {}
     token = token_for(home)
@@ -1438,6 +1469,7 @@ def pair(home: Path, user_id: int, chat_id: int) -> int:
         raise TelegramError("the pinned private chat must belong to the pinned user")
     config.update({"user_id": user_id, "chat_id": chat_id, "bot_id": int(result["id"]),
                    "api_base": api_base(home, config)})
+    require_pairing_service_inactive(home)
     atomic_json(config_path(home), config)
     print("Telegram pairing verified.")
     return 0
@@ -1524,8 +1556,11 @@ def request_bind(home: Path, request_id: str, work_id: str) -> int:
         if bound is not None and bound != work_id:
             return die("active Telegram conversation is bound to different work")
         if bound is None:
+            if work_record_exists(home, work_id):
+                return die("work identifier already has a lifecycle record")
             active["work_id"] = work_id
             active["bound_at"] = now()
+            active["work_published"] = False
             atomic_json(active_path(home), active)
         _sync_request_wakes_locked(home)
     print("Telegram work binding recorded.")
@@ -1866,7 +1901,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     def add_home(command: argparse.ArgumentParser) -> None:
         command.add_argument("--home", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-    pair_parser = sub.add_parser("pair", help="verify and save one private Telegram pairing")
+    pair_parser = sub.add_parser(
+        "pair", help="verify and save one private pairing while its service is inactive"
+    )
     add_home(pair_parser)
     pair_parser.add_argument("--user-id", type=int, required=True)
     pair_parser.add_argument("--chat-id", type=int, required=True)
