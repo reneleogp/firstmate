@@ -49,6 +49,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.connection.shutdown(socket.SHUT_RDWR)
                 self.connection.close()
                 return
+            if (home / 'unauthorized-next-getme').exists():
+                (home / 'unauthorized-next-getme').unlink()
+                raw = json.dumps({'ok': False, 'description': 'Unauthorized'}).encode()
+                self.send_response(401); self.send_header('Content-Length', str(len(raw)))
+                self.end_headers(); self.wfile.write(raw)
+                return
             bot_id = 9902 if '/botreplacement-token/' in self.path else 9901
             return self._write({'id': bot_id, 'is_bot': True})
         if method == 'getChat': return self._write({'id': int(params.get('chat_id', 0)), 'type': 'private'})
@@ -187,6 +193,10 @@ run_tg "$pin_home" serve --once >/dev/null 2>&1
 [ "$?" -eq 1 ] || fail "transient bot verification failure used the permanent configuration exit"
 run_tg "$pin_home" serve --once >/dev/null
 [ "$(find "$pin_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || fail "explicit re-pairing did not authorize the replacement bot"
+touch "$pin_home/unauthorized-next-getme" "$pin_home/state/telegram/enabled"
+run_tg "$pin_home" serve --once >/dev/null 2>&1
+[ "$?" -eq 78 ] || fail "definitive bot authentication failure did not use the permanent configuration exit"
+[ ! -e "$pin_home/state/telegram/enabled" ] || fail "authentication failure left transport supervision active"
 
 rm -f "$home/port"
 start_server "$home" "$home/port"
@@ -210,11 +220,30 @@ run_tg "$home" serve --once >/dev/null
 run_tg "$home" request-read "$(basename "$inbox" .json)" > "$home/read.txt"
 grep -Fx 'please inspect this' "$home/read.txt" >/dev/null || fail "request-read must expose only queued request text"
 request_id=$(basename "$inbox" .json)
+python3 - "$inbox" <<'PY'
+import json, sys
+path = sys.argv[1]
+record = json.load(open(path, encoding='utf-8'))
+record['wake_recorded'] = False
+json.dump(record, open(path, 'w', encoding='utf-8'))
+PY
 run_tg "$home" request-handled "$request_id"
 [ ! -f "$inbox" ] || fail "request-handled must move the private request"
+python3 - "$home/state/telegram/handled/$request_id.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+record = json.load(open(path, encoding='utf-8'))
+assert record['wake_recorded'] is True
+record['wake_recorded'] = False
+json.dump(record, open(path, 'w', encoding='utf-8'))
+PY
 [ "$(run_tg "$home" active-request)" = "$request_id" ] || fail "request handling must persist the active Telegram origin"
 grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "unbound initial claim was not recoverably wakeable"
 run_tg "$home" request-handled "$request_id" || fail "replayed initial claim was not idempotent"
+python3 - "$home/state/telegram/handled/$request_id.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1], encoding='utf-8'))['wake_recorded'] is True
+PY
 [ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$request_id" ] || fail "replayed initial claim lost its conversation route"
 run_tg "$home" request-bind "$request_id" telegram-work >/dev/null
 ! grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "bound initial claim retained its recovery wake"

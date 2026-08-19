@@ -68,9 +68,11 @@ UNSUPPORTED_MESSAGE_CONTENT_FIELDS = frozenset({
 
 
 class TelegramError(RuntimeError):
-    def __init__(self, message: str, delivery_unknown: bool = False):
+    def __init__(self, message: str, delivery_unknown: bool = False,
+                 http_status: Optional[int] = None):
         super().__init__(message)
         self.delivery_unknown = delivery_unknown
+        self.http_status = http_status
 
 
 class PermanentConfigurationError(TelegramError):
@@ -207,7 +209,8 @@ def raw_api_call(home: Path, token: str, method: str,
         with urllib.request.urlopen(request, timeout=45) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
-        raise TelegramError(f"Telegram request failed for {method}") from exc
+        raise TelegramError(f"Telegram request failed for {method}",
+                            http_status=exc.code) from exc
     except (OSError, urllib.error.URLError) as exc:
         raise TelegramError(f"Telegram request failed for {method}", delivery_unknown=True) from exc
     try:
@@ -228,7 +231,14 @@ def verified_token_for(home: Path, config: Optional[Dict[str, Any]] = None) -> s
     token = token_for(home)
     if _VERIFIED_BOT_IDS.get(key) == expected:
         return token
-    result = raw_api_call(home, token, "getMe", {}, pairing)
+    try:
+        result = raw_api_call(home, token, "getMe", {}, pairing)
+    except TelegramError as exc:
+        if exc.http_status in {400, 401, 403, 404}:
+            raise PermanentConfigurationError(
+                "Telegram bot token could not authenticate; pair again"
+            ) from exc
+        raise
     if (not isinstance(result, dict) or result.get("is_bot") is not True
             or not strict_int(result.get("id")) or result.get("id") != expected):
         raise PermanentConfigurationError(
@@ -1446,10 +1456,17 @@ def request_handled(home: Path, request_id: str) -> int:
                 active_state = active_record(home)
                 if active == request_id:
                     if active_state is not None and active_state.get("work_id") is None:
+                        if (isinstance(target_record, dict)
+                                and target_record.get("wake_recorded") is not True):
+                            target_record["wake_recorded"] = True
+                            atomic_json(target, target_record)
                         return 0
                     return die("request is already routed")
                 if (isinstance(target_record, dict)
                         and target_record.get("continuation_of") == active):
+                    if target_record.get("wake_recorded") is not True:
+                        target_record["wake_recorded"] = True
+                        atomic_json(target, target_record)
                     return 0
             return die("request not found")
         if not isinstance(record, dict) or record.get("request_id") != request_id:
@@ -1463,7 +1480,8 @@ def request_handled(home: Path, request_id: str) -> int:
             atomic_json(active_path(home), {"request_id": request_id, "claimed_at": now()})
         elif continuation_of == active:
             record["continuation_routing"] = "pending"
-            atomic_json(source, record)
+        record["wake_recorded"] = True
+        atomic_json(source, record)
         os.replace(source, target)
         private_file(target)
         _sync_request_wakes_locked(home)
