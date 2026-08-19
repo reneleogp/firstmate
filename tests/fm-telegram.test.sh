@@ -179,6 +179,43 @@ fi
 run_tg "$home" pair --user-id 77 --chat-id 77 >/dev/null
 [ "$(path_mode "$home/config/telegram.json")" = 600 ] || fail "pairing config must be mode 0600"
 
+# Home-owned storage components cannot redirect pairing or state outside the selected home.
+unsafe_home=$(new_home unsafe-storage)
+unsafe_target="$TMP_ROOT/unsafe-storage-target"
+mkdir -p "$unsafe_target"
+ln -s "$unsafe_target" "$unsafe_home/state"
+start_server "$unsafe_home" "$unsafe_home/port"
+if run_tg "$unsafe_home" pair --user-id 77 --chat-id 77 >/dev/null 2>&1; then
+  fail "pairing accepted a symlinked state directory"
+fi
+[ -z "$(find "$unsafe_target" -mindepth 1 -print -quit)" ] || fail "symlinked state received Telegram files"
+rm "$unsafe_home/state"
+mkdir "$unsafe_home/state"
+ln -s "$unsafe_target" "$unsafe_home/state/telegram"
+if run_tg "$unsafe_home" pair --user-id 77 --chat-id 77 >/dev/null 2>&1; then
+  fail "pairing accepted a symlinked Telegram state directory"
+fi
+[ -z "$(find "$unsafe_target" -mindepth 1 -print -quit)" ] || fail "symlinked Telegram state received files"
+rm "$unsafe_home/state/telegram"
+printf 'not a directory\n' > "$unsafe_home/state/telegram"
+if run_tg "$unsafe_home" pair --user-id 77 --chat-id 77 >/dev/null 2>&1; then
+  fail "pairing accepted a non-directory Telegram state component"
+fi
+rm "$unsafe_home/state/telegram"
+ln -s "$unsafe_target" "$unsafe_home/config"
+if run_tg "$unsafe_home" pair --user-id 77 --chat-id 77 >/dev/null 2>&1; then
+  fail "pairing accepted a symlinked config directory"
+fi
+[ ! -e "$unsafe_target/telegram.json" ] || fail "symlinked config received pairing state"
+rm "$unsafe_home/config"
+mkdir "$unsafe_home/config"
+printf 'external pairing sentinel\n' > "$unsafe_target/telegram.json"
+ln -s "$unsafe_target/telegram.json" "$unsafe_home/config/telegram.json"
+if run_tg "$unsafe_home" pair --user-id 77 --chat-id 77 >/dev/null 2>&1; then
+  fail "pairing accepted a symlinked config file"
+fi
+[ "$(cat "$unsafe_target/telegram.json")" = "external pairing sentinel" ] || fail "symlinked config file was changed"
+
 # One process pins its verified token, while a later process rejects a changed bot until re-pairing.
 pin_home=$(new_home bot-pinning)
 start_server "$pin_home" "$pin_home/port"
@@ -466,6 +503,12 @@ run_tg "$home" serve --once >/dev/null || fail "oversized identifiers stopped th
 [ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq "$before" ] || fail "oversized identifiers received a reply"
 [ "$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")" -eq "$callbacks_before" ] || fail "oversized callback identifiers were acknowledged"
 ! find "$home/state/telegram/inbox" -name '*4503599627370496*' -print -quit | grep . >/dev/null || fail "oversized identifiers reached request paths"
+zero_inbox_before=$(find "$home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')
+set_updates '[{"update_id":9000,"message":{"message_id":0,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"zero message"}},{"update_id":9001,"callback_query":{"id":"zero-callback-message","from":{"id":77},"message":{"message_id":0,"chat":{"id":77,"type":"private"}},"data":"cancel:any:1"}}]' "$home"
+run_tg "$home" serve --once >/dev/null || fail "zero message identifiers stopped the transport"
+[ "$(find "$home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq "$zero_inbox_before" ] || fail "zero message identifier was queued"
+[ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq "$before" ] || fail "zero message identifier received a reply"
+[ "$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")" -eq "$callbacks_before" ] || fail "zero callback message identifier was acknowledged"
 
 # Locked admission retains only the newest 256 queued requests for text and confirmed voice.
 capacity_home=$(new_home capacity)
@@ -1031,6 +1074,18 @@ lifecycle_env=(env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:
 supervision_needs() {
   bash -c '. "$1"; fm_supervision_needed "$2"' _ "$ROOT/bin/fm-supervision-lib.sh" "$1/state"
 }
+bash -c 'exec -a pi sleep 30' &
+install_primary_pid=$!
+sleep .05
+printf '%s\n' "$install_primary_pid" > "$voice_home/state/.lock"
+if "${lifecycle_env[@]}" "$SCRIPT" install >/dev/null 2>&1; then
+  fail "install activated beside an idle primary without healthy supervision"
+fi
+[ -e "$voice_home/state/telegram/enabled" ] || fail "install precondition discarded the durable Telegram supervision need"
+[ "$(cat "$TMP_ROOT/systemctl.enabled")" = disabled ] || fail "install precondition retained a partially enabled service"
+rm -f "$voice_home/state/.lock"
+kill "$install_primary_pid" 2>/dev/null || true
+wait "$install_primary_pid" 2>/dev/null || true
 touch "$TMP_ROOT/systemctl.fail-start"
 if "${lifecycle_env[@]}" "$SCRIPT" install >/dev/null 2>&1; then
   fail "install accepted a failed service start"
@@ -1058,6 +1113,18 @@ PY
 [ ! -e "$voice_home/state/telegram/pending.json" ] || fail "stop retained pending voice state"
 if supervision_needs "$voice_home"; then fail "stopped Telegram transport still required supervision"; fi
 if "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null; then fail "stop did not verify inactive state"; fi
+bash -c 'exec -a pi sleep 30' &
+start_primary_pid=$!
+sleep .05
+printf '%s\n' "$start_primary_pid" > "$voice_home/state/.lock"
+if "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null 2>&1; then
+  fail "start activated beside an idle primary without healthy supervision"
+fi
+[ -e "$voice_home/state/telegram/enabled" ] || fail "start precondition discarded the durable Telegram supervision need"
+[ "$(cat "$TMP_ROOT/systemctl.active")" = inactive ] || fail "start precondition changed service state"
+rm -f "$voice_home/state/.lock"
+kill "$start_primary_pid" 2>/dev/null || true
+wait "$start_primary_pid" 2>/dev/null || true
 touch "$TMP_ROOT/systemctl.fail-start"
 if "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null 2>&1; then
   fail "start accepted a failed service activation"

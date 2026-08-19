@@ -15,6 +15,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,10 @@ class PermanentConfigurationError(TelegramError):
     pass
 
 
+class WatcherPreconditionError(TelegramError):
+    pass
+
+
 def die(message: str, exit_status: int = 1) -> int:
     print("fm-telegram: " + message, file=sys.stderr)
     return exit_status
@@ -118,6 +123,45 @@ def private_dir(path: Path) -> None:
 
 def private_file(path: Path) -> None:
     os.chmod(path, 0o600)
+
+
+def require_path_kind(path: Path, expected: str) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(mode):
+        raise TelegramError(f"Telegram home component must not be a symlink: {path}")
+    valid = stat.S_ISDIR(mode) if expected == "directory" else stat.S_ISREG(mode)
+    if not valid:
+        raise TelegramError(f"Telegram home component must be a {expected}: {path}")
+
+
+def validate_home_storage(home: Path) -> None:
+    if not home.is_dir() or home.is_symlink():
+        raise TelegramError(f"Telegram home must be an existing directory: {home}")
+    state = home / "state"
+    config = home / "config"
+    telegram = state / "telegram"
+    for path in (state, config, telegram, telegram / "inbox", telegram / "handled"):
+        require_path_kind(path, "directory")
+    for path in (
+        config / CONFIG_NAME,
+        state / ".telegram-cleaned",
+        state / ".telegram-lifecycle.lock",
+        state / ".telegram-service.lock",
+        state / ".telegram-state.lock",
+    ):
+        require_path_kind(path, "regular file")
+    if telegram.is_dir():
+        for child in telegram.iterdir():
+            if child.name in {"inbox", "handled"}:
+                continue
+            require_path_kind(child, "regular file")
+        for directory in (telegram / "inbox", telegram / "handled"):
+            if directory.is_dir():
+                for child in directory.iterdir():
+                    require_path_kind(child, "regular file")
 
 
 def durable_replace(source: Path, target: Path) -> None:
@@ -740,7 +784,7 @@ def bounded_cleanup(home: Path) -> None:
 def deterministic_request_id(source: str, update_id: int, message_id: int) -> str:
     if (source not in {"text", "voice"}
             or not telegram_numeric_id(update_id)
-            or not telegram_numeric_id(message_id)):
+            or not telegram_numeric_id(message_id, positive=True)):
         raise TelegramError("request identifiers are invalid")
     return f"tg-{source}-u{update_id}-m{message_id}"
 
@@ -750,7 +794,8 @@ def _queue_request_locked(home: Path, text: str, chat_id: int, message_id: int,
                           attach_to_active: bool) -> str:
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
         raise TelegramError("request text is empty or too long")
-    if not telegram_numeric_id(update_id) or not telegram_numeric_id(message_id):
+    if (not telegram_numeric_id(update_id)
+            or not telegram_numeric_id(message_id, positive=True)):
         raise TelegramError("request identifiers are invalid")
     request_id = deterministic_request_id(source, update_id, message_id)
     inbox, handled = request_dirs(home)
@@ -1201,7 +1246,7 @@ def pinned_message(config: Dict[str, Any], message: Any) -> Optional[Tuple[Dict[
         return None
     if not telegram_numeric_id(sender_id, positive=True) or sender_id != config.get("user_id"):
         return None
-    if not telegram_numeric_id(message.get("message_id")):
+    if not telegram_numeric_id(message.get("message_id"), positive=True):
         return None
     return message, chat
 
@@ -1330,7 +1375,7 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
             or sender.get("id") != config.get("user_id")):
         return False
     if (not isinstance(message, dict)
-            or not telegram_numeric_id(message.get("message_id"))
+            or not telegram_numeric_id(message.get("message_id"), positive=True)
             or not set(message).issubset(CALLBACK_MESSAGE_FIELDS)):
         return False
     chat = message.get("chat")
@@ -1954,7 +1999,7 @@ def set_telegram_enabled(home: Path, enabled: bool) -> None:
 def prepare_transport_activation(home: Path) -> None:
     set_telegram_enabled(home, True)
     if primary_running(home) and not watcher_running(home):
-        raise TelegramError(
+        raise WatcherPreconditionError(
             "a running primary must establish its harness-owned watcher before Telegram starts; retry after supervision is healthy"
         )
 
@@ -2020,12 +2065,16 @@ def verify_transport_marker(home: Path, expected: bool) -> None:
         raise TelegramError("Telegram supervision state did not converge")
 
 
-def reconcile_failed_activation(home: Path, disable_new_install: bool = False) -> None:
+def reconcile_failed_activation(home: Path, disable_new_install: bool = False,
+                                preserve_supervision: bool = False) -> None:
     active_result = systemctl("is-active", SERVICE_NAME, check=False)
     if active_result.stdout.strip() not in {"inactive", "failed", "unknown", "not-found"}:
         return
-    set_telegram_enabled(home, False)
-    verify_transport_marker(home, False)
+    if preserve_supervision:
+        verify_transport_marker(home, True)
+    else:
+        set_telegram_enabled(home, False)
+        verify_transport_marker(home, False)
     if disable_new_install:
         systemctl("disable", SERVICE_NAME)
         verify_service(enabled=False)
@@ -2053,8 +2102,11 @@ def install(home: Path) -> int:
                 require_unit_owner(home)
                 verify_service(active=True, enabled=True)
                 verify_transport_marker(home, True)
-            except (TelegramError, OSError, ValueError):
-                reconcile_failed_activation(home, enabled_by_install)
+            except (TelegramError, OSError, ValueError) as exc:
+                reconcile_failed_activation(
+                    home, enabled_by_install,
+                    preserve_supervision=isinstance(exc, WatcherPreconditionError),
+                )
                 raise
     print("Telegram service installed and active.")
     return 0
@@ -2072,8 +2124,10 @@ def start_service(home: Path) -> int:
                 require_unit_owner(home)
                 verify_service(active=True)
                 verify_transport_marker(home, True)
-            except (TelegramError, OSError, ValueError):
-                reconcile_failed_activation(home)
+            except (TelegramError, OSError, ValueError) as exc:
+                reconcile_failed_activation(
+                    home, preserve_supervision=isinstance(exc, WatcherPreconditionError)
+                )
                 raise
     print("Telegram service active.")
     return 0
@@ -2240,6 +2294,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         home = home_from(args)
+        validate_home_storage(home)
         if args.command == "pair":
             return pair(home, args.user_id, args.chat_id)
         if args.command == "serve":
