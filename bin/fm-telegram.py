@@ -40,7 +40,9 @@ POLL_TIMEOUT = 30
 
 
 class TelegramError(RuntimeError):
-    pass
+    def __init__(self, message: str, delivery_unknown: bool = False):
+        super().__init__(message)
+        self.delivery_unknown = delivery_unknown
 
 
 def die(message: str) -> int:
@@ -136,7 +138,7 @@ def load_config(home: Path) -> Dict[str, Any]:
     if not isinstance(config, dict):
         raise TelegramError("Telegram pairing is not configured")
     for key in ("user_id", "chat_id", "bot_id"):
-        if not isinstance(config.get(key), int):
+        if not strict_int(config.get(key)):
             raise TelegramError("Telegram pairing is incomplete")
     try:
         mode = path.stat().st_mode & 0o777
@@ -167,12 +169,14 @@ def api_call(home: Path, method: str, params: Optional[Dict[str, Any]] = None,
     try:
         with urllib.request.urlopen(request, timeout=45) as response:
             raw = response.read()
-    except (OSError, urllib.error.URLError) as exc:
+    except urllib.error.HTTPError as exc:
         raise TelegramError(f"Telegram request failed for {method}") from exc
+    except (OSError, urllib.error.URLError) as exc:
+        raise TelegramError(f"Telegram request failed for {method}", delivery_unknown=True) from exc
     try:
         envelope = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise TelegramError(f"Telegram returned invalid data for {method}") from exc
+        raise TelegramError(f"Telegram returned invalid data for {method}", delivery_unknown=True) from exc
     if not isinstance(envelope, dict) or envelope.get("ok") is not True:
         raise TelegramError(f"Telegram rejected {method}")
     return envelope.get("result")
@@ -376,15 +380,31 @@ def closing_path(home: Path) -> Path:
     return state_dir(home) / "closing.json"
 
 
+def request_order_key(path: Path) -> Tuple[int, int, int, str]:
+    record = read_json(path, {})
+    if not isinstance(record, dict):
+        return (-1, -1, -1, path.stem)
+    created = record.get("created_at")
+    update_id = record.get("update_id")
+    message_id = record.get("message_id")
+    request_id = record.get("request_id")
+    return (
+        created if strict_int(created) else -1,
+        update_id if strict_int(update_id) else -1,
+        message_id if strict_int(message_id) else -1,
+        request_id if isinstance(request_id, str) else path.stem,
+    )
+
+
 def bounded_cleanup(home: Path) -> None:
     inbox, handled = request_dirs(home)
     active = active_request_id(home)
     cutoff = now() - INBOX_TTL
-    inbox_files = sorted(inbox.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    inbox_files = sorted(inbox.glob("*.json"), key=request_order_key, reverse=True)
     for index, path in enumerate(inbox_files):
         record = read_json(path, {})
         created = record.get("created_at", 0) if isinstance(record, dict) else 0
-        if index >= MAX_INBOX or not isinstance(created, int) or created < cutoff:
+        if index >= MAX_INBOX or not strict_int(created) or created < cutoff:
             try:
                 consume_safe_wakes(home, [path.stem])
                 path.unlink()
@@ -477,22 +497,36 @@ def reconcile_request(home: Path, request_id: str) -> bool:
     if path.parent.name == "inbox" and record.get("wake_recorded") is not True:
         append_safe_wake(home, request_id)
         record = update_request_record(home, request_id, wake_recorded=True)
-    if record.get("receipt_status") != "sent":
+    receipt_status = record.get("receipt_status")
+    if receipt_status != "sent":
         receipt = record.get("receipt_text")
         chat_id = record.get("chat_id")
-        if not isinstance(receipt, str) or not isinstance(chat_id, int):
+        attempts = record.get("receipt_attempts", 0)
+        if (receipt_status not in {"pending", "delivery_unknown"}
+                or not isinstance(receipt, str) or not strict_int(chat_id)
+                or not strict_int(attempts) or attempts < 0):
             raise TelegramError("request receipt state is malformed")
+        update_request_record(
+            home,
+            request_id,
+            receipt_status="delivery_unknown",
+            receipt_attempts=min(attempts + 1, 65535),
+            receipt_attempted_at=now(),
+        )
         try:
             send_text(home, chat_id, receipt)
-        except TelegramError:
+        except TelegramError as exc:
+            if not exc.delivery_unknown:
+                update_request_record(home, request_id, receipt_status="pending")
             return False
-        update_request_record(home, request_id, receipt_status="sent")
+        update_request_record(home, request_id, receipt_status="sent", receipt_sent_at=now())
     return True
 
 
 def reconcile_requests(home: Path) -> None:
-    inbox, _handled = request_dirs(home)
-    for path in sorted(inbox.glob("*.json"), key=lambda item: item.stat().st_mtime):
+    inbox, handled = request_dirs(home)
+    paths = list(inbox.glob("*.json")) + list(handled.glob("*.json"))
+    for path in sorted(paths, key=request_order_key):
         record = read_json(path)
         if not isinstance(record, dict) or not isinstance(record.get("request_id"), str):
             continue
@@ -669,9 +703,12 @@ def pinned_message(config: Dict[str, Any], message: Any) -> Optional[Tuple[Dict[
     sender = message.get("from")
     if not isinstance(chat, dict) or not isinstance(sender, dict):
         return None
-    if chat.get("type") != "private" or chat.get("id") != config.get("chat_id"):
+    chat_id = chat.get("id")
+    sender_id = sender.get("id")
+    if (chat.get("type") != "private" or not strict_int(chat_id)
+            or chat_id != config.get("chat_id")):
         return None
-    if sender.get("id") != config.get("user_id"):
+    if not strict_int(sender_id) or sender_id != config.get("user_id"):
         return None
     if not strict_int(message.get("message_id")):
         return None
@@ -793,13 +830,14 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
     message = query.get("message")
     if not isinstance(callback_id, str) or not callback_id:
         return False
-    if not isinstance(sender, dict) or sender.get("id") != config.get("user_id"):
+    if (not isinstance(sender, dict) or not strict_int(sender.get("id"))
+            or sender.get("id") != config.get("user_id")):
         return False
     if not isinstance(message, dict) or not strict_int(message.get("message_id")):
         return False
     chat = message.get("chat")
     if (not isinstance(chat, dict) or chat.get("type") != "private"
-            or chat.get("id") != config.get("chat_id")):
+            or not strict_int(chat.get("id")) or chat.get("id") != config.get("chat_id")):
         return False
     callback_data = query.get("data")
     if not isinstance(callback_data, str):
@@ -964,39 +1002,44 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> i
 
     signal.signal(signal.SIGTERM, stop_service)
     signal.signal(signal.SIGINT, stop_service)
-    while not stop:
-        reconcile_closing(home)
-        expire_pending(home)
-        bounded_cleanup(home)
-        reconcile_requests(home)
-        reconcile_pending(home, config)
-        try:
-            updates = api_call(home, "getUpdates", {"offset": offset, "timeout": poll_timeout,
-                                                       "allowed_updates": ["message", "callback_query"]}, config)
-            if not isinstance(updates, list):
-                updates = []
-            for update in updates:
-                if isinstance(update, dict) and strict_int(update.get("update_id")):
-                    offset = max(offset, int(update["update_id"]) + 1)
-                process_update(home, config, update)
+    set_telegram_enabled(home, True)
+    try:
+        while not stop:
+            reconcile_closing(home)
+            expire_pending(home)
+            bounded_cleanup(home)
             reconcile_requests(home)
-        except TelegramError:
+            reconcile_pending(home, config)
+            try:
+                updates = api_call(home, "getUpdates", {"offset": offset, "timeout": poll_timeout,
+                                                           "allowed_updates": ["message", "callback_query"]}, config)
+                if not isinstance(updates, list):
+                    updates = []
+                for update in updates:
+                    if isinstance(update, dict) and strict_int(update.get("update_id")):
+                        offset = max(offset, int(update["update_id"]) + 1)
+                    process_update(home, config, update)
+                reconcile_requests(home)
+            except TelegramError:
+                if once:
+                    return 1
+                time.sleep(2)
             if once:
-                return 1
-            time.sleep(2)
-        if once:
-            break
-    return 0
+                break
+        return 0
+    finally:
+        set_telegram_enabled(home, False)
 
 
 def pair(home: Path, user_id: int, chat_id: int) -> int:
     config_existing = read_json(config_path(home), {})
     config = config_existing if isinstance(config_existing, dict) else {}
     result = api_call(home, "getMe", {}, config)
-    if not isinstance(result, dict) or not isinstance(result.get("id"), int):
+    if not isinstance(result, dict) or not strict_int(result.get("id")):
         raise TelegramError("bot identity could not be verified")
     chat = api_call(home, "getChat", {"chat_id": chat_id}, config)
-    if not isinstance(chat, dict) or chat.get("type") != "private" or chat.get("id") != chat_id:
+    if (not isinstance(chat, dict) or chat.get("type") != "private"
+            or not strict_int(chat.get("id")) or chat.get("id") != chat_id):
         raise TelegramError("pairing requires the pinned private bot DM")
     if user_id <= 0 or chat_id <= 0:
         raise TelegramError("user and chat ids must be positive integers")
@@ -1093,7 +1136,7 @@ def request_active(home: Path, work_id: Optional[str] = None) -> int:
 
 def wake_next_request(home: Path) -> None:
     inbox, _handled = request_dirs(home)
-    paths = sorted(inbox.glob("*.json"), key=lambda item: item.stat().st_mtime)
+    paths = sorted(inbox.glob("*.json"), key=request_order_key)
     if not paths:
         return
     request_id = paths[0].stem
@@ -1226,6 +1269,14 @@ def verify_service(active: Optional[bool] = None, enabled: Optional[bool] = None
             raise TelegramError("Telegram service enabled state did not converge")
 
 
+def verify_transport_marker(home: Path, expected: bool) -> None:
+    deadline = time.monotonic() + 3
+    while telegram_enabled_path(home).is_file() != expected and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if telegram_enabled_path(home).is_file() != expected:
+        raise TelegramError("Telegram supervision state did not converge")
+
+
 def install(home: Path) -> int:
     load_config(home)
     token_for(home)
@@ -1235,9 +1286,9 @@ def install(home: Path) -> int:
     atomic_bytes(path, unit_contents(home).encode())
     systemctl("daemon-reload")
     systemctl("enable", SERVICE_NAME)
-    set_telegram_enabled(home, True)
     systemctl("start", SERVICE_NAME)
     verify_service(active=True, enabled=True)
+    verify_transport_marker(home, True)
     print("Telegram service installed and active.")
     return 0
 
@@ -1245,9 +1296,9 @@ def install(home: Path) -> int:
 def start_service(home: Path) -> int:
     load_config(home)
     require_unit_owner(home)
-    set_telegram_enabled(home, True)
     systemctl("start", SERVICE_NAME)
     verify_service(active=True)
+    verify_transport_marker(home, True)
     print("Telegram service active.")
     return 0
 
@@ -1257,6 +1308,7 @@ def stop_service(home: Path) -> int:
     systemctl("stop", SERVICE_NAME)
     verify_service(active=False)
     set_telegram_enabled(home, False)
+    verify_transport_marker(home, False)
     print("Telegram service stopped.")
     return 0
 
@@ -1273,6 +1325,7 @@ def disable_service(home: Path) -> int:
     systemctl("disable", "--now", SERVICE_NAME)
     verify_service(active=False, enabled=False)
     set_telegram_enabled(home, False)
+    verify_transport_marker(home, False)
     print("Telegram service disabled.")
     return 0
 
@@ -1289,16 +1342,23 @@ def cleanup(home: Path) -> int:
     unit_present = path.exists() or path.is_symlink()
     if not owned and (unit_present or not safely_inactive or not safely_disabled):
         raise TelegramError("Telegram service ownership could not be verified")
+    telegram_state = home / "state" / "telegram"
+    pending_records = []
+    if telegram_state.is_dir() and not telegram_state.is_symlink():
+        pending = read_json(telegram_state / "pending.json")
+        if isinstance(pending, dict):
+            pending_records.append(pending)
     if owned:
         systemctl("disable", "--now", SERVICE_NAME)
         verify_service(active=False, enabled=False)
         path.unlink()
         systemctl("daemon-reload")
-    telegram_state = home / "state" / "telegram"
     if telegram_state.is_dir() and not telegram_state.is_symlink():
         pending = read_json(telegram_state / "pending.json")
         if isinstance(pending, dict):
-            remove_audio(pending)
+            pending_records.append(pending)
+    for pending in pending_records:
+        remove_audio(pending)
     consume_safe_wakes(home)
     if telegram_state.is_symlink() or telegram_state.is_file():
         telegram_state.unlink()
