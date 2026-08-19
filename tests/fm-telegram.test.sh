@@ -171,7 +171,12 @@ request_id=$(basename "$inbox" .json)
 run_tg "$home" request-handled "$request_id"
 [ ! -f "$inbox" ] || fail "request-handled must move the private request"
 [ "$(run_tg "$home" active-request)" = "$request_id" ] || fail "request handling must persist the active Telegram origin"
+grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "unbound initial claim was not recoverably wakeable"
+run_tg "$home" request-handled "$request_id" || fail "replayed initial claim was not idempotent"
+[ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$request_id" ] || fail "replayed initial claim lost its conversation route"
 run_tg "$home" request-bind "$request_id" telegram-work >/dev/null
+! grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "bound initial claim retained its recovery wake"
+if run_tg "$home" request-handled "$request_id" >/dev/null 2>&1; then fail "bound initial claim was routed twice"; fi
 [ "$(run_tg "$home" active-request --work-id telegram-work)" = "$request_id" ] || fail "matching lifecycle work did not resolve its Telegram origin"
 routing_before=$(grep -c 'sendMessage' "$home/calls.jsonl")
 if run_tg "$home" active-request --work-id terminal-work >/dev/null 2>&1; then
@@ -228,7 +233,7 @@ PY
 before=$(grep -c 'sendMessage' "$home/calls.jsonl")
 callbacks_before=$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")
 files_before=$(grep -c 'getFile' "$home/calls.jsonl")
-set_updates '[{"update_id":2,"message":{"message_id":11,"from":{"id":999},"chat":{"id":77,"type":"private"},"text":"ignore"}},{"update_id":3,"message":{"message_id":12,"from":{"id":77},"chat":{"id":77,"type":"group"},"text":"ignore"}},{"update_id":4,"message":{"message_id":13,"from":{"id":77},"chat":{"id":77,"type":"private"},"photo":[{"file_id":"must not download"}]}},{"update_id":5,"edited_message":{"message":{"voice":{"file_id":"must not download"}}}},{"update_id":7,"callback_query":{"id":"bad-shape","from":{"id":77},"data":"cancel:any:1","message":{"message_id":70,"chat":"not-an-object"}}},{"update_id":8,"callback_query":{"from":{"id":77},"data":"cancel:any:1","message":{"message_id":80,"chat":{"id":77,"type":"private"}}}},{"update_id":true,"message":{"message_id":81,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"boolean update"}},{"update_id":81,"message":{"message_id":true,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"boolean message"}},{"update_id":82,"message":{"message_id":82,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"","duration":2,"file_size":20}}},{"update_id":83,"message":{"message_id":83,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-bool-duration","duration":true,"file_size":20}}},{"update_id":84,"message":{"message_id":84,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-bool-size","duration":2,"file_size":true}}}]' "$home"
+set_updates '[{"update_id":2,"message":{"message_id":11,"from":{"id":999},"chat":{"id":77,"type":"private"},"text":"ignore"}},{"update_id":3,"message":{"message_id":12,"from":{"id":77},"chat":{"id":77,"type":"group"},"text":"ignore"}},{"update_id":4,"message":{"message_id":13,"from":{"id":77},"chat":{"id":77,"type":"private"},"photo":[{"file_id":"must not download"}]}},{"update_id":5,"edited_message":{"message":{"voice":{"file_id":"must not download"}}}},{"update_id":7,"callback_query":{"id":"bad-shape","from":{"id":77},"data":"cancel:any:1","message":{"message_id":70,"chat":"not-an-object"}}},{"update_id":8,"callback_query":{"from":{"id":77},"data":"cancel:any:1","message":{"message_id":80,"chat":{"id":77,"type":"private"}}}},{"update_id":true,"message":{"message_id":81,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"boolean update"}},{"update_id":81,"message":{"message_id":true,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"boolean message"}},{"update_id":82,"message":{"message_id":82,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"","duration":2,"file_size":20}}},{"update_id":83,"message":{"message_id":83,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-bool-duration","duration":true,"file_size":20}}},{"update_id":84,"message":{"message_id":84,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-bool-size","duration":2,"file_size":true}}},{"update_id":85,"message":{"message_id":85,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"conflicting text","photo":[{"file_id":"must not download"}]}},{"update_id":86,"message":{"message_id":86,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"must not download","duration":2,"file_size":20},"sticker":{"file_id":"must not download"}}},{"update_id":87,"message":{"message_id":87,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"conflicting update"},"edited_message":{"message_id":88,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"must not parse"}}]' "$home"
 run_tg "$home" serve --once >/dev/null
 [ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq "$before" ] || fail "unsupported or unpinned updates must be silent"
 [ "$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")" -eq "$callbacks_before" ] || fail "malformed callback received an acknowledgement"
@@ -308,7 +313,7 @@ grep -F "telegram $live_id" "$home/state/.wake-queue" >/dev/null || fail "finali
 ! grep -F "telegram $later_id" "$home/state/.wake-queue" >/dev/null || fail "mutable request mtime reordered the Telegram conversation queue"
 run_tg "$home" request-handled "$live_id" >/dev/null || fail "recovered next conversation remained blocked by its predecessor"
 
-# A delivery-unknown receipt is retained across a claim and reconciled from handled state.
+# A delivery-unknown receipt backs off, survives a claim, and reconciles from handled state.
 retry_home=$(new_home retry)
 start_server "$retry_home" "$retry_home/port"
 run_tg "$retry_home" pair --user-id 77 --chat-id 77 >/dev/null
@@ -321,10 +326,28 @@ python3 - "$retry_request" <<'PY'
 import json, sys
 record = json.load(open(sys.argv[1]))
 assert record['receipt_status'] == 'delivery_unknown'
-assert record['receipt_attempts'] == 2
+assert record['receipt_attempts'] == 1
+assert record['receipt_unknown_attempts'] == 1
+assert record['receipt_retry_at'] > record['receipt_attempted_at']
 PY
+run_tg "$retry_home" serve --once >/dev/null
+[ "$(grep -c 'sendMessage' "$retry_home/calls.jsonl")" -eq 1 ] || fail "delivery-unknown receipt ignored its retry backoff"
+python3 - "$retry_request" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1])); data['receipt_retry_at'] = 0
+json.dump(data, open(sys.argv[1], 'w'))
+PY
+run_tg "$retry_home" serve --once >/dev/null
 retry_id=$(basename "$retry_request" .json)
 run_tg "$retry_home" request-handled "$retry_id" >/dev/null
+python3 - "$retry_home/state/telegram/handled/$retry_id.json" <<'PY'
+import json, sys
+path = sys.argv[1]; data = json.load(open(path))
+assert data['receipt_status'] == 'delivery_unknown'
+assert data['receipt_attempts'] == 2
+data['receipt_retry_at'] = 0
+json.dump(data, open(path, 'w'))
+PY
 set_updates '[]' "$retry_home"
 run_tg "$retry_home" serve --once >/dev/null
 python3 - "$retry_home/state/telegram/handled/$retry_id.json" <<'PY'
@@ -334,6 +357,34 @@ PY
 [ "$(grep -c 'sendMessage' "$retry_home/calls.jsonl")" -eq 3 ] || fail "handled delivery-unknown receipt was not reconciled"
 ! grep -F 'ambient-wrong-token' "$retry_home/calls.jsonl" >/dev/null || fail "ambient token overrode the selected home's .env token"
 grep -F '/bottest-only-token/' "$retry_home/calls.jsonl" >/dev/null || fail "service did not use the selected home's .env token"
+
+# Delivery-unknown recovery reaches a finite terminal state instead of retrying forever.
+terminal_home=$(new_home terminal-receipt)
+start_server "$terminal_home" "$terminal_home/port"
+run_tg "$terminal_home" pair --user-id 77 --chat-id 77 >/dev/null
+printf '4\n' > "$terminal_home/disconnect-after-send-count"
+set_updates '[{"update_id":16,"message":{"message_id":16,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"bound my receipt retries"}}]' "$terminal_home"
+run_tg "$terminal_home" serve --once >/dev/null
+terminal_request="$terminal_home/state/telegram/inbox/tg-text-u16-m16.json"
+for expected in 2 3; do
+  python3 - "$terminal_request" <<'PY'
+import json, sys
+path = sys.argv[1]; data = json.load(open(path)); data['receipt_retry_at'] = 0
+json.dump(data, open(path, 'w'))
+PY
+  run_tg "$terminal_home" serve --once >/dev/null
+  python3 - "$terminal_request" "$expected" <<'PY'
+import json, sys
+record = json.load(open(sys.argv[1]))
+assert record['receipt_attempts'] == int(sys.argv[2])
+PY
+done
+python3 - "$terminal_request" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))['receipt_status'] == 'delivery_unknown_terminal'
+PY
+run_tg "$terminal_home" serve --once >/dev/null
+[ "$(grep -c 'sendMessage' "$terminal_home/calls.jsonl")" -eq 3 ] || fail "terminal delivery-unknown receipt retried beyond its bound"
 expiry_home=$(new_home expiry)
 start_server "$expiry_home" "$expiry_home/port"
 run_tg "$expiry_home" pair --user-id 77 --chat-id 77 >/dev/null

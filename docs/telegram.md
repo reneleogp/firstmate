@@ -36,6 +36,7 @@ If a primary is already running without a healthy watcher, activation records th
 The reply means queued, not started or completed.
 Telegram update and message identifiers are deduplicated in a bounded private record, and deterministic local request identifiers let interrupted processing reconcile the same queued request instead of creating another request.
 Receipt attempts enter a durable delivery-unknown state before the Bot API call and are reconciled from either the inbox or handled-request directory.
+Delivery-unknown recovery uses finite backoff and stops in a terminal delivery-unknown state after the attempt limit reported by `--help`.
 If the service loses the response or crashes after Telegram accepts a receipt, recovery may send that receipt again because the Bot API provides no idempotency key.
 Unknown, malformed, unpinned, and unsupported updates are silently dropped.
 Only private text and Telegram voice notes are accepted, and other media is not downloaded.
@@ -50,7 +51,7 @@ The service writes only a private request record and a safe wake containing its 
 Raw Telegram text and audio never enter wake records, status logs, shell arguments, unit files, diagnostics, or tracked files.
 The primary receives the request through `bin/fm-telegram-agent-request.sh <local-request-id>`, whose generated context preserves the trusted authority boundary around the untrusted body, and claims it with `request-handled <local-request-id>`.
 The operator can inspect only the stored body with `bin/fm-telegram.py request-read <local-request-id>`.
-When the request receives a lifecycle work identifier, `request-bind <local-request-id> <work-id>` persists the exact origin binding after compaction or restart.
+An initial claim remains durably wakeable after interruption until `request-bind <local-request-id> <work-id>` persists its lifecycle origin binding.
 Lifecycle routing uses `active-request --work-id <work-id>` and refuses unrelated terminal work.
 Replies use the pinned chat without a recipient argument, for example `bin/fm-telegram.py reply <local-request-id> --text-file reply.txt`.
 The terminal reply adds `--final` to clear the active binding and wake the next queued conversation.
