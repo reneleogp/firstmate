@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import secrets
@@ -34,6 +35,7 @@ MAX_SEEN = 4096
 MAX_HANDLED = 4096
 MAX_INBOX = 256
 MAX_PENDING_VOICES = 64
+MAX_RESPONSE_JOURNAL = 256
 MAX_ATOMIC_TEMPS = 256
 MAX_TEXT = 12000
 MAX_TRANSCRIPT_UNITS = 4096
@@ -50,6 +52,7 @@ CALLBACK_DELIVERY_ATTEMPTS = 3
 TELEGRAM_API_BASE = "https://api.telegram.org"
 PERMANENT_CONFIG_EXIT = 78
 FINAL_CONTINUATION_PENDING_EXIT = 2
+DELIVERY_UNKNOWN_EXIT = 3
 FIRSTMATE_REPLY_LABEL = "Firstmate · "
 MESSAGE_ENVELOPE_FIELDS = frozenset({
     "author_signature", "business_connection_id", "chat", "date", "direct_messages_topic",
@@ -69,6 +72,8 @@ ATOMIC_STATE_TARGETS = frozenset({
     "active.json", "admission-sequence.json", "callback-actions.json", "closing.json",
     "enabled", "pending.json", "pending-voice-queue.json", "seen.json",
 })
+RESPONSE_TERMINAL_STATES = frozenset({"pending", "rendering", "rendered"})
+RESPONSE_DELIVERY_STATES = frozenset({"pending", "delivery_unknown", "rejected", "sent"})
 _PROCESS_TOKENS: Dict[Path, str] = {}
 _VERIFIED_BOT_IDS: Dict[Path, int] = {}
 _TEST_API_BASES: Dict[Path, str] = {}
@@ -166,7 +171,9 @@ def validate_home_storage(home: Path) -> None:
     state = home / "state"
     config = home / "config"
     telegram = state / "telegram"
-    for path in (state, config, telegram, telegram / "inbox", telegram / "handled"):
+    for path in (
+            state, config, telegram, telegram / "inbox", telegram / "handled",
+            telegram / "responses"):
         require_path_kind(path, "directory")
     for path in (
         config / CONFIG_NAME,
@@ -179,10 +186,11 @@ def validate_home_storage(home: Path) -> None:
         require_path_kind(path, "regular file")
     if telegram.is_dir():
         for child in telegram.iterdir():
-            if child.name in {"inbox", "handled"}:
+            if child.name in {"inbox", "handled", "responses"}:
                 continue
             require_path_kind(child, "regular file")
-        for directory in (telegram / "inbox", telegram / "handled"):
+        for directory in (
+                telegram / "inbox", telegram / "handled", telegram / "responses"):
             if directory.is_dir():
                 for child in directory.iterdir():
                     require_path_kind(child, "regular file")
@@ -525,6 +533,20 @@ def request_dirs(home: Path, create: bool = True) -> Tuple[Path, Path]:
     return inbox, handled
 
 
+def response_dir(home: Path, create: bool = True) -> Path:
+    path = state_dir(home) / "responses"
+    if create:
+        private_dir(path)
+    return path
+
+
+def response_paths(home: Path, response_id: str) -> Tuple[Path, Path]:
+    if not response_id.isascii() or not safe_id(response_id) or len(response_id) > 128:
+        raise TelegramError("response identifier is invalid")
+    root = response_dir(home)
+    return root / f"{response_id}.json", root / f"{response_id}.txt"
+
+
 def safe_id(value: str) -> bool:
     return bool(value) and all(ch.isalnum() or ch in "._-" for ch in value)
 
@@ -799,6 +821,52 @@ def closing_path(home: Path) -> Path:
     return state_dir(home) / "closing.json"
 
 
+def response_record_locked(home: Path, response_id: str) -> Optional[Dict[str, Any]]:
+    metadata_path, body_path = response_paths(home, response_id)
+    record = read_json(metadata_path)
+    if not isinstance(record, dict) or record.get("response_id") != response_id:
+        return None
+    claimed_request = record.get("claimed_request_id")
+    conversation_id = record.get("conversation_id")
+    terminal_status = record.get("terminal_status")
+    telegram_status = record.get("telegram_status")
+    if (not isinstance(claimed_request, str) or not safe_id(claimed_request)
+            or not isinstance(conversation_id, str) or not safe_id(conversation_id)
+            or not isinstance(record.get("final"), bool)
+            or terminal_status not in RESPONSE_TERMINAL_STATES
+            or telegram_status not in RESPONSE_DELIVERY_STATES
+            or not strict_int(record.get("created_at"))
+            or not body_path.is_file() or body_path.is_symlink()):
+        raise TelegramError("Telegram response journal is malformed")
+    try:
+        body = body_path.read_bytes()
+        text = body.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise TelegramError("Telegram response journal is malformed") from exc
+    if (not text.startswith(FIRSTMATE_REPLY_LABEL)
+            or record.get("body_sha256") != hashlib.sha256(body).hexdigest()):
+        raise TelegramError("Telegram response journal is malformed")
+    return record
+
+
+def claimed_conversation_locked(home: Path, claimed_request: str) -> Optional[str]:
+    path = request_path(home, claimed_request)
+    if path is None or path.parent.name != "handled":
+        return None
+    record = read_json(path)
+    active = active_record(home)
+    if (not isinstance(record, dict) or record.get("request_id") != claimed_request
+            or active is None):
+        return None
+    conversation_id = str(active["request_id"])
+    if claimed_request == conversation_id:
+        return conversation_id
+    if (record.get("continuation_of") == conversation_id
+            and record.get("continuation_routing") == "pending"):
+        return conversation_id
+    return None
+
+
 def request_order_key(path: Path) -> Tuple[int, int, int, int, str]:
     record = read_json(path, {})
     if not isinstance(record, dict):
@@ -903,6 +971,14 @@ def owned_atomic_temp(home: Path, path: Path) -> bool:
     root = state_dir(home)
     if path.parent == root:
         return target in ATOMIC_STATE_TARGETS
+    if path.parent == root / "responses":
+        if target.endswith(".json"):
+            response_id = target[:-5]
+        elif target.endswith(".txt"):
+            response_id = target[:-4]
+        else:
+            return False
+        return safe_id(response_id)
     if path.parent not in {root / "inbox", root / "handled"} or not target.endswith(".json"):
         return False
     request_id = target[:-5]
@@ -923,7 +999,7 @@ def owned_atomic_temp(home: Path, path: Path) -> bool:
 def cleanup_atomic_temps_locked(home: Path) -> None:
     root = state_dir(home)
     paths = []
-    for directory in (root, root / "inbox", root / "handled"):
+    for directory in (root, root / "inbox", root / "handled", root / "responses"):
         if not directory.is_dir() or directory.is_symlink():
             continue
         for path in directory.iterdir():
@@ -945,6 +1021,42 @@ def cleanup_atomic_temps_locked(home: Path) -> None:
                 private_file(path)
         except OSError:
             pass
+
+
+def cleanup_response_journal_locked(home: Path) -> None:
+    root = response_dir(home)
+    records = []
+    referenced_bodies = set()
+    for metadata_path in root.glob("*.json"):
+        try:
+            record = response_record_locked(home, metadata_path.stem)
+        except TelegramError:
+            record = None
+        if record is None:
+            durable_unlink(metadata_path)
+            durable_unlink(root / f"{metadata_path.stem}.txt")
+            continue
+        body_path = root / f"{metadata_path.stem}.txt"
+        referenced_bodies.add(body_path.name)
+        records.append((int(record["created_at"]), metadata_path, body_path, record))
+    for body_path in root.glob("*.txt"):
+        if body_path.name not in referenced_bodies:
+            durable_unlink(body_path)
+    records.sort(key=lambda item: item[0], reverse=True)
+    retained = [item for item in records
+                if request_path(home, str(item[3]["claimed_request_id"])) is not None]
+    excess = max(0, len(retained) - MAX_RESPONSE_JOURNAL)
+    for _created_at, metadata_path, body_path, record in reversed(records):
+        claimed_request = str(record["claimed_request_id"])
+        completed = (record.get("terminal_status") in {"rendering", "rendered"}
+                     and record.get("telegram_status") == "sent")
+        remove = request_path(home, claimed_request) is None
+        if not remove and completed and excess > 0:
+            remove = True
+            excess -= 1
+        if remove:
+            durable_unlink(metadata_path)
+            durable_unlink(body_path)
 
 
 def bounded_cleanup(home: Path) -> None:
@@ -973,6 +1085,7 @@ def bounded_cleanup(home: Path) -> None:
                 durable_unlink(path)
             except OSError:
                 pass
+        cleanup_response_journal_locked(home)
         pending = state_dir(home) / "pending.json"
         data = read_json(pending)
         try:
@@ -1338,19 +1451,22 @@ def save_pending(home: Path, data: Dict[str, Any]) -> None:
     atomic_json(pending_path(home), data)
 
 
-def command_for(config: Dict[str, Any], kind: str) -> str:
+def command_for(config: Dict[str, Any], kind: str) -> Tuple[str, bool]:
     env_key = "FM_TELEGRAM_PARAKEET_CMD" if kind == "parakeet" else "FM_TELEGRAM_WHISPER_CMD"
     value = os.environ.get(env_key)
+    environment_override = value is not None
     if value is None:
         value = config.get("parakeet_command" if kind == "parakeet" else "whisper_command")
     if not value:
         value = "parakeet-tdt-0.6b-v3" if kind == "parakeet" else "whisper-small-q8"
-    return str(value)
+    return str(value), environment_override
 
 
 def transcribe(home: Path, config: Dict[str, Any], audio: Path, kind: str) -> str:
-    command = command_for(config, kind)
-    parts = [command] if command.startswith("/") else shlex.split(command)
+    command, environment_override = command_for(config, kind)
+    parts = shlex.split(command) if environment_override else (
+        [command] if command.startswith("/") else shlex.split(command)
+    )
     if not parts:
         raise TelegramError("voice transcription command is empty")
     if any("{audio}" in part for part in parts):
@@ -2165,7 +2281,7 @@ def identity_bound_state_exists(home: Path) -> bool:
         path = root / name
         if path.exists() or path.is_symlink():
             return True
-    for name in ("inbox", "handled"):
+    for name in ("inbox", "handled", "responses"):
         path = root / name
         if path.is_symlink() or (path.exists() and not path.is_dir()):
             return True
@@ -2517,6 +2633,91 @@ def wake_next_request(home: Path) -> None:
     sync_request_wakes(home)
 
 
+def response_stage(home: Path, claimed_request: str, response_id: str,
+                   text: str, final: bool = False) -> int:
+    if (not text.startswith(FIRSTMATE_REPLY_LABEL)
+            or unicode_text_units(text) is None):
+        return die("Telegram response must be valid UTF-8 beginning with the static Firstmate label")
+    body = text.encode("utf-8")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        metadata_path, body_path = response_paths(home, response_id)
+        existing = response_record_locked(home, response_id)
+        if existing is not None:
+            try:
+                existing_body = body_path.read_bytes()
+            except OSError as exc:
+                raise TelegramError("Telegram response journal is malformed") from exc
+            if (existing.get("claimed_request_id") != claimed_request
+                    or existing.get("final") is not final or existing_body != body):
+                return die("response identity is already bound to different content or route")
+            print(str(body_path), flush=True)
+            return 0
+        conversation_id = claimed_conversation_locked(home, claimed_request)
+        if conversation_id is None:
+            return die("claimed Telegram response route is not active")
+        if final and claimed_request != conversation_id:
+            return die("a continuation response cannot close its predecessor")
+        cleanup_response_journal_locked(home)
+        if len(list(response_dir(home).glob("*.json"))) >= MAX_RESPONSE_JOURNAL:
+            return die("Telegram response journal is full")
+        atomic_bytes(body_path, body)
+        atomic_json(metadata_path, {
+            "response_id": response_id,
+            "claimed_request_id": claimed_request,
+            "conversation_id": conversation_id,
+            "final": final,
+            "body_sha256": hashlib.sha256(body).hexdigest(),
+            "created_at": now(),
+            "terminal_status": "pending",
+            "telegram_status": "pending",
+            "telegram_attempts": 0,
+        })
+    bounded_cleanup(home)
+    print(str(body_path), flush=True)
+    return 0
+
+
+def response_status(home: Path, claimed_request: str, response_id: str) -> int:
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        record = response_record_locked(home, response_id)
+        if record is None or record.get("claimed_request_id") != claimed_request:
+            return 1
+        _metadata_path, body_path = response_paths(home, response_id)
+        final = "final" if record["final"] else "non-final"
+        print(f"{body_path}\t{record['terminal_status']}\t{record['telegram_status']}\t{final}")
+    return 0
+
+
+def response_render(home: Path, claimed_request: str, response_id: str) -> int:
+    with FileLock(lifecycle_lock(home)):
+        with FileLock(state_lock(home)):
+            require_state_available_locked(home)
+            record = response_record_locked(home, response_id)
+            if record is None or record.get("claimed_request_id") != claimed_request:
+                return die("staged Telegram response not found")
+            if record["terminal_status"] != "pending":
+                return 0
+            metadata_path, body_path = response_paths(home, response_id)
+            record["terminal_status"] = "rendering"
+            record["terminal_attempted_at"] = now()
+            atomic_json(metadata_path, record)
+            body = body_path.read_bytes()
+        sys.stdout.buffer.write(body)
+        sys.stdout.buffer.flush()
+        with FileLock(state_lock(home)):
+            current = response_record_locked(home, response_id)
+            if (current is not None
+                    and current.get("claimed_request_id") == claimed_request
+                    and current.get("terminal_status") == "rendering"):
+                metadata_path, _body_path = response_paths(home, response_id)
+                current["terminal_status"] = "rendered"
+                current["terminal_rendered_at"] = now()
+                atomic_json(metadata_path, current)
+    return 0
+
+
 def reconcile_closing(home: Path) -> None:
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
@@ -2543,58 +2744,106 @@ def reconcile_closing(home: Path) -> None:
         durable_unlink(closing_path(home))
 
 
-def _send_command_locked(home: Path, text: str, request_id: Optional[str] = None,
-                         final: bool = False) -> int:
+def _send_command_locked(home: Path, text: str) -> int:
     config = load_config(home)
-    chat_id = int(config["chat_id"])
-    if final and request_id is None:
-        raise TelegramError("only a request reply can be final")
-    if request_id is not None and not text.startswith(FIRSTMATE_REPLY_LABEL):
-        raise TelegramError("Telegram reply text must begin with the static Firstmate label")
-    record: Optional[Dict[str, Any]] = None
-    if request_id is not None:
-        path = request_path(home, request_id)
-        if path is None:
-            return die("request not found")
-        value = read_json(path)
-        if not isinstance(value, dict) or value.get("origin") != "telegram":
-            return die("request is not a Telegram request")
-        record = value
-        if active_request_id(home) != request_id:
-            if final and record.get("final_sent") is True:
-                reconcile_closing(home)
-                print("Telegram final reply already sent.")
-                return 0
-            return die("request is not the active Telegram conversation")
-        chat_id = int(record["chat_id"])
-    final_already_sent = bool(final and record is not None and record.get("final_sent") is True)
-    if not final_already_sent:
-        send_text(home, chat_id, text)
-    if final and request_id is not None:
-        with FileLock(state_lock(home)):
-            current = active_record(home)
-            if current is None or current.get("request_id") != request_id:
-                raise TelegramError("active Telegram conversation changed during final reply")
-            _update_request_record_locked(home, request_id, final_sent=True, final_sent_at=now())
-            atomic_json(closing_path(home), {"request_id": request_id, "created_at": now()})
-        reconcile_closing(home)
-        with FileLock(state_lock(home)):
-            closing = read_json(closing_path(home))
-            if isinstance(closing, dict) and closing.get("request_id") == request_id:
-                status = "already sent" if final_already_sent else "sent"
-                print(f"Telegram final reply {status}; continuation handling remains pending.")
-                return FINAL_CONTINUATION_PENDING_EXIT
-        status = "already sent" if final_already_sent else "sent"
-        print(f"Telegram final reply {status}.")
-        return 0
-    print("Telegram reply sent.")
+    send_text(home, int(config["chat_id"]), text)
+    print("Telegram message sent.")
     return 0
 
 
-def send_command(home: Path, text: str, request_id: Optional[str] = None,
-                 final: bool = False) -> int:
+def reconcile_staged_final(home: Path, request_id: str) -> bool:
+    with FileLock(state_lock(home)):
+        current = active_record(home)
+        path = request_path(home, request_id)
+        request = read_json(path) if path is not None else None
+        if current is not None and current.get("request_id") == request_id:
+            _update_request_record_locked(home, request_id, final_sent=True, final_sent_at=now())
+            atomic_json(closing_path(home), {"request_id": request_id, "created_at": now()})
+        elif not isinstance(request, dict) or request.get("final_sent") is not True:
+            raise TelegramError("active Telegram conversation changed during final reply")
+    reconcile_closing(home)
+    with FileLock(state_lock(home)):
+        closing = read_json(closing_path(home))
+        return isinstance(closing, dict) and closing.get("request_id") == request_id
+
+
+def _send_staged_response_locked(home: Path, request_id: str, response_id: str) -> int:
+    config = load_config(home)
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        record = response_record_locked(home, response_id)
+        if record is None or record.get("conversation_id") != request_id:
+            return die("staged Telegram response does not match the conversation")
+        if record["terminal_status"] == "pending":
+            return die("staged Telegram response has not been rendered in the terminal")
+        metadata_path, body_path = response_paths(home, response_id)
+        request_path_value = request_path(home, request_id)
+        request = read_json(request_path_value) if request_path_value is not None else None
+        if not isinstance(request, dict) or request.get("origin") != "telegram":
+            return die("request is not a Telegram request")
+        telegram_status = str(record["telegram_status"])
+        if telegram_status == "delivery_unknown":
+            print("Telegram reply delivery remains unknown; not resent.")
+            return DELIVERY_UNKNOWN_EXIT
+        already_sent = telegram_status == "sent"
+        if not already_sent:
+            if active_request_id(home) != request_id:
+                return die("request is not the active Telegram conversation")
+            attempts = record.get("telegram_attempts", 0)
+            if not strict_int(attempts) or attempts < 0:
+                attempts = 0
+            record["telegram_attempts"] = attempts + 1
+            record["telegram_status"] = "delivery_unknown"
+            record["telegram_attempted_at"] = now()
+            atomic_json(metadata_path, record)
+            body = body_path.read_bytes().decode("utf-8")
+            chat_id = int(request["chat_id"])
+        else:
+            body = ""
+            chat_id = int(request["chat_id"])
+    if not already_sent:
+        try:
+            send_text(home, chat_id, body)
+        except TelegramError as exc:
+            if not exc.delivery_unknown:
+                with FileLock(state_lock(home)):
+                    current = response_record_locked(home, response_id)
+                    if (current is not None
+                            and current.get("telegram_status") == "delivery_unknown"):
+                        metadata_path, _body_path = response_paths(home, response_id)
+                        current["telegram_status"] = "rejected"
+                        current["telegram_rejected_at"] = now()
+                        atomic_json(metadata_path, current)
+            raise
+        with FileLock(state_lock(home)):
+            current = response_record_locked(home, response_id)
+            if current is None or current.get("telegram_status") != "delivery_unknown":
+                raise TelegramError("Telegram response journal changed during delivery")
+            metadata_path, _body_path = response_paths(home, response_id)
+            current["telegram_status"] = "sent"
+            current["telegram_sent_at"] = now()
+            atomic_json(metadata_path, current)
+    if record["final"]:
+        continuations_pending = reconcile_staged_final(home, request_id)
+        status = "already sent" if already_sent else "sent"
+        if continuations_pending:
+            print(f"Telegram final reply {status}; continuation handling remains pending.")
+            return FINAL_CONTINUATION_PENDING_EXIT
+        print(f"Telegram final reply {status}.")
+        return 0
+    status = "already sent" if already_sent else "sent"
+    print(f"Telegram reply {status}.")
+    return 0
+
+
+def send_command(home: Path, text: str) -> int:
     with FileLock(lifecycle_lock(home)):
-        return _send_command_locked(home, text, request_id, final)
+        return _send_command_locked(home, text)
+
+
+def reply_command(home: Path, request_id: str, response_id: str) -> int:
+    with FileLock(lifecycle_lock(home)):
+        return _send_staged_response_locked(home, request_id, response_id)
 
 
 def telegram_enabled_path(home: Path) -> Path:
@@ -2892,13 +3141,13 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, request-read, request-handled, request-bind, request-routed, active-request, continuation-handled, send, reply, install, start, stop, status, disable, cleanup.\n"
-                "Retention limits: 256 queued requests for 7 days and 4096 handled requests.\n"
+        epilog=("Commands: pair, serve, request-read, request-handled, request-bind, request-routed, active-request, continuation-handled, response-stage, response-status, response-render, send, reply, install, start, stop, status, disable, cleanup.\n"
+                "Retention limits: 256 queued requests for 7 days, 4096 handled requests, and 256 staged responses.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
                 "Voice limits: 10 MiB, 120 seconds, a 4096-unit transcript, and 64 waiting notes. Temporary audio is restricted to /dev/shm.\n"
                 "Pairing accepts --parakeet-command and --whisper-command as absolute executable paths; configured paths must be regular executable files.\n"
                 "FM_TELEGRAM_PARAKEET_CMD and FM_TELEGRAM_WHISPER_CMD override the local transcription commands for one process.\n"
-                "Text for send and reply is read with --text-file or stdin (-); no recipient argument is accepted."),
+                "Response staging and send text read UTF-8 from --text-file or stdin (-); no recipient argument is accepted."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--home", help="the one Firstmate home to use")
@@ -2967,19 +3216,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_home(continuation_parser)
     continuation_parser.add_argument("request_id")
-    for name, help_text in (("send", "send to the paired private chat"), ("reply", "reply to one Telegram request")):
-        command = sub.add_parser(name, help=help_text)
-        add_home(command)
-        if name == "reply":
-            command.add_argument("request_id")
-            command.add_argument(
-                "--final", action="store_true",
-                help="close after delivery; exits 2 while queued continuations keep it active",
-            )
-        text_help = "UTF-8 text file, or - for stdin"
-        if name == "reply":
-            text_help = "UTF-8 response beginning with 'Firstmate · '; sent unchanged, or - for stdin"
-        command.add_argument("--text-file", required=True, help=text_help)
+    stage_parser = sub.add_parser(
+        "response-stage", help="durably bind one labeled response file to a claimed route"
+    )
+    add_home(stage_parser)
+    stage_parser.add_argument("claimed_request_id")
+    stage_parser.add_argument("response_id")
+    stage_parser.add_argument("--final", action="store_true")
+    stage_parser.add_argument("--text-file", required=True, help="UTF-8 labeled response, or -")
+    status_parser = sub.add_parser(
+        "response-status", help="print a staged response path and its render and delivery states"
+    )
+    add_home(status_parser)
+    status_parser.add_argument("claimed_request_id")
+    status_parser.add_argument("response_id")
+    render_parser = sub.add_parser(
+        "response-render", help="render staged response bytes at most once"
+    )
+    add_home(render_parser)
+    render_parser.add_argument("claimed_request_id")
+    render_parser.add_argument("response_id")
+    send_parser = sub.add_parser("send", help="send to the paired private chat")
+    add_home(send_parser)
+    send_parser.add_argument("--text-file", required=True, help="UTF-8 text file, or - for stdin")
+    reply_parser = sub.add_parser("reply", help="deliver one staged Telegram response")
+    add_home(reply_parser)
+    reply_parser.add_argument("request_id")
+    reply_parser.add_argument("--response-id", required=True)
     for name, help_text in (("install", "install and start the user service"), ("start", "start the user service"),
                             ("stop", "stop the user service"), ("status", "show user service status"),
                             ("disable", "disable the user service"), ("cleanup", "remove this service and private state")):
@@ -3026,10 +3289,19 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return request_active(home, args.work_id, args.claimed_request)
         if args.command == "continuation-handled":
             return continuation_handled(home, args.request_id)
+        if args.command == "response-stage":
+            return response_stage(
+                home, args.claimed_request_id, args.response_id,
+                text_from_file(args.text_file), args.final,
+            )
+        if args.command == "response-status":
+            return response_status(home, args.claimed_request_id, args.response_id)
+        if args.command == "response-render":
+            return response_render(home, args.claimed_request_id, args.response_id)
         if args.command == "send":
             return send_command(home, text_from_file(args.text_file))
         if args.command == "reply":
-            return send_command(home, text_from_file(args.text_file), args.request_id, args.final)
+            return reply_command(home, args.request_id, args.response_id)
         if args.command == "install":
             return install(home)
         if args.command == "start":

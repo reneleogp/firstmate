@@ -66,7 +66,9 @@ If the service loses a response or stops after Telegram accepts an Edit prompt o
 For terminal delivery, the service writes a private request record and a safe wake containing only its local request identifier.
 Raw Telegram text and audio never enter wake records, status logs, shell arguments, unit files, diagnostics, or tracked files.
 The authenticated request body is visible in the primary's terminal with the static `Bot · ` origin label while its origin binding and ordered conversation route remain durable across interruption.
-Responses generated for Telegram-originated work are shown once in the terminal with `Firstmate · ` and the same labeled response body is delivered to Telegram from the same response file.
+Responses generated for Telegram-originated work are staged in a bounded private response journal before rendering or delivery.
+The journal binds one stable wake response identity to the claimed conversation route, exact `Firstmate · ` labeled file, terminal-render state, and independent Telegram delivery state.
+The staged file is shown at most once in the terminal and its exact bytes are delivered to Telegram; replay resumes the same file without regeneration or redisplay, and a delivery-unknown response is not blindly resent.
 Requests originating in the terminal remain terminal-only and are never mirrored to Telegram.
 Pinned replies to the active conversation return to the same work in order.
 A final response may be delivered while continuations are already queued, but the conversation is released only after those continuations are delivered.
@@ -79,8 +81,8 @@ The transport has no model or action authority and does not interpret the reques
 
 ## Operations and privacy
 
-The same CLI provides safe request inspection and handling, lifecycle routing, pinned-chat send and reply, and service-state cleanup; outbound text is read from a file or standard input rather than a shell argument, and no recipient argument is accepted.
-Private inbox, handled-request, deduplication, and pending voice records are bounded and stored under the home state directory with private permissions.
+The same CLI provides safe request inspection and handling, lifecycle routing, response staging, pinned-chat send and reply, and service-state cleanup; generated response and send text is read from a file or standard input rather than a shell argument, and no recipient argument is accepted.
+Private inbox, handled-request, response-journal, deduplication, and pending voice records are bounded and stored under the home state directory with private permissions.
 Queued requests older than the retention window or beyond the fixed queue cap are removed oldest-first, including their Telegram wake records, so an unattended offline home does not retain message bodies indefinitely.
 The executable's `--help` reports the current numeric retention limits.
 Temporary audio is deleted after sending, cancellation, expiry, a failed initial transcription, or service stop, disable, or cleanup.

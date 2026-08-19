@@ -183,6 +183,23 @@ PY
 }
 test_api_base() { printf 'http://127.0.0.1:%s' "$(cat "$1/port")"; }
 run_tg() { env FM_HOME="$1" "$SCRIPT" --test-api-base "$(test_api_base "$1")" "${@:2}"; }
+stage_response() {
+  local home=$1 claimed=$2 response_id=$3 text_file=$4
+  shift 4
+  run_tg "$home" response-stage "$claimed" "$response_id" --text-file "$text_file" "$@"
+}
+render_response() {
+  run_tg "$1" response-render "$2" "$3"
+}
+reply_response() {
+  run_tg "$1" reply "$2" --response-id "$3"
+}
+prepare_response() {
+  local home=$1 claimed=$2 response_id=$3 text_file=$4
+  shift 4
+  stage_response "$home" "$claimed" "$response_id" "$text_file" "$@" >/dev/null
+  render_response "$home" "$claimed" "$response_id" >/dev/null
+}
 callback_data() {
   python3 - "$1/calls.jsonl" "$2" <<'PY'
 import json, sys
@@ -556,8 +573,9 @@ fi
 printf 'Firstmate · decision reply\r\nsecond line\n' > "$home/reply.txt"
 response_terminal="$home/response-terminal.txt"
 response_status="$home/response-status.txt"
-cat "$home/reply.txt" >"$response_terminal"
-run_tg "$home" reply "$request_id" --text-file "$home/reply.txt" >"$response_status"
+stage_response "$home" "$request_id" wake-decision "$home/reply.txt" >/dev/null
+render_response "$home" "$request_id" wake-decision >"$response_terminal"
+reply_response "$home" "$request_id" wake-decision >"$response_status"
 cmp -s "$home/reply.txt" "$response_terminal" || fail "terminal rendering changed the generated response bytes"
 [ "$(cat "$response_status")" = 'Telegram reply sent.' ] || fail "reply transport rendered response content"
 python3 - "$home/calls.jsonl" "$home/reply.txt" <<'PY' || fail "reply surface fan-out changed the response bytes"
@@ -583,7 +601,8 @@ run_tg "$home" continuation-handled "$continuation_id"
 ! grep -F "telegram:$continuation_id" "$home/state/.wake-queue" >/dev/null || fail "acknowledged continuation retained its durable wake"
 [ "$(run_tg "$home" active-request --work-id telegram-work)" = "$request_id" ] || fail "continuation answer replaced the active Telegram work"
 printf 'Firstmate · final answer\n' > "$home/reply.txt"
-run_tg "$home" reply "$request_id" --final --text-file "$home/reply.txt" >/dev/null
+prepare_response "$home" "$request_id" wake-final "$home/reply.txt" --final
+reply_response "$home" "$request_id" wake-final >/dev/null
 if run_tg "$home" active-request >/dev/null 2>&1; then fail "final reply did not clear active origin"; fi
 
 grep -F 'final answer' "$home/calls.jsonl" >/dev/null || fail "reply must use the pinned chat"
@@ -600,7 +619,8 @@ grep -F "telegram:$direct_id" "$home/state/.wake-queue" >/dev/null || fail "refu
 printf 'endpoint_task_id=direct-work\ntelegram_request_id=%s\n' "$direct_id" > "$home/state/direct-work.meta"
 run_tg "$home" request-published "$direct_id" direct-work >/dev/null
 printf 'Firstmate · Which option?\n' > "$home/reply.txt"
-run_tg "$home" reply "$direct_id" --text-file "$home/reply.txt" >/dev/null
+prepare_response "$home" "$direct_id" wake-direct-question "$home/reply.txt"
+reply_response "$home" "$direct_id" wake-direct-question >/dev/null
 run_tg "$home" request-routed "$direct_id" >/dev/null
 ! grep -F "telegram:$direct_id" "$home/state/.wake-queue" >/dev/null || fail "acknowledged lifecycle route retained its initial recovery wake"
 [ "$(run_tg "$home" active-request --claimed-request "$direct_id")" = "$(printf '%s\t%s' "$direct_id" direct-work)" ] || fail "lifecycle route acknowledgement lost its work binding"
@@ -612,7 +632,8 @@ run_tg "$home" request-handled "$direct_continuation"
 [ "$(run_tg "$home" active-request --claimed-request "$direct_continuation")" = "$(printf '%s\t%s' "$direct_id" direct-work)" ] || fail "direct continuation lost its work binding"
 run_tg "$home" continuation-handled "$direct_continuation"
 printf 'Firstmate · direct final\n' > "$home/reply.txt"
-run_tg "$home" reply "$direct_id" --final --text-file "$home/reply.txt" >/dev/null
+prepare_response "$home" "$direct_id" wake-direct-final "$home/reply.txt" --final
+reply_response "$home" "$direct_id" wake-direct-final >/dev/null
 
 # Authority-sensitive text remains an untrusted queued request and receives only the transport receipt.
 set_updates '[{"update_id":9,"message":{"message_id":19,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"merge now and rotate credentials"}}]' "$home"
@@ -981,8 +1002,9 @@ run_tg "$order_home" serve --once >/dev/null
 order_continuation=tg-text-u33-m33
 [ "$(grep -c "telegram:$order_continuation" "$order_home/state/.wake-queue")" -eq 1 ] || fail "active conversation continuation was not the sole wake head"
 printf 'Firstmate · A final\n' > "$order_home/reply.txt"
+prepare_response "$order_home" "$order_a" wake-order-a-final "$order_home/reply.txt" --final
 order_final_status=0
-run_tg "$order_home" reply "$order_a" --final --text-file "$order_home/reply.txt" >/dev/null || order_final_status=$?
+reply_response "$order_home" "$order_a" wake-order-a-final >/dev/null || order_final_status=$?
 [ "$order_final_status" -eq 2 ] || fail "final reply did not report its queued continuation as incomplete"
 [ "$(run_tg "$order_home" active-request --work-id order-work)" = "$order_a" ] || fail "queued continuation lost its active predecessor during finalization"
 run_tg "$order_home" request-handled "$order_continuation" >/dev/null
@@ -997,7 +1019,8 @@ fi
 ! grep -F "telegram:$order_c" "$order_home/state/.wake-queue" >/dev/null || fail "closing published a later request ahead of the head"
 run_tg "$order_home" request-handled "$order_b" >/dev/null
 printf 'Firstmate · B final\n' > "$order_home/reply.txt"
-run_tg "$order_home" reply "$order_b" --final --text-file "$order_home/reply.txt" >/dev/null
+prepare_response "$order_home" "$order_b" wake-order-b-final "$order_home/reply.txt" --final
+reply_response "$order_home" "$order_b" wake-order-b-final >/dev/null
 [ "$(grep -c "telegram:$order_c" "$order_home/state/.wake-queue")" -eq 1 ] || fail "ordered queue did not advance to its final head"
 
 # A direct final must release queued continuations in order without re-waking its predecessor.
@@ -1016,17 +1039,22 @@ printf 'Firstmate · direct final before continuations\n' > "$direct_order_home/
 direct_order_terminal="$direct_order_home/response-terminal.txt"
 direct_order_status="$direct_order_home/response-status.txt"
 direct_order_replay_status="$direct_order_home/response-replay-status.txt"
-cat "$direct_order_home/reply.txt" >"$direct_order_terminal"
+stage_response "$direct_order_home" "$direct_order_a" wake-direct-order-final \
+  "$direct_order_home/reply.txt" --final >/dev/null
+render_response "$direct_order_home" "$direct_order_a" wake-direct-order-final >"$direct_order_terminal"
 direct_final_status=0
-run_tg "$direct_order_home" reply "$direct_order_a" --final \
-  --text-file "$direct_order_home/reply.txt" >"$direct_order_status" || direct_final_status=$?
+reply_response "$direct_order_home" "$direct_order_a" wake-direct-order-final \
+  >"$direct_order_status" || direct_final_status=$?
 [ "$direct_final_status" -eq 2 ] || fail "direct final did not report queued continuations as incomplete"
 [ "$(cat "$direct_order_status")" = 'Telegram final reply sent; continuation handling remains pending.' ] || fail "direct final transport rendered response content"
 direct_replay_status=0
-run_tg "$direct_order_home" reply "$direct_order_a" --final \
-  --text-file "$direct_order_home/reply.txt" >"$direct_order_replay_status" || direct_replay_status=$?
+render_response "$direct_order_home" "$direct_order_a" wake-direct-order-final \
+  >"$direct_order_home/response-replay-terminal.txt"
+reply_response "$direct_order_home" "$direct_order_a" wake-direct-order-final \
+  >"$direct_order_replay_status" || direct_replay_status=$?
 [ "$direct_replay_status" -eq 2 ] || fail "replayed direct final did not preserve pending status"
 [ "$(cat "$direct_order_replay_status")" = 'Telegram final reply already sent; continuation handling remains pending.' ] || fail "replayed direct final rendered response content"
+[ ! -s "$direct_order_home/response-replay-terminal.txt" ] || fail "replayed direct final rendered a second terminal response"
 cmp -s "$direct_order_home/reply.txt" "$direct_order_terminal" || fail "direct final terminal rendering changed response bytes"
 python3 - "$direct_order_home/calls.jsonl" "$direct_order_home/reply.txt" <<'PY' || fail "direct final replay changed fan-out behavior"
 from pathlib import Path
@@ -1043,8 +1071,9 @@ run_tg "$direct_order_home" request-handled "$direct_order_b" >/dev/null
 run_tg "$direct_order_home" request-handled "$direct_order_b" >/dev/null || fail "replayed first continuation claim was not idempotent"
 [ "$(run_tg "$direct_order_home" active-request --claimed-request "$direct_order_b")" = "$direct_order_a" ] || fail "first direct continuation route was not recoverable"
 printf 'Firstmate · first continuation answered\n' > "$direct_order_home/continuation-reply.txt"
-run_tg "$direct_order_home" reply "$direct_order_a" \
-  --text-file "$direct_order_home/continuation-reply.txt" >"$direct_order_status"
+prepare_response "$direct_order_home" "$direct_order_b" wake-direct-order-b \
+  "$direct_order_home/continuation-reply.txt"
+reply_response "$direct_order_home" "$direct_order_a" wake-direct-order-b >"$direct_order_status"
 [ "$(cat "$direct_order_status")" = 'Telegram reply sent.' ] || fail "first direct continuation reply rendered response content"
 run_tg "$direct_order_home" continuation-handled "$direct_order_b" >/dev/null
 run_tg "$direct_order_home" continuation-handled "$direct_order_b" >/dev/null || fail "replayed first continuation route was not idempotent"
@@ -1053,8 +1082,9 @@ run_tg "$direct_order_home" request-handled "$direct_order_c" >/dev/null
 run_tg "$direct_order_home" request-handled "$direct_order_c" >/dev/null || fail "replayed second continuation claim was not idempotent"
 [ "$(run_tg "$direct_order_home" active-request --claimed-request "$direct_order_c")" = "$direct_order_a" ] || fail "second direct continuation route was not recoverable"
 printf 'Firstmate · second continuation answered\n' > "$direct_order_home/continuation-reply.txt"
-run_tg "$direct_order_home" reply "$direct_order_a" \
-  --text-file "$direct_order_home/continuation-reply.txt" >"$direct_order_status"
+prepare_response "$direct_order_home" "$direct_order_c" wake-direct-order-c \
+  "$direct_order_home/continuation-reply.txt"
+reply_response "$direct_order_home" "$direct_order_a" wake-direct-order-c >"$direct_order_status"
 [ "$(cat "$direct_order_status")" = 'Telegram reply sent.' ] || fail "second direct continuation reply rendered response content"
 run_tg "$direct_order_home" continuation-handled "$direct_order_c" >/dev/null
 run_tg "$direct_order_home" continuation-handled "$direct_order_c" >/dev/null || fail "replayed second continuation route was not idempotent"
@@ -1062,8 +1092,8 @@ if run_tg "$direct_order_home" active-request >/dev/null 2>&1; then
   fail "direct final retained the active conversation after all continuations"
 fi
 [ ! -e "$direct_order_home/state/telegram/closing.json" ] || fail "direct final retained closing state after all continuations"
-run_tg "$direct_order_home" reply "$direct_order_a" --final \
-  --text-file "$direct_order_home/reply.txt" >"$direct_order_replay_status" || fail "closed final replay failed"
+reply_response "$direct_order_home" "$direct_order_a" wake-direct-order-final \
+  >"$direct_order_replay_status" || fail "closed final replay failed"
 [ "$(cat "$direct_order_replay_status")" = 'Telegram final reply already sent.' ] || fail "closed final replay rendered response content"
 python3 - "$direct_order_home/calls.jsonl" "$direct_order_home/reply.txt" <<'PY' || fail "closed final replay duplicated Telegram delivery"
 from pathlib import Path
@@ -1078,6 +1108,103 @@ run_tg "$direct_order_home" serve --once >/dev/null
 direct_order_d=tg-text-u43-m43
 run_tg "$direct_order_home" request-handled "$direct_order_d" >/dev/null || fail "next independent request could not claim after direct close"
 [ "$(run_tg "$direct_order_home" active-request)" = "$direct_order_d" ] || fail "next independent request did not become active"
+
+response_crash_home=$(new_home response-crash)
+start_server "$response_crash_home" "$response_crash_home/port"
+run_tg "$response_crash_home" pair --user-id 77 --chat-id 77 >/dev/null
+set_updates '[{"update_id":44,"message":{"message_id":44,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"recover one response"}}]' "$response_crash_home"
+run_tg "$response_crash_home" serve --once >/dev/null
+response_crash_request=tg-text-u44-m44
+run_tg "$response_crash_home" request-handled "$response_crash_request" >/dev/null
+python3 - "$response_crash_home/reply.txt" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('Firstmate · ' + ('recoverable bytes ' * 700) + '\n', encoding='utf-8')
+PY
+staged_path=$(stage_response "$response_crash_home" "$response_crash_request" \
+  wake-response-crash "$response_crash_home/reply.txt")
+response_crash_status=$(run_tg "$response_crash_home" response-status \
+  "$response_crash_request" wake-response-crash)
+[ "$response_crash_status" = "$(printf '%s\tpending\tpending\tnon-final' "$staged_path")" ] || fail "staged response did not persist both pending boundaries"
+cmp -s "$response_crash_home/reply.txt" "$staged_path" || fail "response staging changed the generated bytes"
+printf 'Firstmate · regenerated different bytes\n' >"$response_crash_home/regenerated.txt"
+if stage_response "$response_crash_home" "$response_crash_request" \
+    wake-response-crash "$response_crash_home/regenerated.txt" >/dev/null 2>&1; then
+  fail "stable response identity accepted regenerated bytes"
+fi
+python3 - "$SCRIPT" "$response_crash_home" "$response_crash_request" <<'PY' || fail "response render crash fixture failed"
+import fcntl, os, subprocess, sys, time
+script, home, request_id = sys.argv[1:]
+read_fd, write_fd = os.pipe()
+fcntl.fcntl(write_fd, fcntl.F_SETPIPE_SZ, 4096)
+process = subprocess.Popen(
+    [script, '--home', home, 'response-render', request_id, 'wake-response-crash'],
+    stdout=write_fd,
+    stderr=subprocess.DEVNULL,
+)
+os.close(write_fd)
+for _ in range(200):
+    status = subprocess.run(
+        [script, '--home', home, 'response-status', request_id, 'wake-response-crash'],
+        text=True, capture_output=True,
+    )
+    if '\trendering\t' in status.stdout:
+        break
+    time.sleep(.01)
+else:
+    process.kill()
+    process.wait()
+    os.close(read_fd)
+    raise SystemExit(1)
+process.kill()
+process.wait()
+os.close(read_fd)
+PY
+render_response "$response_crash_home" "$response_crash_request" \
+  wake-response-crash >"$response_crash_home/render-replay.txt"
+[ ! -s "$response_crash_home/render-replay.txt" ] || fail "render-unknown response was displayed again"
+response_crash_status=$(run_tg "$response_crash_home" response-status \
+  "$response_crash_request" wake-response-crash)
+case $response_crash_status in
+  *$'\trendering\tpending\tnon-final') ;;
+  *) fail "interrupted rendering did not retain independent unknown evidence" ;;
+esac
+touch "$response_crash_home/hold-send"
+rm -f "$response_crash_home/send-entered"
+env FM_HOME="$response_crash_home" "$SCRIPT" \
+  --test-api-base "$(test_api_base "$response_crash_home")" reply \
+  "$response_crash_request" --response-id wake-response-crash \
+  >"$response_crash_home/reply-crash.out" 2>&1 &
+response_reply_pid=$!
+response_send_entered=0
+for _ in $(seq 1 100); do
+  if [ -e "$response_crash_home/send-entered" ]; then response_send_entered=1; break; fi
+  sleep .02
+done
+[ "$response_send_entered" -eq 1 ] || fail "staged response did not reach its delivery-unknown boundary"
+kill -9 "$response_reply_pid" 2>/dev/null || true
+wait "$response_reply_pid" 2>/dev/null || true
+rm -f "$response_crash_home/hold-send"
+sleep .05
+response_reply_replay_status=0
+reply_response "$response_crash_home" "$response_crash_request" \
+  wake-response-crash >"$response_crash_home/reply-replay.out" || response_reply_replay_status=$?
+[ "$response_reply_replay_status" -eq 3 ] || fail "delivery-unknown response replay was not held"
+[ "$(cat "$response_crash_home/reply-replay.out")" = 'Telegram reply delivery remains unknown; not resent.' ] || fail "delivery-unknown replay exposed response content"
+python3 - "$response_crash_home/calls.jsonl" "$response_crash_home/reply.txt" <<'PY' || fail "delivery-unknown replay resent staged bytes"
+from pathlib import Path
+import json, sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding='utf-8')]
+expected = Path(sys.argv[2]).read_bytes()
+replies = [call['params']['text'].encode() for call in calls if call['path'].endswith('/sendMessage')]
+assert replies.count(expected) == 1
+PY
+response_crash_status=$(run_tg "$response_crash_home" response-status \
+  "$response_crash_request" wake-response-crash)
+case $response_crash_status in
+  *$'\trendering\tdelivery_unknown\tnon-final') ;;
+  *) fail "delivery interruption did not preserve independent unknown evidence" ;;
+esac
 
 # Unsafe configured commands are rejected before pairing contacts Telegram and without leaking private values.
 command_config_home=$(new_home command-config)
@@ -1101,6 +1228,21 @@ fi
 ! grep -F "$unsafe_command" "$command_config_err" >/dev/null || fail "missing command path was exposed in pairing diagnostics"
 ! grep -F 'test-only-token' "$command_config_err" >/dev/null || fail "bot token was exposed in missing-command diagnostics"
 [ ! -e "$command_config_home/config/telegram.json" ] || fail "missing-command pairing wrote configuration"
+
+override_home=$(new_home command-override)
+start_server "$override_home" "$override_home/port"
+cat >"$override_home/override-transcriber" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = --model ] && [ "$2" = test ] && [ -f "$3" ] || exit 1
+printf 'environment override transcript\n'
+SH
+chmod +x "$override_home/override-transcriber"
+run_tg "$override_home" pair --user-id 77 --chat-id 77 >/dev/null
+set_updates '[{"update_id":45,"message":{"message_id":45,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-override","duration":2,"file_size":20}}}]' "$override_home"
+env FM_TELEGRAM_PARAKEET_CMD="$override_home/override-transcriber --model test {audio}" \
+  FM_HOME="$override_home" "$SCRIPT" --test-api-base "$(test_api_base "$override_home")" \
+  serve --once >/dev/null
+grep -F 'environment override transcript' "$override_home/calls.jsonl" >/dev/null || fail "absolute environment override lost arguments or its audio placeholder"
 
 # A full voice queue leaves the next valid voice unconfirmed and pauses its batch.
 overflow_home=$(new_home voice-overflow)
@@ -1446,6 +1588,11 @@ invalid_utf8_audio=$(cat "$voice_home/parakeet.sh.audio")
 [ "$(grep -c "I couldn't transcribe that voice note." "$voice_home/calls.jsonl")" -eq "$((transcription_failures_before + 1))" ] || fail "invalid UTF-8 transcription did not report failure"
 
 # Service lifecycle and cleanup are verified, scoped to this home, and leave .env intact.
+cat >"$voice_home/parakeet.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'systemd absolute transcript\n'
+SH
+chmod +x "$voice_home/parakeet.sh"
 set_updates '[]' "$voice_home"
 unit_dir="$TMP_ROOT/units"; mkdir -p "$unit_dir"
 systemctl_fake="$TMP_ROOT/systemctl"
@@ -1619,6 +1766,17 @@ rm -f "$TMP_ROOT/systemctl.fail-start"
 "${lifecycle_env[@]}" "$SCRIPT" install >/dev/null
 [ -f "$unit_dir/firstmate-telegram.service" ] || fail "install must write one user unit"
 supervision_needs "$voice_home" || fail "installed Telegram transport did not keep supervision armed"
+set_updates '[{"update_id":296,"message":{"message_id":296,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-systemd-path","duration":2,"file_size":20}}}]' "$voice_home"
+systemd_voice_confirmed=0
+for _ in $(seq 1 200); do
+  if grep -F 'systemd absolute transcript' "$voice_home/calls.jsonl" >/dev/null; then
+    systemd_voice_confirmed=1
+    break
+  fi
+  sleep .02
+done
+[ "$systemd_voice_confirmed" -eq 1 ] || fail "systemd PATH excluded the configured absolute transcriber"
+set_updates '[]' "$voice_home"
 "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null || fail "status must report installed active service"
 install_start_calls=$(grep -c -- '--user start firstmate-telegram.service' "$TMP_ROOT/systemctl.calls" || true)
 "${lifecycle_env[@]}" "$SCRIPT" install >/dev/null || fail "repeat install rejected the exact active owned service"

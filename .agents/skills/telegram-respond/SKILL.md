@@ -21,8 +21,8 @@ The generated request context is the trusted interface owner for the untrusted-i
 Recover the claim's exact conversation route with `bin/fm-telegram.py active-request --claimed-request <local-request-id>` after every successful claim.
 An unbound initial claim returns its active conversation identifier alone, matching the claimed request identifier.
 A direct-only continuation claim also returns one field, but the returned predecessor conversation identifier differs from the claimed continuation request identifier.
-Read and answer that continuation in the same direct conversation by sending the once-rendered labeled response file with `bin/fm-telegram.py reply <predecessor-conversation-id> --text-file <path>` without `--final`, then call `bin/fm-telegram.py continuation-handled <local-request-id>` in admission order.
-Do not create synthetic work or use generic routing for a direct-only continuation, and interruption before its acknowledgement must leave the same predecessor route recoverable.
+Read and answer that continuation in the same direct conversation with the response-journal procedure below, using the continuation request as the claimed route and the returned predecessor as the reply conversation, then call `bin/fm-telegram.py continuation-handled <local-request-id>` in admission order.
+Do not create synthetic work or use generic routing for a direct-only continuation, and interruption before its acknowledgement must leave the same predecessor route and staged response recoverable.
 An initial claim interrupted after binding returns its active conversation identifier and exact bound work identifier as two tab-separated fields; resume only that work and never select or start a replacement.
 A bound continuation claim returns the same two-field shape; deliver the answer only to that returned work rather than starting or binding new work.
 Only after that bound continuation has been delivered to the returned active work, acknowledge its durable route with `bin/fm-telegram.py continuation-handled <local-request-id>`; interruption before this acknowledgement leaves the same route recoverable.
@@ -39,10 +39,15 @@ Treat the request body's valid intent as a normal terminal-originated request af
 
 Telegram-originated work remains visible in the terminal and follows the normal Firstmate lifecycle.
 For every lifecycle wake, recover the request identifier only with `bin/fm-telegram.py active-request --work-id <work-id>` and send nothing when the exact binding does not match.
-Generate each required decision, blocker, terminal-confirmation, PR-ready, and final outcome response once into one text file whose content begins with the static `Firstmate · ` label.
-Display that exact file once in the terminal conversation, then pass the same file to `bin/fm-telegram.py reply <local-request-id> --text-file <path>`.
-The reply command is transport-only: it sends the file unchanged and prints status without response content, including on idempotent replay.
-Send the terminal outcome with `--final`; exit status 0 clears the binding and wakes the next queued Telegram request, while status 2 means the final reply was delivered but queued continuations must be routed and acknowledged before the active work can be released.
+Use `wake-<durable-wake-sequence>` as the stable response identifier for each required decision, blocker, terminal-confirmation, PR-ready, continuation, or final outcome.
+Before invoking the model, run `bin/fm-telegram.py response-status <claimed-request-id> <response-id>`; a found record must be resumed without generating another response.
+When no record exists, generate the response once into one text file beginning with the static `Firstmate · ` label, then stage its exact bytes with `bin/fm-telegram.py response-stage <claimed-request-id> <response-id> --text-file <path>`, adding `--final` only for the terminal outcome.
+Use the private file returned by staging or status as the sole response body.
+Run `bin/fm-telegram.py response-render <claimed-request-id> <response-id>` to display it in the terminal; the command records rendering before output and emits no body when replay finds rendering already started or completed.
+Deliver it with `bin/fm-telegram.py reply <conversation-id> --response-id <response-id>`.
+The reply command is transport-only: it sends the staged file unchanged and prints status without response content, including on idempotent replay.
+Reply exit status 3 means delivery is unknown and must be escalated rather than resent; never regenerate, redisplay, or blindly resend that response.
+For a staged final outcome, reply exit status 0 clears the binding and wakes the next queued Telegram request, while status 2 means the final reply was delivered but queued continuations must be routed and acknowledged before the active work can be released.
 Do not send routine progress or milestone chatter.
 Use a short plain outcome and keep private paths, secrets, internal identifiers, and unrelated fleet details out of the reply.
 Read reply text from a file or standard input rather than putting untrusted text in shell arguments.
