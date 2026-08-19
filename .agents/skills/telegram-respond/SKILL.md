@@ -18,9 +18,9 @@ The wake contains only the opaque local request identifier; the private request 
 Read the request in the terminal with `bin/fm-telegram-agent-request.sh <local-request-id>` and then claim and mark that request handled with `bin/fm-telegram.py request-handled <local-request-id>`.
 The generated request context is the trusted interface owner for the untrusted-input and terminal-confirmation boundary.
 Recover the claim's exact conversation route with `bin/fm-telegram.py active-request --claimed-request <local-request-id>` after every successful claim.
-An initial claim remains durably wakeable until its lifecycle identifier is persisted with `request-bind`, so repeat delivery after an interruption resumes the same claim rather than starting duplicate work.
-When the local request identifier differs from the returned conversation identifier, treat the message as the durable continuation answer for that Telegram work rather than starting or binding new work.
-Only after that continuation has been delivered to the active work, acknowledge its durable route with `bin/fm-telegram.py continuation-handled <local-request-id>`; interruption before this acknowledgement leaves the same route recoverable.
+An initial claim returns its active conversation identifier alone and remains durably wakeable until its lifecycle identifier is persisted with `request-bind`, so repeat delivery after an interruption resumes the same claim rather than starting duplicate work.
+A continuation claim returns its active conversation identifier and exact bound work identifier as two tab-separated fields; deliver the answer only to that returned work rather than starting or binding new work.
+Only after that continuation has been delivered to the returned active work, acknowledge its durable route with `bin/fm-telegram.py continuation-handled <local-request-id>`; interruption before this acknowledgement leaves the same route recoverable.
 As soon as new Telegram-originated work receives a lifecycle identifier, persist the exact origin binding with `bin/fm-telegram.py request-bind <active-conversation-id> <work-id>`.
 The claim and work binding are the durable one-conversation origin record used after compaction or restart.
 If another Telegram conversation is active and the request is not its continuation, leave the request queued until the active conversation receives its final reply.

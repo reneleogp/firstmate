@@ -44,6 +44,11 @@ class Handler(BaseHTTPRequestHandler):
             if (home / 'replace-token-on-getme').exists():
                 (home / 'replace-token-on-getme').unlink()
                 (home / '.env').write_text('FM_TELEGRAM_BOT_TOKEN=replacement-token\n')
+            if (home / 'disconnect-next-getme').exists():
+                (home / 'disconnect-next-getme').unlink()
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+                return
             bot_id = 9902 if '/botreplacement-token/' in self.path else 9901
             return self._write({'id': bot_id, 'is_bot': True})
         if method == 'getChat': return self._write({'id': int(params.get('chat_id', 0)), 'type': 'private'})
@@ -164,9 +169,11 @@ run_tg "$pin_home" serve --once >/dev/null
 ! grep -F '/botreplacement-token/' "$pin_home/calls.jsonl" >/dev/null || fail "running service switched tokens after verification"
 pin_updates_before=$(grep -c 'getUpdates' "$pin_home/calls.jsonl")
 pin_sends_before=$(grep -c 'sendMessage' "$pin_home/calls.jsonl")
-if run_tg "$pin_home" serve --once >/dev/null 2>&1; then
-  fail "changed bot token was accepted without re-pairing"
-fi
+touch "$pin_home/state/telegram/enabled"
+run_tg "$pin_home" serve --once >/dev/null 2>&1
+mismatch_status=$?
+[ "$mismatch_status" -eq 78 ] || fail "changed bot token did not use the permanent configuration exit"
+[ ! -e "$pin_home/state/telegram/enabled" ] || fail "changed bot token left transport supervision active"
 printf 'must not send\n' > "$pin_home/send.txt"
 if run_tg "$pin_home" send --text-file "$pin_home/send.txt" >/dev/null 2>&1; then
   fail "send accepted a bot token that did not match the pairing"
@@ -175,6 +182,9 @@ fi
 [ "$(grep -c 'sendMessage' "$pin_home/calls.jsonl")" -eq "$pin_sends_before" ] || fail "mismatched bot token sent a message"
 run_tg "$pin_home" pair --user-id 77 --chat-id 77 >/dev/null
 set_updates '[{"update_id":91,"message":{"message_id":91,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"accepted after explicit repair"}}]' "$pin_home"
+touch "$pin_home/disconnect-next-getme"
+run_tg "$pin_home" serve --once >/dev/null 2>&1
+[ "$?" -eq 1 ] || fail "transient bot verification failure used the permanent configuration exit"
 run_tg "$pin_home" serve --once >/dev/null
 [ "$(find "$pin_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 2 ] || fail "explicit re-pairing did not authorize the replacement bot"
 
@@ -231,8 +241,9 @@ run_tg "$home" serve --once >/dev/null
 continuation_id=tg-text-u101-m110
 [ "$(run_tg "$home" request-read "$continuation_id")" = "the answer is option two" ] || fail "active conversation answer was not durably readable"
 run_tg "$home" request-handled "$continuation_id"
-[ "$(run_tg "$home" active-request --claimed-request "$continuation_id")" = "$request_id" ] || fail "continuation claim lost its active Telegram predecessor"
-[ "$(run_tg "$home" active-request --claimed-request "$continuation_id")" = "$request_id" ] || fail "unacknowledged continuation route was not recoverable"
+continuation_route=$(printf '%s\t%s' "$request_id" telegram-work)
+[ "$(run_tg "$home" active-request --claimed-request "$continuation_id")" = "$continuation_route" ] || fail "continuation claim lost its exact active work route"
+[ "$(run_tg "$home" active-request --claimed-request "$continuation_id")" = "$continuation_route" ] || fail "unacknowledged continuation route was not recoverable"
 grep -F "telegram:$continuation_id" "$home/state/.wake-queue" >/dev/null || fail "unacknowledged continuation lost its durable wake"
 run_tg "$home" continuation-handled "$continuation_id"
 ! grep -F "telegram:$continuation_id" "$home/state/.wake-queue" >/dev/null || fail "acknowledged continuation retained its durable wake"
@@ -520,8 +531,9 @@ printf 'A final\n' > "$order_home/reply.txt"
 run_tg "$order_home" reply "$order_a" --final --text-file "$order_home/reply.txt" >/dev/null
 [ "$(run_tg "$order_home" active-request --work-id order-work)" = "$order_a" ] || fail "queued continuation lost its active predecessor during finalization"
 run_tg "$order_home" request-handled "$order_continuation" >/dev/null
-[ "$(run_tg "$order_home" active-request --claimed-request "$order_continuation")" = "$order_a" ] || fail "claimed continuation lost its predecessor during finalization"
-[ "$(run_tg "$order_home" active-request --claimed-request "$order_continuation")" = "$order_a" ] || fail "claimed continuation route was consumed before acknowledgement"
+order_continuation_route=$(printf '%s\t%s' "$order_a" order-work)
+[ "$(run_tg "$order_home" active-request --claimed-request "$order_continuation")" = "$order_continuation_route" ] || fail "claimed continuation lost its exact work route during finalization"
+[ "$(run_tg "$order_home" active-request --claimed-request "$order_continuation")" = "$order_continuation_route" ] || fail "claimed continuation route was consumed before acknowledgement"
 run_tg "$order_home" continuation-handled "$order_continuation"
 if next_active=$(run_tg "$order_home" active-request 2>/dev/null); then
   [ "$next_active" != "$order_continuation" ] || fail "continuation was promoted to unrelated active work"
@@ -719,6 +731,8 @@ assert environment == ['FM_HOME=' + expected]
 assert command[0] == ':/usr/bin/python3'
 assert command[1].endswith('/bin/fm-telegram.py')
 assert command[2:] == ['--home', expected, 'serve']
+assert value('Restart') == 'on-failure'
+assert words(value('RestartPreventExitStatus')) == ['78']
 PY
     fi
     ;;

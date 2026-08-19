@@ -38,6 +38,7 @@ INBOX_TTL = 7 * 24 * 60 * 60
 PENDING_TTL = 10 * 60
 POLL_TIMEOUT = 30
 RECEIPT_RETRY_DELAYS = (30, 120, 300)
+PERMANENT_CONFIG_EXIT = 78
 UNSUPPORTED_UPDATE_FIELDS = frozenset({
     "business_connection", "business_message", "channel_post", "chat_boost",
     "chat_join_request", "chat_member", "chosen_inline_result", "deleted_business_messages",
@@ -72,9 +73,13 @@ class TelegramError(RuntimeError):
         self.delivery_unknown = delivery_unknown
 
 
-def die(message: str) -> int:
+class PermanentConfigurationError(TelegramError):
+    pass
+
+
+def die(message: str, exit_status: int = 1) -> int:
     print("fm-telegram: " + message, file=sys.stderr)
-    return 1
+    return exit_status
 
 
 def home_from(args: argparse.Namespace) -> Path:
@@ -226,7 +231,9 @@ def verified_token_for(home: Path, config: Optional[Dict[str, Any]] = None) -> s
     result = raw_api_call(home, token, "getMe", {}, pairing)
     if (not isinstance(result, dict) or result.get("is_bot") is not True
             or not strict_int(result.get("id")) or result.get("id") != expected):
-        raise TelegramError("Telegram bot token does not match the verified pairing; pair again")
+        raise PermanentConfigurationError(
+            "Telegram bot token does not match the verified pairing; pair again"
+        )
     _VERIFIED_BOT_IDS[key] = expected
     return token
 
@@ -1333,7 +1340,11 @@ def expire_pending(home: Path) -> None:
 
 def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> int:
     config = load_config(home)
-    verified_token_for(home, config)
+    try:
+        verified_token_for(home, config)
+    except PermanentConfigurationError:
+        set_telegram_enabled(home, False)
+        raise
     offset = 0
     stop = False
 
@@ -1484,28 +1495,34 @@ def request_bind(home: Path, request_id: str, work_id: str) -> int:
 def request_active(home: Path, work_id: Optional[str] = None,
                    claimed_request: Optional[str] = None) -> int:
     reconcile_closing(home)
-    active = active_record(home)
-    if active is None:
-        return 1
-    request_id = str(active["request_id"])
-    if request_path(home, request_id) is None:
-        return 1
-    if work_id is not None and active.get("work_id") != work_id:
-        return 1
-    if claimed_request is not None:
-        claimed_path = request_path(home, claimed_request)
-        if claimed_path is None or claimed_path.parent.name != "handled":
+    with FileLock(state_lock(home)):
+        active = active_record(home)
+        if active is None:
             return 1
-        value = read_json(claimed_path)
-        if not isinstance(value, dict) or value.get("request_id") != claimed_request:
+        request_id = str(active["request_id"])
+        if request_path(home, request_id) is None:
             return 1
-        if claimed_request == request_id:
-            if active.get("work_id") is not None:
+        if work_id is not None and active.get("work_id") != work_id:
+            return 1
+        route = request_id
+        if claimed_request is not None:
+            claimed_path = request_path(home, claimed_request)
+            if claimed_path is None or claimed_path.parent.name != "handled":
                 return 1
-        elif (value.get("continuation_of") != request_id
-              or value.get("continuation_routing") != "pending"):
-            return 1
-    print(request_id, flush=True)
+            value = read_json(claimed_path)
+            if not isinstance(value, dict) or value.get("request_id") != claimed_request:
+                return 1
+            if claimed_request == request_id:
+                if active.get("work_id") is not None:
+                    return 1
+            else:
+                bound_work = active.get("work_id")
+                if (value.get("continuation_of") != request_id
+                        or value.get("continuation_routing") != "pending"
+                        or not isinstance(bound_work, str) or not safe_id(bound_work)):
+                    return 1
+                route = f"{request_id}\t{bound_work}"
+    print(route, flush=True)
     return 0
 
 
@@ -1648,7 +1665,8 @@ def unit_contents(home: Path) -> str:
             "[Service]\nType=simple\n"
             f"Environment={systemd_quote('FM_HOME=' + str(home))}\n"
             f"ExecStart=:/usr/bin/python3 {arguments}\n"
-            "Restart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n")
+            "Restart=on-failure\nRestartPreventExitStatus=78\nRestartSec=3\n\n"
+            "[Install]\nWantedBy=default.target\n")
 
 
 def unit_owned_by(home: Path) -> bool:
@@ -1825,7 +1843,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_home(bind_parser)
     bind_parser.add_argument("request_id")
     bind_parser.add_argument("work_id")
-    active_parser = sub.add_parser("active-request", help="print the active Telegram request id")
+    active_parser = sub.add_parser(
+        "active-request", help="print the active request route and claimed continuation work id"
+    )
     add_home(active_parser)
     active_group = active_parser.add_mutually_exclusive_group()
     active_group.add_argument("--work-id", help="require an exact lifecycle work binding")
@@ -1886,6 +1906,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if args.command == "cleanup":
             return cleanup(home)
         return 2
+    except PermanentConfigurationError as exc:
+        return die(str(exc), PERMANENT_CONFIG_EXIT)
     except (TelegramError, OSError, ValueError) as exc:
         return die(str(exc))
 
