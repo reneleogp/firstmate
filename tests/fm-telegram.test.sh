@@ -94,7 +94,7 @@ class Handler(BaseHTTPRequestHandler):
             inbox = list((request_root / 'inbox').glob('*.json')) if (request_root / 'inbox').exists() else []
             handled = list((request_root / 'handled').glob('*.json')) if (request_root / 'handled').exists() else []
             text = params.get('text')
-            if isinstance(text, str) and text.startswith('Message received'):
+            if isinstance(text, str) and text.startswith('Bot · Message received'):
                 wake_path = home / 'state' / '.wake-queue'
                 wake = wake_path.read_text() if wake_path.exists() else ''
                 if not inbox and not handled:
@@ -428,7 +428,12 @@ inbox=$(find "$home/state/telegram/inbox" -name '*.json' -print -quit)
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["text"])' "$inbox")" = "please inspect this" ] || fail "queued request text mismatch"
 call_count=$(grep -c 'sendMessage' "$home/calls.jsonl")
 [ "$call_count" -eq 1 ] || fail "text receipt must be sent once"
-grep -F 'Message received and queued. It will be processed when Firstmate starts.' "$home/calls.jsonl" >/dev/null || fail "offline wording mismatch"
+python3 - "$home/calls.jsonl" <<'PY' || fail "offline wording mismatch"
+import json, sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding='utf-8')]
+sent = [call['params']['text'] for call in calls if call['path'].endswith('/sendMessage')]
+assert sent[-1] == 'Bot · Message received and queued. It will be processed when Firstmate starts.'
+PY
 [ ! -e "$home/receipt-before-durable" ] || fail "receipt was sent before request and wake durability"
 grep -F 'please inspect this' "$home/state/.wake-queue" >/dev/null && fail "raw Telegram text entered wake queue"
 grep -F "telegram tg-" "$home/state/.wake-queue" >/dev/null || fail "wake did not carry local request id"
@@ -548,16 +553,21 @@ if run_tg "$home" active-request --work-id terminal-work >/dev/null 2>&1; then
   fail "unrelated terminal work matched the active Telegram origin"
 fi
 [ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq "$routing_before" ] || fail "unrelated lifecycle lookup sent a Telegram reply"
-printf 'decision reply\n' > "$home/reply.txt"
+printf 'Firstmate · decision reply\r\nsecond line\n' > "$home/reply.txt"
 response_terminal="$home/response-terminal.txt"
-run_tg "$home" reply "$request_id" --text-file "$home/reply.txt" >"$response_terminal"
-[ "$(cat "$response_terminal")" = $'Firstmate · decision reply' ] || fail "reply terminal rendering changed the generated response"
-python3 - "$home/calls.jsonl" <<'PY' || fail "reply surface fan-out changed the response body"
+response_status="$home/response-status.txt"
+cat "$home/reply.txt" >"$response_terminal"
+run_tg "$home" reply "$request_id" --text-file "$home/reply.txt" >"$response_status"
+cmp -s "$home/reply.txt" "$response_terminal" || fail "terminal rendering changed the generated response bytes"
+[ "$(cat "$response_status")" = 'Telegram reply sent.' ] || fail "reply transport rendered response content"
+python3 - "$home/calls.jsonl" "$home/reply.txt" <<'PY' || fail "reply surface fan-out changed the response bytes"
+from pathlib import Path
 import json, sys
 calls = [json.loads(line) for line in open(sys.argv[1], encoding='utf-8')]
-replies = [call['params']['text'] for call in calls if call['path'].endswith('/sendMessage') and call['params']['text'].startswith('Firstmate · ')]
-assert replies[-1] == 'Firstmate · decision reply\n'
-assert replies.count('Firstmate · decision reply\n') == 1
+expected = Path(sys.argv[2]).read_bytes()
+replies = [call['params']['text'].encode() for call in calls if call['path'].endswith('/sendMessage') and call['params']['text'].startswith('Firstmate · ')]
+assert replies[-1] == expected
+assert replies.count(expected) == 1
 PY
 [ "$(run_tg "$home" active-request)" = "$request_id" ] || fail "non-final reply cleared the active origin"
 set_updates '[{"update_id":101,"message":{"message_id":110,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"the answer is option two"}}]' "$home"
@@ -572,7 +582,7 @@ grep -F "telegram:$continuation_id" "$home/state/.wake-queue" >/dev/null || fail
 run_tg "$home" continuation-handled "$continuation_id"
 ! grep -F "telegram:$continuation_id" "$home/state/.wake-queue" >/dev/null || fail "acknowledged continuation retained its durable wake"
 [ "$(run_tg "$home" active-request --work-id telegram-work)" = "$request_id" ] || fail "continuation answer replaced the active Telegram work"
-printf 'final answer\n' > "$home/reply.txt"
+printf 'Firstmate · final answer\n' > "$home/reply.txt"
 run_tg "$home" reply "$request_id" --final --text-file "$home/reply.txt" >/dev/null
 if run_tg "$home" active-request >/dev/null 2>&1; then fail "final reply did not clear active origin"; fi
 
@@ -589,7 +599,7 @@ fi
 grep -F "telegram:$direct_id" "$home/state/.wake-queue" >/dev/null || fail "refused direct route lost its recovery wake"
 printf 'endpoint_task_id=direct-work\ntelegram_request_id=%s\n' "$direct_id" > "$home/state/direct-work.meta"
 run_tg "$home" request-published "$direct_id" direct-work >/dev/null
-printf 'Which option?\n' > "$home/reply.txt"
+printf 'Firstmate · Which option?\n' > "$home/reply.txt"
 run_tg "$home" reply "$direct_id" --text-file "$home/reply.txt" >/dev/null
 run_tg "$home" request-routed "$direct_id" >/dev/null
 ! grep -F "telegram:$direct_id" "$home/state/.wake-queue" >/dev/null || fail "acknowledged lifecycle route retained its initial recovery wake"
@@ -601,7 +611,7 @@ grep -F "telegram:$direct_continuation" "$home/state/.wake-queue" >/dev/null || 
 run_tg "$home" request-handled "$direct_continuation"
 [ "$(run_tg "$home" active-request --claimed-request "$direct_continuation")" = "$(printf '%s\t%s' "$direct_id" direct-work)" ] || fail "direct continuation lost its work binding"
 run_tg "$home" continuation-handled "$direct_continuation"
-printf 'direct final\n' > "$home/reply.txt"
+printf 'Firstmate · direct final\n' > "$home/reply.txt"
 run_tg "$home" reply "$direct_id" --final --text-file "$home/reply.txt" >/dev/null
 
 # Authority-sensitive text remains an untrusted queued request and receives only the transport receipt.
@@ -756,7 +766,12 @@ kill "$telegram_watcher_pid" 2>/dev/null || true
 wait "$telegram_watcher_pid" 2>/dev/null || true
 kill "$harness_pid" 2>/dev/null || true
 [ "$watcher_delivered" -eq 1 ] || fail "healthy watcher did not surface the queued Telegram request"
-grep -F 'Message received.' "$live_home/calls.jsonl" >/dev/null || fail "live-primary receipt mismatch"
+python3 - "$live_home/calls.jsonl" <<'PY' || fail "live-primary receipt mismatch"
+import json, sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding='utf-8')]
+sent = [call['params']['text'] for call in calls if call['path'].endswith('/sendMessage')]
+assert 'Bot · Message received.' in sent
+PY
 rm -f "$home/port"
 start_server "$home" "$home/port"
 set_updates '[{"update_id":6,"message":{"message_id":14,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"queued request"}}]' "$home"
@@ -965,7 +980,7 @@ set_updates '[{"update_id":33,"message":{"message_id":33,"from":{"id":77},"chat"
 run_tg "$order_home" serve --once >/dev/null
 order_continuation=tg-text-u33-m33
 [ "$(grep -c "telegram:$order_continuation" "$order_home/state/.wake-queue")" -eq 1 ] || fail "active conversation continuation was not the sole wake head"
-printf 'A final\n' > "$order_home/reply.txt"
+printf 'Firstmate · A final\n' > "$order_home/reply.txt"
 order_final_status=0
 run_tg "$order_home" reply "$order_a" --final --text-file "$order_home/reply.txt" >/dev/null || order_final_status=$?
 [ "$order_final_status" -eq 2 ] || fail "final reply did not report its queued continuation as incomplete"
@@ -981,7 +996,7 @@ fi
 [ "$(grep -c "telegram:$order_b" "$order_home/state/.wake-queue")" -eq 1 ] || fail "closing did not publish the immutable-order next head"
 ! grep -F "telegram:$order_c" "$order_home/state/.wake-queue" >/dev/null || fail "closing published a later request ahead of the head"
 run_tg "$order_home" request-handled "$order_b" >/dev/null
-printf 'B final\n' > "$order_home/reply.txt"
+printf 'Firstmate · B final\n' > "$order_home/reply.txt"
 run_tg "$order_home" reply "$order_b" --final --text-file "$order_home/reply.txt" >/dev/null
 [ "$(grep -c "telegram:$order_c" "$order_home/state/.wake-queue")" -eq 1 ] || fail "ordered queue did not advance to its final head"
 
@@ -997,28 +1012,67 @@ set_updates '[{"update_id":41,"message":{"message_id":41,"from":{"id":77},"chat"
 run_tg "$direct_order_home" serve --once >/dev/null
 direct_order_b=tg-text-u41-m41
 direct_order_c=tg-text-u42-m42
-printf 'direct final before continuations\n' > "$direct_order_home/reply.txt"
+printf 'Firstmate · direct final before continuations\n' > "$direct_order_home/reply.txt"
+direct_order_terminal="$direct_order_home/response-terminal.txt"
+direct_order_status="$direct_order_home/response-status.txt"
+direct_order_replay_status="$direct_order_home/response-replay-status.txt"
+cat "$direct_order_home/reply.txt" >"$direct_order_terminal"
 direct_final_status=0
-run_tg "$direct_order_home" reply "$direct_order_a" --final --text-file "$direct_order_home/reply.txt" >/dev/null || direct_final_status=$?
+run_tg "$direct_order_home" reply "$direct_order_a" --final \
+  --text-file "$direct_order_home/reply.txt" >"$direct_order_status" || direct_final_status=$?
 [ "$direct_final_status" -eq 2 ] || fail "direct final did not report queued continuations as incomplete"
+[ "$(cat "$direct_order_status")" = 'Telegram final reply sent; continuation handling remains pending.' ] || fail "direct final transport rendered response content"
+direct_replay_status=0
+run_tg "$direct_order_home" reply "$direct_order_a" --final \
+  --text-file "$direct_order_home/reply.txt" >"$direct_order_replay_status" || direct_replay_status=$?
+[ "$direct_replay_status" -eq 2 ] || fail "replayed direct final did not preserve pending status"
+[ "$(cat "$direct_order_replay_status")" = 'Telegram final reply already sent; continuation handling remains pending.' ] || fail "replayed direct final rendered response content"
+cmp -s "$direct_order_home/reply.txt" "$direct_order_terminal" || fail "direct final terminal rendering changed response bytes"
+python3 - "$direct_order_home/calls.jsonl" "$direct_order_home/reply.txt" <<'PY' || fail "direct final replay changed fan-out behavior"
+from pathlib import Path
+import json, sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding='utf-8')]
+expected = Path(sys.argv[2]).read_bytes()
+replies = [call['params']['text'].encode() for call in calls if call['path'].endswith('/sendMessage')]
+assert replies.count(expected) == 1
+PY
 ! grep -F "telegram:$direct_order_a" "$direct_order_home/state/.wake-queue" >/dev/null || fail "direct final re-woke its handled predecessor"
 [ "$(grep -c "telegram:$direct_order_b" "$direct_order_home/state/.wake-queue")" -eq 1 ] || fail "direct final did not wake the first continuation"
 ! grep -F "telegram:$direct_order_c" "$direct_order_home/state/.wake-queue" >/dev/null || fail "direct final woke a later continuation out of order"
 run_tg "$direct_order_home" request-handled "$direct_order_b" >/dev/null
 run_tg "$direct_order_home" request-handled "$direct_order_b" >/dev/null || fail "replayed first continuation claim was not idempotent"
 [ "$(run_tg "$direct_order_home" active-request --claimed-request "$direct_order_b")" = "$direct_order_a" ] || fail "first direct continuation route was not recoverable"
+printf 'Firstmate · first continuation answered\n' > "$direct_order_home/continuation-reply.txt"
+run_tg "$direct_order_home" reply "$direct_order_a" \
+  --text-file "$direct_order_home/continuation-reply.txt" >"$direct_order_status"
+[ "$(cat "$direct_order_status")" = 'Telegram reply sent.' ] || fail "first direct continuation reply rendered response content"
 run_tg "$direct_order_home" continuation-handled "$direct_order_b" >/dev/null
 run_tg "$direct_order_home" continuation-handled "$direct_order_b" >/dev/null || fail "replayed first continuation route was not idempotent"
 [ "$(grep -c "telegram:$direct_order_c" "$direct_order_home/state/.wake-queue")" -eq 1 ] || fail "acknowledged first continuation did not wake the second"
 run_tg "$direct_order_home" request-handled "$direct_order_c" >/dev/null
 run_tg "$direct_order_home" request-handled "$direct_order_c" >/dev/null || fail "replayed second continuation claim was not idempotent"
 [ "$(run_tg "$direct_order_home" active-request --claimed-request "$direct_order_c")" = "$direct_order_a" ] || fail "second direct continuation route was not recoverable"
+printf 'Firstmate · second continuation answered\n' > "$direct_order_home/continuation-reply.txt"
+run_tg "$direct_order_home" reply "$direct_order_a" \
+  --text-file "$direct_order_home/continuation-reply.txt" >"$direct_order_status"
+[ "$(cat "$direct_order_status")" = 'Telegram reply sent.' ] || fail "second direct continuation reply rendered response content"
 run_tg "$direct_order_home" continuation-handled "$direct_order_c" >/dev/null
 run_tg "$direct_order_home" continuation-handled "$direct_order_c" >/dev/null || fail "replayed second continuation route was not idempotent"
 if run_tg "$direct_order_home" active-request >/dev/null 2>&1; then
   fail "direct final retained the active conversation after all continuations"
 fi
 [ ! -e "$direct_order_home/state/telegram/closing.json" ] || fail "direct final retained closing state after all continuations"
+run_tg "$direct_order_home" reply "$direct_order_a" --final \
+  --text-file "$direct_order_home/reply.txt" >"$direct_order_replay_status" || fail "closed final replay failed"
+[ "$(cat "$direct_order_replay_status")" = 'Telegram final reply already sent.' ] || fail "closed final replay rendered response content"
+python3 - "$direct_order_home/calls.jsonl" "$direct_order_home/reply.txt" <<'PY' || fail "closed final replay duplicated Telegram delivery"
+from pathlib import Path
+import json, sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding='utf-8')]
+expected = Path(sys.argv[2]).read_bytes()
+replies = [call['params']['text'].encode() for call in calls if call['path'].endswith('/sendMessage')]
+assert replies.count(expected) == 1
+PY
 set_updates '[{"update_id":43,"message":{"message_id":43,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"next independent request"}}]' "$direct_order_home"
 run_tg "$direct_order_home" serve --once >/dev/null
 direct_order_d=tg-text-u43-m43

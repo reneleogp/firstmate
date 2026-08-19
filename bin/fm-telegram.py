@@ -50,6 +50,7 @@ CALLBACK_DELIVERY_ATTEMPTS = 3
 TELEGRAM_API_BASE = "https://api.telegram.org"
 PERMANENT_CONFIG_EXIT = 78
 FINAL_CONTINUATION_PENDING_EXIT = 2
+FIRSTMATE_REPLY_LABEL = "Firstmate · "
 MESSAGE_ENVELOPE_FIELDS = frozenset({
     "author_signature", "business_connection_id", "chat", "date", "direct_messages_topic",
     "edit_date", "effect_id", "external_reply", "forward_origin", "from",
@@ -2238,8 +2239,8 @@ def pair(home: Path, user_id: int, chat_id: int,
 
 def text_from_file(path: str) -> str:
     if path == "-":
-        return sys.stdin.read()
-    return Path(path).read_text(encoding="utf-8")
+        return sys.stdin.buffer.read().decode("utf-8")
+    return Path(path).read_bytes().decode("utf-8")
 
 
 def request_read(home: Path, request_id: str) -> int:
@@ -2548,6 +2549,8 @@ def _send_command_locked(home: Path, text: str, request_id: Optional[str] = None
     chat_id = int(config["chat_id"])
     if final and request_id is None:
         raise TelegramError("only a request reply can be final")
+    if request_id is not None and not text.startswith(FIRSTMATE_REPLY_LABEL):
+        raise TelegramError("Telegram reply text must begin with the static Firstmate label")
     record: Optional[Dict[str, Any]] = None
     if request_id is not None:
         path = request_path(home, request_id)
@@ -2560,13 +2563,13 @@ def _send_command_locked(home: Path, text: str, request_id: Optional[str] = None
         if active_request_id(home) != request_id:
             if final and record.get("final_sent") is True:
                 reconcile_closing(home)
-                print("Firstmate · " + text, end="" if text.endswith("\n") else "\n")
+                print("Telegram final reply already sent.")
                 return 0
             return die("request is not the active Telegram conversation")
         chat_id = int(record["chat_id"])
     final_already_sent = bool(final and record is not None and record.get("final_sent") is True)
     if not final_already_sent:
-        send_text(home, chat_id, "Firstmate · " + text)
+        send_text(home, chat_id, text)
     if final and request_id is not None:
         with FileLock(state_lock(home)):
             current = active_record(home)
@@ -2578,9 +2581,13 @@ def _send_command_locked(home: Path, text: str, request_id: Optional[str] = None
         with FileLock(state_lock(home)):
             closing = read_json(closing_path(home))
             if isinstance(closing, dict) and closing.get("request_id") == request_id:
-                print("Firstmate · " + text, end="" if text.endswith("\n") else "\n")
+                status = "already sent" if final_already_sent else "sent"
+                print(f"Telegram final reply {status}; continuation handling remains pending.")
                 return FINAL_CONTINUATION_PENDING_EXIT
-    print("Firstmate · " + text, end="" if text.endswith("\n") else "\n")
+        status = "already sent" if final_already_sent else "sent"
+        print(f"Telegram final reply {status}.")
+        return 0
+    print("Telegram reply sent.")
     return 0
 
 
@@ -2969,7 +2976,10 @@ def build_parser() -> argparse.ArgumentParser:
                 "--final", action="store_true",
                 help="close after delivery; exits 2 while queued continuations keep it active",
             )
-        command.add_argument("--text-file", required=True, help="UTF-8 text file, or - for stdin")
+        text_help = "UTF-8 text file, or - for stdin"
+        if name == "reply":
+            text_help = "UTF-8 response beginning with 'Firstmate · '; sent unchanged, or - for stdin"
+        command.add_argument("--text-file", required=True, help=text_help)
     for name, help_text in (("install", "install and start the user service"), ("start", "start the user service"),
                             ("stop", "stop the user service"), ("status", "show user service status"),
                             ("disable", "disable the user service"), ("cleanup", "remove this service and private state")):
