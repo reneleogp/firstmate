@@ -57,6 +57,7 @@ An initial claim remains durably wakeable after interruption until the bound wor
 Binding refuses a lifecycle identifier that already has a work record, so terminal-originated work cannot acquire a Telegram origin after the fact.
 Binding before launch is safe because `active-request --claimed-request <local-request-id>` exposes the already selected work identifier on recovery and the wake remains until that publication boundary.
 Once publication is observed, its Telegram-origin acknowledgement remains latched even if lifecycle cleanup later removes the work record.
+Directly handled work that sends a non-final question acknowledges the initial route with `request-routed <local-request-id>` only after delivering that response, which preserves interruption recovery while allowing its continuation to surface.
 Lifecycle routing uses `active-request --work-id <work-id>` and refuses unrelated terminal work.
 Replies use the pinned chat without a recipient argument, for example `bin/fm-telegram.py reply <local-request-id> --text-file reply.txt`.
 The terminal reply adds `--final` to clear the active binding and wake the next queued conversation.
@@ -73,7 +74,7 @@ The transport has no model or action authority and does not interpret the reques
 
 ## Operations and privacy
 
-`request-read`, `request-handled`, `request-bind`, `active-request`, `continuation-handled`, `send`, and `reply` are the small operator surface; text is read from a file or standard input rather than a shell argument.
+`request-read`, `request-handled`, `request-bind`, `request-routed`, `active-request`, `continuation-handled`, `send`, and `reply` are the small operator surface; text is read from a file or standard input rather than a shell argument.
 Private inbox, handled-request, deduplication, and pending voice records are bounded and stored under the home state directory with private permissions.
 Queued requests older than the retention window or beyond the fixed queue cap are removed oldest-first, including their Telegram wake records, so an unattended offline home does not retain message bodies indefinitely.
 The executable's `--help` reports the current numeric retention limits.

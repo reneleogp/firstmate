@@ -52,6 +52,8 @@ TEXT_MESSAGE_FIELDS = MESSAGE_ENVELOPE_FIELDS | frozenset({
     "entities", "link_preview_options", "suggested_post_info", "text",
 })
 VOICE_MESSAGE_FIELDS = MESSAGE_ENVELOPE_FIELDS | frozenset({"voice"})
+CALLBACK_QUERY_FIELDS = frozenset({"chat_instance", "data", "from", "id", "message"})
+CALLBACK_MESSAGE_FIELDS = TEXT_MESSAGE_FIELDS
 _PROCESS_TOKENS: Dict[Path, str] = {}
 _VERIFIED_BOT_IDS: Dict[Path, int] = {}
 
@@ -614,7 +616,8 @@ def _sync_request_wakes_locked(home: Path) -> None:
                 continue
             if (record.get("request_id") == active
                     and active_state is not None
-                    and active_state.get("work_published") is not True):
+                    and active_state.get("work_published") is not True
+                    and active_state.get("initial_routing_consumed") is not True):
                 routed_paths.append(path)
             elif (record.get("continuation_of") == active
                   and (path.parent == inbox
@@ -1237,6 +1240,12 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any], up
 
 
 def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], update_id: int) -> bool:
+    required_fields = {"id", "from", "message", "data"}
+    if not required_fields.issubset(query) or not set(query).issubset(CALLBACK_QUERY_FIELDS):
+        return False
+    chat_instance = query.get("chat_instance")
+    if chat_instance is not None and not isinstance(chat_instance, str):
+        return False
     callback_id = query.get("id")
     sender = query.get("from")
     message = query.get("message")
@@ -1245,7 +1254,8 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
     if (not isinstance(sender, dict) or not strict_int(sender.get("id"))
             or sender.get("id") != config.get("user_id")):
         return False
-    if not isinstance(message, dict) or not strict_int(message.get("message_id")):
+    if (not isinstance(message, dict) or not strict_int(message.get("message_id"))
+            or not set(message).issubset(CALLBACK_MESSAGE_FIELDS)):
         return False
     chat = message.get("chat")
     if (not isinstance(chat, dict) or chat.get("type") != "private"
@@ -1685,6 +1695,25 @@ def request_bind(home: Path, request_id: str, work_id: str) -> int:
     return 0
 
 
+def request_routed(home: Path, request_id: str) -> int:
+    with FileLock(state_lock(home)):
+        active = active_record(home)
+        if active is None or active.get("request_id") != request_id:
+            return die("request is not the active Telegram conversation")
+        path = request_path(home, request_id)
+        if path is None or path.parent.name != "handled":
+            return die("request is not a handled Telegram request")
+        if not isinstance(active.get("work_id"), str):
+            return die("active Telegram conversation is not bound to work")
+        if active.get("initial_routing_consumed") is not True:
+            active["initial_routing_consumed"] = True
+            active["initial_routing_consumed_at"] = now()
+            atomic_json(active_path(home), active)
+        _sync_request_wakes_locked(home)
+    print("Telegram initial route acknowledged.")
+    return 0
+
+
 def request_active(home: Path, work_id: Optional[str] = None,
                    claimed_request: Optional[str] = None) -> int:
     reconcile_closing(home)
@@ -1940,12 +1969,13 @@ def stop_service(home: Path) -> int:
         require_unit_owner(home)
         systemctl("stop", SERVICE_NAME)
         verify_service(active=False)
-        with FileLock(state_lock(home)):
-            pending = read_json(pending_path(home))
-            if isinstance(pending, dict):
-                remove_pending(home, pending)
-        set_telegram_enabled(home, False)
-        verify_transport_marker(home, False)
+        with FileLock(service_lock(home), blocking=False, timeout=1):
+            with FileLock(state_lock(home)):
+                pending = read_json(pending_path(home))
+                if isinstance(pending, dict):
+                    remove_pending(home, pending)
+            set_telegram_enabled(home, False)
+            verify_transport_marker(home, False)
     print("Telegram service stopped.")
     return 0
 
@@ -1962,12 +1992,13 @@ def disable_service(home: Path) -> int:
         require_unit_owner(home)
         systemctl("disable", "--now", SERVICE_NAME)
         verify_service(active=False, enabled=False)
-        with FileLock(state_lock(home)):
-            pending = read_json(pending_path(home))
-            if isinstance(pending, dict):
-                remove_pending(home, pending)
-        set_telegram_enabled(home, False)
-        verify_transport_marker(home, False)
+        with FileLock(service_lock(home), blocking=False, timeout=1):
+            with FileLock(state_lock(home)):
+                pending = read_json(pending_path(home))
+                if isinstance(pending, dict):
+                    remove_pending(home, pending)
+            set_telegram_enabled(home, False)
+            verify_transport_marker(home, False)
     print("Telegram service disabled.")
     return 0
 
@@ -2017,7 +2048,7 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, request-read, request-handled, request-bind, active-request, continuation-handled, send, reply, install, start, stop, status, disable, cleanup.\n"
+        epilog=("Commands: pair, serve, request-read, request-handled, request-bind, request-routed, active-request, continuation-handled, send, reply, install, start, stop, status, disable, cleanup.\n"
                 "Retention limits: 256 queued requests for 7 days and 4096 handled requests.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
                 "Voice limits: 10 MiB, 120 seconds, and a 4096-unit transcript. Temporary audio is restricted to /dev/shm.\n"
@@ -2049,6 +2080,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_home(bind_parser)
     bind_parser.add_argument("request_id")
     bind_parser.add_argument("work_id")
+    routed_parser = sub.add_parser(
+        "request-routed", help="acknowledge a directly handled initial route"
+    )
+    add_home(routed_parser)
+    routed_parser.add_argument("request_id")
     active_parser = sub.add_parser(
         "active-request", help="print the active request route and any claimed work id"
     )
@@ -2094,6 +2130,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return request_handled(home, args.request_id)
         if args.command == "request-bind":
             return request_bind(home, args.request_id, args.work_id)
+        if args.command == "request-routed":
+            return request_routed(home, args.request_id)
         if args.command == "active-request":
             return request_active(home, args.work_id, args.claimed_request)
         if args.command == "continuation-handled":

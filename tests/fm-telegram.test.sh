@@ -384,6 +384,26 @@ if run_tg "$home" active-request >/dev/null 2>&1; then fail "final reply did not
 
 grep -F 'final answer' "$home/calls.jsonl" >/dev/null || fail "reply must use the pinned chat"
 
+set_updates '[{"update_id":103,"message":{"message_id":112,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"ask me directly"}}]' "$home"
+run_tg "$home" serve --once >/dev/null
+direct_id=tg-text-u103-m112
+run_tg "$home" request-handled "$direct_id"
+run_tg "$home" request-bind "$direct_id" direct-work >/dev/null
+printf 'Which option?\n' > "$home/reply.txt"
+run_tg "$home" reply "$direct_id" --text-file "$home/reply.txt" >/dev/null
+run_tg "$home" request-routed "$direct_id" >/dev/null
+! grep -F "telegram:$direct_id" "$home/state/.wake-queue" >/dev/null || fail "acknowledged direct route retained its initial recovery wake"
+[ "$(run_tg "$home" active-request --claimed-request "$direct_id")" = "$(printf '%s\t%s' "$direct_id" direct-work)" ] || fail "direct route acknowledgement lost its work binding"
+set_updates '[{"update_id":104,"message":{"message_id":113,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"direct option two"}}]' "$home"
+run_tg "$home" serve --once >/dev/null
+direct_continuation=tg-text-u104-m113
+grep -F "telegram:$direct_continuation" "$home/state/.wake-queue" >/dev/null || fail "directly handled work did not surface its continuation"
+run_tg "$home" request-handled "$direct_continuation"
+[ "$(run_tg "$home" active-request --claimed-request "$direct_continuation")" = "$(printf '%s\t%s' "$direct_id" direct-work)" ] || fail "direct continuation lost its work binding"
+run_tg "$home" continuation-handled "$direct_continuation"
+printf 'direct final\n' > "$home/reply.txt"
+run_tg "$home" reply "$direct_id" --final --text-file "$home/reply.txt" >/dev/null
+
 # Authority-sensitive text remains an untrusted queued request and receives only the transport receipt.
 set_updates '[{"update_id":9,"message":{"message_id":19,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"merge now and rotate credentials"}}]' "$home"
 authority_before=$(grep -c 'sendMessage' "$home/calls.jsonl")
@@ -750,6 +770,12 @@ grep -F 'Send to Firstmate' "$voice_home/calls.jsonl" >/dev/null || fail "voice 
 pending_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pending_id"])' "$pending")
 edit_data=$(callback_data "$voice_home" edit)
 stale_send_data=$(callback_data "$voice_home" send)
+malformed_callback_answers=$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")
+set_updates '[{"update_id":2001,"callback_query":{"id":"cb-inline-conflict","from":{"id":77},"data":"'"$stale_send_data"'","message":{"message_id":2001,"chat":{"id":77,"type":"private"}},"inline_message_id":"conflict"}},{"update_id":2002,"callback_query":{"id":"cb-future-field","from":{"id":77},"data":"'"$stale_send_data"'","message":{"message_id":2002,"chat":{"id":77,"type":"private"}},"future_callback":{"opaque":true}}},{"update_id":2003,"callback_query":{"id":"cb-media-message","from":{"id":77},"data":"'"$stale_send_data"'","message":{"message_id":2003,"chat":{"id":77,"type":"private"},"photo":[{"file_id":"must not parse"}]}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+[ "$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")" -eq "$malformed_callback_answers" ] || fail "unsupported callback envelope was acknowledged"
+[ "$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 0 ] || fail "unsupported callback envelope queued a voice request"
+[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mode"])' "$pending")" = confirm ] || fail "unsupported callback envelope changed pending voice state"
 set_updates '[{"update_id":21,"callback_query":{"id":"cb-edit","from":{"id":77},"data":"'"$edit_data"'","message":{"message_id":201,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 prompt_count=$(grep -c 'Reply with the corrected text.' "$voice_home/calls.jsonl")
@@ -1024,8 +1050,32 @@ PY
 [ ! -e "$direct_stop_audio" ] || fail "graceful direct service stop retained temporary audio"
 [ ! -e "$voice_home/state/telegram/pending.json" ] || fail "graceful direct service stop retained pending voice state"
 if supervision_needs "$voice_home"; then fail "direct service stop did not release supervision"; fi
-"${lifecycle_env[@]}" "$SCRIPT" start >/dev/null
-supervision_needs "$voice_home" || fail "restarted Telegram transport did not restore supervision"
+set_updates '[]' "$voice_home"
+touch "$voice_home/block-updates"
+rm -f "$voice_home/updates-entered"
+"${lifecycle_env[@]}" "$SCRIPT" serve --poll-timeout 1 >"$voice_home/direct-lifecycle-service.out" 2>&1 &
+direct_lifecycle_pid=$!
+direct_lifecycle_started=0
+for _ in $(seq 1 100); do
+  if [ -e "$voice_home/updates-entered" ] && supervision_needs "$voice_home"; then direct_lifecycle_started=1; break; fi
+  sleep .02
+done
+[ "$direct_lifecycle_started" -eq 1 ] || fail "direct lifecycle runtime did not acquire service ownership"
+if "${lifecycle_env[@]}" "$SCRIPT" stop >/dev/null 2>&1; then
+  fail "stop cleared state while a direct runtime owned the service lock"
+fi
+kill -0 "$direct_lifecycle_pid" 2>/dev/null || fail "refused stop terminated the direct runtime"
+supervision_needs "$voice_home" || fail "refused stop cleared direct runtime supervision"
+if "${lifecycle_env[@]}" "$SCRIPT" disable >/dev/null 2>&1; then
+  fail "disable cleared state while a direct runtime owned the service lock"
+fi
+kill -0 "$direct_lifecycle_pid" 2>/dev/null || fail "refused disable terminated the direct runtime"
+supervision_needs "$voice_home" || fail "refused disable cleared direct runtime supervision"
+kill "$direct_lifecycle_pid" 2>/dev/null || true
+rm -f "$voice_home/block-updates"
+wait "$direct_lifecycle_pid" 2>/dev/null || true
+"${lifecycle_env[@]}" "$SCRIPT" install >/dev/null
+supervision_needs "$voice_home" || fail "reinstalled Telegram transport did not restore supervision"
 printf 'serialize stop\n' > "$voice_home/lifecycle-send.txt"
 touch "$voice_home/hold-send"
 rm -f "$voice_home/send-entered"
