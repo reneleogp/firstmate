@@ -370,6 +370,22 @@ fi
             raise TelegramError("safe Telegram wakes could not be cleaned")
 
 
+def queued_safe_wake_ids(home: Path) -> List[str]:
+    library = Path(__file__).resolve().parent / "fm-wake-lib.sh"
+    script = '. "$1"; fm_wake_queued_keys check'
+    environment = os.environ.copy()
+    environment["FM_HOME"] = str(home)
+    environment["FM_STATE_OVERRIDE"] = str(home / "state")
+    result = subprocess.run(
+        ["/bin/bash", "-c", script, "fm-telegram", str(library)],
+        env=environment, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise TelegramError("safe Telegram wakes could not be inspected")
+    return [line[len("telegram:"):] for line in result.stdout.splitlines()
+            if line.startswith("telegram:")]
+
+
 def active_path(home: Path) -> Path:
     return state_dir(home) / "active.json"
 
@@ -425,9 +441,13 @@ def _sync_request_wakes_locked(home: Path) -> None:
                 continuation_paths.append(path)
         paths = continuation_paths
     paths.sort(key=request_order_key)
+    desired = paths[0].stem if paths else None
+    queued = queued_safe_wake_ids(home)
+    if desired is not None and queued == [desired]:
+        return
     consume_safe_wakes(home)
-    if paths:
-        append_safe_wake(home, paths[0].stem)
+    if desired is not None:
+        append_safe_wake(home, desired)
 
 
 def sync_request_wakes(home: Path) -> None:

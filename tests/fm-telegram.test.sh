@@ -373,6 +373,13 @@ order_c=tg-text-u32-m32
 [ "$(grep -c "telegram:$order_a" "$order_home/state/.wake-queue")" -eq 1 ] || fail "ordered queue did not publish its first head exactly once"
 ! grep -F "telegram:$order_b" "$order_home/state/.wake-queue" >/dev/null || fail "ordered queue published its second request early"
 ! grep -F "telegram:$order_c" "$order_home/state/.wake-queue" >/dev/null || fail "ordered queue published its third request early"
+: > "$order_home/state/.seen-telegram-$order_a"
+order_wake_sequence=$(cat "$order_home/state/.wake-queue.seq")
+set_updates '[]' "$order_home"
+run_tg "$order_home" serve --once >/dev/null
+[ "$(cat "$order_home/state/.wake-queue.seq")" = "$order_wake_sequence" ] || fail "unchanged wake head was re-emitted during reconciliation"
+[ -e "$order_home/state/.seen-telegram-$order_a" ] || fail "unchanged surfaced wake marker was cleared during reconciliation"
+[ "$(grep -c "telegram:$order_a" "$order_home/state/.wake-queue")" -eq 1 ] || fail "unchanged surfaced wake was duplicated during reconciliation"
 run_tg "$order_home" request-handled "$order_a" >/dev/null
 run_tg "$order_home" request-bind "$order_a" order-work >/dev/null
 set_updates '[{"update_id":33,"message":{"message_id":33,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"late answer for A"}}]' "$order_home"
