@@ -232,6 +232,21 @@ def primary_running(home: Path) -> bool:
     return result.returncode == 0
 
 
+def watcher_running(home: Path) -> bool:
+    root = Path(__file__).resolve().parent
+    library = root / "fm-wake-lib.sh"
+    watcher = root / "fm-watch.sh"
+    environment = os.environ.copy()
+    environment["FM_HOME"] = str(home)
+    environment["FM_STATE_OVERRIDE"] = str(home / "state")
+    result = subprocess.run(
+        ["/bin/bash", "-c", '. "$1"; fm_watcher_healthy "$2" "$3" "${FM_GUARD_GRACE:-300}" "$4"',
+         "fm-telegram", str(library), str(home / "state"), str(watcher), str(home)],
+        env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
 def now() -> int:
     return int(time.time())
 
@@ -608,6 +623,29 @@ def pending_path(home: Path) -> Path:
     return state_dir(home) / "pending.json"
 
 
+def callback_history_path(home: Path) -> Path:
+    return state_dir(home) / "callback-actions.json"
+
+
+def callback_completion_key(pending_id: str, token: str) -> str:
+    return f"{pending_id}:{token}"
+
+
+def completed_callback_locked(home: Path, pending_id: str, token: str) -> bool:
+    history = read_json(callback_history_path(home), [])
+    key = callback_completion_key(pending_id, token)
+    return isinstance(history, list) and key in history
+
+
+def remember_callback_locked(home: Path, pending_id: str, token: str) -> None:
+    history = read_json(callback_history_path(home), [])
+    values = [value for value in history if isinstance(value, str)] if isinstance(history, list) else []
+    key = callback_completion_key(pending_id, token)
+    if key not in values:
+        values.append(key)
+    atomic_json(callback_history_path(home), values[-MAX_SEEN:])
+
+
 def remove_audio(data: Dict[str, Any]) -> None:
     value = data.get("audio_path")
     if not isinstance(value, str):
@@ -709,8 +747,10 @@ def complete_retry(home: Path, config: Dict[str, Any], pending: Dict[str, Any]) 
         pending["revision"] = revision + 1
         pending["heading_sent"] = False
         pending["transcript_sent"] = False
-        pending.pop("retry_token", None)
+        retry_token = pending.pop("retry_token", None)
         save_pending(home, pending)
+        if isinstance(retry_token, str) and isinstance(pending.get("pending_id"), str):
+            remember_callback_locked(home, str(pending["pending_id"]), retry_token)
         show_confirmation(home, config, pending)
         return True
     except (TelegramError, OSError, KeyError, TypeError, ValueError):
@@ -899,40 +939,51 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
         return False
     if revision <= 0 or str(revision) != raw_revision:
         return False
-    answer_callback(home, callback_id)
+    token = f"{action}:{revision}"
     with FileLock(state_lock(home)):
         pending = read_json(pending_path(home))
         if not isinstance(pending, dict) or pending.get("pending_id") != pending_id:
-            return True
+            if completed_callback_locked(home, pending_id, token):
+                answer_callback(home, callback_id)
+                return True
+            return False
         try:
             expired = now() - int(pending.get("created_at", 0)) >= PENDING_TTL
         except (TypeError, ValueError):
             expired = True
         if expired:
             remove_pending(home, pending)
+            answer_callback(home, callback_id)
             return True
-        token = f"{action}:{revision}"
         completed = pending.get("completed_actions", [])
         if not isinstance(completed, list):
             return False
-        if token in completed or pending.get("revision") != revision:
+        if token in completed or completed_callback_locked(home, pending_id, token):
+            answer_callback(home, callback_id)
             return True
+        if pending.get("revision") != revision:
+            return False
         pending["completed_actions"] = [
             value for value in completed if isinstance(value, str)
         ][-31:] + [token]
         if action == "cancel":
             remove_pending(home, pending)
+            remember_callback_locked(home, pending_id, token)
+            answer_callback(home, callback_id)
             return True
         if action == "edit":
             pending["mode"] = "edit"
             pending["edit_prompt_sent"] = False
             save_pending(home, pending)
+            remember_callback_locked(home, pending_id, token)
+            answer_callback(home, callback_id)
             reconcile_pending(home, config)
             return True
         if action == "retry":
             pending["mode"] = "retry"
             pending["retry_token"] = token
             save_pending(home, pending)
+            answer_callback(home, callback_id)
             return complete_retry(home, config, pending)
         if action == "send":
             try:
@@ -941,6 +992,8 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
                     int(pending["message_id"]), int(pending["update_id"]),
                     "voice", True, True,
                 )
+                remember_callback_locked(home, pending_id, token)
+                answer_callback(home, callback_id)
             except (TelegramError, KeyError, TypeError, ValueError):
                 return False
     if action == "send":
@@ -1053,7 +1106,7 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> i
 
     signal.signal(signal.SIGTERM, stop_service)
     signal.signal(signal.SIGINT, stop_service)
-    set_telegram_enabled(home, True)
+    prepare_transport_activation(home)
     try:
         while not stop:
             reconcile_closing(home)
@@ -1079,7 +1132,13 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> i
                 break
         return 0
     finally:
-        set_telegram_enabled(home, False)
+        if stop:
+            with FileLock(state_lock(home)):
+                pending = read_json(pending_path(home))
+                if isinstance(pending, dict):
+                    remove_pending(home, pending)
+        if stop or once:
+            set_telegram_enabled(home, False)
 
 
 def pair(home: Path, user_id: int, chat_id: int) -> int:
@@ -1147,6 +1206,9 @@ def request_handled(home: Path, request_id: str) -> int:
             if isinstance(continuation_of, str):
                 return die("continuation predecessor is no longer active")
             atomic_json(active_path(home), {"request_id": request_id, "claimed_at": now()})
+        elif continuation_of == active:
+            record["continuation_routing"] = "pending"
+            atomic_json(source, record)
         os.replace(source, target)
         private_file(target)
         _sync_request_wakes_locked(home)
@@ -1174,7 +1236,8 @@ def request_bind(home: Path, request_id: str, work_id: str) -> int:
     return 0
 
 
-def request_active(home: Path, work_id: Optional[str] = None) -> int:
+def request_active(home: Path, work_id: Optional[str] = None,
+                   claimed_request: Optional[str] = None) -> int:
     reconcile_closing(home)
     active = active_record(home)
     if active is None:
@@ -1184,7 +1247,31 @@ def request_active(home: Path, work_id: Optional[str] = None) -> int:
         return 1
     if work_id is not None and active.get("work_id") != work_id:
         return 1
-    print(request_id)
+    claimed_record: Optional[Dict[str, Any]] = None
+    if claimed_request is not None:
+        claimed_path = request_path(home, claimed_request)
+        if claimed_path is None or claimed_path.parent.name != "handled":
+            return 1
+        value = read_json(claimed_path)
+        if not isinstance(value, dict) or value.get("request_id") != claimed_request:
+            return 1
+        if claimed_request != request_id:
+            if (value.get("continuation_of") != request_id
+                    or value.get("continuation_routing") != "pending"):
+                return 1
+            claimed_record = value
+    print(request_id, flush=True)
+    if claimed_record is not None and claimed_request is not None:
+        with FileLock(state_lock(home)):
+            path = request_path(home, claimed_request)
+            current = read_json(path) if path is not None else None
+            if (isinstance(current, dict)
+                    and current.get("continuation_of") == request_id
+                    and current.get("continuation_routing") == "pending"):
+                current["continuation_routing"] = "routed"
+                current["continuation_routed_at"] = now()
+                atomic_json(path, current)
+        reconcile_closing(home)
     return 0
 
 
@@ -1203,10 +1290,12 @@ def reconcile_closing(home: Path) -> None:
         active = active_record(home)
         if active is not None and active.get("request_id") != request_id:
             raise TelegramError("Telegram closing transition conflicts with active work")
-        inbox, _handled = request_dirs(home)
-        for path in inbox.glob("*.json"):
+        inbox, handled = request_dirs(home)
+        continuation_paths = list(inbox.glob("*.json")) + list(handled.glob("*.json"))
+        for path in continuation_paths:
             record = read_json(path, {})
-            if isinstance(record, dict) and record.get("continuation_of") == request_id:
+            if (isinstance(record, dict) and record.get("continuation_of") == request_id
+                    and (path.parent == inbox or record.get("continuation_routing") == "pending")):
                 _sync_request_wakes_locked(home)
                 return
         if active is not None:
@@ -1268,6 +1357,14 @@ def set_telegram_enabled(home: Path, enabled: bool) -> None:
             path.unlink()
         except FileNotFoundError:
             pass
+
+
+def prepare_transport_activation(home: Path) -> None:
+    set_telegram_enabled(home, True)
+    if primary_running(home) and not watcher_running(home):
+        raise TelegramError(
+            "a running primary must establish its harness-owned watcher before Telegram starts; retry after supervision is healthy"
+        )
 
 
 def unit_path() -> Path:
@@ -1339,6 +1436,7 @@ def install(home: Path) -> int:
     atomic_bytes(path, unit_contents(home).encode())
     systemctl("daemon-reload")
     systemctl("enable", SERVICE_NAME)
+    prepare_transport_activation(home)
     systemctl("start", SERVICE_NAME)
     verify_service(active=True, enabled=True)
     verify_transport_marker(home, True)
@@ -1349,6 +1447,7 @@ def install(home: Path) -> int:
 def start_service(home: Path) -> int:
     load_config(home)
     require_unit_owner(home)
+    prepare_transport_activation(home)
     systemctl("start", SERVICE_NAME)
     verify_service(active=True)
     verify_transport_marker(home, True)
@@ -1466,7 +1565,9 @@ def build_parser() -> argparse.ArgumentParser:
     bind_parser.add_argument("work_id")
     active_parser = sub.add_parser("active-request", help="print the active Telegram request id")
     add_home(active_parser)
-    active_parser.add_argument("--work-id", help="require an exact lifecycle work binding")
+    active_group = active_parser.add_mutually_exclusive_group()
+    active_group.add_argument("--work-id", help="require an exact lifecycle work binding")
+    active_group.add_argument("--claimed-request", help="consume routing for this handled request")
     for name, help_text in (("send", "send to the paired private chat"), ("reply", "reply to one Telegram request")):
         command = sub.add_parser(name, help=help_text)
         add_home(command)
@@ -1498,7 +1599,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if args.command == "request-bind":
             return request_bind(home, args.request_id, args.work_id)
         if args.command == "active-request":
-            return request_active(home, args.work_id)
+            return request_active(home, args.work_id, args.claimed_request)
         if args.command == "send":
             return send_command(home, text_from_file(args.text_file))
         if args.command == "reply":

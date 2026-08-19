@@ -32,6 +32,7 @@ Cleanup never edits `.env` or unrelated home records.
 Pinned private text is durably stored in the home's private Telegram inbox before the transport reply is sent.
 A running primary receives `Message received.` and an offline primary receives `Message received and queued. It will be processed when Firstmate starts.`
 Starting the transport keeps the home's existing supervision watcher active so queued requests can wake an idle running primary, while stopping or disabling it removes that need.
+If a primary is already running without a healthy watcher, activation records the supervision need but refuses to start the transport until the primary's existing harness protocol establishes that watcher; return to the primary and retry `install` or `start` after supervision is healthy.
 The reply means queued, not started or completed.
 Telegram update and message identifiers are deduplicated in a bounded private record, and deterministic local request identifiers let interrupted processing reconcile the same queued request instead of creating another request.
 Receipt attempts enter a durable delivery-unknown state before the Bot API call and are reconciled from either the inbox or handled-request directory.
@@ -54,6 +55,7 @@ Lifecycle routing uses `active-request --work-id <work-id>` and refuses unrelate
 Replies use the pinned chat without a recipient argument, for example `bin/fm-telegram.py reply <local-request-id> --text-file reply.txt`.
 The terminal reply adds `--final` to clear the active binding and wake the next queued conversation.
 A pinned text reply received while that conversation is active is durably routed back to the same work as its continuation answer.
+Claim routing is consumed with `active-request --claimed-request <local-request-id>`, which preserves a continuation's predecessor across a concurrent final reply.
 Telegram-originated work can receive decision, blocker, terminal-confirmation, PR-ready, and final replies through this command, while routine progress and milestone chatter stay terminal-only.
 Requests that start in the terminal remain terminal-only.
 

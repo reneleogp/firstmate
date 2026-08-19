@@ -182,6 +182,7 @@ run_tg "$home" serve --once >/dev/null
 continuation_id=tg-text-u101-m110
 [ "$(run_tg "$home" request-read "$continuation_id")" = "the answer is option two" ] || fail "active conversation answer was not durably readable"
 run_tg "$home" request-handled "$continuation_id"
+[ "$(run_tg "$home" active-request --claimed-request "$continuation_id")" = "$request_id" ] || fail "continuation claim lost its active Telegram predecessor"
 [ "$(run_tg "$home" active-request --work-id telegram-work)" = "$request_id" ] || fail "continuation answer replaced the active Telegram work"
 printf 'final answer\n' > "$home/reply.txt"
 run_tg "$home" reply "$request_id" --final --text-file "$home/reply.txt" >/dev/null
@@ -226,17 +227,46 @@ run_tg "$home" serve --once >/dev/null
 [ "$(grep -c 'getFile' "$home/calls.jsonl")" -eq "$files_before" ] || fail "malformed voice metadata triggered a download"
 ! grep -F 'must not download' "$home/calls.jsonl" >/dev/null || fail "unsupported media was downloaded"
 
-# A verified live primary changes only the deterministic transport wording and does not mirror terminal state.
+# A live primary must have its harness-owned watcher before activation can accept requests.
+live_home=$(new_home live-primary)
+start_server "$live_home" "$live_home/port"
+run_tg "$live_home" pair --user-id 77 --chat-id 77 >/dev/null
 bash -c 'exec -a pi sleep 30' &
 harness_pid=$!
 sleep .05
-printf '%s\n' "$harness_pid" > "$home/state/.lock"
-printf 'terminal-originated-unique\n' > "$home/state/terminal-task.status"
-set_updates '[{"update_id":6,"message":{"message_id":14,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"live request"}}]' "$home"
-run_tg "$home" serve --once >/dev/null
+mkdir -p "$live_home/state"
+printf '%s\n' "$harness_pid" > "$live_home/state/.lock"
+set_updates '[{"update_id":60,"message":{"message_id":60,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"live request"}}]' "$live_home"
+get_updates_before=$(grep -c 'getUpdates' "$live_home/calls.jsonl" || true)
+if run_tg "$live_home" serve --once >/dev/null 2>&1; then
+  fail "transport activated beside an idle primary without healthy supervision"
+fi
+[ "$(grep -c 'getUpdates' "$live_home/calls.jsonl" || true)" -eq "$get_updates_before" ] || fail "failed activation polled Telegram before supervision was healthy"
+[ -e "$live_home/state/telegram/enabled" ] || fail "failed activation did not record the harness-owned supervision need"
+touch "$live_home/state/.last-heartbeat" "$live_home/state/.last-check"
+FM_HOME="$live_home" FM_STATE_OVERRIDE="$live_home/state" FM_POLL=1 FM_SIGNAL_GRACE=0 FM_HEARTBEAT=600 "$ROOT/bin/fm-watch.sh" > "$live_home/telegram-watcher.out" 2>&1 &
+telegram_watcher_pid=$!
+watcher_ready=0
+for _ in $(seq 1 100); do
+  if [ -s "$live_home/state/.watch.lock/pid" ] && [ -e "$live_home/state/.last-watcher-beat" ]; then watcher_ready=1; break; fi
+  sleep .02
+done
+[ "$watcher_ready" -eq 1 ] || fail "harness-safe Telegram supervision watcher did not become healthy"
+run_tg "$live_home" serve --once >/dev/null
+watcher_delivered=0
+for _ in $(seq 1 100); do
+  if grep -F "check: telegram tg-text-u60-m60" "$live_home/telegram-watcher.out" >/dev/null 2>&1; then watcher_delivered=1; break; fi
+  sleep .02
+done
+kill "$telegram_watcher_pid" 2>/dev/null || true
+wait "$telegram_watcher_pid" 2>/dev/null || true
 kill "$harness_pid" 2>/dev/null || true
-grep -F 'Message received.' "$home/calls.jsonl" >/dev/null || fail "live-primary receipt mismatch"
-! grep -F 'terminal-originated-unique' "$home/calls.jsonl" >/dev/null || fail "terminal-originated state was mirrored"
+[ "$watcher_delivered" -eq 1 ] || fail "healthy watcher did not surface the queued Telegram request"
+grep -F 'Message received.' "$live_home/calls.jsonl" >/dev/null || fail "live-primary receipt mismatch"
+rm -f "$home/port"
+start_server "$home" "$home/port"
+set_updates '[{"update_id":6,"message":{"message_id":14,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"queued request"}}]' "$home"
+run_tg "$home" serve --once >/dev/null
 live_id=tg-text-u6-m14
 set_updates '[{"update_id":102,"message":{"message_id":111,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"later queued request"}}]' "$home"
 run_tg "$home" serve --once >/dev/null
@@ -345,6 +375,7 @@ printf 'A final\n' > "$order_home/reply.txt"
 run_tg "$order_home" reply "$order_a" --final --text-file "$order_home/reply.txt" >/dev/null
 [ "$(run_tg "$order_home" active-request --work-id order-work)" = "$order_a" ] || fail "queued continuation lost its active predecessor during finalization"
 run_tg "$order_home" request-handled "$order_continuation" >/dev/null
+[ "$(run_tg "$order_home" active-request --claimed-request "$order_continuation")" = "$order_a" ] || fail "claimed continuation lost its predecessor during finalization"
 if next_active=$(run_tg "$order_home" active-request 2>/dev/null); then
   [ "$next_active" != "$order_continuation" ] || fail "continuation was promoted to unrelated active work"
 fi
@@ -413,6 +444,11 @@ set_updates '[{"update_id":24,"callback_query":{"id":"cb-cancel","from":{"id":77
 run_tg "$voice_home" serve --once >/dev/null
 [ ! -e "$audio" ] || fail "cancel must delete temporary audio"
 [ ! -e "$pending" ] || fail "cancel must delete pending state"
+cancel_answers=$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")
+set_updates '[{"update_id":240,"callback_query":{"id":"cb-cancel-completed","from":{"id":77},"data":"'"$cancel_data"'","message":{"message_id":203,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+[ "$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")" -eq "$((cancel_answers + 1))" ] || fail "durably completed callback was not recognized idempotently"
+[ ! -e "$pending" ] && [ ! -e "$audio" ] || fail "completed cancel callback recreated pending voice state"
 
 # Confirmed voice queues text, while an expired pending record deletes its audio.
 set_updates '[{"update_id":25,"message":{"message_id":25,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-2","duration":2,"file_size":20}}}]' "$voice_home"
@@ -557,7 +593,14 @@ if supervision_needs "$voice_home"; then fail "stopped Telegram transport still 
 if "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null; then fail "stop did not verify inactive state"; fi
 "${lifecycle_env[@]}" "$systemctl_fake" --user start firstmate-telegram.service
 supervision_needs "$voice_home" || fail "direct enabled-service restart did not restore supervision"
+direct_stop_audio=$(mktemp /dev/shm/firstmate-telegram-direct-stop.XXXXXX)
+python3 - "$voice_home/state/telegram/pending.json" "$direct_stop_audio" <<'PY'
+import json, sys, time
+json.dump({'audio_path': sys.argv[2], 'created_at': int(time.time()), 'mode': 'parked'}, open(sys.argv[1], 'w'))
+PY
 "${lifecycle_env[@]}" "$systemctl_fake" --user stop firstmate-telegram.service
+[ ! -e "$direct_stop_audio" ] || fail "graceful direct service stop retained temporary audio"
+[ ! -e "$voice_home/state/telegram/pending.json" ] || fail "graceful direct service stop retained pending voice state"
 if supervision_needs "$voice_home"; then fail "direct service stop did not release supervision"; fi
 "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null
 supervision_needs "$voice_home" || fail "restarted Telegram transport did not restore supervision"
