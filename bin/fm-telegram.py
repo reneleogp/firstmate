@@ -79,13 +79,63 @@ def home_from(args: argparse.Namespace) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def fsync_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def private_dir(path: Path) -> None:
+    missing = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        parent = cursor.parent
+        if parent == cursor:
+            break
+        cursor = parent
     path.mkdir(parents=True, exist_ok=True)
+    for created in reversed(missing):
+        os.chmod(created, 0o700)
+        fsync_directory(created.parent)
     os.chmod(path, 0o700)
 
 
 def private_file(path: Path) -> None:
     os.chmod(path, 0o600)
+
+
+def durable_replace(source: Path, target: Path) -> None:
+    os.replace(source, target)
+    fsync_directory(target.parent)
+    if source.parent != target.parent:
+        fsync_directory(source.parent)
+
+
+def durable_unlink(path: Path, missing_ok: bool = True) -> bool:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        if missing_ok:
+            return False
+        raise
+    fsync_directory(path.parent)
+    return True
+
+
+def durable_rmtree(path: Path) -> None:
+    shutil.rmtree(path)
+    fsync_directory(path.parent)
 
 
 def atomic_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -97,13 +147,7 @@ def atomic_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        private_file(path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        durable_replace(Path(temporary), path)
     finally:
         try:
             os.unlink(temporary)
@@ -357,7 +401,7 @@ def state_lock(home: Path) -> Path:
 
 
 def lifecycle_lock(home: Path) -> Path:
-    return state_dir(home) / ".lifecycle.lock"
+    return home / "state" / ".telegram-lifecycle.lock"
 
 
 class FileLock:
@@ -366,7 +410,7 @@ class FileLock:
         self.stream = None
 
     def __enter__(self) -> "FileLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        private_dir(self.path.parent)
         self.stream = self.path.open("a+")
         os.chmod(self.path, 0o600)
         fcntl.flock(self.stream.fileno(), fcntl.LOCK_EX)
@@ -393,6 +437,13 @@ def append_safe_wake(home: Path, request_id: str) -> None:
                             env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if result.returncode != 0:
         raise TelegramError("safe Telegram wake could not be recorded")
+    queue = home / "state" / ".wake-queue"
+    sequence = home / "state" / ".wake-queue.seq"
+    if queue.is_file() and not queue.is_symlink():
+        fsync_file(queue)
+    if sequence.is_file() and not sequence.is_symlink():
+        fsync_file(sequence)
+    fsync_directory(home / "state")
 
 
 def consume_safe_wakes(home: Path, request_ids: Optional[List[str]] = None) -> None:
@@ -441,6 +492,10 @@ fi
         )
         if result.returncode != 0:
             raise TelegramError("safe Telegram wakes could not be cleaned")
+        queue = home / "state" / ".wake-queue"
+        if queue.is_file() and not queue.is_symlink():
+            fsync_file(queue)
+        fsync_directory(home / "state")
 
 
 def queued_safe_wake_ids(home: Path) -> List[str]:
@@ -574,7 +629,7 @@ def bounded_cleanup(home: Path) -> None:
             if index >= MAX_INBOX or not strict_int(created) or created < cutoff:
                 try:
                     consume_safe_wakes(home, [path.stem])
-                    path.unlink()
+                    durable_unlink(path)
                 except (OSError, TelegramError):
                     pass
         handled_files = sorted(
@@ -583,7 +638,7 @@ def bounded_cleanup(home: Path) -> None:
         )
         for path in handled_files[MAX_HANDLED:]:
             try:
-                path.unlink()
+                durable_unlink(path)
             except OSError:
                 pass
         pending = state_dir(home) / "pending.json"
@@ -829,10 +884,7 @@ def remove_audio(data: Dict[str, Any]) -> None:
     except (OSError, ValueError):
         return
     if path.name.startswith("firstmate-telegram-"):
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        durable_unlink(path)
 
 
 def remove_pending(home: Path, data: Optional[Dict[str, Any]] = None) -> None:
@@ -840,10 +892,7 @@ def remove_pending(home: Path, data: Optional[Dict[str, Any]] = None) -> None:
         data = read_json(pending_path(home), {})
     if isinstance(data, dict):
         remove_audio(data)
-    try:
-        pending_path(home).unlink()
-    except FileNotFoundError:
-        pass
+    durable_unlink(pending_path(home))
 
 
 def save_pending(home: Path, data: Dict[str, Any]) -> None:
@@ -1470,26 +1519,25 @@ def identity_bound_state_exists(home: Path) -> bool:
 
 
 def pair(home: Path, user_id: int, chat_id: int) -> int:
-    require_pairing_service_inactive(home)
-    config_existing = read_json(config_path(home), {})
-    config = config_existing if isinstance(config_existing, dict) else {}
-    token = token_for(home)
-    result = raw_api_call(home, token, "getMe", {}, config)
-    if (not isinstance(result, dict) or result.get("is_bot") is not True
-            or not strict_int(result.get("id"))):
-        raise TelegramError("bot identity could not be verified")
-    chat = raw_api_call(home, token, "getChat", {"chat_id": chat_id}, config)
-    if (not isinstance(chat, dict) or chat.get("type") != "private"
-            or not strict_int(chat.get("id")) or chat.get("id") != chat_id):
-        raise TelegramError("pairing requires the pinned private bot DM")
-    if user_id <= 0 or chat_id <= 0:
-        raise TelegramError("user and chat ids must be positive integers")
-    if user_id != chat_id:
-        raise TelegramError("the pinned private chat must belong to the pinned user")
-    endpoint = api_base(home, config)
-    new_identity = (user_id, chat_id, int(result["id"]))
     with FileLock(lifecycle_lock(home)):
         require_pairing_service_inactive(home)
+        config_existing = read_json(config_path(home), {})
+        config = config_existing if isinstance(config_existing, dict) else {}
+        token = token_for(home)
+        result = raw_api_call(home, token, "getMe", {}, config)
+        if (not isinstance(result, dict) or result.get("is_bot") is not True
+                or not strict_int(result.get("id"))):
+            raise TelegramError("bot identity could not be verified")
+        chat = raw_api_call(home, token, "getChat", {"chat_id": chat_id}, config)
+        if (not isinstance(chat, dict) or chat.get("type") != "private"
+                or not strict_int(chat.get("id")) or chat.get("id") != chat_id):
+            raise TelegramError("pairing requires the pinned private bot DM")
+        if user_id <= 0 or chat_id <= 0:
+            raise TelegramError("user and chat ids must be positive integers")
+        if user_id != chat_id:
+            raise TelegramError("the pinned private chat must belong to the pinned user")
+        endpoint = api_base(home, config)
+        new_identity = (user_id, chat_id, int(result["id"]))
         with FileLock(state_lock(home)):
             current = read_json(config_path(home), {})
             config = current if isinstance(current, dict) else {}
@@ -1571,7 +1619,7 @@ def request_handled(home: Path, request_id: str) -> int:
             record["continuation_routing"] = "pending"
         record["wake_recorded"] = True
         atomic_json(source, record)
-        os.replace(source, target)
+        durable_replace(source, target)
         private_file(target)
         _sync_request_wakes_locked(home)
     bounded_cleanup(home)
@@ -1687,16 +1735,13 @@ def reconcile_closing(home: Path) -> None:
                 _sync_request_wakes_locked(home)
                 return
         if active is not None:
-            active_path(home).unlink()
+            durable_unlink(active_path(home))
         _sync_request_wakes_locked(home)
-        try:
-            closing_path(home).unlink()
-        except FileNotFoundError:
-            pass
+        durable_unlink(closing_path(home))
 
 
-def send_command(home: Path, text: str, request_id: Optional[str] = None,
-                 final: bool = False) -> int:
+def _send_command_locked(home: Path, text: str, request_id: Optional[str] = None,
+                         final: bool = False) -> int:
     config = load_config(home)
     chat_id = int(config["chat_id"])
     if final and request_id is None:
@@ -1732,6 +1777,12 @@ def send_command(home: Path, text: str, request_id: Optional[str] = None,
     return 0
 
 
+def send_command(home: Path, text: str, request_id: Optional[str] = None,
+                 final: bool = False) -> int:
+    with FileLock(lifecycle_lock(home)):
+        return _send_command_locked(home, text, request_id, final)
+
+
 def telegram_enabled_path(home: Path) -> Path:
     return state_dir(home) / "enabled"
 
@@ -1741,10 +1792,7 @@ def set_telegram_enabled(home: Path, enabled: bool) -> None:
     if enabled:
         atomic_bytes(path, b"enabled\n")
     else:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        durable_unlink(path)
 
 
 def prepare_transport_activation(home: Path) -> None:
@@ -1882,7 +1930,7 @@ def disable_service(home: Path) -> int:
     return 0
 
 
-def cleanup(home: Path) -> int:
+def _cleanup_locked(home: Path) -> int:
     path = unit_path()
     active_result = systemctl("is-active", SERVICE_NAME, check=False)
     enabled_result = systemctl("is-enabled", SERVICE_NAME, check=False)
@@ -1903,7 +1951,7 @@ def cleanup(home: Path) -> int:
     if owned:
         systemctl("disable", "--now", SERVICE_NAME)
         verify_service(active=False, enabled=False)
-        path.unlink()
+        durable_unlink(path)
         systemctl("daemon-reload")
     if telegram_state.is_dir() and not telegram_state.is_symlink():
         pending = read_json(telegram_state / "pending.json")
@@ -1913,14 +1961,19 @@ def cleanup(home: Path) -> int:
         remove_audio(pending)
     consume_safe_wakes(home)
     if telegram_state.is_symlink() or telegram_state.is_file():
-        telegram_state.unlink()
+        durable_unlink(telegram_state)
     elif telegram_state.is_dir():
-        shutil.rmtree(telegram_state)
+        durable_rmtree(telegram_state)
     config = config_path(home)
     if config.is_symlink() or config.is_file():
-        config.unlink()
+        durable_unlink(config)
     print("Telegram service and private Telegram state cleaned up.")
     return 0
+
+
+def cleanup(home: Path) -> int:
+    with FileLock(lifecycle_lock(home)):
+        return _cleanup_locked(home)
 
 
 def build_parser() -> argparse.ArgumentParser:

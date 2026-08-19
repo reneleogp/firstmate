@@ -835,7 +835,7 @@ PY
       count=$(cat "$root/systemctl.race-pair-count" 2>/dev/null || printf 0)
       count=$((count + 1))
       printf '%s\n' "$count" > "$root/systemctl.race-pair-count"
-      if [ "$count" -eq 2 ]; then
+      if [ "$count" -eq 1 ]; then
         rm -f "$root/systemctl.race-pair"
         (
           env FM_HOME="$FM_TELEGRAM_EXPECT_HOME" FM_TELEGRAM_API_BASE="$FM_TELEGRAM_API_BASE" \
@@ -970,6 +970,53 @@ FM_HOME="$voice_home" FM_STATE_OVERRIDE="$voice_home/state" bash -c '. "$1"; fm_
 grep -F $'\tcheck\tunrelated:keep\t' "$voice_home/state/.wake-queue" >/dev/null || fail "cleanup removed an unrelated wake"
 ! grep -F $'\tcheck\ttelegram:' "$voice_home/state/.wake-queue" >/dev/null || fail "cleanup left Telegram wake rows"
 "${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null || fail "cleanup must be idempotent"
+
+# Pairing, outbound sends, and cleanup share one stable home lifecycle boundary.
+"${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null
+printf 'serialized outbound\n' > "$voice_home/serialized-send.txt"
+touch "$voice_home/hold-send"
+rm -f "$voice_home/send-entered"
+"${lifecycle_env[@]}" "$SCRIPT" send --text-file "$voice_home/serialized-send.txt" >/dev/null &
+serialized_send_pid=$!
+serialized_send_entered=0
+for _ in $(seq 1 100); do
+  if [ -e "$voice_home/send-entered" ]; then serialized_send_entered=1; break; fi
+  sleep .02
+done
+[ "$serialized_send_entered" -eq 1 ] || fail "serialized outbound send did not reach the fake server"
+"${lifecycle_env[@]}" "$SCRIPT" pair --user-id 88 --chat-id 88 >/dev/null &
+serialized_pair_pid=$!
+sleep .1
+kill -0 "$serialized_pair_pid" 2>/dev/null || fail "pairing did not wait for the in-flight outbound send"
+[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["user_id"])' "$voice_home/config/telegram.json")" -eq 77 ] || fail "pairing changed identity during an outbound send"
+rm -f "$voice_home/hold-send"
+wait "$serialized_send_pid" || fail "serialized outbound send failed"
+wait "$serialized_pair_pid" || fail "serialized pairing replacement failed"
+[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["user_id"])' "$voice_home/config/telegram.json")" -eq 88 ] || fail "serialized pairing replacement was not committed"
+"${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null
+
+touch "$voice_home/hold-send"
+rm -f "$voice_home/send-entered"
+"${lifecycle_env[@]}" "$SCRIPT" send --text-file "$voice_home/serialized-send.txt" >/dev/null &
+cleanup_send_pid=$!
+cleanup_send_entered=0
+for _ in $(seq 1 100); do
+  if [ -e "$voice_home/send-entered" ]; then cleanup_send_entered=1; break; fi
+  sleep .02
+done
+[ "$cleanup_send_entered" -eq 1 ] || fail "cleanup serialization send did not reach the fake server"
+"${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null &
+serialized_cleanup_pid=$!
+sleep .1
+kill -0 "$serialized_cleanup_pid" 2>/dev/null || fail "cleanup did not wait for the in-flight outbound send"
+[ -f "$voice_home/config/telegram.json" ] || fail "cleanup removed pairing during an outbound send"
+rm -f "$voice_home/hold-send"
+wait "$cleanup_send_pid" || fail "outbound send failed while cleanup waited"
+wait "$serialized_cleanup_pid" || fail "serialized cleanup failed"
+[ ! -e "$voice_home/state/telegram" ] || fail "serialized cleanup retained private Telegram state"
+[ ! -e "$voice_home/config/telegram.json" ] || fail "serialized cleanup retained pairing config"
+[ -f "$voice_home/state/.telegram-lifecycle.lock" ] || fail "cleanup removed the stable lifecycle lock"
+"${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null || fail "cleanup with the retained lifecycle lock was not idempotent"
 
 grep -F 'test-only-token' "$home/state/.wake-queue" >/dev/null && fail "bot token entered wake data"
 pass "Telegram transport pairing, queueing, dedupe, drops, voice flow, safety, and lifecycle behave as specified"
