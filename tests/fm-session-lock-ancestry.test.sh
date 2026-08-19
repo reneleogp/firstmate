@@ -220,6 +220,33 @@ SH
   pass "session-lock: a live version-named session holding the lock is not mistaken for a stale owner"
 }
 
+test_zombie_harness_is_not_alive() {
+  local dir fakebin
+  dir="$TMP_ROOT/zombie"
+  fakebin=$(fm_fakebin "$dir")
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+set -u
+field=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) field=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$field" in
+  stat=) printf '%s\n' 'Z+' ;;
+  comm=) printf '%s\n' pi ;;
+  args=) printf '%s\n' pi ;;
+esac
+SH
+  chmod +x "$fakebin/ps"
+  if lib_eval "$fakebin" 'fm_harness_pid_alive 777'; then
+    fail "a zombie harness process was classified as a running primary"
+  fi
+  pass "session-lock: a zombie harness does not hold a live primary lock"
+}
+
 # --- end-to-end layer: the real Stop auto-arm in real process trees ----------
 
 install_autoarm_scripts() {
@@ -360,6 +387,7 @@ test_version_named_session_is_identified_on_both_platforms
 test_ordinary_paths_are_never_harness_processes
 test_harness_beyond_a_gap_never_owns_the_lock
 test_competing_version_named_session_is_seen_as_live
+test_zombie_harness_is_not_alive
 test_e2e_version_named_session_claims_the_home
 test_e2e_daemon_parented_session_claims_the_home
 test_e2e_daemon_parented_version_named_session_keeps_its_lock

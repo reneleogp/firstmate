@@ -66,6 +66,11 @@ class Handler(BaseHTTPRequestHandler):
         return self._write({})
     def do_GET(self):
         if '/file/' in self.path:
+            pending_path = home / 'state' / 'telegram' / 'pending.json'
+            pending = json.loads(pending_path.read_text()) if pending_path.exists() else {}
+            audio = Path(str(pending.get('audio_path', '')))
+            if pending.get('mode') != 'transcribing' or not audio.is_file():
+                (home / 'audio-not-journaled-before-download').write_text('failed')
             raw = b'fake audio bytes'
             self.send_response(200); self.send_header('Content-Length', str(len(raw))); self.end_headers(); self.wfile.write(raw)
             return
@@ -135,6 +140,13 @@ request_id=$(basename "$inbox" .json)
 run_tg "$home" request-handled "$request_id"
 [ ! -f "$inbox" ] || fail "request-handled must move the private request"
 [ "$(run_tg "$home" active-request)" = "$request_id" ] || fail "request handling must persist the active Telegram origin"
+run_tg "$home" request-bind "$request_id" telegram-work >/dev/null
+[ "$(run_tg "$home" active-request --work-id telegram-work)" = "$request_id" ] || fail "matching lifecycle work did not resolve its Telegram origin"
+routing_before=$(grep -c 'sendMessage' "$home/calls.jsonl")
+if run_tg "$home" active-request --work-id terminal-work >/dev/null 2>&1; then
+  fail "unrelated terminal work matched the active Telegram origin"
+fi
+[ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq "$routing_before" ] || fail "unrelated lifecycle lookup sent a Telegram reply"
 printf 'decision reply\n' > "$home/reply.txt"
 run_tg "$home" reply "$request_id" --text-file "$home/reply.txt" >/dev/null
 [ "$(run_tg "$home" active-request)" = "$request_id" ] || fail "non-final reply cleared the active origin"
@@ -149,7 +161,13 @@ set_updates '[{"update_id":9,"message":{"message_id":19,"from":{"id":77},"chat":
 authority_before=$(grep -c 'sendMessage' "$home/calls.jsonl")
 run_tg "$home" serve --once >/dev/null
 [ "$(( $(grep -c 'sendMessage' "$home/calls.jsonl") - authority_before ))" -eq 1 ] || fail "authority request produced more than a transport receipt"
-! grep -F 'merged' "$home/calls.jsonl" >/dev/null || fail "transport claimed authority-sensitive work was performed"
+python3 - "$home/calls.jsonl" "$authority_before" <<'PY'
+import json, sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding='utf-8')]
+sent = [call for call in calls if call['path'].endswith('/sendMessage')][int(sys.argv[2]):]
+assert len(sent) == 1
+assert sent[0]['params']['text'].startswith('Message received')
+PY
 
 # Unsupported, malformed, and unpinned updates are dropped without a Bot API send.
 before=$(grep -c 'sendMessage' "$home/calls.jsonl")
@@ -172,8 +190,13 @@ grep -F 'Message received.' "$home/calls.jsonl" >/dev/null || fail "live-primary
 authority_id=tg-text-u9-m19
 live_id=tg-text-u6-m14
 run_tg "$home" request-handled "$authority_id"
+run_tg "$home" request-bind "$authority_id" authority-work >/dev/null
 if run_tg "$home" request-handled "$live_id" >/dev/null 2>&1; then fail "a second Telegram conversation bypassed the active binding"; fi
+if run_tg "$home" active-request --work-id terminal-work >/dev/null 2>&1; then fail "terminal-originated work matched an authority request"; fi
 printf 'Terminal confirmation is required.\n' > "$home/authority-reply.txt"
+run_tg "$home" reply "$authority_id" --text-file "$home/authority-reply.txt" >/dev/null
+grep -F 'Terminal confirmation is required.' "$home/calls.jsonl" >/dev/null || fail "authority-sensitive work did not receive an explicit terminal-confirmation refusal"
+printf 'Request closed without action.\n' > "$home/authority-reply.txt"
 run_tg "$home" reply "$authority_id" --final --text-file "$home/authority-reply.txt" >/dev/null
 grep -F "telegram $live_id" "$home/state/.wake-queue" >/dev/null || fail "final reply did not wake the next ordered conversation"
 
@@ -206,7 +229,7 @@ run_tg "$retry_home" serve --once >/dev/null
 ! grep -F "telegram:$(basename "$retry_request" .json)" "$retry_home/state/.wake-queue" >/dev/null || fail "expired request left its Telegram wake queued"
 
 # Voice confirm, edit, retry, cancel, expiry, and temporary-audio cleanup.
-voice_home=$(new_home voice)
+voice_home=$(new_home 'voice home % dollar$ quote"')
 start_server "$voice_home" "$voice_home/port"
 cat > "$voice_home/parakeet.sh" <<'SH'
 #!/usr/bin/env bash
@@ -220,14 +243,15 @@ SH
 chmod +x "$voice_home/parakeet.sh" "$voice_home/whisper.sh"
 run_tg "$voice_home" pair --user-id 77 --chat-id 77 >/dev/null
 python3 - "$voice_home/config/telegram.json" "$voice_home/parakeet.sh" "$voice_home/whisper.sh" <<'PY'
-import json, sys
-p=sys.argv[1]; d=json.load(open(p)); d['parakeet_command']=sys.argv[2]; d['whisper_command']=sys.argv[3]; json.dump(d, open(p,'w'))
+import json, shlex, sys
+p=sys.argv[1]; d=json.load(open(p)); d['parakeet_command']=shlex.quote(sys.argv[2]); d['whisper_command']=shlex.quote(sys.argv[3]); json.dump(d, open(p,'w'))
 PY
 chmod 600 "$voice_home/config/telegram.json"
 set_updates '[{"update_id":20,"message":{"message_id":20,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-1","duration":2,"file_size":20}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 pending="$voice_home/state/telegram/pending.json"
 [ -f "$pending" ] || fail "voice note must create pending confirmation"
+[ ! -e "$voice_home/audio-not-journaled-before-download" ] || fail "voice audio was downloaded before its cleanup journal was durable"
 audio=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["audio_path"])' "$pending")
 [ -f "$audio" ] || fail "voice audio must be retained for confirmation"
 grep -F 'I heard this:' "$voice_home/calls.jsonl" >/dev/null || fail "voice confirmation heading missing"
@@ -296,6 +320,33 @@ command=${1:-}; shift || true
 active=$(cat "$root/systemctl.active" 2>/dev/null || printf inactive)
 enabled=$(cat "$root/systemctl.enabled" 2>/dev/null || printf disabled)
 case "$command" in
+  daemon-reload)
+    unit="$FM_TELEGRAM_UNIT_DIR/firstmate-telegram.service"
+    if [ -f "$unit" ]; then
+      systemd-analyze --user verify "$unit" >/dev/null 2>&1 || exit 1
+      python3 - "$unit" "$FM_TELEGRAM_EXPECT_HOME" <<'PY'
+import shlex, sys
+from pathlib import Path
+unit = Path(sys.argv[1]).read_text(encoding='utf-8').splitlines()
+expected = sys.argv[2]
+def value(name):
+    matches = [line.split('=', 1)[1] for line in unit if line.startswith(name + '=')]
+    assert len(matches) == 1
+    return matches[0]
+def words(raw):
+    lexer = shlex.shlex(raw, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    return [word.replace('%%', '%') for word in lexer]
+environment = words(value('Environment'))
+command = words(value('ExecStart'))
+assert environment == ['FM_HOME=' + expected]
+assert command[0] == ':/usr/bin/python3'
+assert command[1].endswith('/bin/fm-telegram.py')
+assert command[2:] == ['--home', expected, 'serve']
+PY
+    fi
+    ;;
   start) printf active > "$root/systemctl.active" ;;
   stop) printf inactive > "$root/systemctl.active" ;;
   enable) printf enabled > "$root/systemctl.enabled" ;;
@@ -316,10 +367,9 @@ esac
 exit 0
 SH
 chmod +x "$systemctl_fake"
-lifecycle_env=(env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir")
+lifecycle_env=(env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" FM_TELEGRAM_EXPECT_HOME="$voice_home")
 "${lifecycle_env[@]}" "$SCRIPT" install >/dev/null
 [ -f "$unit_dir/firstmate-telegram.service" ] || fail "install must write one user unit"
-grep -F "FM_HOME=$voice_home" "$unit_dir/firstmate-telegram.service" >/dev/null || fail "unit must pin one home"
 "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null || fail "status must report installed active service"
 "${lifecycle_env[@]}" "$SCRIPT" stop >/dev/null
 if "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null; then fail "stop did not verify inactive state"; fi
@@ -333,7 +383,16 @@ before_systemctl=$(wc -l < "$TMP_ROOT/systemctl.calls")
 if env FM_HOME="$other_home" FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" "$SCRIPT" cleanup >/dev/null 2>&1; then
   fail "cleanup for another home accepted the installed singleton unit"
 fi
-[ "$(wc -l < "$TMP_ROOT/systemctl.calls")" -eq "$before_systemctl" ] || fail "wrong-home cleanup mutated the singleton service"
+tail -n +$((before_systemctl + 1)) "$TMP_ROOT/systemctl.calls" | grep -Ev -- '^--user is-(active|enabled) firstmate-telegram\.service$' > "$TMP_ROOT/wrong-home.mutations" || true
+[ ! -s "$TMP_ROOT/wrong-home.mutations" ] || fail "wrong-home cleanup mutated the singleton service"
+unit="$unit_dir/firstmate-telegram.service"
+mv "$unit" "$unit.saved"
+ln -s "$unit.missing" "$unit"
+if "${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null 2>&1; then fail "cleanup accepted an active service with unverified ownership"; fi
+[ "$(cat "$TMP_ROOT/systemctl.active")" = active ] || fail "unverified cleanup changed the active service"
+[ -e "$voice_home/state/telegram" ] || fail "unverified cleanup removed private state"
+rm "$unit"
+mv "$unit.saved" "$unit"
 touch "$TMP_ROOT/systemctl.fail-disable"
 if "${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null 2>&1; then fail "cleanup ignored systemctl failure"; fi
 [ -e "$voice_home/state/telegram" ] || fail "failed cleanup removed private state while service could be live"

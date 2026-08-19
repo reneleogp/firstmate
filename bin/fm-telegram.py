@@ -11,6 +11,7 @@ import errno
 import fcntl
 import json
 import os
+import secrets
 import shlex
 import shutil
 import signal
@@ -354,7 +355,12 @@ def active_record(home: Path) -> Optional[Dict[str, Any]]:
     active = read_json(active_path(home))
     if not isinstance(active, dict) or not isinstance(active.get("request_id"), str):
         return None
-    return active if safe_id(str(active["request_id"])) else None
+    if not safe_id(str(active["request_id"])):
+        return None
+    work_id = active.get("work_id")
+    if work_id is not None and (not isinstance(work_id, str) or not safe_id(work_id)):
+        return None
+    return active
 
 
 def active_request_id(home: Path) -> Optional[str]:
@@ -599,7 +605,9 @@ def reconcile_pending(home: Path, config: Dict[str, Any]) -> None:
     if not isinstance(pending, dict):
         return
     try:
-        if pending.get("mode") == "confirm":
+        if pending.get("mode") == "transcribing":
+            remove_pending(home, pending)
+        elif pending.get("mode") == "confirm":
             show_confirmation(home, config, pending)
         elif pending.get("mode") == "edit" and pending.get("edit_prompt_sent") is not True:
             send_text(home, int(config["chat_id"]), "Reply with the corrected text.")
@@ -669,37 +677,46 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any], up
     if isinstance(pending, dict):
         remove_pending(home, pending)
     audio: Optional[Path] = None
+    pending: Optional[Dict[str, Any]] = None
+    journaled = False
     saved = False
     try:
         result = api_call(home, "getFile", {"file_id": file_id}, config)
         if not isinstance(result, dict) or not isinstance(result.get("file_path"), str):
             raise TelegramError("Telegram returned no voice file")
-        fd, filename = tempfile.mkstemp(prefix="firstmate-telegram-", suffix=".oga", dir="/dev/shm")
-        os.close(fd)
-        audio = Path(filename)
-        download_file(home, str(result["file_path"]), audio, config)
-        transcript = transcribe(home, config, audio, "parakeet")
+        audio = Path("/dev/shm") / f"firstmate-telegram-{secrets.token_hex(16)}.oga"
         pending = {
             "pending_id": pending_id,
-            "mode": "confirm",
-            "text": transcript,
+            "mode": "transcribing",
             "audio_path": str(audio),
             "chat_id": int(config["chat_id"]),
             "message_id": int(message["message_id"]),
             "update_id": update_id,
             "created_at": now(),
+        }
+        save_pending(home, pending)
+        journaled = True
+        descriptor = os.open(audio, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(descriptor)
+        download_file(home, str(result["file_path"]), audio, config)
+        transcript = transcribe(home, config, audio, "parakeet")
+        pending.update({
+            "mode": "confirm",
+            "text": transcript,
             "heading_sent": False,
             "transcript_sent": False,
-        }
+        })
         save_pending(home, pending)
         saved = True
         audio = None
         reconcile_pending(home, config)
         return True
-    except TelegramError:
-        if audio is not None:
-            remove_audio({"audio_path": str(audio)})
+    except (TelegramError, OSError):
         if not saved:
+            if journaled and pending is not None:
+                remove_pending(home, pending)
+            elif audio is not None:
+                remove_audio({"audio_path": str(audio)})
             try:
                 send_text(home, int(config["chat_id"]), "I couldn't transcribe that voice note.")
             except TelegramError:
@@ -956,9 +973,34 @@ def request_handled(home: Path, request_id: str) -> int:
     return 0
 
 
-def request_active(home: Path) -> int:
-    request_id = active_request_id(home)
-    if request_id is None or request_path(home, request_id) is None:
+def request_bind(home: Path, request_id: str, work_id: str) -> int:
+    if not safe_id(work_id):
+        return die("work identifier is invalid")
+    with FileLock(state_lock(home)):
+        active = active_record(home)
+        if active is None or active.get("request_id") != request_id:
+            return die("request is not the active Telegram conversation")
+        if request_path(home, request_id) is None:
+            return die("request not found")
+        bound = active.get("work_id")
+        if bound is not None and bound != work_id:
+            return die("active Telegram conversation is bound to different work")
+        if bound is None:
+            active["work_id"] = work_id
+            active["bound_at"] = now()
+            atomic_json(active_path(home), active)
+    print("Telegram work binding recorded.")
+    return 0
+
+
+def request_active(home: Path, work_id: Optional[str] = None) -> int:
+    active = active_record(home)
+    if active is None:
+        return 1
+    request_id = str(active["request_id"])
+    if request_path(home, request_id) is None:
+        return 1
+    if work_id is not None and active.get("work_id") != work_id:
         return 1
     print(request_id)
     return 0
@@ -1021,12 +1063,20 @@ def unit_path() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user" / SERVICE_NAME
 
 
+def systemd_quote(value: str) -> str:
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise TelegramError("service paths contain unsupported control characters")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'
+
+
 def unit_contents(home: Path) -> str:
     script = Path(__file__).resolve()
+    arguments = " ".join(systemd_quote(value) for value in (str(script), "--home", str(home), "serve"))
     return ("[Unit]\nDescription=Firstmate Telegram transport\nAfter=network-online.target\n\n"
             "[Service]\nType=simple\n"
-            f"Environment=FM_HOME={home}\n"
-            f"ExecStart=/usr/bin/python3 {script} --home {home} serve\n"
+            f"Environment={systemd_quote('FM_HOME=' + str(home))}\n"
+            f"ExecStart=:/usr/bin/python3 {arguments}\n"
             "Restart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n")
 
 
@@ -1062,7 +1112,7 @@ def install(home: Path) -> int:
     load_config(home)
     token_for(home)
     path = unit_path()
-    if path.exists() and not unit_owned_by(home):
+    if (path.exists() or path.is_symlink()) and not unit_owned_by(home):
         raise TelegramError("Telegram service unit belongs to another home or installation")
     atomic_bytes(path, unit_contents(home).encode())
     systemctl("daemon-reload")
@@ -1107,8 +1157,17 @@ def disable_service(home: Path) -> int:
 
 def cleanup(home: Path) -> int:
     path = unit_path()
-    if path.exists():
-        require_unit_owner(home)
+    active_result = systemctl("is-active", SERVICE_NAME, check=False)
+    enabled_result = systemctl("is-enabled", SERVICE_NAME, check=False)
+    active_state = active_result.stdout.strip()
+    enabled_state = enabled_result.stdout.strip()
+    safely_inactive = active_state in {"inactive", "failed", "unknown"}
+    safely_disabled = enabled_state in {"disabled", "not-found"}
+    owned = unit_owned_by(home)
+    unit_present = path.exists() or path.is_symlink()
+    if not owned and (unit_present or not safely_inactive or not safely_disabled):
+        raise TelegramError("Telegram service ownership could not be verified")
+    if owned:
         systemctl("disable", "--now", SERVICE_NAME)
         verify_service(active=False, enabled=False)
         path.unlink()
@@ -1133,7 +1192,7 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, request-read, request-handled, active-request, send, reply, install, start, stop, status, disable, cleanup.\n"
+        epilog=("Commands: pair, serve, request-read, request-handled, request-bind, active-request, send, reply, install, start, stop, status, disable, cleanup.\n"
                 "Retention limits: 256 queued requests for 7 days and 4096 handled requests.\n"
                 "Voice limits: 10 MiB, 120 seconds, and a 4096-unit transcript. Temporary audio is restricted to /dev/shm.\n"
                 "FM_TELEGRAM_PARAKEET_CMD and FM_TELEGRAM_WHISPER_CMD override the local transcription commands.\n"
@@ -1158,8 +1217,13 @@ def build_parser() -> argparse.ArgumentParser:
     handled_parser = sub.add_parser("request-handled", help="claim and mark one Telegram request handled")
     add_home(handled_parser)
     handled_parser.add_argument("request_id")
+    bind_parser = sub.add_parser("request-bind", help="bind the active request to one lifecycle work id")
+    add_home(bind_parser)
+    bind_parser.add_argument("request_id")
+    bind_parser.add_argument("work_id")
     active_parser = sub.add_parser("active-request", help="print the active Telegram request id")
     add_home(active_parser)
+    active_parser.add_argument("--work-id", help="require an exact lifecycle work binding")
     for name, help_text in (("send", "send to the paired private chat"), ("reply", "reply to one Telegram request")):
         command = sub.add_parser(name, help=help_text)
         add_home(command)
@@ -1188,8 +1252,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return request_read(home, args.request_id)
         if args.command == "request-handled":
             return request_handled(home, args.request_id)
+        if args.command == "request-bind":
+            return request_bind(home, args.request_id, args.work_id)
         if args.command == "active-request":
-            return request_active(home)
+            return request_active(home, args.work_id)
         if args.command == "send":
             return send_command(home, text_from_file(args.text_file))
         if args.command == "reply":
