@@ -232,6 +232,10 @@ def now() -> int:
     return int(time.time())
 
 
+def strict_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def request_dirs(home: Path) -> Tuple[Path, Path]:
     root = state_dir(home)
     inbox = root / "inbox"
@@ -368,6 +372,10 @@ def active_request_id(home: Path) -> Optional[str]:
     return str(active["request_id"]) if active is not None else None
 
 
+def closing_path(home: Path) -> Path:
+    return state_dir(home) / "closing.json"
+
+
 def bounded_cleanup(home: Path) -> None:
     inbox, handled = request_dirs(home)
     active = active_request_id(home)
@@ -409,11 +417,14 @@ def deterministic_request_id(source: str, update_id: int, message_id: int) -> st
 
 def queue_request(home: Path, text: str, chat_id: int, message_id: int,
                   update_id: Optional[int], source: str = "text",
-                  confirmed: bool = False) -> str:
+                  confirmed: bool = False,
+                  continuation_of: Optional[str] = None) -> str:
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
         raise TelegramError("request text is empty or too long")
-    if not isinstance(update_id, int):
-        raise TelegramError("request update identifier is invalid")
+    if not strict_int(update_id) or not strict_int(message_id):
+        raise TelegramError("request identifiers are invalid")
+    if continuation_of is not None and not safe_id(continuation_of):
+        raise TelegramError("continuation identifier is invalid")
     request_id = deterministic_request_id(source, update_id, message_id)
     inbox, handled = request_dirs(home)
     path = inbox / f"{request_id}.json"
@@ -438,6 +449,8 @@ def queue_request(home: Path, text: str, chat_id: int, message_id: int,
         "receipt_text": transport_reply(home),
         "receipt_status": "pending",
     }
+    if continuation_of is not None:
+        record["continuation_of"] = continuation_of
     atomic_json(path, record)
     return request_id
 
@@ -575,18 +588,22 @@ def transcribe(home: Path, config: Dict[str, Any], audio: Path, kind: str) -> st
     return transcript
 
 
-def confirmation_markup(request_id: str) -> Dict[str, Any]:
+def confirmation_markup(request_id: str, revision: int) -> Dict[str, Any]:
+    suffix = f"{request_id}:{revision}"
     return {"inline_keyboard": [[
-        {"text": "Send to Firstmate", "callback_data": f"send:{request_id}"},
-        {"text": "Edit", "callback_data": f"edit:{request_id}"},
+        {"text": "Send to Firstmate", "callback_data": f"send:{suffix}"},
+        {"text": "Edit", "callback_data": f"edit:{suffix}"},
     ], [
-        {"text": "Retry with Whisper", "callback_data": f"retry:{request_id}"},
-        {"text": "Cancel", "callback_data": f"cancel:{request_id}"},
+        {"text": "Retry with Whisper", "callback_data": f"retry:{suffix}"},
+        {"text": "Cancel", "callback_data": f"cancel:{suffix}"},
     ]]}
 
 
 def show_confirmation(home: Path, config: Dict[str, Any], pending: Dict[str, Any]) -> None:
     text = str(pending["text"])
+    revision = pending.get("revision")
+    if not strict_int(revision) or revision <= 0:
+        raise TelegramError("voice confirmation revision is invalid")
     if len(text.encode("utf-16-le")) // 2 > MAX_TRANSCRIPT_UNITS:
         raise TelegramError("voice transcript exceeds Telegram's message limit")
     if pending.get("heading_sent") is not True:
@@ -595,9 +612,35 @@ def show_confirmation(home: Path, config: Dict[str, Any], pending: Dict[str, Any
         save_pending(home, pending)
     if pending.get("transcript_sent") is not True:
         send_text(home, int(pending["chat_id"]), text,
-                  confirmation_markup(str(pending["pending_id"])))
+                  confirmation_markup(str(pending["pending_id"]), revision))
         pending["transcript_sent"] = True
         save_pending(home, pending)
+
+
+def complete_retry(home: Path, config: Dict[str, Any], pending: Dict[str, Any]) -> bool:
+    try:
+        transcript = transcribe(home, config, Path(str(pending["audio_path"])), "whisper")
+        revision = pending.get("revision")
+        if not strict_int(revision) or revision <= 0:
+            raise TelegramError("voice confirmation revision is invalid")
+        pending["text"] = transcript
+        pending["mode"] = "confirm"
+        pending["revision"] = revision + 1
+        pending["heading_sent"] = False
+        pending["transcript_sent"] = False
+        pending.pop("retry_token", None)
+        save_pending(home, pending)
+        show_confirmation(home, config, pending)
+        return True
+    except (TelegramError, OSError, KeyError, TypeError, ValueError):
+        pending["mode"] = "confirm"
+        completed = pending.get("completed_actions", [])
+        token = pending.get("retry_token")
+        if isinstance(completed, list) and isinstance(token, str):
+            pending["completed_actions"] = [value for value in completed if value != token]
+        pending.pop("retry_token", None)
+        save_pending(home, pending)
+        return False
 
 
 def reconcile_pending(home: Path, config: Dict[str, Any]) -> None:
@@ -607,6 +650,8 @@ def reconcile_pending(home: Path, config: Dict[str, Any]) -> None:
     try:
         if pending.get("mode") == "transcribing":
             remove_pending(home, pending)
+        elif pending.get("mode") == "retry":
+            complete_retry(home, config, pending)
         elif pending.get("mode") == "confirm":
             show_confirmation(home, config, pending)
         elif pending.get("mode") == "edit" and pending.get("edit_prompt_sent") is not True:
@@ -628,31 +673,45 @@ def pinned_message(config: Dict[str, Any], message: Any) -> Optional[Tuple[Dict[
         return None
     if sender.get("id") != config.get("user_id"):
         return None
-    if not isinstance(message.get("message_id"), int):
+    if not strict_int(message.get("message_id")):
         return None
     return message, chat
 
 
 def handle_text(home: Path, config: Dict[str, Any], message: Dict[str, Any], update_id: int) -> bool:
     text = message.get("text")
+    message_id = message.get("message_id")
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
         return False
     pending = read_json(pending_path(home))
-    if isinstance(pending, dict) and pending.get("mode") == "edit":
-        if len(text.encode("utf-16-le")) // 2 > MAX_TRANSCRIPT_UNITS:
-            return False
-        if pending.get("edit_message_id") != message["message_id"]:
+    if isinstance(pending, dict):
+        edit_replay = (pending.get("edit_update_id") == update_id
+                       and pending.get("edit_message_id") == message_id)
+        if edit_replay:
+            reconcile_pending(home, config)
+            return True
+        if pending.get("mode") == "edit":
+            if len(text.encode("utf-16-le")) // 2 > MAX_TRANSCRIPT_UNITS:
+                return False
+            revision = pending.get("revision")
+            if not strict_int(revision) or revision <= 0:
+                return False
             pending["text"] = text
             pending["mode"] = "confirm"
-            pending["edit_message_id"] = message["message_id"]
+            pending["revision"] = revision + 1
+            pending["edit_update_id"] = update_id
+            pending["edit_message_id"] = message_id
             pending["heading_sent"] = False
             pending["transcript_sent"] = False
             pending.pop("edit_prompt_sent", None)
             save_pending(home, pending)
-        reconcile_pending(home, config)
-        return True
+            reconcile_pending(home, config)
+            return True
+    active = active_record(home)
+    continuation_of = str(active["request_id"]) if active is not None else None
     request_id = queue_request(home, text, int(config["chat_id"]),
-                               int(message["message_id"]), update_id)
+                               int(message_id), update_id,
+                               continuation_of=continuation_of)
     reconcile_request(home, request_id)
     record = read_json(request_path(home, request_id))
     return isinstance(record, dict) and record.get("wake_recorded") is True
@@ -665,7 +724,9 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any], up
     duration = voice.get("duration")
     size = voice.get("file_size", 0)
     file_id = voice.get("file_id")
-    if not isinstance(duration, int) or not isinstance(size, int) or not isinstance(file_id, str):
+    if not strict_int(duration) or not strict_int(size):
+        return False
+    if not isinstance(file_id, str) or not file_id.strip() or "\x00" in file_id:
         return False
     if duration < 0 or duration > MAX_VOICE_SECONDS or size < 0 or size > MAX_VOICE_BYTES:
         return False
@@ -693,6 +754,8 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any], up
             "message_id": int(message["message_id"]),
             "update_id": update_id,
             "created_at": now(),
+            "revision": 1,
+            "completed_actions": [],
         }
         save_pending(home, pending)
         journaled = True
@@ -732,17 +795,26 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
         return False
     if not isinstance(sender, dict) or sender.get("id") != config.get("user_id"):
         return False
-    if not isinstance(message, dict):
+    if not isinstance(message, dict) or not strict_int(message.get("message_id")):
         return False
     chat = message.get("chat")
     if (not isinstance(chat, dict) or chat.get("type") != "private"
             or chat.get("id") != config.get("chat_id")):
         return False
     callback_data = query.get("data")
-    if not isinstance(callback_data, str) or ":" not in callback_data:
+    if not isinstance(callback_data, str):
         return False
-    action, pending_id = callback_data.split(":", 1)
+    parts = callback_data.split(":")
+    if len(parts) != 3:
+        return False
+    action, pending_id, raw_revision = parts
     if action not in {"send", "edit", "retry", "cancel"} or not safe_id(pending_id):
+        return False
+    try:
+        revision = int(raw_revision)
+    except ValueError:
+        return False
+    if revision <= 0 or str(revision) != raw_revision:
         return False
     answer_callback(home, callback_id)
     with FileLock(state_lock(home)):
@@ -756,37 +828,38 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
         if expired:
             remove_pending(home, pending)
             return True
-        if pending.get("completed_update_id") == update_id:
+        token = f"{action}:{revision}"
+        completed = pending.get("completed_actions", [])
+        if not isinstance(completed, list):
+            return False
+        if token in completed or pending.get("revision") != revision:
             return True
+        pending["completed_actions"] = [
+            value for value in completed if isinstance(value, str)
+        ][-31:] + [token]
         if action == "cancel":
             remove_pending(home, pending)
             return True
         if action == "edit":
             pending["mode"] = "edit"
             pending["edit_prompt_sent"] = False
-            pending["completed_update_id"] = update_id
             save_pending(home, pending)
             reconcile_pending(home, config)
             return True
         if action == "retry":
-            try:
-                transcript = transcribe(home, config, Path(str(pending["audio_path"])), "whisper")
-            except (TelegramError, OSError):
-                return False
-            pending["text"] = transcript
-            pending["mode"] = "confirm"
-            pending["heading_sent"] = False
-            pending["transcript_sent"] = False
-            pending["completed_update_id"] = update_id
+            pending["mode"] = "retry"
+            pending["retry_token"] = token
             save_pending(home, pending)
-            reconcile_pending(home, config)
-            return True
+            return complete_retry(home, config, pending)
         if action == "send":
             try:
+                active = active_record(home)
+                continuation_of = str(active["request_id"]) if active is not None else None
                 request_id = queue_request(
                     home, str(pending["text"]), int(pending["chat_id"]),
                     int(pending["message_id"]), int(pending["update_id"]),
                     source="voice", confirmed=True,
+                    continuation_of=continuation_of,
                 )
                 reconcile_request(home, request_id)
                 record = read_json(request_path(home, request_id))
@@ -800,7 +873,7 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
 
 
 def process_update(home: Path, config: Dict[str, Any], update: Any) -> None:
-    if not isinstance(update, dict) or not isinstance(update.get("update_id"), int):
+    if not isinstance(update, dict) or not strict_int(update.get("update_id")):
         return
     update_id = int(update["update_id"])
     if update_id < 0:
@@ -892,6 +965,7 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> i
     signal.signal(signal.SIGTERM, stop_service)
     signal.signal(signal.SIGINT, stop_service)
     while not stop:
+        reconcile_closing(home)
         expire_pending(home)
         bounded_cleanup(home)
         reconcile_requests(home)
@@ -902,7 +976,7 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> i
             if not isinstance(updates, list):
                 updates = []
             for update in updates:
-                if isinstance(update, dict) and isinstance(update.get("update_id"), int):
+                if isinstance(update, dict) and strict_int(update.get("update_id")):
                     offset = max(offset, int(update["update_id"]) + 1)
                 process_update(home, config, update)
             reconcile_requests(home)
@@ -956,15 +1030,25 @@ def request_read(home: Path, request_id: str) -> int:
 
 
 def request_handled(home: Path, request_id: str) -> int:
+    reconcile_closing(home)
     inbox, handled = request_dirs(home)
     source = inbox / f"{request_id}.json"
     target = handled / f"{request_id}.json"
     with FileLock(state_lock(home)):
         active = active_request_id(home)
-        if active is not None and active != request_id:
-            return die("another Telegram conversation is active")
+        record = read_json(source)
         if not source.is_file() or source.is_symlink():
-            return 0 if target.is_file() and active == request_id else die("request not found")
+            if target.is_file():
+                target_record = read_json(target)
+                if active == request_id or (isinstance(target_record, dict)
+                                             and target_record.get("continuation_of") == active):
+                    return 0
+            return die("request not found")
+        if not isinstance(record, dict) or record.get("request_id") != request_id:
+            return die("request is malformed")
+        continuation_of = record.get("continuation_of")
+        if active is not None and active != request_id and continuation_of != active:
+            return die("another Telegram conversation is active")
         if active is None:
             atomic_json(active_path(home), {"request_id": request_id, "claimed_at": now()})
         os.replace(source, target)
@@ -994,6 +1078,7 @@ def request_bind(home: Path, request_id: str, work_id: str) -> int:
 
 
 def request_active(home: Path, work_id: Optional[str] = None) -> int:
+    reconcile_closing(home)
     active = active_record(home)
     if active is None:
         return 1
@@ -1016,24 +1101,49 @@ def wake_next_request(home: Path) -> None:
     append_safe_wake(home, request_id)
 
 
+def reconcile_closing(home: Path) -> None:
+    with FileLock(state_lock(home)):
+        closing = read_json(closing_path(home))
+        if not isinstance(closing, dict):
+            return
+        request_id = closing.get("request_id")
+        if not isinstance(request_id, str) or not safe_id(request_id):
+            raise TelegramError("Telegram closing transition is malformed")
+        active = active_record(home)
+        if active is not None:
+            if active.get("request_id") != request_id:
+                raise TelegramError("Telegram closing transition conflicts with active work")
+            active_path(home).unlink()
+        wake_next_request(home)
+        try:
+            closing_path(home).unlink()
+        except FileNotFoundError:
+            pass
+
+
 def send_command(home: Path, text: str, request_id: Optional[str] = None,
                  final: bool = False) -> int:
     config = load_config(home)
     chat_id = int(config["chat_id"])
     if final and request_id is None:
         raise TelegramError("only a request reply can be final")
+    record: Optional[Dict[str, Any]] = None
     if request_id is not None:
-        if active_request_id(home) != request_id:
-            return die("request is not the active Telegram conversation")
         path = request_path(home, request_id)
         if path is None:
             return die("request not found")
-        record = read_json(path)
-        if not isinstance(record, dict) or record.get("origin") != "telegram":
+        value = read_json(path)
+        if not isinstance(value, dict) or value.get("origin") != "telegram":
             return die("request is not a Telegram request")
+        record = value
+        if active_request_id(home) != request_id:
+            if final and record.get("final_sent") is True:
+                reconcile_closing(home)
+                print("Telegram reply sent.")
+                return 0
+            return die("request is not the active Telegram conversation")
         chat_id = int(record["chat_id"])
-    active = active_record(home) if request_id is not None else None
-    final_already_sent = bool(final and active is not None and active.get("final_sent") is True)
+    final_already_sent = bool(final and record is not None and record.get("final_sent") is True)
     if not final_already_sent:
         send_text(home, chat_id, text)
     if final and request_id is not None:
@@ -1041,19 +1151,27 @@ def send_command(home: Path, text: str, request_id: Optional[str] = None,
             current = active_record(home)
             if current is None or current.get("request_id") != request_id:
                 raise TelegramError("active Telegram conversation changed during final reply")
-            if current.get("final_sent") is not True:
-                current["final_sent"] = True
-                current["final_sent_at"] = now()
-                atomic_json(active_path(home), current)
-        wake_next_request(home)
-        with FileLock(state_lock(home)):
-            if active_request_id(home) == request_id:
-                try:
-                    active_path(home).unlink()
-                except FileNotFoundError:
-                    pass
+            update_request_record(home, request_id, final_sent=True, final_sent_at=now())
+            atomic_json(closing_path(home), {"request_id": request_id, "created_at": now()})
+            active_path(home).unlink()
+        reconcile_closing(home)
     print("Telegram reply sent.")
     return 0
+
+
+def telegram_enabled_path(home: Path) -> Path:
+    return state_dir(home) / "enabled"
+
+
+def set_telegram_enabled(home: Path, enabled: bool) -> None:
+    path = telegram_enabled_path(home)
+    if enabled:
+        atomic_bytes(path, b"enabled\n")
+    else:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def unit_path() -> Path:
@@ -1117,6 +1235,7 @@ def install(home: Path) -> int:
     atomic_bytes(path, unit_contents(home).encode())
     systemctl("daemon-reload")
     systemctl("enable", SERVICE_NAME)
+    set_telegram_enabled(home, True)
     systemctl("start", SERVICE_NAME)
     verify_service(active=True, enabled=True)
     print("Telegram service installed and active.")
@@ -1126,6 +1245,7 @@ def install(home: Path) -> int:
 def start_service(home: Path) -> int:
     load_config(home)
     require_unit_owner(home)
+    set_telegram_enabled(home, True)
     systemctl("start", SERVICE_NAME)
     verify_service(active=True)
     print("Telegram service active.")
@@ -1136,6 +1256,7 @@ def stop_service(home: Path) -> int:
     require_unit_owner(home)
     systemctl("stop", SERVICE_NAME)
     verify_service(active=False)
+    set_telegram_enabled(home, False)
     print("Telegram service stopped.")
     return 0
 
@@ -1151,6 +1272,7 @@ def disable_service(home: Path) -> int:
     require_unit_owner(home)
     systemctl("disable", "--now", SERVICE_NAME)
     verify_service(active=False, enabled=False)
+    set_telegram_enabled(home, False)
     print("Telegram service disabled.")
     return 0
 

@@ -31,6 +31,7 @@ Cleanup never edits `.env` or unrelated home records.
 
 Pinned private text is durably stored in the home's private Telegram inbox before the transport reply is sent.
 A running primary receives `Message received.` and an offline primary receives `Message received and queued. It will be processed when Firstmate starts.`
+Starting the transport keeps the home's existing supervision watcher active so queued requests can wake an idle running primary, while stopping or disabling it removes that need.
 The reply means queued, not started or completed.
 Telegram update and message identifiers are deduplicated in a bounded private record, and deterministic local request identifiers let interrupted processing reconcile the same queued request and receipt instead of creating another request.
 Unknown, malformed, unpinned, and unsupported updates are silently dropped.
@@ -49,6 +50,7 @@ When the request receives a lifecycle work identifier, `request-bind <local-requ
 Lifecycle routing uses `active-request --work-id <work-id>` and refuses unrelated terminal work.
 Replies use the pinned chat without a recipient argument, for example `bin/fm-telegram.py reply <local-request-id> --text-file reply.txt`.
 The terminal reply adds `--final` to clear the active binding and wake the next queued conversation.
+A pinned text reply received while that conversation is active is durably routed back to the same work as its continuation answer.
 Telegram-originated work can receive decision, blocker, terminal-confirmation, PR-ready, and final replies through this command, while routine progress and milestone chatter stay terminal-only.
 Requests that start in the terminal remain terminal-only.
 
@@ -62,7 +64,7 @@ The transport has no model or action authority and does not interpret the reques
 Private inbox, handled-request, deduplication, and pending voice records are bounded and stored under the home state directory with private permissions.
 Queued requests older than the retention window or beyond the fixed queue cap are removed oldest-first, including their Telegram wake records, so an unattended offline home does not retain message bodies indefinitely.
 The executable's `--help` reports the current numeric retention limits.
-Temporary audio is deleted after confirmation, cancellation, expiry, or a failed transcription.
+Temporary audio is deleted after sending, cancellation, expiry, or a failed transcription.
 
 Telegram bot chats are not end-to-end encrypted.
 The laptop being off prevents delivery and processing until it is running again.

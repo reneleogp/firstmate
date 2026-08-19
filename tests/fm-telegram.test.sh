@@ -108,6 +108,22 @@ new_home() {
 set_updates() { printf '%s\n' "$1" > "$2/updates.json"; }
 api_env() { printf 'FM_HOME=%s FM_TELEGRAM_API_BASE=http://127.0.0.1:%s' "$1" "$(cat "$1/port")"; }
 run_tg() { env FM_HOME="$1" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$1/port")" "$SCRIPT" "${@:2}"; }
+callback_data() {
+  python3 - "$1/calls.jsonl" "$2" <<'PY'
+import json, sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding='utf-8')]
+prefix = sys.argv[2] + ':'
+for call in reversed(calls):
+    keyboard = call.get('params', {}).get('reply_markup', {}).get('inline_keyboard', [])
+    for row in keyboard:
+        for button in row:
+            value = button.get('callback_data')
+            if isinstance(value, str) and value.startswith(prefix):
+                print(value)
+                raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
 
 home=$(new_home basic)
 start_server "$home" "$home/port"
@@ -150,6 +166,12 @@ fi
 printf 'decision reply\n' > "$home/reply.txt"
 run_tg "$home" reply "$request_id" --text-file "$home/reply.txt" >/dev/null
 [ "$(run_tg "$home" active-request)" = "$request_id" ] || fail "non-final reply cleared the active origin"
+set_updates '[{"update_id":101,"message":{"message_id":110,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"the answer is option two"}}]' "$home"
+run_tg "$home" serve --once >/dev/null
+continuation_id=tg-text-u101-m110
+[ "$(run_tg "$home" request-read "$continuation_id")" = "the answer is option two" ] || fail "active conversation answer was not durably readable"
+run_tg "$home" request-handled "$continuation_id"
+[ "$(run_tg "$home" active-request --work-id telegram-work)" = "$request_id" ] || fail "continuation answer replaced the active Telegram work"
 printf 'final answer\n' > "$home/reply.txt"
 run_tg "$home" reply "$request_id" --final --text-file "$home/reply.txt" >/dev/null
 if run_tg "$home" active-request >/dev/null 2>&1; then fail "final reply did not clear active origin"; fi
@@ -171,9 +193,13 @@ PY
 
 # Unsupported, malformed, and unpinned updates are dropped without a Bot API send.
 before=$(grep -c 'sendMessage' "$home/calls.jsonl")
-set_updates '[{"update_id":2,"message":{"message_id":11,"from":{"id":999},"chat":{"id":77,"type":"private"},"text":"ignore"}},{"update_id":3,"message":{"message_id":12,"from":{"id":77},"chat":{"id":77,"type":"group"},"text":"ignore"}},{"update_id":4,"message":{"message_id":13,"from":{"id":77},"chat":{"id":77,"type":"private"},"photo":[{"file_id":"must not download"}]}},{"update_id":5,"edited_message":{"message":{"voice":{"file_id":"must not download"}}}},{"update_id":7,"callback_query":{"id":"bad-shape","from":{"id":77},"data":"cancel:any","message":{"chat":"not-an-object"}}},{"update_id":8,"callback_query":{"from":{"id":77},"data":"cancel:any","message":{"chat":{"id":77,"type":"private"}}}}]' "$home"
+callbacks_before=$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")
+files_before=$(grep -c 'getFile' "$home/calls.jsonl")
+set_updates '[{"update_id":2,"message":{"message_id":11,"from":{"id":999},"chat":{"id":77,"type":"private"},"text":"ignore"}},{"update_id":3,"message":{"message_id":12,"from":{"id":77},"chat":{"id":77,"type":"group"},"text":"ignore"}},{"update_id":4,"message":{"message_id":13,"from":{"id":77},"chat":{"id":77,"type":"private"},"photo":[{"file_id":"must not download"}]}},{"update_id":5,"edited_message":{"message":{"voice":{"file_id":"must not download"}}}},{"update_id":7,"callback_query":{"id":"bad-shape","from":{"id":77},"data":"cancel:any:1","message":{"message_id":70,"chat":"not-an-object"}}},{"update_id":8,"callback_query":{"from":{"id":77},"data":"cancel:any:1","message":{"message_id":80,"chat":{"id":77,"type":"private"}}}},{"update_id":true,"message":{"message_id":81,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"boolean update"}},{"update_id":81,"message":{"message_id":true,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"boolean message"}},{"update_id":82,"message":{"message_id":82,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"","duration":2,"file_size":20}}},{"update_id":83,"message":{"message_id":83,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-bool-duration","duration":true,"file_size":20}}},{"update_id":84,"message":{"message_id":84,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-bool-size","duration":2,"file_size":true}}}]' "$home"
 run_tg "$home" serve --once >/dev/null
 [ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq "$before" ] || fail "unsupported or unpinned updates must be silent"
+[ "$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")" -eq "$callbacks_before" ] || fail "malformed callback received an acknowledgement"
+[ "$(grep -c 'getFile' "$home/calls.jsonl")" -eq "$files_before" ] || fail "malformed voice metadata triggered a download"
 ! grep -F 'must not download' "$home/calls.jsonl" >/dev/null || fail "unsupported media was downloaded"
 
 # A verified live primary changes only the deterministic transport wording and does not mirror terminal state.
@@ -196,9 +222,17 @@ if run_tg "$home" active-request --work-id terminal-work >/dev/null 2>&1; then f
 printf 'Terminal confirmation is required.\n' > "$home/authority-reply.txt"
 run_tg "$home" reply "$authority_id" --text-file "$home/authority-reply.txt" >/dev/null
 grep -F 'Terminal confirmation is required.' "$home/calls.jsonl" >/dev/null || fail "authority-sensitive work did not receive an explicit terminal-confirmation refusal"
-printf 'Request closed without action.\n' > "$home/authority-reply.txt"
-run_tg "$home" reply "$authority_id" --final --text-file "$home/authority-reply.txt" >/dev/null
-grep -F "telegram $live_id" "$home/state/.wake-queue" >/dev/null || fail "final reply did not wake the next ordered conversation"
+python3 - "$home/state/telegram/handled/$authority_id.json" "$home/state/telegram/closing.json" "$authority_id" <<'PY'
+import json, sys
+request_path, closing_path, request_id = sys.argv[1:]
+record = json.load(open(request_path, encoding='utf-8'))
+record['final_sent'] = True
+json.dump(record, open(request_path, 'w', encoding='utf-8'))
+json.dump({'request_id': request_id, 'created_at': 1}, open(closing_path, 'w', encoding='utf-8'))
+PY
+if run_tg "$home" active-request >/dev/null 2>&1; then fail "interrupted finalization left its predecessor active"; fi
+grep -F "telegram $live_id" "$home/state/.wake-queue" >/dev/null || fail "finalization recovery did not wake the next ordered conversation"
+run_tg "$home" request-handled "$live_id" >/dev/null || fail "recovered next conversation remained blocked by its predecessor"
 
 # Known receipt failure is retried from the durable outbox without duplicating the request.
 retry_home=$(new_home retry)
@@ -257,21 +291,32 @@ audio=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["audio_p
 grep -F 'I heard this:' "$voice_home/calls.jsonl" >/dev/null || fail "voice confirmation heading missing"
 grep -F 'Send to Firstmate' "$voice_home/calls.jsonl" >/dev/null || fail "voice controls missing"
 
-set_updates '[{"update_id":21,"callback_query":{"id":"cb-edit","from":{"id":77},"data":"edit:'"$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pending_id"])' "$pending")"'","message":{"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+pending_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pending_id"])' "$pending")
+edit_data=$(callback_data "$voice_home" edit)
+set_updates '[{"update_id":21,"callback_query":{"id":"cb-edit","from":{"id":77},"data":"'"$edit_data"'","message":{"message_id":201,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
-grep -F 'Reply with the corrected text.' "$voice_home/calls.jsonl" >/dev/null || fail "edit prompt missing"
+prompt_count=$(grep -c 'Reply with the corrected text.' "$voice_home/calls.jsonl")
+[ "$prompt_count" -eq 1 ] || fail "edit prompt missing"
+set_updates '[{"update_id":210,"callback_query":{"id":"cb-edit-second-tap","from":{"id":77},"data":"'"$edit_data"'","message":{"message_id":201,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+[ "$(grep -c 'Reply with the corrected text.' "$voice_home/calls.jsonl")" -eq "$prompt_count" ] || fail "a second edit tap repeated the prompt"
 set_updates '[{"update_id":22,"message":{"message_id":22,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"corrected voice text"}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 grep -F 'corrected voice text' "$voice_home/calls.jsonl" >/dev/null || fail "edit must reconfirm corrected text"
-
-pending_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pending_id"])' "$pending")
-set_updates '[{"update_id":23,"callback_query":{"id":"cb-retry","from":{"id":77},"data":"retry:'"$pending_id"'","message":{"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
-run_tg "$voice_home" serve --once >/dev/null
-grep -F 'whisper transcript' "$voice_home/calls.jsonl" >/dev/null || fail "retry must use Whisper transcript"
+edit_inbox_before=$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')
 rm -f "$voice_home/state/telegram/seen.json"
 run_tg "$voice_home" serve --once >/dev/null
-[ "$(wc -c < "$voice_home/whisper.sh.calls" | tr -d ' ')" -eq 1 ] || fail "replayed retry callback transcribed twice"
-set_updates '[{"update_id":24,"callback_query":{"id":"cb-cancel","from":{"id":77},"data":"cancel:'"$pending_id"'","message":{"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+[ "$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq "$edit_inbox_before" ] || fail "replayed edited text bypassed voice confirmation"
+
+retry_data=$(callback_data "$voice_home" retry)
+set_updates '[{"update_id":23,"callback_query":{"id":"cb-retry","from":{"id":77},"data":"'"$retry_data"'","message":{"message_id":202,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+grep -F 'whisper transcript' "$voice_home/calls.jsonl" >/dev/null || fail "retry must use Whisper transcript"
+set_updates '[{"update_id":230,"callback_query":{"id":"cb-retry-second-tap","from":{"id":77},"data":"'"$retry_data"'","message":{"message_id":202,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+[ "$(wc -c < "$voice_home/whisper.sh.calls" | tr -d ' ')" -eq 1 ] || fail "a second retry tap transcribed twice"
+cancel_data=$(callback_data "$voice_home" cancel)
+set_updates '[{"update_id":24,"callback_query":{"id":"cb-cancel","from":{"id":77},"data":"'"$cancel_data"'","message":{"message_id":203,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 [ ! -e "$audio" ] || fail "cancel must delete temporary audio"
 [ ! -e "$pending" ] || fail "cancel must delete pending state"
@@ -281,7 +326,8 @@ set_updates '[{"update_id":25,"message":{"message_id":25,"from":{"id":77},"chat"
 run_tg "$voice_home" serve --once >/dev/null
 pending_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pending_id"])' "$pending")
 send_audio=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["audio_path"])' "$pending")
-set_updates '[{"update_id":26,"callback_query":{"id":"cb-send","from":{"id":77},"data":"send:'"$pending_id"'","message":{"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+send_data=$(callback_data "$voice_home" send)
+set_updates '[{"update_id":26,"callback_query":{"id":"cb-send","from":{"id":77},"data":"'"$send_data"'","message":{"message_id":204,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 [ ! -e "$pending" ] || fail "send must clear pending voice state"
 [ ! -e "$send_audio" ] || fail "send must delete temporary audio"
@@ -368,17 +414,25 @@ exit 0
 SH
 chmod +x "$systemctl_fake"
 lifecycle_env=(env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" FM_TELEGRAM_EXPECT_HOME="$voice_home")
+supervision_needs() {
+  bash -c '. "$1"; fm_supervision_needed "$2"' _ "$ROOT/bin/fm-supervision-lib.sh" "$1/state"
+}
 "${lifecycle_env[@]}" "$SCRIPT" install >/dev/null
 [ -f "$unit_dir/firstmate-telegram.service" ] || fail "install must write one user unit"
+supervision_needs "$voice_home" || fail "installed Telegram transport did not keep supervision armed"
 "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null || fail "status must report installed active service"
 "${lifecycle_env[@]}" "$SCRIPT" stop >/dev/null
+if supervision_needs "$voice_home"; then fail "stopped Telegram transport still required supervision"; fi
 if "${lifecycle_env[@]}" "$SCRIPT" status >/dev/null; then fail "stop did not verify inactive state"; fi
 "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null
+supervision_needs "$voice_home" || fail "restarted Telegram transport did not restore supervision"
 "${lifecycle_env[@]}" "$SCRIPT" disable >/dev/null
+if supervision_needs "$voice_home"; then fail "disabled Telegram transport still required supervision"; fi
 [ "$(cat "$TMP_ROOT/systemctl.active")" = inactive ] || fail "disable did not verify service stopped"
 [ "$(cat "$TMP_ROOT/systemctl.enabled")" = disabled ] || fail "disable did not verify service disabled"
 "${lifecycle_env[@]}" "$SCRIPT" install >/dev/null
 other_home=$(new_home other-cleanup)
+if supervision_needs "$other_home"; then fail "Telegram supervision marker leaked into another home"; fi
 before_systemctl=$(wc -l < "$TMP_ROOT/systemctl.calls")
 if env FM_HOME="$other_home" FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" "$SCRIPT" cleanup >/dev/null 2>&1; then
   fail "cleanup for another home accepted the installed singleton unit"
