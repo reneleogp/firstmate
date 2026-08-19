@@ -409,6 +409,12 @@ spawn_remote_secondmate() {
     echo "error: another spawn is already creating task $id" >&2
     return 1
   fi
+  if FM_HOME="$FM_HOME" "$FM_ROOT/bin/fm-telegram.py" publication-reserved "$id" \
+      >/dev/null 2>&1; then
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: task $id is reserved for an authenticated Telegram-origin spawn" >&2
+    return 1
+  fi
   registry_lock=$(secondmate_registry_lock_path "$STATE")
   if ! fm_lock_acquire_wait "$registry_lock"; then
     fm_lock_release "$SPAWN_TASK_LOCK" || true
@@ -888,19 +894,9 @@ fi
 ID=${POS[0]}
 fm_task_id_creation_valid "$ID" || { echo "error: invalid task id" >&2; exit 2; }
 TELEGRAM_REQUEST_ID=
-if [ -n "${FM_TELEGRAM_REQUEST_ID:-}" ]; then
-  [ "$RELAUNCH" -eq 0 ] || { echo "error: Telegram origin publication is valid only for a fresh spawn" >&2; exit 2; }
-  if ! FM_HOME="$FM_HOME" "$FM_ROOT/bin/fm-telegram.py" publication-authorize \
-      "$FM_TELEGRAM_REQUEST_ID" "$ID" >/dev/null; then
-    echo "error: Telegram origin publication does not match this task" >&2
-    exit 1
-  fi
-  TELEGRAM_REQUEST_ID=$FM_TELEGRAM_REQUEST_ID
-  unset FM_TELEGRAM_REQUEST_ID
-elif FM_HOME="$FM_HOME" "$FM_ROOT/bin/fm-telegram.py" publication-reserved "$ID" \
-    >/dev/null 2>&1; then
-  echo "error: task $ID is reserved for an authenticated Telegram-origin spawn" >&2
-  exit 1
+if [ -n "${FM_TELEGRAM_REQUEST_ID:-}" ] && [ "$KIND" = secondmate ]; then
+  echo "error: Telegram-originated work cannot be routed to a secondmate" >&2
+  exit 2
 fi
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_CONTROL_LOCK="$STATE/.control-$ID.lock"
@@ -985,6 +981,20 @@ if ! fm_lock_try_acquire "$SPAWN_TASK_LOCK"; then
   exit 1
 fi
 SPAWN_TASK_LOCK_HELD=1
+if [ -n "${FM_TELEGRAM_REQUEST_ID:-}" ]; then
+  [ "$RELAUNCH" -eq 0 ] || { echo "error: Telegram origin publication is valid only for a fresh spawn" >&2; exit 2; }
+  if ! FM_HOME="$FM_HOME" "$FM_ROOT/bin/fm-telegram.py" publication-authorize \
+      "$FM_TELEGRAM_REQUEST_ID" "$ID" >/dev/null; then
+    echo "error: Telegram origin publication does not match this task" >&2
+    exit 1
+  fi
+  TELEGRAM_REQUEST_ID=$FM_TELEGRAM_REQUEST_ID
+  unset FM_TELEGRAM_REQUEST_ID
+elif FM_HOME="$FM_HOME" "$FM_ROOT/bin/fm-telegram.py" publication-reserved "$ID" \
+    >/dev/null 2>&1; then
+  echo "error: task $ID is reserved for an authenticated Telegram-origin spawn" >&2
+  exit 1
+fi
 PROJ=
 ARG3=
 FIRSTMATE_HOME=

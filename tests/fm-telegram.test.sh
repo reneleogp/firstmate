@@ -478,7 +478,38 @@ if run_tg "$home" request-bind "$request_id" terminal-work >/dev/null 2>&1; then
   fail "Telegram request bound to a pre-existing terminal work record"
 fi
 [ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$request_id" ] || fail "rejected terminal work binding changed the active route"
+touch "$home/hold-task-creation-lock"
+(
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$ROOT/bin/fm-wake-lib.sh"
+  STATE="$home/state"
+  task_lock="$STATE/.spawn-telegram-work.lock"
+  fm_lock_try_acquire "$task_lock" || exit 1
+  touch "$home/task-creation-lock-held"
+  while [ -e "$home/hold-task-creation-lock" ]; do sleep .01; done
+  fm_lock_release "$task_lock"
+) &
+task_lock_pid=$!
+for _ in $(seq 1 100); do
+  [ -e "$home/task-creation-lock-held" ] && break
+  sleep .02
+done
+[ -e "$home/task-creation-lock-held" ] || fail "task creation lock fixture did not start"
+if run_tg "$home" request-bind "$request_id" telegram-work >/dev/null 2>&1; then
+  rm -f "$home/hold-task-creation-lock"
+  wait "$task_lock_pid" || true
+  fail "request-bind raced an in-progress terminal task creation"
+fi
+rm -f "$home/hold-task-creation-lock"
+wait "$task_lock_pid" || fail "task creation lock fixture failed"
 run_tg "$home" request-bind "$request_id" telegram-work >/dev/null
+if FM_TELEGRAM_REQUEST_ID="$request_id" FM_HOME="$home" \
+    "$ROOT/bin/fm-spawn.sh" telegram-work "$home" --secondmate \
+    >"$home/telegram-secondmate.out" 2>"$home/telegram-secondmate.err"; then
+  fail "Telegram-originated work launched as a secondmate"
+fi
+grep -F 'Telegram-originated work cannot be routed to a secondmate' \
+  "$home/telegram-secondmate.err" >/dev/null || fail "Telegram secondmate route was not rejected at publication"
 if FM_HOME="$home" "$ROOT/bin/fm-spawn.sh" telegram-work "$home" "sh -c 'exit 0'" --scout \
     >"$home/terminal-spawn.out" 2>"$home/terminal-spawn.err"; then
   fail "ordinary terminal spawn consumed a Telegram-reserved work identifier"
@@ -602,6 +633,10 @@ run_tg "$home" serve --once >/dev/null
 [ "$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")" -eq "$callbacks_before" ] || fail "malformed callback received an acknowledgement"
 [ "$(grep -c 'getFile' "$home/calls.jsonl")" -eq "$files_before" ] || fail "malformed voice metadata triggered a download"
 ! grep -F 'must not download' "$home/calls.jsonl" >/dev/null || fail "unsupported media was downloaded"
+set_raw_updates '[{"update_id":8999,"message":{"message_id":8999,"date":1,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"\ud800","duration":2,"file_size":20}}}]' "$home"
+run_tg "$home" serve --once >/dev/null || fail "malformed Unicode voice identifier stopped the transport"
+[ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq "$before" ] || fail "malformed Unicode voice identifier received a reply"
+[ "$(grep -c 'getFile' "$home/calls.jsonl")" -eq "$files_before" ] || fail "malformed Unicode voice identifier reached Telegram file lookup"
 python3 - "$home/updates.json" <<'PY' || fail "oversized identifier fixture failed"
 import json, sys
 oversized = 1 << 52

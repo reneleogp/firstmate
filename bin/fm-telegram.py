@@ -1544,7 +1544,8 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any], up
     file_id = voice.get("file_id")
     if not strict_int(duration) or not strict_int(size):
         return False
-    if not isinstance(file_id, str) or not file_id.strip() or "\x00" in file_id:
+    if (not isinstance(file_id, str) or not file_id.strip() or "\x00" in file_id
+            or unicode_text_units(file_id) is None):
         return False
     if duration < 0 or duration > MAX_VOICE_SECONDS or size < 0 or size > MAX_VOICE_BYTES:
         return False
@@ -2095,9 +2096,34 @@ def request_handled(home: Path, request_id: str) -> int:
     return 0
 
 
-def request_bind(home: Path, request_id: str, work_id: str) -> int:
+def spawn_lock_owned_by_parent(home: Path, work_id: str) -> bool:
+    state = home / "state"
+    lock = state / f".spawn-{work_id}.lock"
+    if not lock.is_symlink():
+        return False
+    try:
+        target = Path(os.readlink(lock))
+    except OSError:
+        return False
+    if (not target.is_absolute() or target.parent != state
+            or not target.name.startswith(f"{lock.name}.owner.")
+            or not target.is_dir() or target.is_symlink()):
+        return False
+    pid_path = target / "pid"
+    if not pid_path.is_file() or pid_path.is_symlink():
+        return False
+    try:
+        owner_pid = int(pid_path.read_text(encoding="ascii").strip())
+    except (OSError, UnicodeError, ValueError):
+        return False
+    return owner_pid == os.getppid()
+
+
+def request_bind_locked(home: Path, request_id: str, work_id: str) -> int:
     if not lifecycle_task_id_valid(work_id):
         return die("work identifier is invalid")
+    if not spawn_lock_owned_by_parent(home, work_id):
+        return die("work creation lock is not held by the binding parent")
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
         active = active_record(home)
@@ -2118,6 +2144,26 @@ def request_bind(home: Path, request_id: str, work_id: str) -> int:
         _sync_request_wakes_locked(home)
     print("Telegram work binding recorded.")
     return 0
+
+
+def request_bind(home: Path, request_id: str, work_id: str) -> int:
+    if not lifecycle_task_id_valid(work_id):
+        return die("work identifier is invalid")
+    wake_lib = Path(__file__).resolve().with_name("fm-wake-lib.sh")
+    lock = home / "state" / f".spawn-{work_id}.lock"
+    command = (
+        '. "$1"; STATE=$2; lock=$3; '
+        'if ! fm_lock_try_acquire "$lock"; then '
+        'echo "error: work creation is already in progress" >&2; exit 1; fi; '
+        'trap \'fm_lock_release "$lock"\' EXIT; '
+        '"$4" --home "$5" request-bind-locked "$6" "$7"'
+    )
+    result = subprocess.run(
+        ["/bin/bash", "-c", command, "_", str(wake_lib), str(home / "state"),
+         str(lock), str(Path(__file__).resolve()), str(home), request_id, work_id],
+        check=False,
+    )
+    return result.returncode
 
 
 def publication_reserved(home: Path, work_id: str) -> int:
@@ -2649,6 +2695,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_home(bind_parser)
     bind_parser.add_argument("request_id")
     bind_parser.add_argument("work_id")
+    bind_locked_parser = sub.add_parser("request-bind-locked", help=argparse.SUPPRESS)
+    add_home(bind_locked_parser)
+    bind_locked_parser.add_argument("request_id")
+    bind_locked_parser.add_argument("work_id")
     authorize_parser = sub.add_parser("publication-authorize", help=argparse.SUPPRESS)
     add_home(authorize_parser)
     authorize_parser.add_argument("request_id")
@@ -2716,6 +2766,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return request_handled(home, args.request_id)
         if args.command == "request-bind":
             return request_bind(home, args.request_id, args.work_id)
+        if args.command == "request-bind-locked":
+            return request_bind_locked(home, args.request_id, args.work_id)
         if args.command == "publication-authorize":
             return publication_authorize(home, args.request_id, args.work_id)
         if args.command == "publication-reserved":
