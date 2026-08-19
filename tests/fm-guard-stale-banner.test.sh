@@ -179,6 +179,18 @@ test_x_mode_without_live_watcher_stays_alarm() {
   pass "fm-guard stale banner: X-mode polling without a live watcher remains unhealthy"
 }
 
+test_telegram_without_live_watcher_names_transport() {
+  local dir home out
+  dir=$(make_guard_case telegram-no-live)
+  home=$(case_home "$dir")
+  rm -f "$home/state/task.meta"
+  mkdir -p "$home/state/telegram"
+  : > "$home/state/telegram/enabled"
+  out=$(run_guard_case "$dir")
+  assert_contains "$out" "Telegram transport needs supervision" "Telegram-only need must name its transport"
+  pass "fm-guard stale banner: Telegram-only supervision names its transport"
+}
+
 test_healthy_recovery_rearms_next_stale_episode() {
   local dir home out1 healthy out2 pid
   dir=$(make_guard_case healthy-recovery)
@@ -699,6 +711,7 @@ test_persistent_no_watcher_banner_names_missing_process
 test_persistent_no_watcher_episode_survives_beacon_touch
 test_fresh_beacon_without_live_watcher_stays_alarm
 test_x_mode_without_live_watcher_stays_alarm
+test_telegram_without_live_watcher_names_transport
 test_healthy_recovery_rearms_next_stale_episode
 test_concurrent_same_episode_prints_one_full_banner
 test_home_isolation

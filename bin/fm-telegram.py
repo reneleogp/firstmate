@@ -404,16 +404,27 @@ def lifecycle_lock(home: Path) -> Path:
     return home / "state" / ".telegram-lifecycle.lock"
 
 
+def service_lock(home: Path) -> Path:
+    return home / "state" / ".telegram-service.lock"
+
+
 class FileLock:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, blocking: bool = True):
         self.path = path
+        self.blocking = blocking
         self.stream = None
 
     def __enter__(self) -> "FileLock":
         private_dir(self.path.parent)
         self.stream = self.path.open("a+")
         os.chmod(self.path, 0o600)
-        fcntl.flock(self.stream.fileno(), fcntl.LOCK_EX)
+        operation = fcntl.LOCK_EX if self.blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            fcntl.flock(self.stream.fileno(), operation)
+        except BlockingIOError as exc:
+            self.stream.close()
+            self.stream = None
+            raise TelegramError("Telegram service is already running") from exc
         return self
 
     def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
@@ -1436,67 +1447,73 @@ def expire_pending(home: Path) -> None:
                     remove_pending(home, current)
 
 
+def clear_stopped_transport_state(home: Path) -> None:
+    with FileLock(state_lock(home)):
+        pending = read_json(pending_path(home))
+        if isinstance(pending, dict):
+            remove_pending(home, pending)
+    set_telegram_enabled(home, False)
+
+
 def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> int:
-    with FileLock(lifecycle_lock(home)):
-        try:
-            config = load_config(home)
-            token_for(home)
-        except TelegramError as exc:
-            set_telegram_enabled(home, False)
-            raise PermanentConfigurationError(str(exc)) from exc
-        try:
-            verified_token_for(home, config)
-        except PermanentConfigurationError:
-            set_telegram_enabled(home, False)
-            raise
-        prepare_transport_activation(home)
-    offset = 0
-    stop = False
-    permanent_failure = False
-
-    def stop_service(_signum: int, _frame: Any) -> None:
-        nonlocal stop
-        stop = True
-
-    signal.signal(signal.SIGTERM, stop_service)
-    signal.signal(signal.SIGINT, stop_service)
-    try:
-        while not stop:
-            reconcile_closing(home)
-            expire_pending(home)
-            bounded_cleanup(home)
-            reconcile_requests(home)
-            reconcile_pending(home, config)
+    with FileLock(service_lock(home), blocking=False):
+        with FileLock(lifecycle_lock(home)):
             try:
-                updates = api_call(home, "getUpdates", {"offset": offset, "timeout": poll_timeout,
-                                                           "allowed_updates": ["message", "callback_query"]}, config)
-                if not isinstance(updates, list):
-                    updates = []
-                for update in updates:
-                    if isinstance(update, dict) and strict_int(update.get("update_id")):
-                        offset = max(offset, int(update["update_id"]) + 1)
-                    process_update(home, config, update)
-                reconcile_requests(home)
+                config = load_config(home)
+                token_for(home)
             except TelegramError as exc:
-                if permanent_auth_failure(exc):
-                    permanent_failure = True
-                    raise PermanentConfigurationError(
-                        "Telegram bot token could not authenticate; pair again"
-                    ) from exc
+                clear_stopped_transport_state(home)
+                raise PermanentConfigurationError(str(exc)) from exc
+            try:
+                verified_token_for(home, config)
+            except PermanentConfigurationError:
+                clear_stopped_transport_state(home)
+                raise
+            prepare_transport_activation(home)
+        offset = 0
+        stop = False
+        permanent_failure = False
+
+        def stop_service(_signum: int, _frame: Any) -> None:
+            nonlocal stop
+            stop = True
+
+        signal.signal(signal.SIGTERM, stop_service)
+        signal.signal(signal.SIGINT, stop_service)
+        try:
+            while not stop:
+                reconcile_closing(home)
+                expire_pending(home)
+                bounded_cleanup(home)
+                reconcile_requests(home)
+                reconcile_pending(home, config)
+                try:
+                    updates = api_call(home, "getUpdates", {"offset": offset, "timeout": poll_timeout,
+                                                               "allowed_updates": ["message", "callback_query"]}, config)
+                    if not isinstance(updates, list):
+                        updates = []
+                    for update in updates:
+                        if isinstance(update, dict) and strict_int(update.get("update_id")):
+                            offset = max(offset, int(update["update_id"]) + 1)
+                        process_update(home, config, update)
+                    reconcile_requests(home)
+                except TelegramError as exc:
+                    if permanent_auth_failure(exc):
+                        permanent_failure = True
+                        raise PermanentConfigurationError(
+                            "Telegram bot token could not authenticate; pair again"
+                        ) from exc
+                    if once:
+                        return 1
+                    time.sleep(2)
                 if once:
-                    return 1
-                time.sleep(2)
-            if once:
-                break
-        return 0
-    finally:
-        if stop or permanent_failure:
-            with FileLock(state_lock(home)):
-                pending = read_json(pending_path(home))
-                if isinstance(pending, dict):
-                    remove_pending(home, pending)
-        if stop or once or permanent_failure:
-            set_telegram_enabled(home, False)
+                    break
+            return 0
+        finally:
+            if stop or permanent_failure:
+                clear_stopped_transport_state(home)
+            elif once:
+                set_telegram_enabled(home, False)
 
 
 def require_pairing_service_inactive(home: Path) -> None:

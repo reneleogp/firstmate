@@ -61,6 +61,9 @@ class Handler(BaseHTTPRequestHandler):
         if method == 'getFile': return self._write({'file_path': 'voice/test.oga'})
         if method == 'getUpdates':
             if (home / 'hold-updates').exists(): time.sleep(.05)
+            if (home / 'block-updates').exists():
+                (home / 'updates-entered').write_text('entered')
+                while (home / 'block-updates').exists(): time.sleep(.01)
             if (home / 'unauthorized-next-updates').exists():
                 (home / 'unauthorized-next-updates').unlink()
                 raw = json.dumps({'ok': False, 'error_code': 401, 'description': 'Unauthorized'}).encode()
@@ -231,9 +234,16 @@ run_tg "$repair_home" serve --once >/dev/null 2>&1
 config_home=$(new_home local-config)
 start_server "$config_home" "$config_home/port"
 mkdir -p "$config_home/state/telegram"
+config_audio=$(mktemp /dev/shm/firstmate-telegram-config.XXXXXX)
+python3 - "$config_home/state/telegram/pending.json" "$config_audio" <<'PY'
+import json, sys, time
+json.dump({'audio_path': sys.argv[2], 'created_at': int(time.time()), 'mode': 'parked'}, open(sys.argv[1], 'w'))
+PY
 touch "$config_home/state/telegram/enabled"
 run_tg "$config_home" serve --once >/dev/null 2>&1
 [ "$?" -eq 78 ] || fail "missing pairing did not use the permanent configuration exit"
+[ ! -e "$config_audio" ] || fail "permanent startup failure retained pending temporary audio"
+[ ! -e "$config_home/state/telegram/pending.json" ] || fail "permanent startup failure retained pending voice state"
 [ ! -e "$config_home/state/telegram/enabled" ] || fail "missing pairing left transport supervision active"
 run_tg "$config_home" pair --user-id 77 --chat-id 77 >/dev/null
 cp "$config_home/config/telegram.json" "$config_home/pairing.valid"
@@ -255,6 +265,31 @@ touch "$config_home/state/telegram/enabled"
 run_tg "$config_home" serve --once >/dev/null 2>&1
 [ "$?" -eq 78 ] || fail "unsafe pairing permissions did not use the permanent configuration exit"
 [ ! -e "$config_home/state/telegram/enabled" ] || fail "unsafe pairing permissions left transport supervision active"
+
+runtime_home=$(new_home runtime-owner)
+start_server "$runtime_home" "$runtime_home/port"
+run_tg "$runtime_home" pair --user-id 77 --chat-id 77 >/dev/null
+touch "$runtime_home/block-updates"
+env FM_HOME="$runtime_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$runtime_home/port")" \
+  "$SCRIPT" serve --poll-timeout 1 >"$runtime_home/service.out" 2>&1 &
+runtime_pid=$!
+runtime_started=0
+for _ in $(seq 1 100); do
+  if [ -e "$runtime_home/updates-entered" ] && [ -e "$runtime_home/state/telegram/enabled" ]; then
+    runtime_started=1
+    break
+  fi
+  sleep .02
+done
+[ "$runtime_started" -eq 1 ] || fail "primary Telegram runtime did not acquire service ownership"
+run_tg "$runtime_home" serve --once >/dev/null 2>&1
+[ "$?" -eq 1 ] || fail "second Telegram runtime did not refuse stable service ownership"
+[ -e "$runtime_home/state/telegram/enabled" ] || fail "refused second runtime cleared the owner's supervision marker"
+kill "$runtime_pid" 2>/dev/null || true
+rm -f "$runtime_home/block-updates"
+wait "$runtime_pid" 2>/dev/null || true
+[ ! -e "$runtime_home/state/telegram/enabled" ] || fail "runtime owner did not clear supervision at shutdown"
+[ -f "$runtime_home/state/.telegram-service.lock" ] || fail "runtime ownership lock was not stable outside removable state"
 
 rm -f "$home/port"
 start_server "$home" "$home/port"
@@ -1158,6 +1193,7 @@ wait "$serialized_cleanup_pid" || fail "serialized cleanup failed"
 [ ! -e "$voice_home/config/telegram.json" ] || fail "serialized cleanup retained pairing config"
 [ -f "$voice_home/state/.telegram-lifecycle.lock" ] || fail "cleanup removed the stable lifecycle lock"
 [ -f "$voice_home/state/.telegram-state.lock" ] || fail "cleanup removed the stable state lock"
+[ -f "$voice_home/state/.telegram-service.lock" ] || fail "cleanup removed the stable service lock"
 "${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null || fail "cleanup with retained stable locks was not idempotent"
 
 grep -F 'test-only-token' "$home/state/.wake-queue" >/dev/null && fail "bot token entered wake data"
