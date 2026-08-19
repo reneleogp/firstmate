@@ -700,6 +700,11 @@ def _queue_request_locked(home: Path, text: str, chat_id: int, message_id: int,
     }
     if continuation_of is not None:
         record["continuation_of"] = continuation_of
+    inbox_files = sorted(inbox.glob("*.json"), key=request_order_key)
+    while len(inbox_files) >= MAX_INBOX:
+        oldest = inbox_files.pop(0)
+        consume_safe_wakes(home, [oldest.stem])
+        durable_unlink(oldest)
     atomic_json(path, record)
     return request_id
 
@@ -1433,7 +1438,12 @@ def expire_pending(home: Path) -> None:
 
 def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> int:
     with FileLock(lifecycle_lock(home)):
-        config = load_config(home)
+        try:
+            config = load_config(home)
+            token_for(home)
+        except TelegramError as exc:
+            set_telegram_enabled(home, False)
+            raise PermanentConfigurationError(str(exc)) from exc
         try:
             verified_token_for(home, config)
         except PermanentConfigurationError:
@@ -1896,15 +1906,16 @@ def start_service(home: Path) -> int:
 
 
 def stop_service(home: Path) -> int:
-    require_unit_owner(home)
-    systemctl("stop", SERVICE_NAME)
-    verify_service(active=False)
-    with FileLock(state_lock(home)):
-        pending = read_json(pending_path(home))
-        if isinstance(pending, dict):
-            remove_pending(home, pending)
-    set_telegram_enabled(home, False)
-    verify_transport_marker(home, False)
+    with FileLock(lifecycle_lock(home)):
+        require_unit_owner(home)
+        systemctl("stop", SERVICE_NAME)
+        verify_service(active=False)
+        with FileLock(state_lock(home)):
+            pending = read_json(pending_path(home))
+            if isinstance(pending, dict):
+                remove_pending(home, pending)
+        set_telegram_enabled(home, False)
+        verify_transport_marker(home, False)
     print("Telegram service stopped.")
     return 0
 
@@ -1917,15 +1928,16 @@ def status_service(home: Path) -> int:
 
 
 def disable_service(home: Path) -> int:
-    require_unit_owner(home)
-    systemctl("disable", "--now", SERVICE_NAME)
-    verify_service(active=False, enabled=False)
-    with FileLock(state_lock(home)):
-        pending = read_json(pending_path(home))
-        if isinstance(pending, dict):
-            remove_pending(home, pending)
-    set_telegram_enabled(home, False)
-    verify_transport_marker(home, False)
+    with FileLock(lifecycle_lock(home)):
+        require_unit_owner(home)
+        systemctl("disable", "--now", SERVICE_NAME)
+        verify_service(active=False, enabled=False)
+        with FileLock(state_lock(home)):
+            pending = read_json(pending_path(home))
+            if isinstance(pending, dict):
+                remove_pending(home, pending)
+        set_telegram_enabled(home, False)
+        verify_transport_marker(home, False)
     print("Telegram service disabled.")
     return 0
 

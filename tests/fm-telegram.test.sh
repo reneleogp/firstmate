@@ -227,6 +227,35 @@ run_tg "$repair_home" serve --once >/dev/null 2>&1
 [ "$?" -eq 78 ] || fail "polling authentication failure did not use the permanent configuration exit"
 [ ! -e "$repair_home/state/telegram/enabled" ] || fail "polling authentication failure left transport supervision active"
 
+# Permanent local service configuration failures stop with status 78 and release supervision.
+config_home=$(new_home local-config)
+start_server "$config_home" "$config_home/port"
+mkdir -p "$config_home/state/telegram"
+touch "$config_home/state/telegram/enabled"
+run_tg "$config_home" serve --once >/dev/null 2>&1
+[ "$?" -eq 78 ] || fail "missing pairing did not use the permanent configuration exit"
+[ ! -e "$config_home/state/telegram/enabled" ] || fail "missing pairing left transport supervision active"
+run_tg "$config_home" pair --user-id 77 --chat-id 77 >/dev/null
+cp "$config_home/config/telegram.json" "$config_home/pairing.valid"
+rm "$config_home/.env"
+touch "$config_home/state/telegram/enabled"
+run_tg "$config_home" serve --once >/dev/null 2>&1
+[ "$?" -eq 78 ] || fail "missing home token did not use the permanent configuration exit"
+[ ! -e "$config_home/state/telegram/enabled" ] || fail "missing home token left transport supervision active"
+printf 'FM_TELEGRAM_BOT_TOKEN=test-only-token\n' > "$config_home/.env"
+printf '{not-json\n' > "$config_home/config/telegram.json"
+chmod 600 "$config_home/config/telegram.json"
+touch "$config_home/state/telegram/enabled"
+run_tg "$config_home" serve --once >/dev/null 2>&1
+[ "$?" -eq 78 ] || fail "malformed pairing did not use the permanent configuration exit"
+[ ! -e "$config_home/state/telegram/enabled" ] || fail "malformed pairing left transport supervision active"
+cp "$config_home/pairing.valid" "$config_home/config/telegram.json"
+chmod 644 "$config_home/config/telegram.json"
+touch "$config_home/state/telegram/enabled"
+run_tg "$config_home" serve --once >/dev/null 2>&1
+[ "$?" -eq 78 ] || fail "unsafe pairing permissions did not use the permanent configuration exit"
+[ ! -e "$config_home/state/telegram/enabled" ] || fail "unsafe pairing permissions left transport supervision active"
+
 rm -f "$home/port"
 start_server "$home" "$home/port"
 set_updates '[{"update_id":1,"message":{"message_id":10,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"please inspect this"}}]' "$home"
@@ -356,6 +385,43 @@ run_tg "$home" serve --once >/dev/null
 [ "$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")" -eq "$callbacks_before" ] || fail "malformed callback received an acknowledgement"
 [ "$(grep -c 'getFile' "$home/calls.jsonl")" -eq "$files_before" ] || fail "malformed voice metadata triggered a download"
 ! grep -F 'must not download' "$home/calls.jsonl" >/dev/null || fail "unsupported media was downloaded"
+
+# Locked admission retains only the newest 256 queued requests for text and confirmed voice.
+capacity_home=$(new_home capacity)
+start_server "$capacity_home" "$capacity_home/port"
+run_tg "$capacity_home" pair --user-id 77 --chat-id 77 >/dev/null
+cat > "$capacity_home/parakeet.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'capacity voice transcript\n'
+SH
+chmod +x "$capacity_home/parakeet.sh"
+python3 - "$capacity_home/config/telegram.json" "$capacity_home/parakeet.sh" "$capacity_home/updates.json" <<'PY'
+import json, shlex, sys
+config_path, parakeet, updates_path = sys.argv[1:]
+config = json.load(open(config_path, encoding='utf-8'))
+config['parakeet_command'] = shlex.quote(parakeet)
+json.dump(config, open(config_path, 'w', encoding='utf-8'))
+updates = [
+    {'update_id': value, 'message': {
+        'message_id': value, 'from': {'id': 77},
+        'chat': {'id': 77, 'type': 'private'}, 'text': f'capacity request {value}'}}
+    for value in range(1, 258)
+]
+json.dump(updates, open(updates_path, 'w', encoding='utf-8'))
+PY
+chmod 600 "$capacity_home/config/telegram.json"
+run_tg "$capacity_home" serve --once >/dev/null
+[ "$(find "$capacity_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 256 ] || fail "text admission exceeded the 256 request cap"
+[ ! -e "$capacity_home/state/telegram/inbox/tg-text-u1-m1.json" ] || fail "text admission did not evict the oldest queued request"
+[ -e "$capacity_home/state/telegram/inbox/tg-text-u257-m257.json" ] || fail "text admission did not retain the newest queued request"
+set_updates '[{"update_id":258,"message":{"message_id":258,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"capacity-voice","duration":2,"file_size":20}}}]' "$capacity_home"
+run_tg "$capacity_home" serve --once >/dev/null
+capacity_send=$(callback_data "$capacity_home" send)
+set_updates "[{\"update_id\":259,\"callback_query\":{\"id\":\"capacity-send\",\"from\":{\"id\":77},\"message\":{\"message_id\":259,\"chat\":{\"id\":77,\"type\":\"private\"}},\"data\":\"$capacity_send\"}}]" "$capacity_home"
+run_tg "$capacity_home" serve --once >/dev/null
+[ "$(find "$capacity_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 256 ] || fail "confirmed voice admission exceeded the 256 request cap"
+[ ! -e "$capacity_home/state/telegram/inbox/tg-text-u2-m2.json" ] || fail "confirmed voice admission did not evict the oldest queued request"
+[ -e "$capacity_home/state/telegram/inbox/tg-voice-u258-m258.json" ] || fail "confirmed voice admission did not retain its queued request"
 
 # A live primary must have its harness-owned watcher before activation can accept requests.
 live_home=$(new_home live-primary)
@@ -923,12 +989,42 @@ PY
 if supervision_needs "$voice_home"; then fail "direct service stop did not release supervision"; fi
 "${lifecycle_env[@]}" "$SCRIPT" start >/dev/null
 supervision_needs "$voice_home" || fail "restarted Telegram transport did not restore supervision"
+printf 'serialize stop\n' > "$voice_home/lifecycle-send.txt"
+touch "$voice_home/hold-send"
+rm -f "$voice_home/send-entered"
+"${lifecycle_env[@]}" "$SCRIPT" send --text-file "$voice_home/lifecycle-send.txt" >/dev/null &
+lifecycle_send_pid=$!
+for _ in $(seq 1 100); do [ -e "$voice_home/send-entered" ] && break; sleep .02; done
+[ -e "$voice_home/send-entered" ] || fail "lifecycle serialization send did not reach the fake server"
+"${lifecycle_env[@]}" "$SCRIPT" stop >/dev/null &
+serialized_stop_pid=$!
+sleep .1
+kill -0 "$serialized_stop_pid" 2>/dev/null || fail "stop did not wait for the lifecycle boundary"
+[ "$(cat "$TMP_ROOT/systemctl.active")" = active ] || fail "stop mutated service state during an outbound transaction"
+rm -f "$voice_home/hold-send"
+wait "$lifecycle_send_pid" || fail "outbound transaction failed while stop waited"
+wait "$serialized_stop_pid" || fail "serialized stop failed"
+"${lifecycle_env[@]}" "$SCRIPT" start >/dev/null
+supervision_needs "$voice_home" || fail "service did not restart after serialized stop"
 disable_audio=$(mktemp /dev/shm/firstmate-telegram-disable.XXXXXX)
 python3 - "$voice_home/state/telegram/pending.json" "$disable_audio" <<'PY'
 import json, sys, time
 json.dump({'audio_path': sys.argv[2], 'created_at': int(time.time()), 'mode': 'parked'}, open(sys.argv[1], 'w'))
 PY
-"${lifecycle_env[@]}" "$SCRIPT" disable >/dev/null
+touch "$voice_home/hold-send"
+rm -f "$voice_home/send-entered"
+"${lifecycle_env[@]}" "$SCRIPT" send --text-file "$voice_home/lifecycle-send.txt" >/dev/null &
+disable_send_pid=$!
+for _ in $(seq 1 100); do [ -e "$voice_home/send-entered" ] && break; sleep .02; done
+[ -e "$voice_home/send-entered" ] || fail "disable serialization send did not reach the fake server"
+"${lifecycle_env[@]}" "$SCRIPT" disable >/dev/null &
+serialized_disable_pid=$!
+sleep .1
+kill -0 "$serialized_disable_pid" 2>/dev/null || fail "disable did not wait for the lifecycle boundary"
+[ "$(cat "$TMP_ROOT/systemctl.active")" = active ] || fail "disable mutated service state during an outbound transaction"
+rm -f "$voice_home/hold-send"
+wait "$disable_send_pid" || fail "outbound transaction failed while disable waited"
+wait "$serialized_disable_pid" || fail "serialized disable failed"
 [ ! -e "$disable_audio" ] || fail "disable retained pending temporary audio"
 [ ! -e "$voice_home/state/telegram/pending.json" ] || fail "disable retained pending voice state"
 if supervision_needs "$voice_home"; then fail "disabled Telegram transport still required supervision"; fi
