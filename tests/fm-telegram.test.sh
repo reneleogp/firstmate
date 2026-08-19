@@ -61,6 +61,18 @@ class Handler(BaseHTTPRequestHandler):
         if method == 'getFile': return self._write({'file_path': 'voice/test.oga'})
         if method == 'getUpdates':
             if (home / 'hold-updates').exists(): time.sleep(.05)
+            if (home / 'unauthorized-next-updates').exists():
+                (home / 'unauthorized-next-updates').unlink()
+                raw = json.dumps({'ok': False, 'error_code': 401, 'description': 'Unauthorized'}).encode()
+                self.send_response(401); self.send_header('Content-Length', str(len(raw)))
+                self.end_headers(); self.wfile.write(raw)
+                return
+            if (home / 'server-error-next-updates').exists():
+                (home / 'server-error-next-updates').unlink()
+                raw = json.dumps({'ok': False, 'error_code': 500, 'description': 'Server error'}).encode()
+                self.send_response(500); self.send_header('Content-Length', str(len(raw)))
+                self.end_headers(); self.wfile.write(raw)
+                return
             updates = json.loads((home / 'updates.json').read_text()) if (home / 'updates.json').exists() else []
             return self._write(updates)
         if method == 'sendMessage':
@@ -197,6 +209,13 @@ touch "$pin_home/unauthorized-next-getme" "$pin_home/state/telegram/enabled"
 run_tg "$pin_home" serve --once >/dev/null 2>&1
 [ "$?" -eq 78 ] || fail "definitive bot authentication failure did not use the permanent configuration exit"
 [ ! -e "$pin_home/state/telegram/enabled" ] || fail "authentication failure left transport supervision active"
+touch "$pin_home/server-error-next-updates"
+run_tg "$pin_home" serve --once >/dev/null 2>&1
+[ "$?" -eq 1 ] || fail "transient polling failure used the permanent configuration exit"
+touch "$pin_home/unauthorized-next-updates" "$pin_home/state/telegram/enabled"
+run_tg "$pin_home" serve --once >/dev/null 2>&1
+[ "$?" -eq 78 ] || fail "polling authentication failure did not use the permanent configuration exit"
+[ ! -e "$pin_home/state/telegram/enabled" ] || fail "polling authentication failure left transport supervision active"
 
 rm -f "$home/port"
 start_server "$home" "$home/port"
@@ -246,16 +265,15 @@ assert json.load(open(sys.argv[1], encoding='utf-8'))['wake_recorded'] is True
 PY
 [ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$request_id" ] || fail "replayed initial claim lost its conversation route"
 run_tg "$home" request-bind "$request_id" telegram-work >/dev/null
-! grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "bound initial claim retained its recovery wake"
-python3 - "$home/state/telegram/handled/$request_id.json" <<'PY'
-import json, sys
-path = sys.argv[1]
-record = json.load(open(path, encoding='utf-8'))
-record['initial_routing'] = 'pending'
-json.dump(record, open(path, 'w', encoding='utf-8'))
-PY
-if run_tg "$home" request-handled "$request_id" >/dev/null 2>&1; then fail "stale request state reopened an atomic work binding"; fi
-if run_tg "$home" active-request --claimed-request "$request_id" >/dev/null 2>&1; then fail "bound work was exposed as an unrouted initial claim"; fi
+grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "bind-before-launch lost the initial recovery wake"
+bound_initial_route=$(printf '%s\t%s' "$request_id" telegram-work)
+[ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$bound_initial_route" ] || fail "bound initial recovery did not expose its exact work id"
+run_tg "$home" request-handled "$request_id" >/dev/null || fail "bound initial recovery claim was not idempotent"
+printf 'endpoint_task_id=telegram-work\n' > "$home/state/telegram-work.meta"
+set_updates '[]' "$home"
+run_tg "$home" serve --once >/dev/null
+! grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "published work retained its initial recovery wake"
+[ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$bound_initial_route" ] || fail "published work binding was not recoverable from a stale claim"
 [ "$(run_tg "$home" active-request --work-id telegram-work)" = "$request_id" ] || fail "matching lifecycle work did not resolve its Telegram origin"
 routing_before=$(grep -c 'sendMessage' "$home/calls.jsonl")
 if run_tg "$home" active-request --work-id terminal-work >/dev/null 2>&1; then
@@ -371,6 +389,7 @@ os.utime(sys.argv[1], (future, future))
 PY
 run_tg "$home" request-handled "$authority_id"
 run_tg "$home" request-bind "$authority_id" authority-work >/dev/null
+printf 'endpoint_task_id=authority-work\n' > "$home/state/authority-work.meta"
 if run_tg "$home" request-handled "$live_id" >/dev/null 2>&1; then fail "a second Telegram conversation bypassed the active binding"; fi
 if run_tg "$home" active-request --work-id terminal-work >/dev/null 2>&1; then fail "terminal-originated work matched an authority request"; fi
 python3 - "$home/state/.wake-queue" <<'PY'
@@ -552,6 +571,7 @@ run_tg "$order_home" serve --once >/dev/null
 [ "$(grep -c "telegram:$order_a" "$order_home/state/.wake-queue")" -eq 1 ] || fail "unchanged surfaced wake was duplicated during reconciliation"
 run_tg "$order_home" request-handled "$order_a" >/dev/null
 run_tg "$order_home" request-bind "$order_a" order-work >/dev/null
+printf 'endpoint_task_id=order-work\n' > "$order_home/state/order-work.meta"
 set_updates '[{"update_id":33,"message":{"message_id":33,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"late answer for A"}}]' "$order_home"
 run_tg "$order_home" serve --once >/dev/null
 order_continuation=tg-text-u33-m33

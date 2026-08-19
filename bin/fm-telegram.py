@@ -218,8 +218,16 @@ def raw_api_call(home: Path, token: str, method: str,
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TelegramError(f"Telegram returned invalid data for {method}", delivery_unknown=True) from exc
     if not isinstance(envelope, dict) or envelope.get("ok") is not True:
-        raise TelegramError(f"Telegram rejected {method}")
+        error_code = envelope.get("error_code") if isinstance(envelope, dict) else None
+        raise TelegramError(
+            f"Telegram rejected {method}",
+            http_status=error_code if strict_int(error_code) else None,
+        )
     return envelope.get("result")
+
+
+def permanent_auth_failure(error: TelegramError) -> bool:
+    return error.http_status in {401, 404}
 
 
 def verified_token_for(home: Path, config: Optional[Dict[str, Any]] = None) -> str:
@@ -234,7 +242,7 @@ def verified_token_for(home: Path, config: Optional[Dict[str, Any]] = None) -> s
     try:
         result = raw_api_call(home, token, "getMe", {}, pairing)
     except TelegramError as exc:
-        if exc.http_status in {400, 401, 403, 404}:
+        if permanent_auth_failure(exc):
             raise PermanentConfigurationError(
                 "Telegram bot token could not authenticate; pair again"
             ) from exc
@@ -479,6 +487,13 @@ def active_request_id(home: Path) -> Optional[str]:
     return str(active["request_id"]) if active is not None else None
 
 
+def work_record_published(home: Path, work_id: Any) -> bool:
+    if not isinstance(work_id, str) or not safe_id(work_id):
+        return False
+    path = home / "state" / f"{work_id}.meta"
+    return path.is_file() and not path.is_symlink()
+
+
 def closing_path(home: Path) -> Path:
     return state_dir(home) / "closing.json"
 
@@ -512,7 +527,7 @@ def _sync_request_wakes_locked(home: Path) -> None:
                 continue
             if (record.get("request_id") == active
                     and active_state is not None
-                    and active_state.get("work_id") is None):
+                    and not work_record_published(home, active_state.get("work_id"))):
                 routed_paths.append(path)
             elif (record.get("continuation_of") == active
                   and (path.parent == inbox
@@ -1357,6 +1372,7 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> i
         raise
     offset = 0
     stop = False
+    permanent_failure = False
 
     def stop_service(_signum: int, _frame: Any) -> None:
         nonlocal stop
@@ -1382,7 +1398,12 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> i
                         offset = max(offset, int(update["update_id"]) + 1)
                     process_update(home, config, update)
                 reconcile_requests(home)
-            except TelegramError:
+            except TelegramError as exc:
+                if permanent_auth_failure(exc):
+                    permanent_failure = True
+                    raise PermanentConfigurationError(
+                        "Telegram bot token could not authenticate; pair again"
+                    ) from exc
                 if once:
                     return 1
                 time.sleep(2)
@@ -1390,12 +1411,12 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT) -> i
                 break
         return 0
     finally:
-        if stop:
+        if stop or permanent_failure:
             with FileLock(state_lock(home)):
                 pending = read_json(pending_path(home))
                 if isinstance(pending, dict):
                     remove_pending(home, pending)
-        if stop or once:
+        if stop or once or permanent_failure:
             set_telegram_enabled(home, False)
 
 
@@ -1455,11 +1476,12 @@ def request_handled(home: Path, request_id: str) -> int:
                 target_record = read_json(target)
                 active_state = active_record(home)
                 if active == request_id:
-                    if active_state is not None and active_state.get("work_id") is None:
-                        if (isinstance(target_record, dict)
-                                and target_record.get("wake_recorded") is not True):
-                            target_record["wake_recorded"] = True
-                            atomic_json(target, target_record)
+                    if (isinstance(target_record, dict)
+                            and target_record.get("wake_recorded") is not True):
+                        target_record["wake_recorded"] = True
+                        atomic_json(target, target_record)
+                    if active_state is not None:
+                        _sync_request_wakes_locked(home)
                         return 0
                     return die("request is already routed")
                 if (isinstance(target_record, dict)
@@ -1531,8 +1553,9 @@ def request_active(home: Path, work_id: Optional[str] = None,
             if not isinstance(value, dict) or value.get("request_id") != claimed_request:
                 return 1
             if claimed_request == request_id:
-                if active.get("work_id") is not None:
-                    return 1
+                bound_work = active.get("work_id")
+                if isinstance(bound_work, str):
+                    route = f"{request_id}\t{bound_work}"
             else:
                 bound_work = active.get("work_id")
                 if (value.get("continuation_of") != request_id
@@ -1862,7 +1885,7 @@ def build_parser() -> argparse.ArgumentParser:
     bind_parser.add_argument("request_id")
     bind_parser.add_argument("work_id")
     active_parser = sub.add_parser(
-        "active-request", help="print the active request route and claimed continuation work id"
+        "active-request", help="print the active request route and any claimed work id"
     )
     add_home(active_parser)
     active_group = active_parser.add_mutually_exclusive_group()

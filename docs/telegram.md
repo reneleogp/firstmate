@@ -51,12 +51,13 @@ The service writes only a private request record and a safe wake containing its 
 Raw Telegram text and audio never enter wake records, status logs, shell arguments, unit files, diagnostics, or tracked files.
 The primary receives the request through `bin/fm-telegram-agent-request.sh <local-request-id>`, whose generated context preserves the trusted authority boundary around the untrusted body, and claims it with `request-handled <local-request-id>`.
 The operator can inspect only the stored body with `bin/fm-telegram.py request-read <local-request-id>`.
-An initial claim remains durably wakeable after interruption until `request-bind <local-request-id> <work-id>` persists its lifecycle origin binding.
+An initial claim remains durably wakeable after interruption until the bound work's durable `fm-spawn.sh` record is published.
+Binding before launch is safe because `active-request --claimed-request <local-request-id>` exposes the already selected work identifier on recovery and the wake remains until that publication boundary.
 Lifecycle routing uses `active-request --work-id <work-id>` and refuses unrelated terminal work.
 Replies use the pinned chat without a recipient argument, for example `bin/fm-telegram.py reply <local-request-id> --text-file reply.txt`.
 The terminal reply adds `--final` to clear the active binding and wake the next queued conversation.
 A pinned text reply received while that conversation is active is durably routed back to the same work as its continuation answer.
-`active-request --claimed-request <local-request-id>` returns an initial claim's active conversation identifier alone or a continuation's active conversation identifier and exact bound work identifier as two tab-separated fields.
+`active-request --claimed-request <local-request-id>` returns an unbound initial claim's active conversation identifier alone, or an initial claim after binding and every continuation as the active conversation identifier and exact bound work identifier in two tab-separated fields.
 The route remains recoverable across interruption or a concurrent final reply.
 After delivering that continuation to the returned work, acknowledge it with `continuation-handled <local-request-id>` so the conversation can advance.
 Telegram-originated work can receive decision, blocker, terminal-confirmation, PR-ready, and final replies through these commands, while routine progress and milestone chatter stay terminal-only.
