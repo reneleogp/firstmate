@@ -460,22 +460,22 @@ updates = [
     {'update_id': value, 'message': {
         'message_id': value, 'from': {'id': 77},
         'chat': {'id': 77, 'type': 'private'}, 'text': f'capacity request {value}'}}
-    for value in range(1, 258)
+    for value in range(257, 0, -1)
 ]
 json.dump(updates, open(updates_path, 'w', encoding='utf-8'))
 PY
 chmod 600 "$capacity_home/config/telegram.json"
 run_tg "$capacity_home" serve --once >/dev/null
 [ "$(find "$capacity_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 256 ] || fail "text admission exceeded the 256 request cap"
-[ ! -e "$capacity_home/state/telegram/inbox/tg-text-u1-m1.json" ] || fail "text admission did not evict the oldest queued request"
-[ -e "$capacity_home/state/telegram/inbox/tg-text-u257-m257.json" ] || fail "text admission did not retain the newest queued request"
+[ ! -e "$capacity_home/state/telegram/inbox/tg-text-u257-m257.json" ] || fail "text admission did not evict the oldest queued request"
+[ -e "$capacity_home/state/telegram/inbox/tg-text-u1-m1.json" ] || fail "text admission did not retain the newest queued request"
 set_updates '[{"update_id":258,"message":{"message_id":258,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"capacity-voice","duration":2,"file_size":20}}}]' "$capacity_home"
 run_tg "$capacity_home" serve --once >/dev/null
 capacity_send=$(callback_data "$capacity_home" send)
 set_updates "[{\"update_id\":259,\"callback_query\":{\"id\":\"capacity-send\",\"from\":{\"id\":77},\"message\":{\"message_id\":259,\"chat\":{\"id\":77,\"type\":\"private\"}},\"data\":\"$capacity_send\"}}]" "$capacity_home"
 run_tg "$capacity_home" serve --once >/dev/null
 [ "$(find "$capacity_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 256 ] || fail "confirmed voice admission exceeded the 256 request cap"
-[ ! -e "$capacity_home/state/telegram/inbox/tg-text-u2-m2.json" ] || fail "confirmed voice admission did not evict the oldest queued request"
+[ ! -e "$capacity_home/state/telegram/inbox/tg-text-u256-m256.json" ] || fail "confirmed voice admission did not evict the oldest queued request"
 [ -e "$capacity_home/state/telegram/inbox/tg-voice-u258-m258.json" ] || fail "confirmed voice admission did not retain its queued request"
 
 # A live primary must have its harness-owned watcher before activation can accept requests.
@@ -932,6 +932,10 @@ assert value('Restart') == 'on-failure'
 assert words(value('RestartPreventExitStatus')) == ['78']
 PY
     fi
+    if [ -n "${FM_TELEGRAM_DAEMON_HOLD:-}" ]; then
+      printf 'entered\n' > "$FM_TELEGRAM_DAEMON_HOLD.entered"
+      while [ ! -e "$FM_TELEGRAM_DAEMON_HOLD.release" ]; do sleep .01; done
+    fi
     ;;
   start)
     if [ ! -s "$root/systemctl.service.pid" ]; then
@@ -1270,6 +1274,40 @@ wait "$serialized_cleanup_pid" || fail "serialized cleanup failed"
 [ -f "$voice_home/state/.telegram-state.lock" ] || fail "cleanup removed the stable state lock"
 [ -f "$voice_home/state/.telegram-service.lock" ] || fail "cleanup removed the stable service lock"
 "${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null || fail "cleanup with retained stable locks was not idempotent"
+
+# The singleton unit transition serializes concurrent installs for different homes.
+"${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null
+env FM_HOME="$other_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" \
+  FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" \
+  FM_TELEGRAM_EXPECT_HOME="$other_home" FM_TELEGRAM_SERVICE_SCRIPT="$SCRIPT" \
+  "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null
+unit_hold="$TMP_ROOT/unit-transition"
+rm -f "$unit_hold.entered" "$unit_hold.release"
+env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" \
+  FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" \
+  FM_TELEGRAM_EXPECT_HOME="$voice_home" FM_TELEGRAM_SERVICE_SCRIPT="$SCRIPT" \
+  FM_TELEGRAM_DAEMON_HOLD="$unit_hold" "$SCRIPT" install >/dev/null &
+first_install_pid=$!
+unit_transition_entered=0
+for _ in $(seq 1 100); do
+  if [ -e "$unit_hold.entered" ]; then unit_transition_entered=1; break; fi
+  sleep .02
+done
+[ "$unit_transition_entered" -eq 1 ] || fail "first singleton install did not reach its held unit transition"
+env FM_HOME="$other_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" \
+  FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" \
+  FM_TELEGRAM_EXPECT_HOME="$other_home" FM_TELEGRAM_SERVICE_SCRIPT="$SCRIPT" \
+  "$SCRIPT" install >/dev/null 2>&1 &
+second_install_pid=$!
+sleep .1
+kill -0 "$second_install_pid" 2>/dev/null || fail "concurrent install bypassed the singleton unit transition"
+touch "$unit_hold.release"
+wait "$first_install_pid" || fail "serialized first singleton install failed"
+if wait "$second_install_pid"; then
+  fail "serialized second home replaced the installed singleton unit"
+fi
+"${lifecycle_env[@]}" "$SCRIPT" status >/dev/null || fail "singleton unit no longer belonged to the first installed home"
+"${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null || fail "serialized singleton cleanup failed"
 
 grep -F 'test-only-token' "$home/state/.wake-queue" >/dev/null && fail "bot token entered wake data"
 pass "Telegram transport pairing, queueing, dedupe, drops, voice flow, safety, and lifecycle behave as specified"

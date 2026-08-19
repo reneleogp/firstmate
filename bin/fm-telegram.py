@@ -411,6 +411,10 @@ def service_lock(home: Path) -> Path:
     return home / "state" / ".telegram-service.lock"
 
 
+def unit_lock() -> Path:
+    return unit_path().parent / ".firstmate-telegram-unit.lock"
+
+
 class FileLock:
     def __init__(self, path: Path, blocking: bool = True, timeout: float = 0):
         self.path = path
@@ -585,20 +589,47 @@ def closing_path(home: Path) -> Path:
     return state_dir(home) / "closing.json"
 
 
-def request_order_key(path: Path) -> Tuple[int, int, int, str]:
+def request_order_key(path: Path) -> Tuple[int, int, int, int, str]:
     record = read_json(path, {})
     if not isinstance(record, dict):
-        return (-1, -1, -1, path.stem)
+        return (0, -1, -1, -1, path.stem)
+    admission_sequence = record.get("admission_sequence")
     created = record.get("created_at")
     update_id = record.get("update_id")
     message_id = record.get("message_id")
     request_id = record.get("request_id")
+    if strict_int(admission_sequence) and admission_sequence > 0:
+        return (
+            1,
+            admission_sequence,
+            update_id if strict_int(update_id) else -1,
+            message_id if strict_int(message_id) else -1,
+            request_id if isinstance(request_id, str) else path.stem,
+        )
     return (
+        0,
         created if strict_int(created) else -1,
         update_id if strict_int(update_id) else -1,
         message_id if strict_int(message_id) else -1,
         request_id if isinstance(request_id, str) else path.stem,
     )
+
+
+def next_admission_sequence_locked(home: Path) -> int:
+    path = state_dir(home) / "admission-sequence.json"
+    value = read_json(path, {})
+    last = value.get("last") if isinstance(value, dict) else None
+    if not strict_int(last) or last < 0:
+        inbox, handled = request_dirs(home)
+        last = 0
+        for request in list(inbox.glob("*.json")) + list(handled.glob("*.json")):
+            record = read_json(request, {})
+            sequence = record.get("admission_sequence") if isinstance(record, dict) else None
+            if strict_int(sequence) and sequence > last:
+                last = sequence
+    sequence = last + 1
+    atomic_json(path, {"last": sequence})
+    return sequence
 
 
 def _sync_request_wakes_locked(home: Path) -> None:
@@ -715,6 +746,7 @@ def _queue_request_locked(home: Path, text: str, chat_id: int, message_id: int,
         "message_id": message_id,
         "update_id": update_id,
         "created_at": now(),
+        "admission_sequence": next_admission_sequence_locked(home),
         "status": "queued",
         "wake_recorded": False,
         "receipt_text": transport_reply(home),
@@ -1934,71 +1966,78 @@ def verify_transport_marker(home: Path, expected: bool) -> None:
 
 
 def install(home: Path) -> int:
-    with FileLock(lifecycle_lock(home)):
-        config = load_config(home)
-        verified_token_for(home, config)
-        path = unit_path()
-        if (path.exists() or path.is_symlink()) and not unit_owned_by(home):
-            raise TelegramError("Telegram service unit belongs to another home or installation")
-        atomic_bytes(path, unit_contents(home).encode())
-        systemctl("daemon-reload")
-        systemctl("enable", SERVICE_NAME)
-        prepare_transport_activation(home)
-        systemctl("start", SERVICE_NAME)
-        verify_service(active=True, enabled=True)
-        verify_transport_marker(home, True)
+    with FileLock(unit_lock()):
+        with FileLock(lifecycle_lock(home)):
+            config = load_config(home)
+            verified_token_for(home, config)
+            path = unit_path()
+            if (path.exists() or path.is_symlink()) and not unit_owned_by(home):
+                raise TelegramError("Telegram service unit belongs to another home or installation")
+            atomic_bytes(path, unit_contents(home).encode())
+            systemctl("daemon-reload")
+            systemctl("enable", SERVICE_NAME)
+            prepare_transport_activation(home)
+            systemctl("start", SERVICE_NAME)
+            require_unit_owner(home)
+            verify_service(active=True, enabled=True)
+            verify_transport_marker(home, True)
     print("Telegram service installed and active.")
     return 0
 
 
 def start_service(home: Path) -> int:
-    with FileLock(lifecycle_lock(home)):
-        config = load_config(home)
-        verified_token_for(home, config)
-        require_unit_owner(home)
-        prepare_transport_activation(home)
-        systemctl("start", SERVICE_NAME)
-        verify_service(active=True)
-        verify_transport_marker(home, True)
+    with FileLock(unit_lock()):
+        with FileLock(lifecycle_lock(home)):
+            config = load_config(home)
+            verified_token_for(home, config)
+            require_unit_owner(home)
+            prepare_transport_activation(home)
+            systemctl("start", SERVICE_NAME)
+            require_unit_owner(home)
+            verify_service(active=True)
+            verify_transport_marker(home, True)
     print("Telegram service active.")
     return 0
 
 
 def stop_service(home: Path) -> int:
-    with FileLock(lifecycle_lock(home)):
-        require_unit_owner(home)
-        systemctl("stop", SERVICE_NAME)
-        verify_service(active=False)
-        with FileLock(service_lock(home), blocking=False, timeout=1):
-            with FileLock(state_lock(home)):
-                pending = read_json(pending_path(home))
-                if isinstance(pending, dict):
-                    remove_pending(home, pending)
-            set_telegram_enabled(home, False)
-            verify_transport_marker(home, False)
+    with FileLock(unit_lock()):
+        with FileLock(lifecycle_lock(home)):
+            require_unit_owner(home)
+            systemctl("stop", SERVICE_NAME)
+            verify_service(active=False)
+            with FileLock(service_lock(home), blocking=False, timeout=1):
+                with FileLock(state_lock(home)):
+                    pending = read_json(pending_path(home))
+                    if isinstance(pending, dict):
+                        remove_pending(home, pending)
+                set_telegram_enabled(home, False)
+                verify_transport_marker(home, False)
     print("Telegram service stopped.")
     return 0
 
 
 def status_service(home: Path) -> int:
-    require_unit_owner(home)
-    result = systemctl("is-active", SERVICE_NAME, check=False)
+    with FileLock(unit_lock()):
+        require_unit_owner(home)
+        result = systemctl("is-active", SERVICE_NAME, check=False)
     print(result.stdout.strip() or "inactive")
     return 0 if result.returncode == 0 and result.stdout.strip() == "active" else 1
 
 
 def disable_service(home: Path) -> int:
-    with FileLock(lifecycle_lock(home)):
-        require_unit_owner(home)
-        systemctl("disable", "--now", SERVICE_NAME)
-        verify_service(active=False, enabled=False)
-        with FileLock(service_lock(home), blocking=False, timeout=1):
-            with FileLock(state_lock(home)):
-                pending = read_json(pending_path(home))
-                if isinstance(pending, dict):
-                    remove_pending(home, pending)
-            set_telegram_enabled(home, False)
-            verify_transport_marker(home, False)
+    with FileLock(unit_lock()):
+        with FileLock(lifecycle_lock(home)):
+            require_unit_owner(home)
+            systemctl("disable", "--now", SERVICE_NAME)
+            verify_service(active=False, enabled=False)
+            with FileLock(service_lock(home), blocking=False, timeout=1):
+                with FileLock(state_lock(home)):
+                    pending = read_json(pending_path(home))
+                    if isinstance(pending, dict):
+                        remove_pending(home, pending)
+                set_telegram_enabled(home, False)
+                verify_transport_marker(home, False)
     print("Telegram service disabled.")
     return 0
 
@@ -2041,8 +2080,9 @@ def _cleanup_locked(home: Path) -> int:
 
 
 def cleanup(home: Path) -> int:
-    with FileLock(lifecycle_lock(home)):
-        return _cleanup_locked(home)
+    with FileLock(unit_lock()):
+        with FileLock(lifecycle_lock(home)):
+            return _cleanup_locked(home)
 
 
 def build_parser() -> argparse.ArgumentParser:
