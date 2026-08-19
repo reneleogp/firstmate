@@ -162,9 +162,27 @@ new_home() {
   printf '%s\n' "$home"
 }
 
-set_updates() { printf '%s\n' "$1" > "$2/updates.json"; }
-api_env() { printf 'FM_HOME=%s FM_TELEGRAM_API_BASE=http://127.0.0.1:%s' "$1" "$(cat "$1/port")"; }
-run_tg() { env FM_HOME="$1" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$1/port")" "$SCRIPT" "${@:2}"; }
+set_raw_updates() { printf '%s\n' "$1" > "$2/updates.json"; }
+set_updates() {
+  "$PYTHON" - "$1" "$2/updates.json" <<'PY'
+import json, sys
+updates = json.loads(sys.argv[1])
+for update in updates:
+    if not isinstance(update, dict):
+        continue
+    messages = [update.get('message')]
+    query = update.get('callback_query')
+    if isinstance(query, dict):
+        messages.append(query.get('message'))
+    for message in messages:
+        if isinstance(message, dict):
+            message.setdefault('date', 1)
+with open(sys.argv[2], 'w', encoding='utf-8') as stream:
+    json.dump(updates, stream)
+PY
+}
+test_api_base() { printf 'http://127.0.0.1:%s' "$(cat "$1/port")"; }
+run_tg() { env FM_HOME="$1" "$SCRIPT" --test-api-base "$(test_api_base "$1")" "${@:2}"; }
 callback_data() {
   python3 - "$1/calls.jsonl" "$2" <<'PY'
 import json, sys
@@ -189,6 +207,23 @@ if run_tg "$home" pair --user-id 78 --chat-id 77 >/dev/null 2>&1; then
 fi
 run_tg "$home" pair --user-id 77 --chat-id 77 >/dev/null
 [ "$(path_mode "$home/config/telegram.json")" = 600 ] || fail "pairing config must be mode 0600"
+python3 - "$home/config/telegram.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+config = json.load(open(path, encoding='utf-8'))
+config['api_base'] = 'https://example.com/collect'
+json.dump(config, open(path, 'w', encoding='utf-8'))
+PY
+run_tg "$home" pair --user-id 77 --chat-id 77 >/dev/null
+python3 - "$home/config/telegram.json" <<'PY' || fail "pairing persisted a test API endpoint"
+import json, sys
+assert 'api_base' not in json.load(open(sys.argv[1], encoding='utf-8'))
+PY
+calls_before_endpoint_refusal=$(wc -l < "$home/calls.jsonl" | tr -d ' ')
+if env FM_HOME="$home" "$SCRIPT" --test-api-base "https://example.com" pair --user-id 77 --chat-id 77 >/dev/null 2>&1; then
+  fail "non-loopback test API endpoint was accepted"
+fi
+[ "$(wc -l < "$home/calls.jsonl" | tr -d ' ')" -eq "$calls_before_endpoint_refusal" ] || fail "refused test API endpoint received the bot token"
 
 # Telegram is confined to a primary home's own regular credential file.
 boundary_home=$(new_home primary-boundary)
@@ -334,8 +369,8 @@ runtime_home=$(new_home runtime-owner)
 start_server "$runtime_home" "$runtime_home/port"
 run_tg "$runtime_home" pair --user-id 77 --chat-id 77 >/dev/null
 touch "$runtime_home/block-updates"
-env FM_HOME="$runtime_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$runtime_home/port")" \
-  "$SCRIPT" serve --poll-timeout 1 >"$runtime_home/service.out" 2>&1 &
+env FM_HOME="$runtime_home" "$SCRIPT" --test-api-base "$(test_api_base "$runtime_home")" \
+  serve --poll-timeout 1 >"$runtime_home/service.out" 2>&1 &
 runtime_pid=$!
 runtime_started=0
 for _ in $(seq 1 100); do
@@ -444,6 +479,11 @@ if run_tg "$home" request-bind "$request_id" terminal-work >/dev/null 2>&1; then
 fi
 [ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$request_id" ] || fail "rejected terminal work binding changed the active route"
 run_tg "$home" request-bind "$request_id" telegram-work >/dev/null
+if FM_HOME="$home" "$ROOT/bin/fm-spawn.sh" telegram-work "$home" "sh -c 'exit 0'" --scout \
+    >"$home/terminal-spawn.out" 2>"$home/terminal-spawn.err"; then
+  fail "ordinary terminal spawn consumed a Telegram-reserved work identifier"
+fi
+grep -F 'reserved for an authenticated Telegram-origin spawn' "$home/terminal-spawn.err" >/dev/null || fail "fm-spawn did not enforce Telegram publication ownership"
 grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "bind-before-launch lost the initial recovery wake"
 bound_initial_route=$(printf '%s\t%s' "$request_id" telegram-work)
 [ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$bound_initial_route" ] || fail "bound initial recovery did not expose its exact work id"
@@ -451,6 +491,13 @@ run_tg "$home" request-handled "$request_id" >/dev/null || fail "bound initial r
 printf 'endpoint_task_id=telegram-work\n' > "$home/state/telegram-work.meta"
 set_updates '[]' "$home"
 run_tg "$home" serve --once >/dev/null
+grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "terminal publication stole the Telegram work binding"
+if run_tg "$home" active-request --work-id telegram-work >/dev/null 2>&1; then
+  fail "unverified terminal publication acquired a Telegram origin"
+fi
+run_tg "$home" publication-authorize "$request_id" telegram-work >/dev/null
+printf 'endpoint_task_id=telegram-work\ntelegram_request_id=%s\n' "$request_id" > "$home/state/telegram-work.meta"
+run_tg "$home" request-published "$request_id" telegram-work >/dev/null
 ! grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "published work retained its initial recovery wake"
 [ "$(run_tg "$home" active-request --claimed-request "$request_id")" = "$bound_initial_route" ] || fail "published work binding was not recoverable from a stale claim"
 [ "$(run_tg "$home" active-request --work-id telegram-work)" = "$request_id" ] || fail "matching lifecycle work did not resolve its Telegram origin"
@@ -493,7 +540,8 @@ if run_tg "$home" request-routed "$direct_id" >/dev/null 2>&1; then
   fail "direct route was acknowledged without durable lifecycle context"
 fi
 grep -F "telegram:$direct_id" "$home/state/.wake-queue" >/dev/null || fail "refused direct route lost its recovery wake"
-printf 'endpoint_task_id=direct-work\n' > "$home/state/direct-work.meta"
+printf 'endpoint_task_id=direct-work\ntelegram_request_id=%s\n' "$direct_id" > "$home/state/direct-work.meta"
+run_tg "$home" request-published "$direct_id" direct-work >/dev/null
 printf 'Which option?\n' > "$home/reply.txt"
 run_tg "$home" reply "$direct_id" --text-file "$home/reply.txt" >/dev/null
 run_tg "$home" request-routed "$direct_id" >/dev/null
@@ -543,6 +591,11 @@ fi
 before=$(grep -c 'sendMessage' "$home/calls.jsonl")
 callbacks_before=$(grep -c 'answerCallbackQuery' "$home/calls.jsonl")
 files_before=$(grep -c 'getFile' "$home/calls.jsonl")
+malformed_inbox_before=$(find "$home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')
+set_raw_updates '[{"update_id":9002,"message":{"message_id":9002,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"missing mandatory date"}}]' "$home"
+run_tg "$home" serve --once >/dev/null
+[ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq "$before" ] || fail "message missing its mandatory date received a reply"
+[ "$(find "$home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq "$malformed_inbox_before" ] || fail "message missing its mandatory date was queued"
 set_updates '[{"update_id":2,"message":{"message_id":11,"from":{"id":999},"chat":{"id":77,"type":"private"},"text":"ignore"}},{"update_id":3,"message":{"message_id":12,"from":{"id":77},"chat":{"id":77,"type":"group"},"text":"ignore"}},{"update_id":4,"message":{"message_id":13,"from":{"id":77},"chat":{"id":77,"type":"private"},"photo":[{"file_id":"must not download"}]}},{"update_id":5,"edited_message":{"message":{"voice":{"file_id":"must not download"}}}},{"update_id":7,"callback_query":{"id":"bad-shape","from":{"id":77},"data":"cancel:any:1","message":{"message_id":70,"chat":"not-an-object"}}},{"update_id":8,"callback_query":{"from":{"id":77},"data":"cancel:any:1","message":{"message_id":80,"chat":{"id":77,"type":"private"}}}},{"update_id":true,"message":{"message_id":81,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"boolean update"}},{"update_id":81,"message":{"message_id":true,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"boolean message"}},{"update_id":82,"message":{"message_id":82,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"","duration":2,"file_size":20}}},{"update_id":83,"message":{"message_id":83,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-bool-duration","duration":true,"file_size":20}}},{"update_id":84,"message":{"message_id":84,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-bool-size","duration":2,"file_size":true}}},{"update_id":85,"message":{"message_id":85,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"conflicting text","photo":[{"file_id":"must not download"}]}},{"update_id":86,"message":{"message_id":86,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"must not download","duration":2,"file_size":20},"sticker":{"file_id":"must not download"}}},{"update_id":87,"message":{"message_id":87,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"conflicting update"},"edited_message":{"message_id":88,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"must not parse"}},{"update_id":88,"message":{"message_id":88,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"unknown update companion"},"future_update":{"opaque":"must not parse"}},{"update_id":89,"message":{"message_id":89,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"unknown message content","future_content":{"opaque":"must not parse"}}}]' "$home"
 run_tg "$home" serve --once >/dev/null
 [ "$(grep -c 'sendMessage' "$home/calls.jsonl")" -eq "$before" ] || fail "unsupported or unpinned updates must be silent"
@@ -554,17 +607,17 @@ import json, sys
 oversized = 1 << 52
 json.dump([
     {'update_id': oversized, 'message': {
-        'message_id': 90, 'from': {'id': 77},
+        'message_id': 90, 'date': 1, 'from': {'id': 77},
         'chat': {'id': 77, 'type': 'private'}, 'text': 'oversized update'}},
     {'update_id': 90, 'message': {
-        'message_id': oversized, 'from': {'id': 77},
+        'message_id': oversized, 'date': 1, 'from': {'id': 77},
         'chat': {'id': 77, 'type': 'private'}, 'text': 'oversized message'}},
     {'update_id': 91, 'callback_query': {
         'id': 'x' * 257, 'from': {'id': 77}, 'data': 'cancel:any:1',
-        'message': {'message_id': 91, 'chat': {'id': 77, 'type': 'private'}}}},
+        'message': {'message_id': 91, 'date': 1, 'chat': {'id': 77, 'type': 'private'}}}},
     {'update_id': 92, 'callback_query': {
         'id': 'oversized-callback-message', 'from': {'id': 77}, 'data': 'cancel:any:1',
-        'message': {'message_id': oversized, 'chat': {'id': 77, 'type': 'private'}}}},
+        'message': {'message_id': oversized, 'date': 1, 'chat': {'id': 77, 'type': 'private'}}}},
 ], open(sys.argv[1], 'w', encoding='utf-8'))
 PY
 run_tg "$home" serve --once >/dev/null || fail "oversized identifiers stopped the transport"
@@ -595,7 +648,7 @@ config['parakeet_command'] = shlex.quote(parakeet)
 json.dump(config, open(config_path, 'w', encoding='utf-8'))
 updates = [
     {'update_id': value, 'message': {
-        'message_id': value, 'from': {'id': 77},
+        'message_id': value, 'date': 1, 'from': {'id': 77},
         'chat': {'id': 77, 'type': 'private'}, 'text': f'capacity request {value}'}}
     for value in range(257, 0, -1)
 ]
@@ -666,7 +719,8 @@ os.utime(sys.argv[1], (future, future))
 PY
 run_tg "$home" request-handled "$authority_id"
 run_tg "$home" request-bind "$authority_id" authority-work >/dev/null
-printf 'endpoint_task_id=authority-work\n' > "$home/state/authority-work.meta"
+printf 'endpoint_task_id=authority-work\ntelegram_request_id=%s\n' "$authority_id" > "$home/state/authority-work.meta"
+run_tg "$home" request-published "$authority_id" authority-work >/dev/null
 if run_tg "$home" request-handled "$live_id" >/dev/null 2>&1; then fail "a second Telegram conversation bypassed the active binding"; fi
 if run_tg "$home" active-request --work-id terminal-work >/dev/null 2>&1; then fail "terminal-originated work matched an authority request"; fi
 python3 - "$home/state/.wake-queue" <<'PY'
@@ -852,7 +906,8 @@ fi
 [ ! -e "$order_home/state/telegram/active.json" ] || fail "out-of-order claim created an active conversation"
 run_tg "$order_home" request-handled "$order_a" >/dev/null
 run_tg "$order_home" request-bind "$order_a" order-work >/dev/null
-printf 'endpoint_task_id=order-work\n' > "$order_home/state/order-work.meta"
+printf 'endpoint_task_id=order-work\ntelegram_request_id=%s\n' "$order_a" > "$order_home/state/order-work.meta"
+run_tg "$order_home" request-published "$order_a" order-work >/dev/null
 set_updates '[{"update_id":33,"message":{"message_id":33,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"late answer for A"}}]' "$order_home"
 run_tg "$order_home" serve --once >/dev/null
 order_continuation=tg-text-u33-m33
@@ -926,10 +981,36 @@ run_tg "$voice_home" serve --once >/dev/null
 [ "$(grep -c 'answerCallbackQuery' "$voice_home/calls.jsonl")" -eq "$malformed_callback_answers" ] || fail "unsupported callback envelope was acknowledged"
 [ "$(find "$voice_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 0 ] || fail "unsupported callback envelope queued a voice request"
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mode"])' "$pending")" = confirm ] || fail "unsupported callback envelope changed pending voice state"
+touch "$voice_home/hold-send"
+rm -f "$voice_home/send-entered"
 set_updates '[{"update_id":21,"callback_query":{"id":"cb-edit","from":{"id":77},"data":"'"$edit_data"'","message":{"message_id":201,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
+env FM_HOME="$voice_home" "$SCRIPT" --test-api-base "$(test_api_base "$voice_home")" serve --once >/dev/null &
+edit_pid=$!
+edit_entered=0
+for _ in $(seq 1 100); do
+  if [ -e "$voice_home/send-entered" ]; then edit_entered=1; break; fi
+  sleep .02
+done
+[ "$edit_entered" -eq 1 ] || fail "edit prompt did not reach its journaled delivery"
+kill -9 "$edit_pid" 2>/dev/null || true
+python3 - "$pending" <<'PY' || fail "edit prompt delivery was not journaled before send"
+import json, sys
+pending = json.load(open(sys.argv[1], encoding='utf-8'))
+assert pending['edit_prompt_delivery'] == 'sending'
+assert pending['edit_prompt_attempts'] == 1
+PY
+rm -f "$voice_home/hold-send"
+wait "$edit_pid" 2>/dev/null || true
+set_updates '[]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 prompt_count=$(grep -c 'Reply with the corrected text.' "$voice_home/calls.jsonl")
-[ "$prompt_count" -eq 1 ] || fail "edit prompt missing"
+[ "$prompt_count" -eq 2 ] || fail "edit prompt delivery-unknown recovery was not bounded and deterministic"
+python3 - "$pending" <<'PY' || fail "edit prompt recovery did not complete"
+import json, sys
+pending = json.load(open(sys.argv[1], encoding='utf-8'))
+assert pending['edit_prompt_delivery'] == 'sent'
+assert pending['edit_prompt_attempts'] == 2
+PY
 set_updates '[{"update_id":210,"callback_query":{"id":"cb-edit-second-tap","from":{"id":77},"data":"'"$edit_data"'","message":{"message_id":201,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 [ "$(grep -c 'Reply with the corrected text.' "$voice_home/calls.jsonl")" -eq "$prompt_count" ] || fail "a second edit tap repeated the prompt"
@@ -957,7 +1038,7 @@ retry_data=$(callback_data "$voice_home" retry)
 touch "$voice_home/whisper.sh.hold"
 rm -f "$voice_home/whisper.sh.entered"
 set_updates '[{"update_id":23,"callback_query":{"id":"cb-retry","from":{"id":77},"data":"'"$retry_data"'","message":{"message_id":202,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
-env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" "$SCRIPT" serve --once >/dev/null &
+env FM_HOME="$voice_home" "$SCRIPT" --test-api-base "$(test_api_base "$voice_home")" serve --once >/dev/null &
 retry_pid=$!
 retry_entered=0
 for _ in $(seq 1 100); do
@@ -965,12 +1046,22 @@ for _ in $(seq 1 100); do
   sleep .02
 done
 [ "$retry_entered" -eq 1 ] || fail "Whisper retry did not start"
-timeout 2 env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" "$SCRIPT" active-request >/dev/null 2>&1
+timeout 2 env FM_HOME="$voice_home" "$SCRIPT" --test-api-base "$(test_api_base "$voice_home")" active-request >/dev/null 2>&1
 retry_lock_status=$?
 [ "$retry_lock_status" -ne 124 ] || fail "Whisper retry held the Telegram state lock"
+printf '1\n' > "$voice_home/disconnect-after-send-count"
 rm -f "$voice_home/whisper.sh.hold"
 wait "$retry_pid"
+python3 - "$pending" <<'PY' || fail "retry confirmation delivery-unknown state was not journaled"
+import json, sys
+pending = json.load(open(sys.argv[1], encoding='utf-8'))
+assert pending['heading_delivery'] == 'delivery_unknown'
+assert pending['heading_attempts'] == 1
+PY
+set_updates '[]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
 grep -F 'whisper transcript' "$voice_home/calls.jsonl" >/dev/null || fail "retry must use Whisper transcript"
+[ "$(wc -c < "$voice_home/whisper.sh.calls" | tr -d ' ')" -eq 1 ] || fail "retry delivery recovery transcribed twice"
 set_updates '[{"update_id":230,"callback_query":{"id":"cb-retry-second-tap","from":{"id":77},"data":"'"$retry_data"'","message":{"message_id":202,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 [ "$(wc -c < "$voice_home/whisper.sh.calls" | tr -d ' ')" -eq 1 ] || fail "a second retry tap transcribed twice"
@@ -1016,7 +1107,7 @@ send_data=$(callback_data "$voice_home" send)
 touch "$voice_home/hold-send"
 rm -f "$voice_home/send-entered"
 set_updates '[{"update_id":26,"callback_query":{"id":"cb-send","from":{"id":77},"data":"'"$send_data"'","message":{"message_id":204,"chat":{"id":77,"type":"private"}}}}]' "$voice_home"
-env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" "$SCRIPT" serve --once >/dev/null &
+env FM_HOME="$voice_home" "$SCRIPT" --test-api-base "$(test_api_base "$voice_home")" serve --once >/dev/null &
 send_pid=$!
 send_entered=0
 for _ in $(seq 1 100); do
@@ -1081,6 +1172,19 @@ chmod +x "$voice_home/parakeet.sh"
 set_updates '[{"update_id":28,"message":{"message_id":28,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-long","duration":2,"file_size":20}}}]' "$voice_home"
 run_tg "$voice_home" serve --once >/dev/null
 [ ! -e "$pending" ] || fail "oversized transcript created unusable Telegram controls"
+cat > "$voice_home/parakeet.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" > "$0.audio"
+printf '\377'
+SH
+chmod +x "$voice_home/parakeet.sh"
+transcription_failures_before=$(grep -c "I couldn't transcribe that voice note." "$voice_home/calls.jsonl" || true)
+set_updates '[{"update_id":29,"message":{"message_id":29,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-invalid-utf8","duration":2,"file_size":20}}}]' "$voice_home"
+run_tg "$voice_home" serve --once >/dev/null
+invalid_utf8_audio=$(cat "$voice_home/parakeet.sh.audio")
+[ ! -e "$invalid_utf8_audio" ] || fail "invalid UTF-8 transcription retained temporary audio"
+[ ! -e "$pending" ] || fail "invalid UTF-8 transcription retained pending voice state"
+[ "$(grep -c "I couldn't transcribe that voice note." "$voice_home/calls.jsonl")" -eq "$((transcription_failures_before + 1))" ] || fail "invalid UTF-8 transcription did not report failure"
 
 # Service lifecycle and cleanup are verified, scoped to this home, and leave .env intact.
 set_updates '[]' "$voice_home"
@@ -1166,8 +1270,8 @@ PY
       printf '%s\n' "$!" > "$FM_TELEGRAM_EXPECT_HOME/state/.lock"
     fi
     if [ ! -s "$root/systemctl.service.pid" ]; then
-      env FM_HOME="$FM_TELEGRAM_EXPECT_HOME" FM_TELEGRAM_API_BASE="$FM_TELEGRAM_API_BASE" \
-        "$FM_TELEGRAM_SERVICE_SCRIPT" --home "$FM_TELEGRAM_EXPECT_HOME" serve --systemd-service --poll-timeout 1 \
+      env FM_HOME="$FM_TELEGRAM_EXPECT_HOME" \
+        "$FM_TELEGRAM_SERVICE_SCRIPT" --test-api-base "$FM_TELEGRAM_TEST_API_BASE" --home "$FM_TELEGRAM_EXPECT_HOME" serve --systemd-service --poll-timeout 1 \
         >"$root/systemctl.service.log" 2>&1 &
       printf '%s\n' "$!" > "$root/systemctl.service.pid"
     fi
@@ -1207,8 +1311,8 @@ PY
       if [ "$count" -eq 1 ]; then
         rm -f "$root/systemctl.race-pair"
         (
-          env FM_HOME="$FM_TELEGRAM_EXPECT_HOME" FM_TELEGRAM_API_BASE="$FM_TELEGRAM_API_BASE" \
-            "$FM_TELEGRAM_SERVICE_SCRIPT" --home "$FM_TELEGRAM_EXPECT_HOME" serve --once --systemd-service \
+          env FM_HOME="$FM_TELEGRAM_EXPECT_HOME" \
+            "$FM_TELEGRAM_SERVICE_SCRIPT" --test-api-base "$FM_TELEGRAM_TEST_API_BASE" --home "$FM_TELEGRAM_EXPECT_HOME" serve --once --systemd-service \
             >"$root/systemctl.race-service.log" 2>&1
           printf '%s\n' "$?" > "$root/systemctl.race-service.status"
         ) </dev/null >/dev/null 2>&1 &
@@ -1229,7 +1333,7 @@ esac
 exit 0
 SH
 chmod +x "$systemctl_fake"
-lifecycle_env=(env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" FM_TELEGRAM_EXPECT_HOME="$voice_home" FM_TELEGRAM_SERVICE_SCRIPT="$SCRIPT")
+lifecycle_env=(env FM_HOME="$voice_home" FM_TELEGRAM_TEST_API_BASE="$(test_api_base "$voice_home")" FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" FM_TELEGRAM_EXPECT_HOME="$voice_home" FM_TELEGRAM_SERVICE_SCRIPT="$SCRIPT")
 supervision_needs() {
   bash -c '. "$1"; fm_supervision_needed "$2"' _ "$ROOT/bin/fm-supervision-lib.sh" "$1/state"
 }
@@ -1262,19 +1366,19 @@ install_start_calls=$(grep -c -- '--user start firstmate-telegram.service' "$TMP
 singleton_other_home=$(new_home singleton-other-home)
 singleton_api="http://127.0.0.1:$(cat "$voice_home/port")"
 printf 'FM_TELEGRAM_BOT_TOKEN=replacement-token\n' > "$singleton_other_home/.env"
-env FM_HOME="$singleton_other_home" FM_TELEGRAM_API_BASE="$singleton_api" \
-  "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null
+env FM_HOME="$singleton_other_home" \
+  "$SCRIPT" --test-api-base "$singleton_api" pair --user-id 77 --chat-id 77 >/dev/null
 singleton_polls_before=$(grep -c '/botreplacement-token/getUpdates' "$voice_home/calls.jsonl" || true)
-if env FM_HOME="$singleton_other_home" FM_TELEGRAM_API_BASE="$singleton_api" \
+if env FM_HOME="$singleton_other_home" \
   FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" \
   FM_TELEGRAM_EXPECT_HOME="$voice_home" FM_TELEGRAM_SERVICE_SCRIPT="$SCRIPT" \
-  "$SCRIPT" serve --once >/dev/null 2>&1; then
+  "$SCRIPT" --test-api-base "$singleton_api" serve --once >/dev/null 2>&1; then
   fail "another home entered beside the installed singleton service"
 fi
-if env FM_HOME="$singleton_other_home" FM_TELEGRAM_API_BASE="$singleton_api" \
+if env FM_HOME="$singleton_other_home" \
   FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" \
   FM_TELEGRAM_EXPECT_HOME="$voice_home" FM_TELEGRAM_SERVICE_SCRIPT="$SCRIPT" \
-  "$SCRIPT" serve --once --systemd-service >/dev/null 2>&1; then
+  "$SCRIPT" --test-api-base "$singleton_api" serve --once --systemd-service >/dev/null 2>&1; then
   fail "hidden systemd entry accepted a home that does not own the singleton unit"
 fi
 [ "$(grep -c '/botreplacement-token/getUpdates' "$voice_home/calls.jsonl" || true)" -eq "$singleton_polls_before" ] || fail "refused singleton home polled Telegram"
@@ -1642,16 +1746,16 @@ wait "$serialized_cleanup_pid" || fail "serialized cleanup failed"
 
 # The singleton unit transition serializes concurrent installs for different homes.
 "${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null
-env FM_HOME="$other_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" \
+env FM_HOME="$other_home" \
   FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" \
   FM_TELEGRAM_EXPECT_HOME="$other_home" FM_TELEGRAM_SERVICE_SCRIPT="$SCRIPT" \
-  "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null
+  "$SCRIPT" --test-api-base "$(test_api_base "$voice_home")" pair --user-id 77 --chat-id 77 >/dev/null
 unit_hold="$TMP_ROOT/unit-transition"
 rm -f "$unit_hold.entered" "$unit_hold.release"
-env FM_HOME="$voice_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" \
+env FM_HOME="$voice_home" FM_TELEGRAM_TEST_API_BASE="$(test_api_base "$voice_home")" \
   FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" \
   FM_TELEGRAM_EXPECT_HOME="$voice_home" FM_TELEGRAM_SERVICE_SCRIPT="$SCRIPT" \
-  FM_TELEGRAM_DAEMON_HOLD="$unit_hold" "$SCRIPT" install >/dev/null &
+  FM_TELEGRAM_DAEMON_HOLD="$unit_hold" "$SCRIPT" --test-api-base "$(test_api_base "$voice_home")" install >/dev/null &
 first_install_pid=$!
 unit_transition_entered=0
 for _ in $(seq 1 100); do
@@ -1659,10 +1763,10 @@ for _ in $(seq 1 100); do
   sleep .02
 done
 [ "$unit_transition_entered" -eq 1 ] || fail "first singleton install did not reach its held unit transition"
-env FM_HOME="$other_home" FM_TELEGRAM_API_BASE="http://127.0.0.1:$(cat "$voice_home/port")" \
+env FM_HOME="$other_home" FM_TELEGRAM_TEST_API_BASE="$(test_api_base "$voice_home")" \
   FM_TELEGRAM_SYSTEMCTL="$systemctl_fake" FM_TELEGRAM_UNIT_DIR="$unit_dir" \
   FM_TELEGRAM_EXPECT_HOME="$other_home" FM_TELEGRAM_SERVICE_SCRIPT="$SCRIPT" \
-  "$SCRIPT" install >/dev/null 2>&1 &
+  "$SCRIPT" --test-api-base "$(test_api_base "$voice_home")" install >/dev/null 2>&1 &
 second_install_pid=$!
 sleep .1
 kill -0 "$second_install_pid" 2>/dev/null || fail "concurrent install bypassed the singleton unit transition"

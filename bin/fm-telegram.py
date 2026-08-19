@@ -44,6 +44,8 @@ PENDING_TTL = 10 * 60
 ATOMIC_TEMP_TTL = 10 * 60
 POLL_TIMEOUT = 30
 RECEIPT_RETRY_DELAYS = (30, 120, 300)
+CALLBACK_DELIVERY_ATTEMPTS = 3
+TELEGRAM_API_BASE = "https://api.telegram.org"
 PERMANENT_CONFIG_EXIT = 78
 FINAL_CONTINUATION_PENDING_EXIT = 2
 MESSAGE_ENVELOPE_FIELDS = frozenset({
@@ -66,6 +68,7 @@ ATOMIC_STATE_TARGETS = frozenset({
 })
 _PROCESS_TOKENS: Dict[Path, str] = {}
 _VERIFIED_BOT_IDS: Dict[Path, int] = {}
+_TEST_API_BASES: Dict[Path, str] = {}
 
 
 class TelegramError(RuntimeError):
@@ -304,11 +307,20 @@ def load_config(home: Path) -> Dict[str, Any]:
     return config
 
 
-def api_base(home: Path, config: Optional[Dict[str, Any]] = None) -> str:
-    value = os.environ.get("FM_TELEGRAM_API_BASE")
-    if value is None and config:
-        value = str(config.get("api_base", ""))
-    return (value or "https://api.telegram.org").rstrip("/")
+def configure_test_api_base(home: Path, value: Optional[str]) -> None:
+    if value is None:
+        return
+    parsed = urllib.parse.urlsplit(value)
+    if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or parsed.path not in {"", "/"}
+            or parsed.port is None):
+        raise TelegramError("test Telegram API endpoint must be an explicit loopback HTTP URL")
+    _TEST_API_BASES[home.resolve()] = value.rstrip("/")
+
+
+def api_base(home: Path, _config: Optional[Dict[str, Any]] = None) -> str:
+    return _TEST_API_BASES.get(home.resolve(), TELEGRAM_API_BASE)
 
 
 def raw_api_call(home: Path, token: str, method: str,
@@ -730,18 +742,20 @@ def work_record_exists(home: Path, work_id: Any) -> bool:
     return path is not None and (path.exists() or path.is_symlink())
 
 
-def latch_work_publication_locked(home: Path,
-                                  active: Dict[str, Any]) -> Dict[str, Any]:
-    if active.get("work_published") is True:
-        return active
-    path = work_record_path(home, active.get("work_id"))
+def telegram_owned_work_record(home: Path, work_id: str, request_id: str) -> bool:
+    path = work_record_path(home, work_id)
     if path is None or not path.is_file() or path.is_symlink():
-        return active
-    updated = dict(active)
-    updated["work_published"] = True
-    updated["work_published_at"] = now()
-    atomic_json(active_path(home), updated)
-    return updated
+        return False
+    try:
+        fields = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key not in fields:
+                fields[key] = value
+    except (OSError, UnicodeError):
+        return False
+    return (fields.get("endpoint_task_id") == work_id
+            and fields.get("telegram_request_id") == request_id)
 
 
 def closing_path(home: Path) -> Path:
@@ -797,8 +811,6 @@ def _desired_request_id_locked(home: Path) -> Optional[str]:
     active = active_request_id(home)
     if active is not None:
         active_state = active_record(home)
-        if active_state is not None:
-            active_state = latch_work_publication_locked(home, active_state)
         routed_paths = []
         for path in paths + list(handled.glob("*.json")):
             record = read_json(path, {})
@@ -1235,7 +1247,7 @@ def transcribe(home: Path, config: Dict[str, Any], audio: Path, kind: str) -> st
     try:
         completed = subprocess.run(parts, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    text=True, timeout=180, check=True)
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
         raise TelegramError("voice transcription failed") from exc
     transcript = completed.stdout.strip()
     units = len(transcript.encode("utf-16-le")) // 2
@@ -1255,43 +1267,80 @@ def confirmation_markup(request_id: str, revision: int) -> Dict[str, Any]:
     ]]}
 
 
+def deliver_pending_message(home: Path, pending_id: str, revision: int,
+                            mode: str, field: str, text: str,
+                            markup: Optional[Dict[str, Any]] = None) -> bool:
+    status_field = f"{field}_delivery"
+    attempts_field = f"{field}_attempts"
+    legacy_field = f"{field}_sent"
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                or current.get("mode") != mode or current.get("revision") != revision):
+            return False
+        if current.get(legacy_field) is True or current.get(status_field) == "sent":
+            return True
+        attempts = current.get(attempts_field, 0)
+        if not strict_int(attempts) or attempts < 0:
+            attempts = 0
+        if attempts >= CALLBACK_DELIVERY_ATTEMPTS:
+            current[status_field] = "delivery_unknown_terminal"
+            save_pending(home, current)
+            return False
+        attempts += 1
+        current[attempts_field] = attempts
+        current[status_field] = "sending"
+        current[f"{field}_attempted_at"] = now()
+        save_pending(home, current)
+        chat_id = int(current["chat_id"])
+    try:
+        send_text(home, chat_id, text, markup)
+    except TelegramError as exc:
+        with FileLock(state_lock(home)):
+            current = read_json(pending_path(home))
+            if (isinstance(current, dict) and current.get("pending_id") == pending_id
+                    and current.get("mode") == mode and current.get("revision") == revision
+                    and current.get(attempts_field) == attempts
+                    and current.get(status_field) == "sending"):
+                terminal = attempts >= CALLBACK_DELIVERY_ATTEMPTS
+                if exc.delivery_unknown:
+                    current[status_field] = (
+                        "delivery_unknown_terminal" if terminal else "delivery_unknown"
+                    )
+                else:
+                    current[status_field] = "rejected_terminal" if terminal else "rejected"
+                save_pending(home, current)
+        return False
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                or current.get("mode") != mode or current.get("revision") != revision
+                or current.get(attempts_field) != attempts):
+            return False
+        current[status_field] = "sent"
+        current[legacy_field] = True
+        save_pending(home, current)
+    return True
+
+
 def show_confirmation(home: Path, config: Dict[str, Any], pending: Dict[str, Any]) -> None:
     pending_id = pending.get("pending_id")
     revision = pending.get("revision")
     if not isinstance(pending_id, str) or not strict_int(revision) or revision <= 0:
         raise TelegramError("voice confirmation revision is invalid")
-    with FileLock(state_lock(home)):
-        current = read_json(pending_path(home))
-        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
-                or current.get("mode") != "confirm" or current.get("revision") != revision):
-            return
-        snapshot = dict(current)
-    text = str(snapshot["text"])
+    text = pending.get("text")
+    if not isinstance(text, str):
+        raise TelegramError("voice transcript is malformed")
     text_units = unicode_text_units(text)
     if text_units is None or text_units > MAX_TRANSCRIPT_UNITS:
         raise TelegramError("voice transcript is malformed or exceeds Telegram's message limit")
-    if snapshot.get("heading_sent") is not True:
-        send_text(home, int(snapshot["chat_id"]), "I heard this:")
-        with FileLock(state_lock(home)):
-            current = read_json(pending_path(home))
-            if (not isinstance(current, dict) or current.get("pending_id") != pending_id
-                    or current.get("mode") != "confirm"
-                    or current.get("revision") != revision):
-                return
-            current["heading_sent"] = True
-            save_pending(home, current)
-            snapshot = dict(current)
-    if snapshot.get("transcript_sent") is not True:
-        send_text(home, int(snapshot["chat_id"]), text,
-                  confirmation_markup(pending_id, revision))
-        with FileLock(state_lock(home)):
-            current = read_json(pending_path(home))
-            if (not isinstance(current, dict) or current.get("pending_id") != pending_id
-                    or current.get("mode") != "confirm"
-                    or current.get("revision") != revision):
-                return
-            current["transcript_sent"] = True
-            save_pending(home, current)
+    if not deliver_pending_message(
+            home, pending_id, revision, "confirm", "heading", "I heard this:"):
+        return
+    deliver_pending_message(
+        home, pending_id, revision, "confirm", "transcript", text,
+        confirmation_markup(pending_id, revision),
+    )
 
 
 def complete_retry(home: Path, config: Dict[str, Any], pending: Dict[str, Any]) -> bool:
@@ -1331,6 +1380,9 @@ def complete_retry(home: Path, config: Dict[str, Any], pending: Dict[str, Any]) 
         current["revision"] = revision + 1
         current["heading_sent"] = False
         current["transcript_sent"] = False
+        for field in ("heading_delivery", "heading_attempts", "heading_attempted_at",
+                      "transcript_delivery", "transcript_attempts", "transcript_attempted_at"):
+            current.pop(field, None)
         current.pop("retry_token", None)
         save_pending(home, current)
         remember_callback_locked(home, pending_id, retry_token)
@@ -1407,19 +1459,15 @@ def reconcile_pending(home: Path, config: Dict[str, Any]) -> None:
             complete_cancel(home, pending)
         elif pending.get("mode") == "confirm":
             show_confirmation(home, config, pending)
-        elif pending.get("mode") == "edit" and pending.get("edit_prompt_sent") is not True:
+        elif pending.get("mode") == "edit":
             pending_id = pending.get("pending_id")
             revision = pending.get("revision")
             if not isinstance(pending_id, str) or not strict_int(revision):
                 return
-            send_text(home, int(config["chat_id"]), "Reply with the corrected text.")
-            with FileLock(state_lock(home)):
-                current = read_json(pending_path(home))
-                if (isinstance(current, dict) and current.get("pending_id") == pending_id
-                        and current.get("mode") == "edit"
-                        and current.get("revision") == revision):
-                    current["edit_prompt_sent"] = True
-                    save_pending(home, current)
+            deliver_pending_message(
+                home, pending_id, revision, "edit", "edit_prompt",
+                "Reply with the corrected text.",
+            )
     except (TelegramError, KeyError, TypeError, ValueError):
         return
 
@@ -1438,7 +1486,8 @@ def pinned_message(config: Dict[str, Any], message: Any) -> Optional[Tuple[Dict[
         return None
     if not telegram_numeric_id(sender_id, positive=True) or sender_id != config.get("user_id"):
         return None
-    if not telegram_numeric_id(message.get("message_id"), positive=True):
+    if (not telegram_numeric_id(message.get("message_id"), positive=True)
+            or not telegram_numeric_id(message.get("date"))):
         return None
     return message, chat
 
@@ -1470,6 +1519,10 @@ def handle_text(home: Path, config: Dict[str, Any], message: Dict[str, Any], upd
             pending["edit_message_id"] = message_id
             pending["heading_sent"] = False
             pending["transcript_sent"] = False
+            for field in ("heading_delivery", "heading_attempts", "heading_attempted_at",
+                          "transcript_delivery", "transcript_attempts", "transcript_attempted_at",
+                          "edit_prompt_delivery", "edit_prompt_attempts", "edit_prompt_attempted_at"):
+                pending.pop(field, None)
             pending.pop("edit_prompt_sent", None)
             save_pending(home, pending)
             reconcile_pending(home, config)
@@ -1570,6 +1623,7 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
         return False
     if (not isinstance(message, dict)
             or not telegram_numeric_id(message.get("message_id"), positive=True)
+            or not telegram_numeric_id(message.get("date"))
             or not set(message).issubset(CALLBACK_MESSAGE_FIELDS)):
         return False
     chat = message.get("chat")
@@ -1653,6 +1707,8 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
                     if action == "edit":
                         pending["mode"] = "edit"
                         pending["edit_prompt_sent"] = False
+                        pending["edit_prompt_delivery"] = "pending"
+                        pending["edit_prompt_attempts"] = 0
                         save_pending(home, pending)
                         remember_callback_locked(home, pending_id, token)
                         operation = "edit"
@@ -1943,7 +1999,6 @@ def pair(home: Path, user_id: int, chat_id: int) -> int:
             raise TelegramError("pairing requires the pinned private bot DM")
         if user_id != chat_id:
             raise TelegramError("the pinned private chat must belong to the pinned user")
-        endpoint = api_base(home, config)
         new_identity = (user_id, chat_id, int(result["id"]))
         with FileLock(state_lock(home)):
             current = read_json(config_path(home), {})
@@ -1958,8 +2013,9 @@ def pair(home: Path, user_id: int, chat_id: int) -> int:
                 raise TelegramError(
                     "clean up private Telegram state before changing its pairing"
                 )
+            config.pop("api_base", None)
             config.update({"user_id": user_id, "chat_id": chat_id,
-                           "bot_id": int(result["id"]), "api_base": endpoint})
+                           "bot_id": int(result["id"])})
             atomic_json(config_path(home), config)
             durable_unlink(state_tombstone(home))
     print("Telegram pairing verified.")
@@ -2064,6 +2120,43 @@ def request_bind(home: Path, request_id: str, work_id: str) -> int:
     return 0
 
 
+def publication_reserved(home: Path, work_id: str) -> int:
+    with FileLock(state_lock(home)):
+        if state_tombstone(home).is_file() or not config_path(home).is_file():
+            return 1
+        active = active_record(home)
+        return 0 if active is not None and active.get("work_id") == work_id else 1
+
+
+def publication_authorize(home: Path, request_id: str, work_id: str) -> int:
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        active = active_record(home)
+        path = request_path(home, request_id)
+        if (active is None or active.get("request_id") != request_id
+                or active.get("work_id") != work_id or path is None
+                or path.parent.name != "handled"):
+            return die("Telegram publication does not match the active work binding")
+    return 0
+
+
+def request_published(home: Path, request_id: str, work_id: str) -> int:
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        active = active_record(home)
+        if (active is None or active.get("request_id") != request_id
+                or active.get("work_id") != work_id):
+            return die("Telegram publication does not match the active work binding")
+        if not telegram_owned_work_record(home, work_id, request_id):
+            return die("work record has no verified Telegram publication owner")
+        if active.get("work_published") is not True:
+            active["work_published"] = True
+            active["work_published_at"] = now()
+            atomic_json(active_path(home), active)
+        _sync_request_wakes_locked(home)
+    return 0
+
+
 def request_routed(home: Path, request_id: str) -> int:
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
@@ -2075,9 +2168,8 @@ def request_routed(home: Path, request_id: str) -> int:
             return die("request is not a handled Telegram request")
         if not isinstance(active.get("work_id"), str):
             return die("active Telegram conversation is not bound to work")
-        active = latch_work_publication_locked(home, active)
         if active.get("work_published") is not True:
-            return die("active Telegram work has no durable lifecycle record")
+            return die("active Telegram work has no verified lifecycle publication")
         if active.get("initial_routing_consumed") is not True:
             active["initial_routing_consumed"] = True
             active["initial_routing_consumed_at"] = now()
@@ -2098,7 +2190,9 @@ def request_active(home: Path, work_id: Optional[str] = None,
         request_id = str(active["request_id"])
         if request_path(home, request_id) is None:
             return 1
-        if work_id is not None and active.get("work_id") != work_id:
+        if (work_id is not None
+                and (active.get("work_id") != work_id
+                     or active.get("work_published") is not True)):
             return 1
         route = request_id
         if claimed_request is not None:
@@ -2530,6 +2624,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--home", help="the one Firstmate home to use")
+    parser.add_argument("--test-api-base", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
     def add_home(command: argparse.ArgumentParser) -> None:
         command.add_argument("--home", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -2554,6 +2649,17 @@ def build_parser() -> argparse.ArgumentParser:
     add_home(bind_parser)
     bind_parser.add_argument("request_id")
     bind_parser.add_argument("work_id")
+    authorize_parser = sub.add_parser("publication-authorize", help=argparse.SUPPRESS)
+    add_home(authorize_parser)
+    authorize_parser.add_argument("request_id")
+    authorize_parser.add_argument("work_id")
+    reserved_parser = sub.add_parser("publication-reserved", help=argparse.SUPPRESS)
+    add_home(reserved_parser)
+    reserved_parser.add_argument("work_id")
+    published_parser = sub.add_parser("request-published", help=argparse.SUPPRESS)
+    add_home(published_parser)
+    published_parser.add_argument("request_id")
+    published_parser.add_argument("work_id")
     routed_parser = sub.add_parser(
         "request-routed", help="acknowledge a directly handled initial route"
     )
@@ -2595,6 +2701,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     try:
         home = home_from(args)
         validate_home_storage(home)
+        configure_test_api_base(
+            home, args.test_api_base or os.environ.get("FM_TELEGRAM_TEST_API_BASE")
+        )
         if args.command == "pair":
             return pair(home, args.user_id, args.chat_id)
         if args.command == "serve":
@@ -2607,6 +2716,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return request_handled(home, args.request_id)
         if args.command == "request-bind":
             return request_bind(home, args.request_id, args.work_id)
+        if args.command == "publication-authorize":
+            return publication_authorize(home, args.request_id, args.work_id)
+        if args.command == "publication-reserved":
+            return publication_reserved(home, args.work_id)
+        if args.command == "request-published":
+            return request_published(home, args.request_id, args.work_id)
         if args.command == "request-routed":
             return request_routed(home, args.request_id)
         if args.command == "active-request":

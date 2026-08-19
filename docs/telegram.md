@@ -47,15 +47,16 @@ Voice notes are bounded by the service's size and duration limits, downloaded on
 The service shows an `I heard this:` message and a separate transcript message with `Send to Firstmate`, `Edit`, `Retry with Whisper`, and `Cancel` controls.
 Editing waits for corrected text and shows a fresh confirmation.
 Sending queues only confirmed text, retrying uses Whisper Small Q8 on the same temporary audio, and cancel or expiry removes the audio and pending record.
-Callback actions are idempotent.
+Callback actions are durably journaled and idempotent.
+If the service loses a response or stops after Telegram accepts an Edit prompt or retried confirmation, bounded recovery may repeat that message because the Bot API has no idempotency key.
 
 The service writes only a private request record and a safe wake containing its local request identifier.
 Raw Telegram text and audio never enter wake records, status logs, shell arguments, unit files, diagnostics, or tracked files.
 The primary receives the request through `bin/fm-telegram-agent-request.sh <local-request-id>`, whose generated context preserves the trusted authority boundary around the untrusted body, and claims it with `request-handled <local-request-id>`.
 The operator can inspect only the stored body with `bin/fm-telegram.py request-read <local-request-id>`.
-An initial claim remains durably wakeable after interruption until the bound work's durable `fm-spawn.sh` record is published.
-Binding refuses a lifecycle identifier that already has a work record, so terminal-originated work cannot acquire a Telegram origin after the fact.
-Binding before launch is safe because `active-request --claimed-request <local-request-id>` exposes the already selected work identifier on recovery and the wake remains until that publication boundary.
+An initial claim remains durably wakeable after interruption until the bound work's durable `fm-spawn.sh` record is published with its authenticated Telegram request identifier.
+Binding refuses a lifecycle identifier that already has a work record, and an ordinary terminal spawn cannot consume a Telegram-reserved identifier, so terminal-originated work cannot acquire a Telegram origin.
+For Telegram-dispatched work, invoke `FM_TELEGRAM_REQUEST_ID=<local-request-id> bin/fm-spawn.sh ...` after binding; `active-request --claimed-request <local-request-id>` exposes the selected work identifier on recovery and the wake remains until that publication boundary.
 Once publication is observed, its Telegram-origin acknowledgement remains latched even if lifecycle cleanup later removes the work record.
 Work that can receive a later decision or blocker answer must publish its normal durable lifecycle record before sending the non-final question.
 `request-routed <local-request-id>` refuses a direct-only route without that record and acknowledges the initial route only after durable lifecycle publication, which preserves enough work context across interruption while allowing its continuation to surface.

@@ -23,7 +23,7 @@ An initial claim interrupted after binding returns its active conversation ident
 A continuation claim returns the same two-field shape; deliver the answer only to that returned work rather than starting or binding new work.
 Only after that continuation has been delivered to the returned active work, acknowledge its durable route with `bin/fm-telegram.py continuation-handled <local-request-id>`; interruption before this acknowledgement leaves the same route recoverable.
 Before launching or otherwise acting on new Telegram-originated work, select its exact lifecycle identifier and persist the origin binding with `bin/fm-telegram.py request-bind <active-conversation-id> <work-id>`.
-For dispatched work, bind that chosen identifier and then invoke `fm-spawn.sh`; the initial recovery wake remains durable until `fm-spawn.sh` publishes that work's durable record.
+For dispatched work, bind that chosen identifier and invoke `FM_TELEGRAM_REQUEST_ID=<active-conversation-id> bin/fm-spawn.sh ...`; the authenticated spawn publication marks the lifecycle record with that Telegram request and the initial recovery wake remains durable until that boundary completes.
 Any work that can receive a later decision or blocker answer must have its normal durable lifecycle record before the non-final question is sent.
 Do not acknowledge a direct-only route without that record; either answer the request finally or establish normal lifecycle work, then use `bin/fm-telegram.py request-routed <active-conversation-id>` only after its record and non-final response are durable.
 If interrupted before that acknowledgement, resume only the exact bound lifecycle work returned by `active-request --claimed-request`.

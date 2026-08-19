@@ -887,6 +887,21 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
 fi
 ID=${POS[0]}
 fm_task_id_creation_valid "$ID" || { echo "error: invalid task id" >&2; exit 2; }
+TELEGRAM_REQUEST_ID=
+if [ -n "${FM_TELEGRAM_REQUEST_ID:-}" ]; then
+  [ "$RELAUNCH" -eq 0 ] || { echo "error: Telegram origin publication is valid only for a fresh spawn" >&2; exit 2; }
+  if ! FM_HOME="$FM_HOME" "$FM_ROOT/bin/fm-telegram.py" publication-authorize \
+      "$FM_TELEGRAM_REQUEST_ID" "$ID" >/dev/null; then
+    echo "error: Telegram origin publication does not match this task" >&2
+    exit 1
+  fi
+  TELEGRAM_REQUEST_ID=$FM_TELEGRAM_REQUEST_ID
+  unset FM_TELEGRAM_REQUEST_ID
+elif FM_HOME="$FM_HOME" "$FM_ROOT/bin/fm-telegram.py" publication-reserved "$ID" \
+    >/dev/null 2>&1; then
+  echo "error: task $ID is reserved for an authenticated Telegram-origin spawn" >&2
+  exit 1
+fi
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_CONTROL_LOCK="$STATE/.control-$ID.lock"
   control_owner=$(cat "$SPAWN_CONTROL_LOCK/pid" 2>/dev/null || true)
@@ -2686,6 +2701,7 @@ preserve_relaunch_meta() {
   if [ "$SPAWN_CONTROL_PARENT" = 1 ] && [ -n "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
     echo "control_relaunch_tx=$FM_CONTROL_RELAUNCH_TX"
   fi
+  [ -z "$TELEGRAM_REQUEST_ID" ] || echo "telegram_request_id=$TELEGRAM_REQUEST_ID"
 } > "$SPAWN_META_PATH"
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_PUBLISH_STARTED=1
@@ -2695,6 +2711,13 @@ if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_TMP=
   fm_lock_release "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=0
+fi
+if [ -n "$TELEGRAM_REQUEST_ID" ]; then
+  if ! FM_HOME="$FM_HOME" "$FM_ROOT/bin/fm-telegram.py" request-published \
+      "$TELEGRAM_REQUEST_ID" "$ID"; then
+    echo "error: Telegram origin publication could not be recorded for task $ID" >&2
+    exit 1
+  fi
 fi
 if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
   # The record is published, so this task is now part of the set a teardown
