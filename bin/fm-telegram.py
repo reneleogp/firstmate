@@ -39,6 +39,7 @@ PENDING_TTL = 10 * 60
 POLL_TIMEOUT = 30
 RECEIPT_RETRY_DELAYS = (30, 120, 300)
 PERMANENT_CONFIG_EXIT = 78
+FINAL_CONTINUATION_PENDING_EXIT = 2
 MESSAGE_ENVELOPE_FIELDS = frozenset({
     "author_signature", "business_connection_id", "chat", "date", "direct_messages_topic",
     "edit_date", "effect_id", "external_reply", "forward_origin", "from",
@@ -409,23 +410,30 @@ def service_lock(home: Path) -> Path:
 
 
 class FileLock:
-    def __init__(self, path: Path, blocking: bool = True):
+    def __init__(self, path: Path, blocking: bool = True, timeout: float = 0):
         self.path = path
         self.blocking = blocking
+        self.timeout = timeout
         self.stream = None
 
     def __enter__(self) -> "FileLock":
         private_dir(self.path.parent)
         self.stream = self.path.open("a+")
         os.chmod(self.path, 0o600)
-        operation = fcntl.LOCK_EX if self.blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
-        try:
-            fcntl.flock(self.stream.fileno(), operation)
-        except BlockingIOError as exc:
-            self.stream.close()
-            self.stream = None
-            raise TelegramError("Telegram service is already running") from exc
-        return self
+        if self.blocking:
+            fcntl.flock(self.stream.fileno(), fcntl.LOCK_EX)
+            return self
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    self.stream.close()
+                    self.stream = None
+                    raise TelegramError("Telegram service is already running") from exc
+                time.sleep(0.02)
 
     def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
         assert self.stream is not None
@@ -1800,6 +1808,11 @@ def _send_command_locked(home: Path, text: str, request_id: Optional[str] = None
             _update_request_record_locked(home, request_id, final_sent=True, final_sent_at=now())
             atomic_json(closing_path(home), {"request_id": request_id, "created_at": now()})
         reconcile_closing(home)
+        with FileLock(state_lock(home)):
+            closing = read_json(closing_path(home))
+            if isinstance(closing, dict) and closing.get("request_id") == request_id:
+                print("Telegram final reply sent; continuation handling remains pending.")
+                return FINAL_CONTINUATION_PENDING_EXIT
     print("Telegram reply sent.")
     return 0
 
@@ -1975,21 +1988,23 @@ def _cleanup_locked(home: Path) -> int:
     if owned:
         systemctl("disable", "--now", SERVICE_NAME)
         verify_service(active=False, enabled=False)
-        durable_unlink(path)
-        systemctl("daemon-reload")
-    with FileLock(state_lock(home)):
-        if telegram_state.is_dir() and not telegram_state.is_symlink():
-            pending = read_json(telegram_state / "pending.json")
-            if isinstance(pending, dict):
-                remove_audio(pending)
-        consume_safe_wakes(home)
-        if telegram_state.is_symlink() or telegram_state.is_file():
-            durable_unlink(telegram_state)
-        elif telegram_state.is_dir():
-            durable_rmtree(telegram_state)
-        config = config_path(home)
-        if config.is_symlink() or config.is_file():
-            durable_unlink(config)
+    with FileLock(service_lock(home), blocking=False, timeout=1):
+        if owned:
+            durable_unlink(path)
+            systemctl("daemon-reload")
+        with FileLock(state_lock(home)):
+            if telegram_state.is_dir() and not telegram_state.is_symlink():
+                pending = read_json(telegram_state / "pending.json")
+                if isinstance(pending, dict):
+                    remove_audio(pending)
+            consume_safe_wakes(home)
+            if telegram_state.is_symlink() or telegram_state.is_file():
+                durable_unlink(telegram_state)
+            elif telegram_state.is_dir():
+                durable_rmtree(telegram_state)
+            config = config_path(home)
+            if config.is_symlink() or config.is_file():
+                durable_unlink(config)
     print("Telegram service and private Telegram state cleaned up.")
     return 0
 
@@ -2051,7 +2066,10 @@ def build_parser() -> argparse.ArgumentParser:
         add_home(command)
         if name == "reply":
             command.add_argument("request_id")
-            command.add_argument("--final", action="store_true", help="close this conversation after delivery")
+            command.add_argument(
+                "--final", action="store_true",
+                help="close after delivery; exits 2 while queued continuations keep it active",
+            )
         command.add_argument("--text-file", required=True, help="UTF-8 text file, or - for stdin")
     for name, help_text in (("install", "install and start the user service"), ("start", "start the user service"),
                             ("stop", "stop the user service"), ("status", "show user service status"),

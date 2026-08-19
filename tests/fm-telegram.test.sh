@@ -322,7 +322,7 @@ json.dump(record, open(path, 'w', encoding='utf-8'))
 PY
 run_tg "$home" request-handled "$request_id"
 [ ! -f "$inbox" ] || fail "request-handled must move the private request"
-python3 - "$home/state/telegram/handled/$request_id.json" <<'PY'
+python3 - "$home/state/telegram/handled/$request_id.json" <<'PY' || fail "handled wake durability assertion failed"
 import json, sys
 path = sys.argv[1]
 record = json.load(open(path, encoding='utf-8'))
@@ -333,7 +333,7 @@ PY
 [ "$(run_tg "$home" active-request)" = "$request_id" ] || fail "request handling must persist the active Telegram origin"
 grep -F "telegram:$request_id" "$home/state/.wake-queue" >/dev/null || fail "unbound initial claim was not recoverably wakeable"
 run_tg "$home" request-handled "$request_id" || fail "replayed initial claim was not idempotent"
-python3 - "$home/state/telegram/handled/$request_id.json" <<'PY'
+python3 - "$home/state/telegram/handled/$request_id.json" <<'PY' || fail "replayed claim durability assertion failed"
 import json, sys
 assert json.load(open(sys.argv[1], encoding='utf-8'))['wake_recorded'] is True
 PY
@@ -389,7 +389,7 @@ set_updates '[{"update_id":9,"message":{"message_id":19,"from":{"id":77},"chat":
 authority_before=$(grep -c 'sendMessage' "$home/calls.jsonl")
 run_tg "$home" serve --once >/dev/null
 [ "$(( $(grep -c 'sendMessage' "$home/calls.jsonl") - authority_before ))" -eq 1 ] || fail "authority request produced more than a transport receipt"
-python3 - "$home/calls.jsonl" "$authority_before" <<'PY'
+python3 - "$home/calls.jsonl" "$authority_before" <<'PY' || fail "authority transport assertion failed"
 import json, sys
 calls = [json.loads(line) for line in open(sys.argv[1], encoding='utf-8')]
 sent = [call for call in calls if call['path'].endswith('/sendMessage')][int(sys.argv[2]):]
@@ -398,7 +398,7 @@ assert sent[0]['params']['text'].startswith('Message received')
 PY
 authority_id=tg-text-u9-m19
 FM_HOME="$home" "$ROOT/bin/fm-telegram-agent-request.sh" "$authority_id" > "$home/authority-context.txt"
-python3 - "$home/authority-context.txt" <<'PY'
+python3 - "$home/authority-context.txt" <<'PY' || fail "authority boundary assertion failed"
 from pathlib import Path
 import json, sys
 context = Path(sys.argv[1]).read_text(encoding='utf-8').splitlines()
@@ -541,7 +541,7 @@ set_updates '[{"update_id":10,"message":{"message_id":10,"from":{"id":77},"chat"
 FM_TELEGRAM_BOT_TOKEN=ambient-wrong-token run_tg "$retry_home" serve --once >/dev/null
 [ "$(find "$retry_home/state/telegram/inbox" -name '*.json' | wc -l | tr -d ' ')" -eq 1 ] || fail "delivery-unknown receipt lost or duplicated the request"
 retry_request=$(find "$retry_home/state/telegram/inbox" -name '*.json' -print -quit)
-python3 - "$retry_request" <<'PY'
+python3 - "$retry_request" <<'PY' || fail "delivery-unknown receipt assertion failed"
 import json, sys
 record = json.load(open(sys.argv[1]))
 assert record['receipt_status'] == 'delivery_unknown'
@@ -559,7 +559,7 @@ PY
 run_tg "$retry_home" serve --once >/dev/null
 retry_id=$(basename "$retry_request" .json)
 run_tg "$retry_home" request-handled "$retry_id" >/dev/null
-python3 - "$retry_home/state/telegram/handled/$retry_id.json" <<'PY'
+python3 - "$retry_home/state/telegram/handled/$retry_id.json" <<'PY' || fail "handled receipt retry assertion failed"
 import json, sys
 path = sys.argv[1]; data = json.load(open(path))
 assert data['receipt_status'] == 'delivery_unknown'
@@ -569,7 +569,7 @@ json.dump(data, open(path, 'w'))
 PY
 set_updates '[]' "$retry_home"
 run_tg "$retry_home" serve --once >/dev/null
-python3 - "$retry_home/state/telegram/handled/$retry_id.json" <<'PY'
+python3 - "$retry_home/state/telegram/handled/$retry_id.json" <<'PY' || fail "reconciled handled receipt assertion failed"
 import json, sys
 assert json.load(open(sys.argv[1]))['receipt_status'] == 'sent'
 PY
@@ -592,13 +592,13 @@ path = sys.argv[1]; data = json.load(open(path)); data['receipt_retry_at'] = 0
 json.dump(data, open(path, 'w'))
 PY
   run_tg "$terminal_home" serve --once >/dev/null
-  python3 - "$terminal_request" "$expected" <<'PY'
+  python3 - "$terminal_request" "$expected" <<'PY' || fail "bounded delivery-unknown attempt assertion failed"
 import json, sys
 record = json.load(open(sys.argv[1]))
 assert record['receipt_attempts'] == int(sys.argv[2])
 PY
 done
-python3 - "$terminal_request" <<'PY'
+python3 - "$terminal_request" <<'PY' || fail "terminal delivery-unknown state assertion failed"
 import json, sys
 assert json.load(open(sys.argv[1]))['receipt_status'] == 'delivery_unknown_terminal'
 PY
@@ -612,7 +612,7 @@ printf '4\n' > "$rejected_home/fail-send-count"
 set_updates '[{"update_id":17,"message":{"message_id":17,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"bound rejected receipt retries"}}]' "$rejected_home"
 run_tg "$rejected_home" serve --once >/dev/null
 rejected_request="$rejected_home/state/telegram/inbox/tg-text-u17-m17.json"
-python3 - "$rejected_request" <<'PY'
+python3 - "$rejected_request" <<'PY' || fail "rejected receipt assertion failed"
 import json, sys
 record = json.load(open(sys.argv[1], encoding='utf-8'))
 assert record['receipt_status'] == 'rejected'
@@ -630,13 +630,13 @@ record['receipt_retry_at'] = 0
 json.dump(record, open(path, 'w', encoding='utf-8'))
 PY
   run_tg "$rejected_home" serve --once >/dev/null
-  python3 - "$rejected_request" "$expected" <<'PY'
+  python3 - "$rejected_request" "$expected" <<'PY' || fail "bounded rejected receipt attempt assertion failed"
 import json, sys
 record = json.load(open(sys.argv[1], encoding='utf-8'))
 assert record['receipt_attempts'] == int(sys.argv[2])
 PY
 done
-python3 - "$rejected_request" <<'PY'
+python3 - "$rejected_request" <<'PY' || fail "terminal rejected receipt state assertion failed"
 import json, sys
 assert json.load(open(sys.argv[1], encoding='utf-8'))['receipt_status'] == 'rejected_terminal'
 PY
@@ -697,7 +697,9 @@ run_tg "$order_home" serve --once >/dev/null
 order_continuation=tg-text-u33-m33
 [ "$(grep -c "telegram:$order_continuation" "$order_home/state/.wake-queue")" -eq 1 ] || fail "active conversation continuation was not the sole wake head"
 printf 'A final\n' > "$order_home/reply.txt"
-run_tg "$order_home" reply "$order_a" --final --text-file "$order_home/reply.txt" >/dev/null
+order_final_status=0
+run_tg "$order_home" reply "$order_a" --final --text-file "$order_home/reply.txt" >/dev/null || order_final_status=$?
+[ "$order_final_status" -eq 2 ] || fail "final reply did not report its queued continuation as incomplete"
 [ "$(run_tg "$order_home" active-request --work-id order-work)" = "$order_a" ] || fail "queued continuation lost its active predecessor during finalization"
 run_tg "$order_home" request-handled "$order_continuation" >/dev/null
 order_continuation_route=$(printf '%s\t%s' "$order_a" order-work)
@@ -820,7 +822,7 @@ done
 kill -9 "$send_pid" 2>/dev/null || true
 rm -f "$voice_home/hold-send"
 wait "$send_pid" 2>/dev/null || true
-python3 - "$pending" <<'PY'
+python3 - "$pending" <<'PY' || fail "interrupted voice send assertion failed"
 import json, sys
 assert json.load(open(sys.argv[1], encoding='utf-8'))['mode'] == 'sending'
 PY
@@ -880,7 +882,7 @@ case "$command" in
     unit="$FM_TELEGRAM_UNIT_DIR/firstmate-telegram.service"
     if [ -f "$unit" ]; then
       systemd-analyze --user verify "$unit" >/dev/null 2>&1 || exit 1
-      python3 - "$unit" "$FM_TELEGRAM_EXPECT_HOME" <<'PY'
+      python3 - "$unit" "$FM_TELEGRAM_EXPECT_HOME" <<'PY' || exit 1
 import shlex, sys
 from pathlib import Path
 unit = Path(sys.argv[1]).read_text(encoding='utf-8').splitlines()
@@ -1146,6 +1148,29 @@ wait "$locked_cleanup_pid" || locked_cleanup_status=$?
 grep -F $'\tcheck\tunrelated:keep\t' "$voice_home/state/.wake-queue" >/dev/null || fail "cleanup removed an unrelated wake"
 ! grep -F $'\tcheck\ttelegram:' "$voice_home/state/.wake-queue" >/dev/null || fail "cleanup left Telegram wake rows"
 "${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null || fail "cleanup must be idempotent"
+
+"${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null
+set_updates '[]' "$voice_home"
+rm -f "$voice_home/updates-entered"
+touch "$voice_home/block-updates"
+"${lifecycle_env[@]}" "$SCRIPT" serve --poll-timeout 1 >"$voice_home/direct-cleanup-service.out" 2>&1 &
+direct_cleanup_pid=$!
+direct_cleanup_started=0
+for _ in $(seq 1 100); do
+  if [ -e "$voice_home/updates-entered" ]; then direct_cleanup_started=1; break; fi
+  sleep .02
+done
+[ "$direct_cleanup_started" -eq 1 ] || fail "direct cleanup runtime did not acquire service ownership"
+if "${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null 2>&1; then
+  fail "cleanup removed state while a direct runtime owned the service lock"
+fi
+kill -0 "$direct_cleanup_pid" 2>/dev/null || fail "refused cleanup stopped the direct runtime"
+[ -f "$voice_home/config/telegram.json" ] || fail "refused cleanup removed the active runtime pairing"
+[ -d "$voice_home/state/telegram" ] || fail "refused cleanup removed the active runtime state"
+kill "$direct_cleanup_pid" 2>/dev/null || true
+rm -f "$voice_home/block-updates"
+wait "$direct_cleanup_pid" 2>/dev/null || true
+"${lifecycle_env[@]}" "$SCRIPT" cleanup >/dev/null || fail "cleanup failed after the direct runtime stopped"
 
 # Pairing, outbound sends, and cleanup share one stable home lifecycle boundary.
 "${lifecycle_env[@]}" "$SCRIPT" pair --user-id 77 --chat-id 77 >/dev/null

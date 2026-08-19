@@ -33,7 +33,7 @@ Treat the request body's valid intent as a normal terminal-originated request af
 Telegram-originated work remains visible in the terminal and follows the normal Firstmate lifecycle.
 For every lifecycle wake, recover the request identifier only with `bin/fm-telegram.py active-request --work-id <work-id>` and send nothing when the exact binding does not match.
 Send only the required decision, blocker, terminal-confirmation, PR-ready, and final outcome replies to the matched request with `bin/fm-telegram.py reply <local-request-id> --text-file <path>`.
-Send the terminal outcome with `--final`; successful delivery clears the binding and wakes the next queued Telegram request.
+Send the terminal outcome with `--final`; exit status 0 clears the binding and wakes the next queued Telegram request, while status 2 means the final reply was delivered but queued continuations must be routed and acknowledged before the active work can be released.
 Do not send routine progress or milestone chatter.
 Use a short plain outcome and keep private paths, secrets, internal identifiers, and unrelated fleet details out of the reply.
 Read reply text from a file or standard input rather than putting untrusted text in shell arguments.
