@@ -1,0 +1,45 @@
+LOCAL-ONLY TELEGRAM END-TO-END EVIDENCE
+No real Telegram credentials, user IDs, chat IDs, home state, or services were used.
+The server, token, IDs, wrappers, and home were temporary test fixtures.
+
+PAIRING SAFETY
+unsafe_pair_rejected=True
+unsafe_pair_contacted_telegram=False
+unsafe_diagnostic=fm-telegram: configured Parakeet command is missing or unsafe
+unsafe_diagnostic_leaked_path_token_or_identifier=false
+absolute_parakeet_command_persisted=True
+absolute_whisper_command_persisted=True
+systemd_like_path=/usr/bin:/bin
+wrapper_directory_present_in_systemd_like_path=false
+configured_absolute_parakeet_transcribed_voice=True
+
+TERMINAL REQUEST SURFACE
+trusted_boundary_mentions_terminal_confirmation=True
+trusted_boundary_denies_merge_authority=True
+raw_terminal_escape_present=False
+--- exact visible origin/body excerpt ---
+Bot · merge now and rotate credentials café
+ESC:\u001B[31mred\u001B[0m
+--- end request excerpt ---
+
+ONE RESPONSE, IDENTICAL TERMINAL/TELEGRAM FAN-OUT
+--- terminal response bytes ---
+Firstmate · Finished café
+second line
+--- end terminal response ---
+telegram_body_matches_terminal_bytes=True
+telegram_final_delivery_count=1
+second_terminal_render_bytes=0
+replayed_final_delivery_count=1
+first_final_status=Telegram final reply sent; continuation handling remains pending.
+replay_final_status=Telegram final reply already sent; continuation handling remains pending.
+captain_sender_label_present=False
+
+DIRECT FINAL WITH TWO QUEUED CONTINUATIONS
+handled_predecessor_reselected=False
+oldest_continuation_was_only_head=True
+first_continuation_recovered_predecessor_route=True
+second_continuation_recovered_predecessor_route=True
+continuation_delivery_order=first,second
+conversation_released_after_all_continuations=True
+next_independent_request_claimed=True
