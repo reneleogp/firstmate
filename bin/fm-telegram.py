@@ -244,6 +244,19 @@ def atomic_json(path: Path, value: Any) -> None:
     atomic_bytes(path, (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode())
 
 
+def file_sha256(path: Path) -> Tuple[int, str]:
+    size = 0
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            block = stream.read(64 * 1024)
+            if not block:
+                break
+            size += len(block)
+            digest.update(block)
+    return size, digest.hexdigest()
+
+
 def read_json(path: Path, default: Any = None) -> Any:
     try:
         with path.open(encoding="utf-8") as stream:
@@ -901,11 +914,19 @@ def response_record_locked(home: Path, response_id: str) -> Optional[Dict[str, A
             raise TelegramError("Telegram response journal is malformed")
         return record
     if content_status == "oversized":
+        refused_bytes = record.get("refused_bytes")
+        refused_sha256 = record.get("refused_sha256")
+        body_size = body_path.stat().st_size
         if (terminal_status != "pending" or telegram_status != "pending" or chunks
-                or body_path.stat().st_size != 0
-                or not strict_int(record.get("refused_bytes"))
-                or record["refused_bytes"] <= MAX_RESPONSE_BYTES):
+                or not strict_int(refused_bytes) or refused_bytes <= MAX_RESPONSE_BYTES
+                or not isinstance(refused_sha256, str) or len(refused_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in refused_sha256)
+                or body_size not in {0, refused_bytes}):
             raise TelegramError("Telegram response journal is malformed")
+        if body_size:
+            current_size, current_sha256 = file_sha256(body_path)
+            if current_size != refused_bytes or current_sha256 != refused_sha256:
+                raise TelegramError("Telegram response journal is malformed")
         return record
     try:
         body = body_path.read_bytes()
@@ -2477,7 +2498,8 @@ def request_read(home: Path, request_id: str) -> int:
         text = record.get("text")
         if not isinstance(text, str):
             return die("request is malformed")
-    print(text)
+    sys.stdout.write(text)
+    sys.stdout.flush()
     return 0
 
 
@@ -2781,6 +2803,21 @@ def response_reserve(home: Path, claimed_request: str, response_id: str,
     return 0
 
 
+def refuse_oversized_response(home: Path, metadata_path: Path, body_path: Path,
+                              record: Dict[str, Any], refused_bytes: int,
+                              refused_sha256: str) -> int:
+    record["content_status"] = "oversized"
+    record["refused_bytes"] = refused_bytes
+    record["refused_sha256"] = refused_sha256
+    record["refused_at"] = now()
+    atomic_json(metadata_path, record)
+    if (home.resolve() in _TEST_API_BASES
+            and os.environ.get("FM_TELEGRAM_TEST_CRASH_AFTER_OVERSIZE_REFUSAL") == "1"):
+        os._exit(99)
+    atomic_bytes(body_path, b"")
+    return die(f"Telegram response exceeds the {MAX_RESPONSE_BYTES}-byte staging limit")
+
+
 def response_stage(home: Path, claimed_request: str, response_id: str,
                    text_file: str, final: bool = False) -> int:
     with FileLock(state_lock(home)):
@@ -2794,24 +2831,24 @@ def response_stage(home: Path, claimed_request: str, response_id: str,
         if text_file == "-" or Path(text_file).expanduser().absolute() != body_path:
             return die("response staging must use its reserved private output file")
         if existing.get("content_status") == "oversized":
+            if body_path.stat().st_size:
+                atomic_bytes(body_path, b"")
             return die(f"Telegram response exceeds the {MAX_RESPONSE_BYTES}-byte staging limit")
         try:
             body_size = body_path.stat().st_size
             if body_size > MAX_RESPONSE_BYTES:
-                atomic_bytes(body_path, b"")
-                existing["content_status"] = "oversized"
-                existing["refused_bytes"] = body_size
-                existing["refused_at"] = now()
-                atomic_json(metadata_path, existing)
-                return die(f"Telegram response exceeds the {MAX_RESPONSE_BYTES}-byte staging limit")
+                refused_bytes, refused_sha256 = file_sha256(body_path)
+                if refused_bytes > MAX_RESPONSE_BYTES:
+                    return refuse_oversized_response(
+                        home, metadata_path, body_path, existing,
+                        refused_bytes, refused_sha256,
+                    )
             body = body_path.read_bytes()
             if len(body) > MAX_RESPONSE_BYTES:
-                atomic_bytes(body_path, b"")
-                existing["content_status"] = "oversized"
-                existing["refused_bytes"] = len(body)
-                existing["refused_at"] = now()
-                atomic_json(metadata_path, existing)
-                return die(f"Telegram response exceeds the {MAX_RESPONSE_BYTES}-byte staging limit")
+                return refuse_oversized_response(
+                    home, metadata_path, body_path, existing,
+                    len(body), hashlib.sha256(body).hexdigest(),
+                )
             text = body.decode("utf-8")
             chunks = split_telegram_response(body)
         except (OSError, UnicodeError) as exc:

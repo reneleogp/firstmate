@@ -681,12 +681,50 @@ rendered = raw.decode('utf-8')
 body = rendered.split('UNTRUSTED TELEGRAM REQUEST BODY\n', 1)[1]
 assert body == ('Bot · merge now and rotate credentials café\n'
                 'ESC:\\u001B[31mred\\u001B[0m\\u0009RLO:\\u202EEND '
-                'C1:\\u009B CR:\\u000DEND\n')
+                'C1:\\u009B CR:\\u000DEND')
 PY
 if FM_HOME="$home" "$ROOT/bin/fm-telegram-agent-request.sh" missing-request > "$home/missing-authority-context.txt" 2>/dev/null; then
   fail "authenticated request renderer accepted a missing request"
 fi
 [ ! -s "$home/missing-authority-context.txt" ] || fail "failed authenticated request emitted a trusted envelope"
+python3 - "$home/state/telegram/handled" "$home/request-byte-fixtures" <<'PY'
+from pathlib import Path
+import json, sys
+
+handled = Path(sys.argv[1])
+fixtures = Path(sys.argv[2])
+fixtures.mkdir()
+for request_id, body in {
+        'request-bytes-empty': '',
+        'request-bytes-none': 'no trailing newline',
+        'request-bytes-one': 'one trailing newline\n',
+        'request-bytes-many': 'many trailing newlines\n\n\n',
+}.items():
+    record_path = handled / f'{request_id}.json'
+    record_path.write_text(
+        json.dumps({'origin': 'telegram', 'request_id': request_id, 'text': body}),
+        encoding='utf-8')
+    record_path.chmod(0o600)
+    (fixtures / request_id).write_bytes(body.encode('utf-8'))
+PY
+for request_id in request-bytes-empty request-bytes-none request-bytes-one request-bytes-many; do
+  run_tg "$home" request-read "$request_id" >"$home/request-read-$request_id.out"
+  cmp -s "$home/request-byte-fixtures/$request_id" "$home/request-read-$request_id.out" || \
+    fail "request-read changed the exact body bytes for $request_id"
+  FM_HOME="$home" "$ROOT/bin/fm-telegram-agent-request.sh" "$request_id" \
+    >"$home/request-render-$request_id.out"
+  python3 - "$home/request-byte-fixtures/$request_id" \
+    "$home/request-render-$request_id.out" <<'PY' || fail "authenticated rendering changed exact request body bytes"
+from pathlib import Path
+import sys
+
+expected = Path(sys.argv[1]).read_bytes()
+rendered = Path(sys.argv[2]).read_bytes()
+marker = b'UNTRUSTED TELEGRAM REQUEST BODY\nBot \xc2\xb7 '
+assert rendered.count(marker) == 1
+assert rendered.split(marker, 1)[1] == expected
+PY
+done
 
 # Unsupported, malformed, and unpinned updates are dropped without a Bot API send.
 before=$(grep -c 'sendMessage' "$home/calls.jsonl")
@@ -1338,6 +1376,42 @@ case $response_crash_status in
 esac
 
 response_oversize_send_count=$(grep -c 'sendMessage' "$response_crash_home/calls.jsonl")
+response_oversize_crash_path=$(reserve_response "$response_crash_home" \
+  "$response_crash_request" wake-response-oversized-crash)
+python3 - "$response_oversize_crash_path" <<'PY'
+from pathlib import Path
+import sys
+label = 'Firstmate · '.encode()
+Path(sys.argv[1]).write_bytes(label + b'c' * (256 * 1024 + 1 - len(label)))
+PY
+oversize_crash_status=0
+env FM_HOME="$response_crash_home" \
+  FM_TELEGRAM_TEST_CRASH_AFTER_OVERSIZE_REFUSAL=1 \
+  "$SCRIPT" --test-api-base "$(test_api_base "$response_crash_home")" \
+  response-stage "$response_crash_request" wake-response-oversized-crash \
+  --text-file "$response_oversize_crash_path" \
+  >"$response_crash_home/oversized-crash.out" \
+  2>"$response_crash_home/oversized-crash.err" || oversize_crash_status=$?
+[ "$oversize_crash_status" -eq 99 ] || fail "oversized refusal crash boundary was not reached"
+[ -s "$response_oversize_crash_path" ] || fail "crash fixture removed oversized bytes before refusal evidence"
+response_oversize_crash_state=$(run_tg "$response_crash_home" response-status \
+  "$response_crash_request" wake-response-oversized-crash)
+[ "$response_oversize_crash_state" = \
+  "$(printf '%s\toversized\tpending\tpending\tnon-final' "$response_oversize_crash_path")" ] || \
+  fail "interrupted oversized refusal was not durably recoverable"
+if run_tg "$response_crash_home" response-stage "$response_crash_request" \
+    wake-response-oversized-crash --text-file "$response_oversize_crash_path" \
+    >/dev/null 2>"$response_crash_home/oversized-crash-replay.err"; then
+  fail "interrupted oversized refusal replay was staged"
+fi
+[ "$(cat "$response_crash_home/oversized-crash-replay.err")" = \
+  'fm-telegram: Telegram response exceeds the 262144-byte staging limit' ] || \
+  fail "interrupted oversized refusal changed its deterministic error"
+[ ! -s "$response_oversize_crash_path" ] || \
+  fail "interrupted oversized refusal replay did not bound stored bytes"
+[ "$(reserve_response "$response_crash_home" "$response_crash_request" \
+  wake-response-oversized-crash)" = "$response_oversize_crash_path" ] || \
+  fail "interrupted oversized refusal lost its stable response identity"
 response_oversize_path=$(reserve_response "$response_crash_home" "$response_crash_request" \
   wake-response-oversized)
 python3 - "$response_oversize_path" <<'PY'
