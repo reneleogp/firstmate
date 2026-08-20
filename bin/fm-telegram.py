@@ -49,6 +49,7 @@ MAX_VOICE_SECONDS = 120
 INBOX_TTL = 7 * 24 * 60 * 60
 PENDING_TTL = 10 * 60
 ATOMIC_TEMP_TTL = 10 * 60
+RESPONSE_GENERATION_IDLE_TTL = 10 * 60
 POLL_TIMEOUT = 30
 RECEIPT_RETRY_DELAYS = (30, 120, 300)
 CALLBACK_DELIVERY_ATTEMPTS = 3
@@ -1153,6 +1154,39 @@ def response_conversation_closed_locked(home: Path, record: Dict[str, Any]) -> b
                  or closing.get("request_id") != conversation_id))
 
 
+def mark_oversized_response(metadata_path: Path, record: Dict[str, Any],
+                            refused_bytes: int,
+                            refused_sha256: str) -> None:
+    record["content_status"] = "oversized"
+    record["refused_bytes"] = refused_bytes
+    record["refused_sha256"] = refused_sha256
+    record["refused_at"] = now()
+    atomic_json(metadata_path, record)
+
+
+def cleanup_abandoned_response_locked(metadata_path: Path, body_path: Path,
+                                       record: Dict[str, Any]) -> Dict[str, Any]:
+    if record["content_status"] != "reserved":
+        return record
+    before = body_path.stat()
+    last_activity = max(float(record["created_at"]), before.st_mtime)
+    if (before.st_size <= MAX_RESPONSE_BYTES
+            or time.time() - last_activity < RESPONSE_GENERATION_IDLE_TTL):
+        return record
+    refused_bytes, refused_sha256 = file_sha256(body_path)
+    after = body_path.stat()
+    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if (refused_bytes <= MAX_RESPONSE_BYTES
+            or any(getattr(before, field) != getattr(after, field)
+                   for field in stable_fields)):
+        return record
+    mark_oversized_response(
+        metadata_path, record, refused_bytes, refused_sha256,
+    )
+    atomic_bytes(body_path, b"")
+    return record
+
+
 def cleanup_response_journal_locked(home: Path, reserve_slots: int = 0) -> None:
     root = response_dir(home)
     records = []
@@ -1167,6 +1201,7 @@ def cleanup_response_journal_locked(home: Path, reserve_slots: int = 0) -> None:
             durable_unlink(root / f"{metadata_path.stem}.txt")
             continue
         body_path = root / f"{metadata_path.stem}.txt"
+        record = cleanup_abandoned_response_locked(metadata_path, body_path, record)
         if record["content_status"] == "oversized" and body_path.stat().st_size:
             atomic_bytes(body_path, b"")
         referenced_bodies.add(body_path.name)
@@ -2500,8 +2535,8 @@ def request_read(home: Path, request_id: str) -> int:
         text = record.get("text")
         if not isinstance(text, str):
             return die("request is malformed")
-    sys.stdout.write(text)
-    sys.stdout.flush()
+    sys.stdout.buffer.write(text.encode("utf-8"))
+    sys.stdout.buffer.flush()
     return 0
 
 
@@ -2808,11 +2843,9 @@ def response_reserve(home: Path, claimed_request: str, response_id: str,
 def refuse_oversized_response(home: Path, metadata_path: Path, body_path: Path,
                               record: Dict[str, Any], refused_bytes: int,
                               refused_sha256: str) -> int:
-    record["content_status"] = "oversized"
-    record["refused_bytes"] = refused_bytes
-    record["refused_sha256"] = refused_sha256
-    record["refused_at"] = now()
-    atomic_json(metadata_path, record)
+    mark_oversized_response(
+        metadata_path, record, refused_bytes, refused_sha256,
+    )
     if (home.resolve() in _TEST_API_BASES
             and os.environ.get("FM_TELEGRAM_TEST_CRASH_AFTER_OVERSIZE_REFUSAL") == "1"):
         os._exit(99)

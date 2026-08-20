@@ -704,6 +704,7 @@ for request_id, body in {
         'request-bytes-none': 'no trailing newline',
         'request-bytes-one': 'one trailing newline\n',
         'request-bytes-many': 'many trailing newlines\n\n\n',
+        'request-bytes-unicode': 'café 🚢',
 }.items():
     record_path = handled / f'{request_id}.json'
     record_path.write_text(
@@ -712,10 +713,14 @@ for request_id, body in {
     record_path.chmod(0o600)
     (fixtures / request_id).write_bytes(body.encode('utf-8'))
 PY
-for request_id in request-bytes-empty request-bytes-none request-bytes-one request-bytes-many; do
+for request_id in request-bytes-empty request-bytes-none request-bytes-one request-bytes-many request-bytes-unicode; do
   run_tg "$home" request-read "$request_id" >"$home/request-read-$request_id.out"
   cmp -s "$home/request-byte-fixtures/$request_id" "$home/request-read-$request_id.out" || \
     fail "request-read changed the exact body bytes for $request_id"
+  env FM_HOME="$home" PYTHONIOENCODING=latin-1 "$SCRIPT" request-read "$request_id" \
+    >"$home/request-read-locale-$request_id.out"
+  cmp -s "$home/request-byte-fixtures/$request_id" "$home/request-read-locale-$request_id.out" || \
+    fail "request-read changed UTF-8 body bytes under a non-UTF-8 process encoding for $request_id"
   FM_HOME="$home" "$ROOT/bin/fm-telegram-agent-request.sh" "$request_id" \
     >"$home/request-render-$request_id.out"
   python3 - "$home/request-byte-fixtures/$request_id" \
@@ -1463,6 +1468,48 @@ if reply_response "$response_crash_home" "$response_crash_request" \
 fi
 [ "$(grep -c 'sendMessage' "$response_crash_home/calls.jsonl")" -eq \
   "$response_oversize_send_count" ] || fail "oversized response contacted Telegram"
+
+response_abandoned_path=$(reserve_response "$response_crash_home" \
+  "$response_crash_request" wake-response-abandoned)
+python3 - "$response_abandoned_path" <<'PY'
+from pathlib import Path
+import sys
+label = 'Firstmate · '.encode()
+Path(sys.argv[1]).write_bytes(label + b'a' * (256 * 1024 + 1 - len(label)))
+PY
+run_tg "$response_crash_home" serve --once >/dev/null
+[ -s "$response_abandoned_path" ] || \
+  fail "cleanup raced a recently generated unstaged response"
+[ "$(run_tg "$response_crash_home" response-status "$response_crash_request" \
+  wake-response-abandoned)" = \
+  "$(printf '%s\treserved\tpending\tpending\tnon-final' "$response_abandoned_path")" ] || \
+  fail "recent unstaged response lost its generation reservation"
+python3 - "$response_crash_home/state/telegram/responses/wake-response-abandoned.json" \
+  "$response_abandoned_path" <<'PY'
+import json, os, sys
+metadata_path, body_path = sys.argv[1:]
+with open(metadata_path, encoding='utf-8') as stream:
+    record = json.load(stream)
+record['created_at'] = 1
+with open(metadata_path, 'w', encoding='utf-8') as stream:
+    json.dump(record, stream)
+os.utime(body_path, (1, 1))
+PY
+run_tg "$response_crash_home" serve --once >/dev/null
+[ ! -s "$response_abandoned_path" ] || \
+  fail "startup cleanup retained an abandoned oversized reservation"
+[ "$(run_tg "$response_crash_home" response-status "$response_crash_request" \
+  wake-response-abandoned)" = \
+  "$(printf '%s\toversized\tpending\tpending\tnon-final' "$response_abandoned_path")" ] || \
+  fail "abandoned oversized reservation lacked durable refusal evidence"
+if run_tg "$response_crash_home" response-stage "$response_crash_request" \
+    wake-response-abandoned --text-file "$response_abandoned_path" \
+    >/dev/null 2>"$response_crash_home/abandoned-stage.err"; then
+  fail "abandoned oversized response was regenerated or staged"
+fi
+[ "$(cat "$response_crash_home/abandoned-stage.err")" = \
+  'fm-telegram: Telegram response exceeds the 262144-byte staging limit' ] || \
+  fail "abandoned oversized response changed its deterministic error"
 
 response_capacity_home=$(new_home response-capacity)
 start_server "$response_capacity_home" "$response_capacity_home/port"
