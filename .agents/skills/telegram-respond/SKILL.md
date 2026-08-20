@@ -58,7 +58,7 @@ Do not release a final or acknowledge a continuation while reply reports incompl
 For a staged final outcome, reply exit status 0 clears the binding and wakes the next queued Telegram request, while status 2 means every chunk was delivered but queued continuations must be routed and acknowledged before the active work can be released.
 Do not send routine progress or milestone chatter.
 Use a short plain outcome and keep private paths, secrets, internal identifiers, and unrelated fleet details out of the reply.
-Read reply text from a file or standard input rather than putting untrusted text in shell arguments.
+Keep reply text in the reserved private response file rather than putting untrusted text in shell arguments.
 
 A single ordered Telegram conversation queue is the supported behavior.
 Do not create generic concurrent decision routing, a secondmate route, a Telegram channel abstraction, or a second Telegram conversation.

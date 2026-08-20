@@ -85,7 +85,7 @@ The transport has no model or action authority and does not interpret the reques
 
 ## Operations and privacy
 
-The same CLI provides safe request inspection and handling, lifecycle routing, response staging, pinned-chat send and reply, and service-state cleanup; generated response and send text is read from a file or standard input rather than a shell argument, and no recipient argument is accepted.
+The same CLI provides safe request inspection and handling, lifecycle routing, response staging, pinned-chat send and reply, and service-state cleanup; response staging requires its reserved private file, while send text is read from a file or standard input rather than a shell argument, and no recipient argument is accepted.
 Private inbox, handled-request, response-journal, deduplication, and pending voice records are bounded and stored under the home state directory with private permissions.
 Queued requests older than the retention window or beyond the fixed queue cap are removed oldest-first, including their Telegram wake records, so an unattended offline home does not retain message bodies indefinitely.
 The executable's `--help` reports the current numeric retention limits.

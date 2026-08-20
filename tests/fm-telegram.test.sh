@@ -665,6 +665,11 @@ assert sent[0]['params']['text'].startswith('Bot · Message received')
 PY
 authority_id=tg-text-u9-m19
 FM_HOME="$home" "$ROOT/bin/fm-telegram-agent-request.sh" "$authority_id" > "$home/authority-context.txt"
+printf 'not a directory\n' > "$home/process-global-tmp"
+FM_HOME="$home" TMPDIR="$home/process-global-tmp" \
+  "$ROOT/bin/fm-telegram-agent-request.sh" "$authority_id" > "$home/authority-context-no-tmp.txt"
+cmp -s "$home/authority-context.txt" "$home/authority-context-no-tmp.txt" || \
+  fail "authenticated request renderer depended on a process-global temporary file"
 python3 - "$home/authority-context.txt" <<'PY' || fail "authority boundary assertion failed"
 from pathlib import Path
 import json, sys

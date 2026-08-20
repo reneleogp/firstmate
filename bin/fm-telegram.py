@@ -3378,7 +3378,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "Voice limits: 10 MiB, 120 seconds, a 4096-unit transcript, and 64 waiting notes. Temporary audio is restricted to /dev/shm.\n"
                 "Pairing accepts --parakeet-command and --whisper-command as absolute executable paths; configured paths must be regular executable files.\n"
                 "FM_TELEGRAM_PARAKEET_CMD and FM_TELEGRAM_WHISPER_CMD override the local transcription commands for one process.\n"
-                "Response staging and send text read UTF-8 from --text-file or stdin (-); no recipient argument is accepted."),
+                "Response staging requires its reserved private --text-file; send reads UTF-8 from --text-file or stdin (-), and no recipient argument is accepted."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--home", help="the one Firstmate home to use")
