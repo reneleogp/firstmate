@@ -94,6 +94,11 @@ class Handler(BaseHTTPRequestHandler):
             inbox = list((request_root / 'inbox').glob('*.json')) if (request_root / 'inbox').exists() else []
             handled = list((request_root / 'handled').glob('*.json')) if (request_root / 'handled').exists() else []
             text = params.get('text')
+            if isinstance(text, str) and len(text.encode('utf-16-le')) // 2 > 4096:
+                raw = json.dumps({'ok': False, 'error_code': 400, 'description': 'message too long'}).encode()
+                self.send_response(400); self.send_header('Content-Length', str(len(raw)))
+                self.end_headers(); self.wfile.write(raw)
+                return
             if isinstance(text, str) and text.startswith('Bot · Message received'):
                 wake_path = home / 'state' / '.wake-queue'
                 wake = wake_path.read_text() if wake_path.exists() else ''
@@ -101,10 +106,14 @@ class Handler(BaseHTTPRequestHandler):
                     (home / 'receipt-before-durable').write_text('failed')
                 if inbox and 'telegram tg-' not in wake:
                     (home / 'receipt-before-durable').write_text('failed')
+            send_count_path = home / 'send-count'
+            send_count = int(send_count_path.read_text()) + 1 if send_count_path.exists() else 1
+            send_count_path.write_text(str(send_count))
             hold = home / 'hold-send'
-            if hold.exists():
+            hold_at = home / 'hold-send-at-count'
+            if hold.exists() or (hold_at.exists() and int(hold_at.read_text()) == send_count):
                 (home / 'send-entered').write_text('entered')
-                while hold.exists(): time.sleep(.01)
+                while hold.exists() or hold_at.exists(): time.sleep(.01)
             disconnect = home / 'disconnect-after-send-count'
             disconnect_count = int(disconnect.read_text()) if disconnect.exists() else 0
             if disconnect_count > 0:
@@ -1121,6 +1130,89 @@ direct_order_d=tg-text-u43-m43
 run_tg "$direct_order_home" request-handled "$direct_order_d" >/dev/null || fail "next independent request could not claim after direct close"
 [ "$(run_tg "$direct_order_home" active-request)" = "$direct_order_d" ] || fail "next independent request did not become active"
 
+response_chunk_home=$(new_home response-chunks)
+start_server "$response_chunk_home" "$response_chunk_home/port"
+run_tg "$response_chunk_home" pair --user-id 77 --chat-id 77 >/dev/null
+set_updates '[{"update_id":47,"message":{"message_id":47,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"chunk one canonical response"}}]' "$response_chunk_home"
+run_tg "$response_chunk_home" serve --once >/dev/null
+response_chunk_request=tg-text-u47-m47
+run_tg "$response_chunk_home" request-handled "$response_chunk_request" >/dev/null
+python3 - "$response_chunk_home/chunk-response.txt" <<'PY'
+from pathlib import Path
+import sys
+label = 'Firstmate · '
+label_units = len(label.encode('utf-16-le')) // 2
+text = label + ('a' * (4096 - label_units)) + ('🙂' * 2048) + ('界' * 4096) + '\n'
+Path(sys.argv[1]).write_text(text, encoding='utf-8')
+PY
+stage_response "$response_chunk_home" "$response_chunk_request" wake-response-chunks \
+  "$response_chunk_home/chunk-response.txt" >/dev/null
+render_response "$response_chunk_home" "$response_chunk_request" wake-response-chunks \
+  >"$response_chunk_home/chunk-terminal.txt"
+reply_response "$response_chunk_home" "$response_chunk_request" wake-response-chunks \
+  >"$response_chunk_home/chunk-reply.out" || fail "bounded Unicode response chunks were not delivered"
+[ "$(cat "$response_chunk_home/chunk-reply.out")" = 'Telegram reply sent.' ] || \
+  fail "chunk delivery exposed response content"
+cmp -s "$response_chunk_home/chunk-response.txt" "$response_chunk_home/chunk-terminal.txt" || \
+  fail "chunked response changed terminal bytes"
+python3 - "$response_chunk_home/calls.jsonl" "$response_chunk_home/chunk-response.txt" <<'PY' || fail "Telegram chunks did not preserve Unicode boundaries and canonical bytes"
+from pathlib import Path
+import json, sys
+calls = [json.loads(line) for line in open(sys.argv[1], encoding='utf-8')]
+expected = Path(sys.argv[2]).read_bytes()
+chunks = [call['params']['text'] for call in calls
+          if call['path'].endswith('/sendMessage')
+          and not call.get('params', {}).get('text', '').startswith('Bot · ')]
+assert len(chunks) == 4
+assert len(chunks[0].encode('utf-16-le')) // 2 == 4096
+assert all(0 < len(chunk.encode('utf-16-le')) // 2 <= 4096 for chunk in chunks)
+assert b''.join(chunk.encode('utf-8') for chunk in chunks) == expected
+assert any('🙂' in chunk for chunk in chunks)
+assert any('界' in chunk for chunk in chunks)
+PY
+set_updates '[{"update_id":48,"message":{"message_id":48,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"continuation behind chunked final"}}]' "$response_chunk_home"
+run_tg "$response_chunk_home" serve --once >/dev/null
+response_chunk_continuation=tg-text-u48-m48
+python3 - "$response_chunk_home/chunk-final.txt" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text('Firstmate · ' + ('final chunk ' * 500) + '\n', encoding='utf-8')
+PY
+stage_response "$response_chunk_home" "$response_chunk_request" wake-response-chunk-final \
+  "$response_chunk_home/chunk-final.txt" --final >/dev/null
+render_response "$response_chunk_home" "$response_chunk_request" wake-response-chunk-final >/dev/null
+printf '1\n' >"$response_chunk_home/disconnect-after-send-count"
+response_chunk_final_status=0
+reply_response "$response_chunk_home" "$response_chunk_request" wake-response-chunk-final \
+  >"$response_chunk_home/chunk-final-first.out" || response_chunk_final_status=$?
+[ "$response_chunk_final_status" -eq 3 ] || fail "unknown first chunk did not stop final release"
+[ "$(cat "$response_chunk_home/chunk-final-first.out")" = \
+  'Telegram reply delivery is incomplete; settled chunks were not resent.' ] || \
+  fail "incomplete chunk delivery exposed response content"
+[ ! -e "$response_chunk_home/state/telegram/closing.json" ] || \
+  fail "final conversation began closing before every chunk settled"
+[ "$(run_tg "$response_chunk_home" active-request)" = "$response_chunk_request" ] || \
+  fail "incomplete chunk delivery released its active conversation"
+response_chunk_final_status=0
+reply_response "$response_chunk_home" "$response_chunk_request" wake-response-chunk-final \
+  >"$response_chunk_home/chunk-final-replay.out" || response_chunk_final_status=$?
+[ "$response_chunk_final_status" -eq 3 ] || fail "settled unknown final lost its uncertainty status"
+[ "$(cat "$response_chunk_home/chunk-final-replay.out")" = \
+  'Telegram final reply delivery unknown; continuation handling remains pending.' ] || \
+  fail "settled unknown final did not enter continuation closing"
+run_tg "$response_chunk_home" request-handled "$response_chunk_continuation" >/dev/null
+[ "$(run_tg "$response_chunk_home" active-request --claimed-request "$response_chunk_continuation")" = \
+  "$response_chunk_request" ] || fail "settled chunked final lost its direct continuation route"
+printf 'Firstmate · continuation settled\n' >"$response_chunk_home/chunk-continuation.txt"
+prepare_response "$response_chunk_home" "$response_chunk_continuation" \
+  wake-response-chunk-continuation "$response_chunk_home/chunk-continuation.txt"
+reply_response "$response_chunk_home" "$response_chunk_request" \
+  wake-response-chunk-continuation >/dev/null
+run_tg "$response_chunk_home" continuation-handled "$response_chunk_continuation" >/dev/null
+if run_tg "$response_chunk_home" active-request >/dev/null 2>&1; then
+  fail "settled chunked continuation retained its closed conversation"
+fi
+
 response_crash_home=$(new_home response-crash)
 start_server "$response_crash_home" "$response_crash_home/port"
 run_tg "$response_crash_home" pair --user-id 77 --chat-id 77 >/dev/null
@@ -1192,7 +1284,8 @@ case $response_crash_status in
   *$'\tstaged\trendering\tpending\tnon-final') ;;
   *) fail "interrupted rendering did not retain independent unknown evidence" ;;
 esac
-touch "$response_crash_home/hold-send"
+printf '%s\n' "$(( $(cat "$response_crash_home/send-count") + 2 ))" \
+  >"$response_crash_home/hold-send-at-count"
 rm -f "$response_crash_home/send-entered"
 env FM_HOME="$response_crash_home" "$SCRIPT" \
   --test-api-base "$(test_api_base "$response_crash_home")" reply \
@@ -1207,20 +1300,35 @@ done
 [ "$response_send_entered" -eq 1 ] || fail "staged response did not reach its delivery-unknown boundary"
 kill -9 "$response_reply_pid" 2>/dev/null || true
 wait "$response_reply_pid" 2>/dev/null || true
-rm -f "$response_crash_home/hold-send"
+rm -f "$response_crash_home/hold-send-at-count"
 sleep .05
+python3 - "$response_crash_home/state/telegram/responses/wake-response-crash.json" <<'PY' || fail "chunk crash did not preserve independent delivery evidence"
+import json, sys
+record = json.load(open(sys.argv[1], encoding='utf-8'))
+statuses = [chunk['telegram_status'] for chunk in record['chunks']]
+assert statuses[:2] == ['sent', 'delivery_unknown']
+assert all(status == 'pending' for status in statuses[2:])
+PY
 response_reply_replay_status=0
 reply_response "$response_crash_home" "$response_crash_request" \
   wake-response-crash >"$response_crash_home/reply-replay.out" || response_reply_replay_status=$?
-[ "$response_reply_replay_status" -eq 3 ] || fail "delivery-unknown response replay was not held"
-[ "$(cat "$response_crash_home/reply-replay.out")" = 'Telegram reply delivery remains unknown; not resent.' ] || fail "delivery-unknown replay exposed response content"
-python3 - "$response_crash_home/calls.jsonl" "$staged_path" <<'PY' || fail "delivery-unknown replay resent staged bytes"
+[ "$response_reply_replay_status" -eq 3 ] || fail "delivery-unknown response replay did not retain uncertainty"
+[ "$(cat "$response_crash_home/reply-replay.out")" = 'Telegram reply delivery unknown; settled chunks were not resent.' ] || fail "delivery-unknown replay exposed response content"
+python3 - "$response_crash_home/calls.jsonl" "$staged_path" \
+  "$response_crash_home/state/telegram/responses/wake-response-crash.json" <<'PY' || fail "chunk replay changed staged bytes or resent settled chunks"
 from pathlib import Path
 import json, sys
 calls = [json.loads(line) for line in open(sys.argv[1], encoding='utf-8')]
 expected = Path(sys.argv[2]).read_bytes()
-replies = [call['params']['text'].encode() for call in calls if call['path'].endswith('/sendMessage')]
-assert replies.count(expected) == 1
+record = json.load(open(sys.argv[3], encoding='utf-8'))
+replies = [call['params']['text'].encode() for call in calls
+           if call['path'].endswith('/sendMessage')
+           and not call.get('params', {}).get('text', '').startswith('Bot · ')]
+assert b''.join(replies) == expected
+assert len(replies) == len(record['chunks'])
+assert [chunk['telegram_status'] for chunk in record['chunks']] == [
+    'sent', 'delivery_unknown', 'sent', 'sent'
+]
 PY
 response_crash_status=$(run_tg "$response_crash_home" response-status \
   "$response_crash_request" wake-response-crash)
@@ -1228,6 +1336,48 @@ case $response_crash_status in
   *$'\tstaged\trendering\tdelivery_unknown\tnon-final') ;;
   *) fail "delivery interruption did not preserve independent unknown evidence" ;;
 esac
+
+response_oversize_send_count=$(grep -c 'sendMessage' "$response_crash_home/calls.jsonl")
+response_oversize_path=$(reserve_response "$response_crash_home" "$response_crash_request" \
+  wake-response-oversized)
+python3 - "$response_oversize_path" <<'PY'
+from pathlib import Path
+import sys
+label = 'Firstmate · '.encode()
+Path(sys.argv[1]).write_bytes(label + b'x' * (256 * 1024 + 1 - len(label)))
+PY
+if run_tg "$response_crash_home" response-stage "$response_crash_request" \
+    wake-response-oversized --text-file "$response_oversize_path" \
+    >"$response_crash_home/oversized-stage.out" 2>"$response_crash_home/oversized-stage.err"; then
+  fail "oversized response was staged"
+fi
+[ "$(cat "$response_crash_home/oversized-stage.err")" = \
+  'fm-telegram: Telegram response exceeds the 262144-byte staging limit' ] || \
+  fail "oversized response did not expose its deterministic local error"
+if run_tg "$response_crash_home" response-stage "$response_crash_request" \
+    wake-response-oversized --text-file "$response_oversize_path" \
+    >/dev/null 2>"$response_crash_home/oversized-stage-replay.err"; then
+  fail "oversized response replay was staged"
+fi
+cmp -s "$response_crash_home/oversized-stage.err" \
+  "$response_crash_home/oversized-stage-replay.err" || \
+  fail "oversized response replay changed its local error"
+[ ! -s "$response_oversize_path" ] || fail "oversized response remained in the bounded journal"
+response_oversize_status=$(run_tg "$response_crash_home" response-status \
+  "$response_crash_request" wake-response-oversized)
+[ "$response_oversize_status" = \
+  "$(printf '%s\toversized\tpending\tpending\tnon-final' "$response_oversize_path")" ] || \
+  fail "oversized response identity was not durably refused"
+if render_response "$response_crash_home" "$response_crash_request" \
+    wake-response-oversized >/dev/null 2>&1; then
+  fail "oversized response rendered in the terminal"
+fi
+if reply_response "$response_crash_home" "$response_crash_request" \
+    wake-response-oversized >/dev/null 2>&1; then
+  fail "oversized response reached Telegram delivery"
+fi
+[ "$(grep -c 'sendMessage' "$response_crash_home/calls.jsonl")" -eq \
+  "$response_oversize_send_count" ] || fail "oversized response contacted Telegram"
 
 response_capacity_home=$(new_home response-capacity)
 start_server "$response_capacity_home" "$response_capacity_home/port"
@@ -1258,9 +1408,18 @@ for index in range(256):
         'terminal_status': terminal,
         'telegram_status': telegram,
         'telegram_attempts': 1 if index == 255 else 0,
+        'chunks': [],
     }
     if status == 'staged':
         record['body_sha256'] = hashlib.sha256(body).hexdigest()
+        record['chunks'] = [{
+            'index': 0,
+            'start': 0,
+            'end': len(body),
+            'body_sha256': hashlib.sha256(body).hexdigest(),
+            'telegram_status': telegram,
+            'telegram_attempts': 1 if index == 255 else 0,
+        }]
     (root / f'{response_id}.txt').write_bytes(body)
     (root / f'{response_id}.json').write_text(
         json.dumps(record, sort_keys=True, separators=(',', ':')) + '\n', encoding='utf-8')

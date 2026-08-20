@@ -36,6 +36,9 @@ MAX_HANDLED = 4096
 MAX_INBOX = 256
 MAX_PENDING_VOICES = 64
 MAX_RESPONSE_JOURNAL = 256
+MAX_RESPONSE_BYTES = 256 * 1024
+MAX_RESPONSE_CHUNKS = 64
+MAX_TELEGRAM_TEXT_UNITS = 4096
 MAX_ATOMIC_TEMPS = 256
 MAX_TEXT = 12000
 MAX_TRANSCRIPT_UNITS = 4096
@@ -72,7 +75,7 @@ ATOMIC_STATE_TARGETS = frozenset({
     "active.json", "admission-sequence.json", "callback-actions.json", "closing.json",
     "enabled", "pending.json", "pending-voice-queue.json", "seen.json",
 })
-RESPONSE_CONTENT_STATES = frozenset({"reserved", "staged"})
+RESPONSE_CONTENT_STATES = frozenset({"reserved", "staged", "oversized"})
 RESPONSE_TERMINAL_STATES = frozenset({"pending", "rendering", "rendered"})
 RESPONSE_DELIVERY_STATES = frozenset({"pending", "delivery_unknown", "rejected", "sent"})
 _PROCESS_TOKENS: Dict[Path, str] = {}
@@ -822,6 +825,55 @@ def closing_path(home: Path) -> Path:
     return state_dir(home) / "closing.json"
 
 
+def split_telegram_response(body: bytes) -> List[Dict[str, Any]]:
+    text = body.decode("utf-8")
+    chunks = []
+    current = []
+    current_units = 0
+    offset = 0
+    for character in text:
+        units = unicode_text_units(character)
+        if units is None:
+            raise UnicodeError("response contains invalid Unicode")
+        if current and current_units + units > MAX_TELEGRAM_TEXT_UNITS:
+            chunk_body = "".join(current).encode("utf-8")
+            chunks.append({
+                "index": len(chunks),
+                "start": offset,
+                "end": offset + len(chunk_body),
+                "body_sha256": hashlib.sha256(chunk_body).hexdigest(),
+                "telegram_status": "pending",
+                "telegram_attempts": 0,
+            })
+            offset += len(chunk_body)
+            current = []
+            current_units = 0
+        current.append(character)
+        current_units += units
+    if current:
+        chunk_body = "".join(current).encode("utf-8")
+        chunks.append({
+            "index": len(chunks),
+            "start": offset,
+            "end": offset + len(chunk_body),
+            "body_sha256": hashlib.sha256(chunk_body).hexdigest(),
+            "telegram_status": "pending",
+            "telegram_attempts": 0,
+        })
+    return chunks
+
+
+def aggregate_response_delivery(chunks: List[Dict[str, Any]]) -> str:
+    statuses = [chunk.get("telegram_status") for chunk in chunks]
+    if statuses and all(status == "sent" for status in statuses):
+        return "sent"
+    if statuses and all(status in {"sent", "delivery_unknown"} for status in statuses):
+        return "delivery_unknown"
+    if "rejected" in statuses:
+        return "rejected"
+    return "pending"
+
+
 def response_record_locked(home: Path, response_id: str) -> Optional[Dict[str, Any]]:
     metadata_path, body_path = response_paths(home, response_id)
     record = read_json(metadata_path)
@@ -832,17 +884,27 @@ def response_record_locked(home: Path, response_id: str) -> Optional[Dict[str, A
     content_status = record.get("content_status")
     terminal_status = record.get("terminal_status")
     telegram_status = record.get("telegram_status")
+    chunks = record.get("chunks")
     if (not isinstance(claimed_request, str) or not safe_id(claimed_request)
             or not isinstance(conversation_id, str) or not safe_id(conversation_id)
             or not isinstance(record.get("final"), bool)
             or content_status not in RESPONSE_CONTENT_STATES
             or terminal_status not in RESPONSE_TERMINAL_STATES
             or telegram_status not in RESPONSE_DELIVERY_STATES
+            or not isinstance(chunks, list)
             or not strict_int(record.get("created_at"))
             or not body_path.is_file() or body_path.is_symlink()):
         raise TelegramError("Telegram response journal is malformed")
     if content_status == "reserved":
-        if terminal_status != "pending" or telegram_status != "pending":
+        if (terminal_status != "pending" or telegram_status != "pending"
+                or chunks):
+            raise TelegramError("Telegram response journal is malformed")
+        return record
+    if content_status == "oversized":
+        if (terminal_status != "pending" or telegram_status != "pending" or chunks
+                or body_path.stat().st_size != 0
+                or not strict_int(record.get("refused_bytes"))
+                or record["refused_bytes"] <= MAX_RESPONSE_BYTES):
             raise TelegramError("Telegram response journal is malformed")
         return record
     try:
@@ -851,7 +913,32 @@ def response_record_locked(home: Path, response_id: str) -> Optional[Dict[str, A
     except (OSError, UnicodeError) as exc:
         raise TelegramError("Telegram response journal is malformed") from exc
     if (not text.startswith(FIRSTMATE_REPLY_LABEL)
+            or len(body) > MAX_RESPONSE_BYTES
+            or not 0 < len(chunks) <= MAX_RESPONSE_CHUNKS
             or record.get("body_sha256") != hashlib.sha256(body).hexdigest()):
+        raise TelegramError("Telegram response journal is malformed")
+    offset = 0
+    for index, chunk in enumerate(chunks):
+        if (not isinstance(chunk, dict)
+                or chunk.get("index") != index
+                or chunk.get("start") != offset
+                or not strict_int(chunk.get("end"))
+                or chunk["end"] <= offset or chunk["end"] > len(body)
+                or chunk.get("telegram_status") not in RESPONSE_DELIVERY_STATES
+                or not strict_int(chunk.get("telegram_attempts"))
+                or chunk["telegram_attempts"] < 0):
+            raise TelegramError("Telegram response journal is malformed")
+        chunk_body = body[offset:chunk["end"]]
+        try:
+            chunk_text = chunk_body.decode("utf-8")
+        except UnicodeError as exc:
+            raise TelegramError("Telegram response journal is malformed") from exc
+        units = unicode_text_units(chunk_text)
+        if (not units or units > MAX_TELEGRAM_TEXT_UNITS
+                or chunk.get("body_sha256") != hashlib.sha256(chunk_body).hexdigest()):
+            raise TelegramError("Telegram response journal is malformed")
+        offset = chunk["end"]
+    if offset != len(body) or telegram_status != aggregate_response_delivery(chunks):
         raise TelegramError("Telegram response journal is malformed")
     return record
 
@@ -2688,6 +2775,7 @@ def response_reserve(home: Path, claimed_request: str, response_id: str,
             "terminal_status": "pending",
             "telegram_status": "pending",
             "telegram_attempts": 0,
+            "chunks": [],
         })
     print(str(body_path), flush=True)
     return 0
@@ -2705,14 +2793,34 @@ def response_stage(home: Path, claimed_request: str, response_id: str,
             return die("reserved Telegram response route was not found")
         if text_file == "-" or Path(text_file).expanduser().absolute() != body_path:
             return die("response staging must use its reserved private output file")
+        if existing.get("content_status") == "oversized":
+            return die(f"Telegram response exceeds the {MAX_RESPONSE_BYTES}-byte staging limit")
         try:
+            body_size = body_path.stat().st_size
+            if body_size > MAX_RESPONSE_BYTES:
+                atomic_bytes(body_path, b"")
+                existing["content_status"] = "oversized"
+                existing["refused_bytes"] = body_size
+                existing["refused_at"] = now()
+                atomic_json(metadata_path, existing)
+                return die(f"Telegram response exceeds the {MAX_RESPONSE_BYTES}-byte staging limit")
             body = body_path.read_bytes()
+            if len(body) > MAX_RESPONSE_BYTES:
+                atomic_bytes(body_path, b"")
+                existing["content_status"] = "oversized"
+                existing["refused_bytes"] = len(body)
+                existing["refused_at"] = now()
+                atomic_json(metadata_path, existing)
+                return die(f"Telegram response exceeds the {MAX_RESPONSE_BYTES}-byte staging limit")
             text = body.decode("utf-8")
+            chunks = split_telegram_response(body)
         except (OSError, UnicodeError) as exc:
             raise TelegramError("Telegram response output is not valid UTF-8") from exc
         if (not text.startswith(FIRSTMATE_REPLY_LABEL)
                 or unicode_text_units(text) is None):
             return die("Telegram response must be valid UTF-8 beginning with the static Firstmate label")
+        if not chunks or len(chunks) > MAX_RESPONSE_CHUNKS:
+            return die(f"Telegram response exceeds the {MAX_RESPONSE_CHUNKS}-chunk staging limit")
         if existing.get("content_status") == "staged":
             if existing.get("body_sha256") != hashlib.sha256(body).hexdigest():
                 return die("response identity is already bound to different content or route")
@@ -2721,6 +2829,7 @@ def response_stage(home: Path, claimed_request: str, response_id: str,
         atomic_bytes(body_path, body)
         existing["content_status"] = "staged"
         existing["body_sha256"] = hashlib.sha256(body).hexdigest()
+        existing["chunks"] = chunks
         existing["staged_at"] = now()
         atomic_json(metadata_path, existing)
     bounded_cleanup(home)
@@ -2820,7 +2929,6 @@ def reconcile_staged_final(home: Path, request_id: str) -> bool:
 
 
 def _send_staged_response_locked(home: Path, request_id: str, response_id: str) -> int:
-    config = load_config(home)
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
         record = response_record_locked(home, response_id)
@@ -2829,62 +2937,93 @@ def _send_staged_response_locked(home: Path, request_id: str, response_id: str) 
             return die("staged Telegram response does not match the conversation")
         if record["terminal_status"] == "pending":
             return die("staged Telegram response has not been rendered in the terminal")
-        metadata_path, body_path = response_paths(home, response_id)
         request_path_value = request_path(home, request_id)
         request = read_json(request_path_value) if request_path_value is not None else None
         if not isinstance(request, dict) or request.get("origin") != "telegram":
             return die("request is not a Telegram request")
-        telegram_status = str(record["telegram_status"])
-        if telegram_status == "delivery_unknown":
-            print("Telegram reply delivery remains unknown; not resent.")
-            return DELIVERY_UNKNOWN_EXIT
-        already_sent = telegram_status == "sent"
-        if not already_sent:
+        if record["telegram_status"] not in {"sent", "delivery_unknown"}:
             if active_request_id(home) != request_id:
                 return die("request is not the active Telegram conversation")
-            attempts = record.get("telegram_attempts", 0)
-            if not strict_int(attempts) or attempts < 0:
-                attempts = 0
-            record["telegram_attempts"] = attempts + 1
-            record["telegram_status"] = "delivery_unknown"
-            record["telegram_attempted_at"] = now()
-            atomic_json(metadata_path, record)
-            body = body_path.read_bytes().decode("utf-8")
-            chat_id = int(request["chat_id"])
-        else:
-            body = ""
-            chat_id = int(request["chat_id"])
-    if not already_sent:
+        chat_id = int(request["chat_id"])
+        final = bool(record["final"])
+        initially_settled = record["telegram_status"] in {"sent", "delivery_unknown"}
+    delivery_interrupted = False
+    while True:
+        with FileLock(state_lock(home)):
+            current = response_record_locked(home, response_id)
+            if current is None or current.get("content_status") != "staged":
+                raise TelegramError("Telegram response journal changed during delivery")
+            pending_index = None
+            for index, chunk in enumerate(current["chunks"]):
+                if chunk["telegram_status"] in {"pending", "rejected"}:
+                    pending_index = index
+                    break
+            if pending_index is None:
+                delivery_status = str(current["telegram_status"])
+                break
+            if delivery_interrupted:
+                delivery_status = str(current["telegram_status"])
+                break
+            metadata_path, body_path = response_paths(home, response_id)
+            chunk = current["chunks"][pending_index]
+            chunk["telegram_attempts"] += 1
+            chunk["telegram_status"] = "delivery_unknown"
+            chunk["telegram_attempted_at"] = now()
+            current["telegram_status"] = aggregate_response_delivery(current["chunks"])
+            atomic_json(metadata_path, current)
+            chunk_text = body_path.read_bytes()[chunk["start"]:chunk["end"]].decode("utf-8")
         try:
-            send_text(home, chat_id, body)
+            send_text(home, chat_id, chunk_text)
         except TelegramError as exc:
-            if not exc.delivery_unknown:
-                with FileLock(state_lock(home)):
-                    current = response_record_locked(home, response_id)
-                    if (current is not None
-                            and current.get("telegram_status") == "delivery_unknown"):
-                        metadata_path, _body_path = response_paths(home, response_id)
-                        current["telegram_status"] = "rejected"
-                        current["telegram_rejected_at"] = now()
+            if exc.delivery_unknown:
+                delivery_interrupted = True
+                continue
+            with FileLock(state_lock(home)):
+                current = response_record_locked(home, response_id)
+                if current is not None:
+                    metadata_path, _body_path = response_paths(home, response_id)
+                    chunk = current["chunks"][pending_index]
+                    if chunk["telegram_status"] == "delivery_unknown":
+                        chunk["telegram_status"] = "rejected"
+                        chunk["telegram_rejected_at"] = now()
+                        current["telegram_status"] = aggregate_response_delivery(current["chunks"])
                         atomic_json(metadata_path, current)
             raise
         with FileLock(state_lock(home)):
             current = response_record_locked(home, response_id)
-            if current is None or current.get("telegram_status") != "delivery_unknown":
+            if current is None:
                 raise TelegramError("Telegram response journal changed during delivery")
             metadata_path, _body_path = response_paths(home, response_id)
-            current["telegram_status"] = "sent"
-            current["telegram_sent_at"] = now()
+            chunk = current["chunks"][pending_index]
+            if chunk["telegram_status"] != "delivery_unknown":
+                raise TelegramError("Telegram response journal changed during delivery")
+            chunk["telegram_status"] = "sent"
+            chunk["telegram_sent_at"] = now()
+            current["telegram_status"] = aggregate_response_delivery(current["chunks"])
             atomic_json(metadata_path, current)
-    if record["final"]:
+    settled = delivery_status in {"sent", "delivery_unknown"}
+    if settled and final:
         continuations_pending = reconcile_staged_final(home, request_id)
-        status = "already sent" if already_sent else "sent"
+    else:
+        continuations_pending = False
+    if delivery_status == "delivery_unknown":
+        if final and continuations_pending:
+            print("Telegram final reply delivery unknown; continuation handling remains pending.")
+        elif final:
+            print("Telegram final reply delivery unknown; settled chunks were not resent.")
+        else:
+            print("Telegram reply delivery unknown; settled chunks were not resent.")
+        return DELIVERY_UNKNOWN_EXIT
+    if not settled:
+        print("Telegram reply delivery is incomplete; settled chunks were not resent.")
+        return DELIVERY_UNKNOWN_EXIT
+    status = "already sent" if initially_settled else "sent"
+    if final:
         if continuations_pending:
             print(f"Telegram final reply {status}; continuation handling remains pending.")
             return FINAL_CONTINUATION_PENDING_EXIT
         print(f"Telegram final reply {status}.")
         return 0
-    status = "already sent" if already_sent else "sent"
     print(f"Telegram reply {status}.")
     return 0
 
@@ -3195,7 +3334,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
         epilog=("Commands: pair, serve, request-read, request-handled, request-bind, request-routed, active-request, continuation-handled, response-reserve, response-stage, response-status, response-render, send, reply, install, start, stop, status, disable, cleanup.\n"
-                "Retention limits: 256 queued requests for 7 days, 4096 handled requests, and 256 staged responses.\n"
+                "Retention limits: 256 queued requests for 7 days, 4096 handled requests, and 256 responses of up to 256 KiB or 64 Telegram chunks each.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
                 "Voice limits: 10 MiB, 120 seconds, a 4096-unit transcript, and 64 waiting notes. Temporary audio is restricted to /dev/shm.\n"
                 "Pairing accepts --parakeet-command and --whisper-command as absolute executable paths; configured paths must be regular executable files.\n"

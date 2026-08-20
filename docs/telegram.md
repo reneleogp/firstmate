@@ -68,8 +68,11 @@ Raw Telegram text and audio never enter wake records, status logs, shell argumen
 The authenticated request body is visible in the primary's terminal with the static `Bot · ` origin label while its origin binding and ordered conversation route remain durable across interruption.
 Ordinary Unicode and line breaks remain readable, while terminal, format, and bidi controls appear as visible Unicode escapes.
 Responses generated for Telegram-originated work are staged in a bounded private response journal before rendering or delivery.
-The journal binds one stable wake response identity to the claimed conversation route, exact `Firstmate · ` labeled file, terminal-render state, and independent Telegram delivery state.
-The staged file is shown at most once in the terminal and its exact bytes are delivered to Telegram; replay resumes the same file without regeneration or redisplay, and a delivery-unknown response is not blindly resent.
+Each canonical labeled response is limited to 256 KiB and 64 Telegram messages, and staging refuses a larger response before it can be rendered or sent.
+The journal binds one stable wake response identity to the claimed conversation route, exact `Firstmate · ` labeled file, terminal-render state, and independent per-chunk Telegram delivery state.
+The staged file is shown at most once in the terminal and is split at Unicode-safe boundaries of at most 4096 UTF-16 units for Telegram.
+Concatenating those Telegram chunks reproduces the exact terminal bytes; replay resumes the same file without regeneration or redisplay and sends only pending chunks, never chunks with sent or delivery-unknown evidence.
+A final conversation or continuation route is released only after every chunk is sent or explicitly delivery-unknown, and delivery uncertainty remains visible for escalation.
 Requests originating in the terminal remain terminal-only and are never mirrored to Telegram.
 Pinned replies to the active conversation return to the same work in order.
 A final response may be delivered while continuations are already queued, but the conversation is released only after those continuations are delivered.

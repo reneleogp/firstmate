@@ -45,13 +45,16 @@ Before invoking the model, run `bin/fm-telegram.py response-status <claimed-requ
 When no record exists, run `bin/fm-telegram.py response-reserve <claimed-request-id> <response-id>`, adding `--final` only for the terminal outcome, before invoking the model.
 Write the generated response once to the exact private path returned by reservation, beginning with the static `Firstmate · ` label, and stage that same path atomically with `bin/fm-telegram.py response-stage <claimed-request-id> <response-id> --text-file <reserved-path>` and the matching final flag.
 A replay of a reserved response stages its nonempty output without invoking the model, while an interruption that left the reserved file empty may complete inference into that same file because inference itself has no external idempotency guarantee.
+Staging rejects a response above the documented finite response limit before terminal rendering or Telegram delivery, and an oversized identity remains a deterministic local error rather than being regenerated.
 A staged response is immutable and must never be regenerated.
 Use the private file returned by reservation, staging, or status as the sole response body.
 Run `bin/fm-telegram.py response-render <claimed-request-id> <response-id>` to display it in the terminal; the command records rendering before output and emits no body when replay finds rendering already started or completed.
 Deliver it with `bin/fm-telegram.py reply <conversation-id> --response-id <response-id>`.
-The reply command is transport-only: it sends the staged file unchanged and prints status without response content, including on idempotent replay.
-Reply exit status 3 means delivery is unknown and must be escalated rather than resent; never regenerate, redisplay, or blindly resend that response.
-For a staged final outcome, reply exit status 0 clears the binding and wakes the next queued Telegram request, while status 2 means the final reply was delivered but queued continuations must be routed and acknowledged before the active work can be released.
+The reply command is transport-only: it deterministically splits the already-staged canonical file at Unicode-safe Telegram boundaries, journals delivery independently for every chunk, sends no settled chunk twice, and prints status without response content.
+Concatenating the chunks yields the exact staged bytes shown in the terminal.
+Reply exit status 3 means at least one chunk has delivery-unknown evidence and must be escalated; replay may send only chunks that remain pending, but must never regenerate, redisplay, or resend a sent or delivery-unknown chunk.
+Do not release a final or acknowledge a continuation while reply reports incomplete delivery; once every chunk is sent or delivery-unknown, preserve the uncertainty escalation and acknowledge a continuation in admission order.
+For a staged final outcome, reply exit status 0 clears the binding and wakes the next queued Telegram request, while status 2 means every chunk was delivered but queued continuations must be routed and acknowledged before the active work can be released.
 Do not send routine progress or milestone chatter.
 Use a short plain outcome and keep private paths, secrets, internal identifiers, and unrelated fleet details out of the reply.
 Read reply text from a file or standard input rather than putting untrusted text in shell arguments.
