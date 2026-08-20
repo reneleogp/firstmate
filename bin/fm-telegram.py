@@ -1167,6 +1167,8 @@ def cleanup_response_journal_locked(home: Path, reserve_slots: int = 0) -> None:
             durable_unlink(root / f"{metadata_path.stem}.txt")
             continue
         body_path = root / f"{metadata_path.stem}.txt"
+        if record["content_status"] == "oversized" and body_path.stat().st_size:
+            atomic_bytes(body_path, b"")
         referenced_bodies.add(body_path.name)
         records.append((int(record["created_at"]), metadata_path, body_path, record))
     for body_path in root.glob("*.txt"):

@@ -1399,6 +1399,12 @@ response_oversize_crash_state=$(run_tg "$response_crash_home" response-status \
 [ "$response_oversize_crash_state" = \
   "$(printf '%s\toversized\tpending\tpending\tnon-final' "$response_oversize_crash_path")" ] || \
   fail "interrupted oversized refusal was not durably recoverable"
+run_tg "$response_crash_home" serve --once >/dev/null
+[ ! -s "$response_oversize_crash_path" ] || \
+  fail "startup cleanup retained oversized response bytes after durable refusal"
+[ "$(run_tg "$response_crash_home" response-status "$response_crash_request" \
+  wake-response-oversized-crash)" = "$response_oversize_crash_state" ] || \
+  fail "startup cleanup changed oversized refusal identity or evidence"
 if run_tg "$response_crash_home" response-stage "$response_crash_request" \
     wake-response-oversized-crash --text-file "$response_oversize_crash_path" \
     >/dev/null 2>"$response_crash_home/oversized-crash-replay.err"; then
