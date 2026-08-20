@@ -66,6 +66,7 @@ If the service loses a response or stops after Telegram accepts an Edit prompt o
 For terminal delivery, the service writes a private request record and a safe wake containing only its local request identifier.
 Raw Telegram text and audio never enter wake records, status logs, shell arguments, unit files, diagnostics, or tracked files.
 The authenticated request body is visible in the primary's terminal with the static `Bot · ` origin label while its origin binding and ordered conversation route remain durable across interruption.
+Ordinary Unicode and line breaks remain readable, while terminal, format, and bidi controls appear as visible Unicode escapes.
 Responses generated for Telegram-originated work are staged in a bounded private response journal before rendering or delivery.
 The journal binds one stable wake response identity to the claimed conversation route, exact `Firstmate · ` labeled file, terminal-render state, and independent Telegram delivery state.
 The staged file is shown at most once in the terminal and its exact bytes are delivered to Telegram; replay resumes the same file without regeneration or redisplay, and a delivery-unknown response is not blindly resent.
