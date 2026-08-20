@@ -906,6 +906,8 @@ def response_record_locked(home: Path, response_id: str) -> Optional[Dict[str, A
             or terminal_status not in RESPONSE_TERMINAL_STATES
             or telegram_status not in RESPONSE_DELIVERY_STATES
             or not isinstance(chunks, list)
+            or not strict_int(record.get("terminal_attempts", 0))
+            or record.get("terminal_attempts", 0) < 0
             or not strict_int(record.get("created_at"))
             or not body_path.is_file() or body_path.is_symlink()):
         raise TelegramError("Telegram response journal is malformed")
@@ -1141,7 +1143,7 @@ def cleanup_atomic_temps_locked(home: Path) -> None:
 
 def response_completed(record: Dict[str, Any]) -> bool:
     return (record.get("content_status") == "staged"
-            and record.get("terminal_status") in {"rendering", "rendered"}
+            and record.get("terminal_status") == "rendered"
             and record.get("telegram_status") == "sent")
 
 
@@ -2832,6 +2834,7 @@ def response_reserve(home: Path, claimed_request: str, response_id: str,
             "content_status": "reserved",
             "created_at": now(),
             "terminal_status": "pending",
+            "terminal_attempts": 0,
             "telegram_status": "pending",
             "telegram_attempts": 0,
             "chunks": [],
@@ -2930,24 +2933,35 @@ def response_render(home: Path, claimed_request: str, response_id: str) -> int:
             if (record is None or record.get("claimed_request_id") != claimed_request
                     or record.get("content_status") != "staged"):
                 return die("staged Telegram response not found")
-            if record["terminal_status"] != "pending":
+            if record["terminal_status"] == "rendered":
                 return 0
             metadata_path, body_path = response_paths(home, response_id)
             record["terminal_status"] = "rendering"
+            record["terminal_attempts"] = record.get("terminal_attempts", 0) + 1
             record["terminal_attempted_at"] = now()
             atomic_json(metadata_path, record)
             body = body_path.read_bytes()
         sys.stdout.buffer.write(body)
         sys.stdout.buffer.flush()
+    return 0
+
+
+def response_rendered(home: Path, claimed_request: str, response_id: str) -> int:
+    with FileLock(lifecycle_lock(home)):
         with FileLock(state_lock(home)):
-            current = response_record_locked(home, response_id)
-            if (current is not None
-                    and current.get("claimed_request_id") == claimed_request
-                    and current.get("terminal_status") == "rendering"):
-                metadata_path, _body_path = response_paths(home, response_id)
-                current["terminal_status"] = "rendered"
-                current["terminal_rendered_at"] = now()
-                atomic_json(metadata_path, current)
+            require_state_available_locked(home)
+            record = response_record_locked(home, response_id)
+            if (record is None or record.get("claimed_request_id") != claimed_request
+                    or record.get("content_status") != "staged"):
+                return die("staged Telegram response not found")
+            if record["terminal_status"] == "rendered":
+                return 0
+            if record["terminal_status"] != "rendering":
+                return die("Telegram response rendering has not started")
+            metadata_path, _body_path = response_paths(home, response_id)
+            record["terminal_status"] = "rendered"
+            record["terminal_rendered_at"] = now()
+            atomic_json(metadata_path, record)
     return 0
 
 
@@ -3007,8 +3021,8 @@ def _send_staged_response_locked(home: Path, request_id: str, response_id: str) 
         if (record is None or record.get("conversation_id") != request_id
                 or record.get("content_status") != "staged"):
             return die("staged Telegram response does not match the conversation")
-        if record["terminal_status"] == "pending":
-            return die("staged Telegram response has not been rendered in the terminal")
+        if record["terminal_status"] != "rendered":
+            return die("staged Telegram response rendering is not acknowledged")
         request_path_value = request_path(home, request_id)
         request = read_json(request_path_value) if request_path_value is not None else None
         if not isinstance(request, dict) or request.get("origin") != "telegram":
@@ -3405,7 +3419,7 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, request-read, request-handled, request-bind, request-routed, active-request, continuation-handled, response-reserve, response-stage, response-status, response-render, send, reply, install, start, stop, status, disable, cleanup.\n"
+        epilog=("Commands: pair, serve, request-read, request-handled, request-bind, request-routed, active-request, continuation-handled, response-reserve, response-stage, response-status, response-render, response-rendered, send, reply, install, start, stop, status, disable, cleanup.\n"
                 "Retention limits: 256 queued requests for 7 days, 4096 handled requests, and 256 responses of up to 256 KiB or 64 Telegram chunks each.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
                 "Voice limits: 10 MiB, 120 seconds, a 4096-unit transcript, and 64 waiting notes. Temporary audio is restricted to /dev/shm.\n"
@@ -3502,11 +3516,17 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("claimed_request_id")
     status_parser.add_argument("response_id")
     render_parser = sub.add_parser(
-        "response-render", help="render staged response bytes at most once"
+        "response-render", help="attempt to render staged response bytes"
     )
     add_home(render_parser)
     render_parser.add_argument("claimed_request_id")
     render_parser.add_argument("response_id")
+    rendered_parser = sub.add_parser(
+        "response-rendered", help="acknowledge a successful terminal render"
+    )
+    add_home(rendered_parser)
+    rendered_parser.add_argument("claimed_request_id")
+    rendered_parser.add_argument("response_id")
     send_parser = sub.add_parser("send", help="send to the paired private chat")
     add_home(send_parser)
     send_parser.add_argument("--text-file", required=True, help="UTF-8 text file, or - for stdin")
@@ -3573,6 +3593,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return response_status(home, args.claimed_request_id, args.response_id)
         if args.command == "response-render":
             return response_render(home, args.claimed_request_id, args.response_id)
+        if args.command == "response-rendered":
+            return response_rendered(home, args.claimed_request_id, args.response_id)
         if args.command == "send":
             return send_command(home, text_from_file(args.text_file))
         if args.command == "reply":

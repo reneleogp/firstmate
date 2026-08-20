@@ -49,8 +49,11 @@ A replay of a reserved response stages its nonempty output without invoking the 
 Staging rejects a response above the documented finite response limit before terminal rendering or Telegram delivery, and an oversized identity remains a deterministic local error rather than being regenerated.
 A staged response is immutable and must never be regenerated.
 Use the private file returned by reservation, staging, or status as the sole response body.
-Run `bin/fm-telegram.py response-render <claimed-request-id> <response-id>` to display it in the terminal; the command records rendering before output and emits no body when replay finds rendering already started or completed.
-Deliver it with `bin/fm-telegram.py reply <conversation-id> --response-id <response-id>`.
+Run `bin/fm-telegram.py response-render <claimed-request-id> <response-id>` to display only the already-staged bytes in the terminal.
+After that renderer exits successfully, run `bin/fm-telegram.py response-rendered <claimed-request-id> <response-id>` to acknowledge the complete terminal render, then deliver it with `bin/fm-telegram.py reply <conversation-id> --response-id <response-id>`.
+Reply fails closed until that separate render acknowledgement is durable.
+If rendering is interrupted or its output pipe breaks, do not acknowledge it; replay `response-render` to emit the same staged bytes without model invocation, then acknowledge only a successful complete attempt.
+A replay after acknowledgement emits no body, while a replay before acknowledgement may duplicate a partial terminal prefix but must always complete the same canonical body before Telegram delivery.
 The reply command is transport-only: it deterministically splits the already-staged canonical file at Unicode-safe Telegram boundaries, journals delivery independently for every chunk, sends no settled chunk twice, and prints status without response content.
 Concatenating the chunks yields the exact staged bytes shown in the terminal.
 Reply exit status 3 means at least one chunk has delivery-unknown evidence and must be escalated; replay may send only chunks that remain pending, but must never regenerate, redisplay, or resend a sent or delivery-unknown chunk.

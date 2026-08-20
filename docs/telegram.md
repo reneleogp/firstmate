@@ -70,8 +70,9 @@ Ordinary Unicode and line breaks remain readable, while terminal, format, and bi
 Responses generated for Telegram-originated work are staged in a bounded private response journal before rendering or delivery.
 Each canonical labeled response is limited to 256 KiB and 64 Telegram messages, and staging refuses a larger response before it can be rendered or sent.
 The journal binds one stable wake response identity to the claimed conversation route, exact `Firstmate · ` labeled file, terminal-render state, and independent per-chunk Telegram delivery state.
-The staged file is shown at most once in the terminal and is split at Unicode-safe boundaries of at most 4096 UTF-16 units for Telegram.
-Concatenating those Telegram chunks reproduces the exact terminal bytes; replay resumes the same file without regeneration or redisplay and sends only pending chunks, never chunks with sent or delivery-unknown evidence.
+The staged file is rendered from one stable identity and is split at Unicode-safe boundaries of at most 4096 UTF-16 units for Telegram.
+Telegram delivery remains blocked until a complete terminal render is separately acknowledged; interruption replays the same staged bytes without regeneration, with only a partial terminal prefix potentially duplicated at the local output boundary.
+Concatenating the Telegram chunks reproduces the exact acknowledged terminal bytes; delivery replay sends only pending chunks, never chunks with sent or delivery-unknown evidence.
 A final conversation or continuation route is released only after every chunk is sent or explicitly delivery-unknown, and delivery uncertainty remains visible for escalation.
 Requests originating in the terminal remain terminal-only and are never mirrored to Telegram.
 Pinned replies to the active conversation return to the same work in order.
