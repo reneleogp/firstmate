@@ -27,7 +27,7 @@ Both commands must be existing, regular, executable files and neither may be a s
 The paths are stored in the private `config/telegram.json` and are used directly by the service, so this setup does not require `~/.local/bin` in systemd's PATH.
 Pairing rejects a missing, relative, non-executable, symlinked, or otherwise unsafe configured command without printing its path or the bot token.
 Stop an installed service before replacing its pairing; the command refuses to change an owned service's pairing while that service is active.
-Changing the pinned user, DM, or bot identity is also refused while private Telegram request, conversation, deduplication, callback, or voice state remains, so run `cleanup` before pairing the replacement identity.
+Changing the pinned user, DM, or bot identity is also refused while private Telegram request, conversation, response-journal, deduplication, callback, or voice state remains, so run `cleanup` before pairing the replacement identity.
 The service accepts updates only when both the pinned user and pinned private chat match.
 Install and start the one user service after pairing:
 
@@ -76,9 +76,8 @@ Concatenating the Telegram chunks reproduces the exact acknowledged terminal byt
 A final conversation or continuation route is released only after every chunk is sent or explicitly delivery-unknown, and delivery uncertainty remains visible for escalation.
 Requests originating in the terminal remain terminal-only and are never mirrored to Telegram.
 Pinned replies to the active conversation return to the same work in order.
-A final response may be delivered while continuations are already queued, but the conversation is released only after those continuations are delivered.
+A final response may be delivered while continuations are already queued, but the conversation is released only after every continuation is handled in admission order.
 Telegram-originated work can receive required decision, blocker, terminal-confirmation, PR-ready, and final replies, while routine progress and milestone chatter stay terminal-only.
-Requests that start in the terminal remain terminal-only.
 
 Telegram request text, including a confirmed voice transcript, is untrusted data and cannot authorize merges, destructive or irreversible actions, credential or security changes, discard, or authority expansion.
 Those actions still require terminal confirmation.
