@@ -1,0 +1,48 @@
+usage: fm-telegram.py [-h] [--home HOME]
+                      {pair,serve,migrate-wakes,mirror-open,mirror-mode,mirror-next,mirror-claim,mirror-read,mirror-delivered,mirror-release,mirror-hold,mirror-recover,mirror-validate,mirror-reserve,mirror-cancel,mirror-reply,mirror-abandon,mirror-complete,mirror-reconcile,install,start,stop,status,disable,cleanup} ...
+
+Private one-home Telegram transport for Firstmate.
+
+positional arguments:
+  {pair,serve,migrate-wakes,mirror-open,mirror-mode,mirror-next,mirror-claim,mirror-read,mirror-delivered,mirror-release,mirror-hold,mirror-recover,mirror-validate,mirror-reserve,mirror-cancel,mirror-reply,mirror-abandon,mirror-complete,mirror-reconcile,install,start,stop,status,disable,cleanup}
+    pair                verify and save one private pairing while its service
+                        is inactive
+    serve               run the outbound Bot API long-poll service
+    migrate-wakes       retire obsolete Telegram wake rows without reading
+                        request content
+    mirror-open         open the lock owner's private extension capability
+    mirror-mode         read or set the private Telegram mirror preference
+    mirror-next         print the next queued mirror request id
+    mirror-claim        claim one queued request for this Pi process
+    mirror-read         print one request owned by this Pi process
+    mirror-delivered    send the zero-token Pi delivery receipt
+    mirror-release      return a failed live claim to the queue
+    mirror-hold         hold one interrupted admission without retrying it
+    mirror-recover      explicitly requeue one held interrupted admission
+    mirror-validate     validate one delivery body without reserving it
+    mirror-reserve      reserve one bounded live terminal delivery
+    mirror-cancel       cancel one unaccepted terminal delivery reservation
+    mirror-reply        deliver one stable finalized assistant body
+    mirror-abandon      finish an admitted request whose response cannot be
+                        delivered
+    mirror-complete     complete a request after settled delivery
+    mirror-reconcile    requeue claims after process or session replacement
+    install             install and start the user service
+    start               start the user service
+    stop                stop the user service
+    status              show user service status
+    disable             disable the user service
+    cleanup             remove this service and private state
+
+options:
+  -h, --help            show this help message and exit
+  --home HOME           the one Firstmate home to use
+
+Commands: pair, serve, migrate-wakes, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-hold, mirror-recover, mirror-validate, mirror-reserve, mirror-cancel, mirror-reply, mirror-abandon, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.
+Private mirror commands require the lock-owning extension capability on an inherited file descriptor.
+Retention limits: 256 queued or interrupted requests for 7 days, 4096 handled requests, and 256 mirror deliveries; unprotected mirror deliveries expire after 7 days and each is at most 256 KiB or 64 Telegram chunks.
+Receipt delivery makes at most 3 attempts with bounded backoff.
+Voice limits: 10 MiB, 120 seconds, a 4096-unit transcript, 64 waiting notes for 7 days, and one active confirmation for 10 minutes. Temporary audio uses /dev/shm on Linux and a private per-user macOS temporary root.
+Pairing accepts --parakeet-command and --whisper-command as absolute executable paths, plus optional --ffmpeg-command; configured paths must be regular executable files.
+FM_TELEGRAM_PARAKEET_CMD, FM_TELEGRAM_WHISPER_CMD, and FM_TELEGRAM_FFMPEG_CMD override local transcription commands for one process.
+Mirror delivery reads UTF-8 from --text-file and accepts no recipient argument.

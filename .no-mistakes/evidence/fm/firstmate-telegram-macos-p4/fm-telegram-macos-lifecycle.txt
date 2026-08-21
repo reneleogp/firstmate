@@ -1,0 +1,20 @@
+Telegram service installed and active.
+gui/1000/com.reneleogp.firstmate.telegram = {
+path = /tmp/fm-telegram-macos.wuKuZD/LaunchAgents/com.reneleogp.firstmate.telegram.plist
+state = running
+pid = 3970935
+}
+Telegram service installed and active.
+Telegram service stopped.
+Telegram service active.
+Telegram service disabled.
+Telegram service installed and active.
+Telegram service disabled.
+Telegram service installed and active.
+Telegram service disabled.
+Telegram service installed and active.
+Telegram service disabled.
+fm-telegram: Telegram LaunchAgent belongs to another home or installation
+foreign unit preserved: {"active": true, "disabled": true, "loaded": true, "path": "/other/foreign.plist"}
+Telegram service and private Telegram state cleaned up.
+ok - macOS LaunchAgent lifecycle, ownership, plist privacy, secure audio, conversion, and cleanup

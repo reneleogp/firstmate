@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "<stdin>", line 3, in <module>
+AssertionError
+not ok - foreign loaded label was mutated
+pre-fix exit=1
