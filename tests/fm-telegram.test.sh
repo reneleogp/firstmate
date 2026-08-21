@@ -43,6 +43,11 @@ class Handler(BaseHTTPRequestHandler):
             updates = json.loads((home / 'updates.json').read_text())
             (home / 'updates.json').write_text('[]')
             return self.reply(updates)
+        if method == 'sendMessage' and (home / 'reject-send').exists():
+            (home / 'reject-send').unlink()
+            body = json.dumps({'ok': False, 'error_code': 400}).encode()
+            self.send_response(200); self.send_header('Content-Length', str(len(body)))
+            self.end_headers(); self.wfile.write(body); return
         return self.reply({})
     def do_GET(self):
         if '/file/' in self.path:
@@ -92,6 +97,9 @@ set_updates '[{"update_id":3,"message":{"message_id":3,"date":1,"from":{"id":77}
 run_tg "$home" serve --once >/dev/null
 request="$home/state/telegram/inbox/tg-text-u3-m3.json"
 [ -f "$request" ] || fail "mode-on text was not durably queued"
+if [ -f "$home/state/.wake-queue" ] && grep -q $'\ttelegram:' "$home/state/.wake-queue"; then
+  fail "mode-on admission published an obsolete model wake"
+fi
 python3 - "$request" <<'PY'
 import json, sys
 assert json.load(open(sys.argv[1]))['text'] == 'hello from Telegram'
@@ -133,4 +141,75 @@ PY
 set_updates '[{"update_id":5,"message":{"message_id":5,"date":1,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"/telegram off"}}]' "$home"
 run_tg "$home" serve --once >/dev/null
 [ "$(cat "$home/config/telegram-mirror")" = off ] || fail "bot /telegram off did not persist mode"
-pass "Telegram pairing, mode-off refusal, exact mode commands, queueing, deduplication, and voice progress behavior"
+
+# A stale voice Send button cannot admit content after mode is turned off, while Cancel still cleans it up.
+set_updates '[{"update_id":6,"callback_query":{"id":"callback-send","from":{"id":77},"message":{"message_id":40,"date":1,"chat":{"id":77,"type":"private"},"text":"confirmed voice text"},"data":"send:voice-u4-m4:1"}}]' "$home"
+run_tg "$home" serve --once >/dev/null
+[ ! -e "$home/state/telegram/inbox/tg-voice-u4-m4.json" ] || fail "mode-off voice callback admitted content"
+[ -e "$home/state/telegram/pending.json" ] || fail "mode-off refusal removed the pending voice cleanup control"
+set_updates '[{"update_id":7,"callback_query":{"id":"callback-cancel","from":{"id":77},"message":{"message_id":40,"date":1,"chat":{"id":77,"type":"private"},"text":"confirmed voice text"},"data":"cancel:voice-u4-m4:1"}}]' "$home"
+run_tg "$home" serve --once >/dev/null
+[ ! -e "$home/state/telegram/pending.json" ] || fail "mode-off Cancel did not clean up pending voice state"
+
+# The real mirror delivery interface chunks Unicode safely, retries definite rejection, and completes only sent requests.
+owner_script="$TMP_ROOT/mirror-owner.py"
+cat >"$owner_script" <<'PY'
+import json, os, subprocess, sys, time
+script, home, base = sys.argv[1:]
+owner = str(os.getpid())
+def run(*args, api=base):
+    return subprocess.run([script, '--home', home, '--test-api-base', api, *args], text=True, capture_output=True)
+request = 'tg-text-u3-m3'
+assert run('mirror-reconcile', '--owner-pid', owner).returncode == 0
+assert run('mirror-claim', request, '--owner-pid', owner).returncode == 0
+body = 'Firstmate · ' + ('😀' * 3000)
+body_path = os.path.join(home, 'long-reply.txt')
+open(body_path, 'w').write(body)
+open(os.path.join(home, 'reject-send'), 'w').close()
+first = run('mirror-reply', 'delivery-long', '--owner-pid', owner, '--text-file', body_path)
+assert first.returncode == 1, first.stderr
+second = run('mirror-reply', 'delivery-long', '--owner-pid', owner, '--text-file', body_path)
+assert second.returncode == 0, second.stderr
+complete = run('mirror-complete', request, 'delivery-long', '--owner-pid', owner)
+assert complete.returncode == 0, complete.stderr
+delivery_root = os.path.join(home, 'state', 'telegram', 'deliveries')
+for index in range(260):
+    delivery_id = f'retained-{index}'
+    text = f'retained {index}'
+    open(os.path.join(delivery_root, delivery_id + '.txt'), 'w').write(text)
+    json.dump({'delivery_id': delivery_id, 'sha256': __import__('hashlib').sha256(text.encode()).hexdigest(),
+               'status': 'sent', 'created_at': int(time.time()), 'chunks': []},
+              open(os.path.join(delivery_root, delivery_id + '.json'), 'w'))
+unknown_path = os.path.join(home, 'unknown-reply.txt')
+open(unknown_path, 'w').write('You · Terminal\n\nuncertain')
+unknown = run('mirror-reply', 'delivery-unknown', '--owner-pid', owner,
+              '--text-file', unknown_path, api='http://127.0.0.1:1')
+assert unknown.returncode == 3, unknown.stderr
+again = run('mirror-reply', 'delivery-unknown', '--owner-pid', owner,
+            '--text-file', unknown_path)
+assert again.returncode == 3, again.stderr
+assert len([name for name in os.listdir(delivery_root) if name.endswith('.json')]) <= 256
+PY
+base="http://127.0.0.1:$(cat "$home/port")"
+"$PYTHON" "$owner_script" "$SCRIPT" "$home" "$base" || fail "mirror delivery settlement interface failed"
+[ ! -e "$home/state/telegram/inbox/tg-text-u3-m3.json" ] || fail "completed request remained queued"
+[ -e "$home/state/telegram/handled/tg-text-u3-m3.json" ] || fail "completed request identity was not retained"
+python3 - "$home/calls.jsonl" "$home/long-reply.txt" <<'PY'
+import json, sys
+calls = [json.loads(line) for line in open(sys.argv[1])]
+body = open(sys.argv[2]).read()
+chunks = [call['params']['text'] for call in calls if call['path'].endswith('/sendMessage') and call['params']['text'].startswith(('Firstmate · ', '😀'))]
+assert len(chunks) == 3
+assert ''.join(chunks[1:]) == body
+assert all(len(chunk.encode('utf-16-le')) // 2 <= 4096 for chunk in chunks)
+PY
+
+# One-time migration consumes legacy Telegram wakes without publishing replacements.
+rm -f "$home/state/telegram/.mirror-migration-v2"
+printf '1\t1\tcheck\ttelegram:legacy-request\ttelegram legacy-request\n' >"$home/state/.wake-queue"
+run_tg "$home" mirror-reconcile >/dev/null
+if grep -q $'\ttelegram:' "$home/state/.wake-queue"; then
+  fail "legacy Telegram wake survived mirror migration"
+fi
+
+pass "Telegram mode, queue, voice, chunked delivery, completion, uncertainty, and migration behavior"

@@ -46,6 +46,8 @@ Turn mode off whenever content should remain local.
 `Bot · Transcribing…` is sent only when that exact voice note starts local transcription.
 These statuses are zero-token transport messages and do not enter the conversation.
 Stable request and message identities prevent ordinary duplicate injection and delivery within one live process.
+A request moves to bounded handled state only after every Unicode-safe Telegram chunk of its assistant response is definitively sent.
+Definite Telegram rejection is retried at most three times, while delivery-unknown state is not resent or marked complete automatically.
 Startup, reload, session replacement, and a bounded rescan reconcile missed notifications.
 Terminal mirroring is live-only and never replays historical messages after startup, resume, clone, or retention expiry.
 
@@ -61,7 +63,7 @@ The Bot API delivery-unknown window can also repeat a transport message after Te
 
 Only authenticated private text and voice notes are accepted.
 Voice notes are downloaded only after pin verification, transcribed locally, and require explicit confirmation before admission.
-Queued requests, handled identities, voice confirmations, and delivery records are bounded and retained only for the documented transport windows.
+Queued requests, handled identities, voice confirmations, and paired delivery metadata and body records are bounded and retained only for the documented transport windows.
 The executable's `--help` output owns exact numeric limits, service paths, and transcriber overrides.
 
 ## Migration and follow-up work
