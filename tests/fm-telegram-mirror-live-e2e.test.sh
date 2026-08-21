@@ -22,8 +22,8 @@ agent_dir="$TMP_ROOT/agent"
 session_dir="$TMP_ROOT/sessions"
 override_config="$TMP_ROOT/override-config"
 mkdir -p "$home/config" "$home/state" "$agent_dir" "$session_dir" "$override_config"
-printf 'off\n' >"$home/config/telegram-mirror"
-printf 'on\n' >"$override_config/telegram-mirror"
+printf 'on\n' >"$home/config/telegram-mirror"
+printf 'off\n' >"$override_config/telegram-mirror"
 touch "$home/state/.lock" "$home/state/.primary"
 
 cat >"$TMP_ROOT/lock-lib.sh" <<'SH'
@@ -60,7 +60,7 @@ def option(name):
 def options(name):
     return [rest[index + 1] for index, value in enumerate(rest[:-1]) if value == name]
 def mode_path():
-    return Path(os.environ.get('FM_CONFIG_OVERRIDE', home / 'config')) / 'telegram-mirror'
+    return home / 'config' / 'telegram-mirror'
 code = 0
 skip_final_save = False
 if command == 'mirror-open':
@@ -122,6 +122,8 @@ elif command == 'mirror-reply':
     delivery_id = rest[0]
     body = sys.stdin.read() if option('--text-file') == '-' else Path(option('--text-file')).read_text()
     if (home / 'reject-mirror-reply').exists(): code = 1
+    if (home / 'reject-user-reply').exists() and body.startswith('You · Terminal'): code = 1
+    if (home / 'reject-assistant-reply').exists() and body.startswith('Firstmate ·'): code = 1
     existing = state['deliveries'].get(delivery_id)
     if code == 0 and existing is not None and existing != body: code = 1
     elif code == 0: state['deliveries'][delivery_id] = body
@@ -333,6 +335,17 @@ assert.equal(existsSync(`${home}/drain-overlapped-reconcile`), false,
 assert.equal(userTexts(initialManager).filter((text) => text.includes('reconcile race request')).length, 1);
 assert.equal(Object.values(state().deliveries).filter((body) => body === 'Firstmate · reconcile race answer').length, 1);
 
+writeFileSync(`${home}/reject-user-reply`, '');
+const usersBeforeRejectedTerminal = userTexts(initialManager).length;
+const callsBeforeRejectedTerminal = faux.state.callCount;
+await runtime.session.prompt('terminal transport rejection', { source: 'interactive' });
+assert.equal(userTexts(initialManager).length, usersBeforeRejectedTerminal,
+  'terminal input entered Pi after its Telegram delivery was rejected');
+assert.equal(faux.state.callCount, callsBeforeRejectedTerminal,
+  'terminal delivery rejection started a model turn');
+assert.equal(notices.some(([message]) => message.includes('Pi turn was not started')), true);
+unlinkSync(`${home}/reject-user-reply`);
+
 faux.appendResponses([
   (context) => {
     assert.doesNotMatch(context.systemPrompt, /authenticated Telegram mirror/);
@@ -346,7 +359,25 @@ current = state();
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'You · Terminal\n\nterminal request').length, 1);
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · terminal\nanswer').length, 1);
 
-writeFileSync(`${process.env.FM_CONFIG_OVERRIDE}/telegram-mirror`, 'off\n');
+writeFileSync(`${home}/reject-assistant-reply`, '');
+faux.appendResponses([fauxAssistantMessage('blocked terminal answer')]);
+await runtime.session.prompt('terminal with blocked assistant', { source: 'interactive' });
+await waitFor(() => statuses.at(-1)?.[1] === 'telegram: delivery needs attention',
+  'accepted terminal turn did not retain its blocked assistant response');
+const callsAfterTerminalBlock = faux.state.callCount;
+unlinkSync(`${home}/reject-assistant-reply`);
+await runtime.session.prompt('/telegram off', { source: 'interactive' });
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await waitFor(() => Object.values(state().deliveries)
+  .some((body) => body === 'Firstmate · blocked terminal answer'),
+'blocked terminal assistant response was not retried');
+assert.equal(faux.state.callCount, callsAfterTerminalBlock,
+  'blocked terminal assistant retry invoked the model');
+assert.equal(userTexts(initialManager)
+  .filter((text) => text.includes('terminal with blocked assistant')).length, 1);
+
+current = state();
+writeFileSync(`${home}/config/telegram-mirror`, 'off\n');
 const beforeModeOff = Object.keys(current.deliveries).length;
 faux.appendResponses([
   (context) => {
@@ -357,7 +388,7 @@ faux.appendResponses([
 ]);
 await runtime.session.prompt('ordinary mode-off terminal', { source: 'interactive' });
 assert.equal(Object.keys(state().deliveries).length, beforeModeOff, 'mode-off terminal turn was mirrored');
-writeFileSync(`${process.env.FM_CONFIG_OVERRIDE}/telegram-mirror`, 'on\n');
+writeFileSync(`${home}/config/telegram-mirror`, 'on\n');
 
 const beforeRpc = Object.keys(state().deliveries).length;
 faux.appendResponses([fauxAssistantMessage('rpc diagnostic answer')]);
@@ -559,7 +590,10 @@ blocked.request = { id: 'tg-text-u17-m17', text: 'delivery block request', statu
 save(blocked);
 writeFileSync(`${home}/reject-mirror-reply`, '');
 faux.appendResponses([fauxAssistantMessage('blocked delivery answer')]);
-await waitFor(() => statuses.some(([, value]) => value === 'telegram: delivery needs attention'),
+await waitFor(() => state().log.some((call) =>
+  call[0] === 'mirror-reply' && call[1].startsWith('assistant-telegram-tg-text-u17-m17-')),
+'assistant delivery failure was not attempted');
+assert.equal(statuses.at(-1)?.[1], 'telegram: delivery needs attention',
   'assistant delivery failure was not surfaced');
 const usersBeforeBlockedPrompt = userTexts(runtime.session.sessionManager).length;
 const callsBeforeBlockedPrompt = faux.state.callCount;
@@ -568,11 +602,29 @@ assert.equal(userTexts(runtime.session.sessionManager).length, usersBeforeBlocke
   'blocked mirror silently admitted an ordinary terminal turn');
 assert.equal(faux.state.callCount, callsBeforeBlockedPrompt, 'blocked mirror terminal input started a model turn');
 assert.equal(notices.some(([message]) => message.includes('use /telegram off before continuing')), true);
+const blockedUserTurns = userTexts(runtime.session.sessionManager)
+  .filter((text) => text.includes('delivery block request')).length;
+const modelCallsAfterBlockedResponse = faux.state.callCount;
 unlinkSync(`${home}/reject-mirror-reply`);
 await runtime.session.prompt('/telegram off', { source: 'interactive' });
 faux.appendResponses([fauxAssistantMessage('ordinary answer after mirror off')]);
 await runtime.session.prompt('ordinary after delivery block off', { source: 'interactive' });
 assert.equal(userTexts(runtime.session.sessionManager).at(-1), 'ordinary after delivery block off');
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await waitFor(() => state().handled?.includes('tg-text-u17-m17'),
+  'blocked settled response did not retry transport delivery after mode on');
+assert.equal(userTexts(runtime.session.sessionManager)
+  .filter((text) => text.includes('delivery block request')).length, blockedUserTurns,
+  'blocked Telegram request started a second Pi turn after mode off/on');
+assert.equal(faux.state.callCount, modelCallsAfterBlockedResponse + 1,
+  'blocked Telegram response transport retry invoked the model');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · blocked delivery answer').length, 1);
+const blockedDeliveryCalls = state().log.filter((call) =>
+  call[0] === 'mirror-reply' && call[1].startsWith('assistant-telegram-tg-text-u17-m17-'));
+assert.equal(blockedDeliveryCalls.length, 2);
+assert.equal(new Set(blockedDeliveryCalls.map((call) => call[1])).size, 1,
+  'blocked response retry changed its stable delivery identity');
 
 unlinkSync(`${home}/state/.primary`);
 await runtime.session.reload();
@@ -593,7 +645,7 @@ assert.equal(Object.keys(state().deliveries).length, nonPrimaryDeliveries, 'non-
 await runtime.dispose();
 
 writeFileSync(`${home}/state/.primary`, '');
-writeFileSync(`${process.env.FM_CONFIG_OVERRIDE}/telegram-mirror`, 'on\n');
+writeFileSync(`${home}/config/telegram-mirror`, 'on\n');
 const failed = state();
 failed.request = { id: 'tg-text-u4-m4', text: 'missing model request', status: 'queued' };
 const receiptsBeforeFailure = failed.receipts.length;

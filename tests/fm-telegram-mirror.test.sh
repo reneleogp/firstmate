@@ -49,7 +49,7 @@ from pathlib import Path
 script = sys.argv[1]; home = sys.argv[2]; attacker = sys.argv[3]
 owner = os.getpid(); capability = b'a' * 64 + b'\\n'
 Path(home, 'state', '.lock').write_text(str(owner) + '\\n')
-mode_path = Path(os.environ.get('FM_CONFIG_OVERRIDE', Path(home, 'config'))) / 'telegram-mirror'
+mode_path = Path(home, 'config', 'telegram-mirror')
 def run(*args):
     reader, writer = os.pipe()
     os.write(writer, capability); os.close(writer)
@@ -73,7 +73,6 @@ body = run('mirror-read', 'tg-text-u1-m1')
 assert body.returncode == 0 and body.stdout == 'same text'
 second = Path(home, 'state', 'telegram', 'inbox', 'tg-text-u2-m2.json')
 second.write_text('{"request_id":"tg-text-u2-m2","origin":"telegram","text":"off","status":"queued"}')
-Path(home, 'config', 'telegram-mirror').write_text('on\\n')
 mode_path.write_text('off\\n')
 refused = run('mirror-claim', 'tg-text-u2-m2')
 assert refused.returncode != 0 and 'mode is off' in refused.stderr

@@ -1141,9 +1141,7 @@ def reconcile_requests(home: Path) -> None:
 
 
 def mirror_mode_path(home: Path) -> Path:
-    override = os.environ.get("FM_CONFIG_OVERRIDE")
-    config_root = Path(override).expanduser().resolve() if override else home / "config"
-    return config_root / MIRROR_MODE_NAME
+    return home / "config" / MIRROR_MODE_NAME
 
 
 def mirror_mode_enabled(home: Path) -> bool:
