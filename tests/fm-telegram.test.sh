@@ -194,6 +194,8 @@ assert run('mirror-open').returncode == 0
 assert run('mirror-reconcile').returncode == 0
 Path(home, 'state', '.wake-queue').write_text(
     '2\t2\tcheck\ttelegram:late-legacy\ttelegram late-legacy\n')
+assert run('mirror-next').returncode == 0
+assert 'telegram:late-legacy' in Path(home, 'state', '.wake-queue').read_text()
 assert run('mirror-reconcile').returncode == 0
 assert 'telegram:' not in Path(home, 'state', '.wake-queue').read_text()
 inbox = Path(home, 'state', 'telegram', 'inbox')

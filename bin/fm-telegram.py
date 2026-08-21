@@ -1402,7 +1402,6 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
 
 
 def mirror_list(home: Path) -> int:
-    mirror_reconcile(home)
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
         paths = mirror_queue_paths_locked(home)
