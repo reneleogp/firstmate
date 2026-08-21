@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Small, private Telegram transport for one Firstmate home.
 
-The service deliberately owns transport, private queue and response-journal
+The service deliberately owns transport, private queue and delivery-record
 durability, and origin binding only.  It does not interpret requests, choose
 actions, or authorize Firstmate operations.
 """
@@ -35,10 +35,12 @@ MAX_SEEN = 4096
 MAX_HANDLED = 4096
 MAX_INBOX = 256
 MAX_PENDING_VOICES = 64
-MAX_RESPONSE_JOURNAL = 256
-MAX_RESPONSE_BYTES = 256 * 1024
-MAX_RESPONSE_CHUNKS = 64
+MAX_MIRROR_DELIVERIES = 256
+MAX_MIRROR_DELIVERY_BYTES = 256 * 1024
+MAX_MIRROR_DELIVERY_CHUNKS = 64
+MAX_MIRROR_DELIVERY_ATTEMPTS = 3
 MAX_TELEGRAM_TEXT_UNITS = 4096
+MAX_MIRROR_CAPABILITY_BYTES = 128
 MAX_ATOMIC_TEMPS = 256
 MAX_TEXT = 12000
 MAX_TRANSCRIPT_UNITS = 4096
@@ -49,7 +51,7 @@ MAX_VOICE_SECONDS = 120
 INBOX_TTL = 7 * 24 * 60 * 60
 PENDING_TTL = 10 * 60
 ATOMIC_TEMP_TTL = 10 * 60
-RESPONSE_GENERATION_IDLE_TTL = 10 * 60
+MIRROR_DELIVERY_TTL = INBOX_TTL
 POLL_TIMEOUT = 30
 RECEIPT_RETRY_DELAYS = (30, 120, 300)
 CALLBACK_DELIVERY_ATTEMPTS = 3
@@ -58,6 +60,16 @@ PERMANENT_CONFIG_EXIT = 78
 FINAL_CONTINUATION_PENDING_EXIT = 2
 DELIVERY_UNKNOWN_EXIT = 3
 FIRSTMATE_REPLY_LABEL = "Firstmate · "
+QUEUED_RECEIPT = "Bot · Queued for Firstmate."
+PI_DELIVERED_RECEIPT = "Pi · Delivered to Firstmate."
+VOICE_PROGRESS_NOTICE = "Bot · Transcribing…"
+MIRROR_OFF_REFUSAL = (
+    "Bot · Telegram mirror mode is off, so this message was not processed. "
+    "Send /telegram on to mirror this chat into the Firstmate terminal."
+)
+MIRROR_COMMANDS = {"/telegram on": "on", "/telegram off": "off", "/telegram status": "status"}
+MIRROR_MODE_NAME = "telegram-mirror"
+MIRROR_OWNER_NAME = "mirror-owner.json"
 MESSAGE_ENVELOPE_FIELDS = frozenset({
     "author_signature", "business_connection_id", "chat", "date", "direct_messages_topic",
     "edit_date", "effect_id", "external_reply", "forward_origin", "from",
@@ -74,11 +86,8 @@ CALLBACK_QUERY_FIELDS = frozenset({"chat_instance", "data", "from", "id", "messa
 CALLBACK_MESSAGE_FIELDS = TEXT_MESSAGE_FIELDS
 ATOMIC_STATE_TARGETS = frozenset({
     "active.json", "admission-sequence.json", "callback-actions.json", "closing.json",
-    "enabled", "pending.json", "pending-voice-queue.json", "seen.json",
+    "enabled", "mirror-owner.json", "pending.json", "pending-voice-queue.json", "seen.json",
 })
-RESPONSE_CONTENT_STATES = frozenset({"reserved", "staged", "oversized"})
-RESPONSE_TERMINAL_STATES = frozenset({"pending", "rendering", "rendered"})
-RESPONSE_DELIVERY_STATES = frozenset({"pending", "delivery_unknown", "rejected", "sent"})
 _PROCESS_TOKENS: Dict[Path, str] = {}
 _VERIFIED_BOT_IDS: Dict[Path, int] = {}
 _TEST_API_BASES: Dict[Path, str] = {}
@@ -93,10 +102,6 @@ class TelegramError(RuntimeError):
 
 
 class PermanentConfigurationError(TelegramError):
-    pass
-
-
-class WatcherPreconditionError(TelegramError):
     pass
 
 
@@ -178,10 +183,11 @@ def validate_home_storage(home: Path) -> None:
     telegram = state / "telegram"
     for path in (
             state, config, telegram, telegram / "inbox", telegram / "handled",
-            telegram / "responses"):
+            telegram / "responses", telegram / "deliveries"):
         require_path_kind(path, "directory")
     for path in (
         config / CONFIG_NAME,
+        config / MIRROR_MODE_NAME,
         state / ".telegram-cleaned",
         state / ".telegram-lifecycle.lock",
         state / ".telegram-service-activation",
@@ -191,11 +197,12 @@ def validate_home_storage(home: Path) -> None:
         require_path_kind(path, "regular file")
     if telegram.is_dir():
         for child in telegram.iterdir():
-            if child.name in {"inbox", "handled", "responses"}:
+            if child.name in {"inbox", "handled", "responses", "deliveries"}:
                 continue
             require_path_kind(child, "regular file")
         for directory in (
-                telegram / "inbox", telegram / "handled", telegram / "responses"):
+                telegram / "inbox", telegram / "handled", telegram / "responses",
+                telegram / "deliveries"):
             if directory.is_dir():
                 for child in directory.iterdir():
                     require_path_kind(child, "regular file")
@@ -486,39 +493,6 @@ def systemctl(*arguments: str, check: bool = True) -> subprocess.CompletedProces
     return result
 
 
-def primary_running(home: Path) -> bool:
-    lock = home / "state" / ".lock"
-    try:
-        value = lock.read_text(encoding="utf-8").strip()
-        pid = int(value)
-        if pid <= 0:
-            return False
-    except (OSError, ValueError):
-        return False
-    library = Path(__file__).resolve().parent / "fm-session-lock-lib.sh"
-    result = subprocess.run(
-        ["/bin/bash", "-c", '. "$1"; fm_harness_pid_alive "$2"',
-         "fm-telegram", str(library), str(pid)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    return result.returncode == 0
-
-
-def watcher_running(home: Path) -> bool:
-    root = Path(__file__).resolve().parent
-    library = root / "fm-wake-lib.sh"
-    watcher = root / "fm-watch.sh"
-    environment = os.environ.copy()
-    environment["FM_HOME"] = str(home)
-    environment["FM_STATE_OVERRIDE"] = str(home / "state")
-    result = subprocess.run(
-        ["/bin/bash", "-c", '. "$1"; fm_watcher_healthy "$2" "$3" "${FM_GUARD_GRACE:-300}" "$4"',
-         "fm-telegram", str(library), str(home / "state"), str(watcher), str(home)],
-        env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    return result.returncode == 0
-
-
 def now() -> int:
     return int(time.time())
 
@@ -551,38 +525,8 @@ def request_dirs(home: Path, create: bool = True) -> Tuple[Path, Path]:
     return inbox, handled
 
 
-def response_dir(home: Path, create: bool = True) -> Path:
-    path = state_dir(home) / "responses"
-    if create:
-        private_dir(path)
-    return path
-
-
-def response_paths(home: Path, response_id: str) -> Tuple[Path, Path]:
-    if not response_id.isascii() or not safe_id(response_id) or len(response_id) > 128:
-        raise TelegramError("response identifier is invalid")
-    root = response_dir(home)
-    return root / f"{response_id}.json", root / f"{response_id}.txt"
-
-
 def safe_id(value: str) -> bool:
     return bool(value) and all(ch.isalnum() or ch in "._-" for ch in value)
-
-
-def lifecycle_task_id_valid(value: str) -> bool:
-    validator = Path(__file__).resolve().with_name("fm-pr-lib.sh")
-    try:
-        result = subprocess.run(
-            ["bash", "-c", '. "$1"; fm_task_id_creation_valid "$2"',
-             "_", str(validator), value],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except (OSError, ValueError):
-        return False
-    return result.returncode == 0
 
 
 def unicode_text_units(value: str) -> Optional[int]:
@@ -699,27 +643,13 @@ def seen_path(home: Path) -> Path:
     return state_dir(home) / "seen.json"
 
 
-def append_safe_wake(home: Path, request_id: str) -> None:
-    root = Path(__file__).resolve().parent
-    wake_lib = root / "fm-wake-lib.sh"
-    script = '. "$1"; fm_wake_append check "telegram:$2" "telegram $2"'
-    environment = os.environ.copy()
-    environment["FM_HOME"] = str(home)
-    environment["FM_STATE_OVERRIDE"] = str(home / "state")
-    result = subprocess.run(["/bin/bash", "-c", script, "fm-telegram", str(wake_lib), request_id],
-                            env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if result.returncode != 0:
-        raise TelegramError("safe Telegram wake could not be recorded")
-    queue = home / "state" / ".wake-queue"
-    sequence = home / "state" / ".wake-queue.seq"
-    if queue.is_file() and not queue.is_symlink():
-        fsync_file(queue)
-    if sequence.is_file() and not sequence.is_symlink():
-        fsync_file(sequence)
-    fsync_directory(home / "state")
+def effective_wake_state(home: Path) -> Path:
+    override = os.environ.get("FM_STATE_OVERRIDE")
+    return Path(override).expanduser().resolve() if override else home / "state"
 
 
-def consume_safe_wakes(home: Path, request_ids: Optional[List[str]] = None) -> None:
+def consume_safe_wakes(home: Path, wake_state: Path,
+                       request_ids: Optional[List[str]] = None) -> None:
     for request_id in request_ids or [""]:
         if request_id and not safe_id(request_id):
             continue
@@ -758,81 +688,26 @@ fi
 '''
         environment = os.environ.copy()
         environment["FM_HOME"] = str(home)
-        environment["FM_STATE_OVERRIDE"] = str(home / "state")
+        environment["FM_STATE_OVERRIDE"] = str(wake_state)
         result = subprocess.run(
             ["/bin/bash", "-c", script, "fm-telegram", str(library), request_id],
             env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         if result.returncode != 0:
             raise TelegramError("safe Telegram wakes could not be cleaned")
-        queue = home / "state" / ".wake-queue"
+        queue = wake_state / ".wake-queue"
         if queue.is_file() and not queue.is_symlink():
             fsync_file(queue)
-        fsync_directory(home / "state")
+        fsync_directory(wake_state)
 
 
-def queued_safe_wake_ids(home: Path) -> List[str]:
-    library = Path(__file__).resolve().parent / "fm-wake-lib.sh"
-    script = '. "$1"; fm_wake_queued_keys check'
-    environment = os.environ.copy()
-    environment["FM_HOME"] = str(home)
-    environment["FM_STATE_OVERRIDE"] = str(home / "state")
-    result = subprocess.run(
-        ["/bin/bash", "-c", script, "fm-telegram", str(library)],
-        env=environment, capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise TelegramError("safe Telegram wakes could not be inspected")
-    return [line[len("telegram:"):] for line in result.stdout.splitlines()
-            if line.startswith("telegram:")]
+def migrate_wakes(home: Path) -> int:
+    consume_safe_wakes(home, effective_wake_state(home))
+    return 0
 
 
 def active_path(home: Path) -> Path:
     return state_dir(home) / "active.json"
-
-
-def active_record(home: Path) -> Optional[Dict[str, Any]]:
-    active = read_json(active_path(home))
-    if not isinstance(active, dict) or not isinstance(active.get("request_id"), str):
-        return None
-    if not safe_id(str(active["request_id"])):
-        return None
-    work_id = active.get("work_id")
-    if work_id is not None and (not isinstance(work_id, str) or not safe_id(work_id)):
-        return None
-    return active
-
-
-def active_request_id(home: Path) -> Optional[str]:
-    active = active_record(home)
-    return str(active["request_id"]) if active is not None else None
-
-
-def work_record_path(home: Path, work_id: Any) -> Optional[Path]:
-    if not isinstance(work_id, str) or not safe_id(work_id):
-        return None
-    return home / "state" / f"{work_id}.meta"
-
-
-def work_record_exists(home: Path, work_id: Any) -> bool:
-    path = work_record_path(home, work_id)
-    return path is not None and (path.exists() or path.is_symlink())
-
-
-def telegram_owned_work_record(home: Path, work_id: str, request_id: str) -> bool:
-    path = work_record_path(home, work_id)
-    if path is None or not path.is_file() or path.is_symlink():
-        return False
-    try:
-        fields = {}
-        for line in path.read_text(encoding="utf-8").splitlines():
-            key, separator, value = line.partition("=")
-            if separator and key not in fields:
-                fields[key] = value
-    except (OSError, UnicodeError):
-        return False
-    return (fields.get("endpoint_task_id") == work_id
-            and fields.get("telegram_request_id") == request_id)
 
 
 def closing_path(home: Path) -> Path:
@@ -881,108 +756,11 @@ def aggregate_response_delivery(chunks: List[Dict[str, Any]]) -> str:
     statuses = [chunk.get("telegram_status") for chunk in chunks]
     if statuses and all(status == "sent" for status in statuses):
         return "sent"
-    if statuses and all(status in {"sent", "delivery_unknown"} for status in statuses):
+    if "delivery_unknown" in statuses or "sending" in statuses:
         return "delivery_unknown"
     if "rejected" in statuses:
         return "rejected"
     return "pending"
-
-
-def response_record_locked(home: Path, response_id: str) -> Optional[Dict[str, Any]]:
-    metadata_path, body_path = response_paths(home, response_id)
-    record = read_json(metadata_path)
-    if not isinstance(record, dict) or record.get("response_id") != response_id:
-        return None
-    claimed_request = record.get("claimed_request_id")
-    conversation_id = record.get("conversation_id")
-    content_status = record.get("content_status")
-    terminal_status = record.get("terminal_status")
-    telegram_status = record.get("telegram_status")
-    chunks = record.get("chunks")
-    if (not isinstance(claimed_request, str) or not safe_id(claimed_request)
-            or not isinstance(conversation_id, str) or not safe_id(conversation_id)
-            or not isinstance(record.get("final"), bool)
-            or content_status not in RESPONSE_CONTENT_STATES
-            or terminal_status not in RESPONSE_TERMINAL_STATES
-            or telegram_status not in RESPONSE_DELIVERY_STATES
-            or not isinstance(chunks, list)
-            or not strict_int(record.get("terminal_attempts", 0))
-            or record.get("terminal_attempts", 0) < 0
-            or not strict_int(record.get("created_at"))
-            or not body_path.is_file() or body_path.is_symlink()):
-        raise TelegramError("Telegram response journal is malformed")
-    if content_status == "reserved":
-        if (terminal_status != "pending" or telegram_status != "pending"
-                or chunks):
-            raise TelegramError("Telegram response journal is malformed")
-        return record
-    if content_status == "oversized":
-        refused_bytes = record.get("refused_bytes")
-        refused_sha256 = record.get("refused_sha256")
-        body_size = body_path.stat().st_size
-        if (terminal_status != "pending" or telegram_status != "pending" or chunks
-                or not strict_int(refused_bytes) or refused_bytes <= MAX_RESPONSE_BYTES
-                or not isinstance(refused_sha256, str) or len(refused_sha256) != 64
-                or any(character not in "0123456789abcdef" for character in refused_sha256)
-                or body_size not in {0, refused_bytes}):
-            raise TelegramError("Telegram response journal is malformed")
-        if body_size:
-            current_size, current_sha256 = file_sha256(body_path)
-            if current_size != refused_bytes or current_sha256 != refused_sha256:
-                raise TelegramError("Telegram response journal is malformed")
-        return record
-    try:
-        body = body_path.read_bytes()
-        text = body.decode("utf-8")
-    except (OSError, UnicodeError) as exc:
-        raise TelegramError("Telegram response journal is malformed") from exc
-    if (not text.startswith(FIRSTMATE_REPLY_LABEL)
-            or len(body) > MAX_RESPONSE_BYTES
-            or not 0 < len(chunks) <= MAX_RESPONSE_CHUNKS
-            or record.get("body_sha256") != hashlib.sha256(body).hexdigest()):
-        raise TelegramError("Telegram response journal is malformed")
-    offset = 0
-    for index, chunk in enumerate(chunks):
-        if (not isinstance(chunk, dict)
-                or chunk.get("index") != index
-                or chunk.get("start") != offset
-                or not strict_int(chunk.get("end"))
-                or chunk["end"] <= offset or chunk["end"] > len(body)
-                or chunk.get("telegram_status") not in RESPONSE_DELIVERY_STATES
-                or not strict_int(chunk.get("telegram_attempts"))
-                or chunk["telegram_attempts"] < 0):
-            raise TelegramError("Telegram response journal is malformed")
-        chunk_body = body[offset:chunk["end"]]
-        try:
-            chunk_text = chunk_body.decode("utf-8")
-        except UnicodeError as exc:
-            raise TelegramError("Telegram response journal is malformed") from exc
-        units = unicode_text_units(chunk_text)
-        if (not units or units > MAX_TELEGRAM_TEXT_UNITS
-                or chunk.get("body_sha256") != hashlib.sha256(chunk_body).hexdigest()):
-            raise TelegramError("Telegram response journal is malformed")
-        offset = chunk["end"]
-    if offset != len(body) or telegram_status != aggregate_response_delivery(chunks):
-        raise TelegramError("Telegram response journal is malformed")
-    return record
-
-
-def claimed_conversation_locked(home: Path, claimed_request: str) -> Optional[str]:
-    path = request_path(home, claimed_request)
-    if path is None or path.parent.name != "handled":
-        return None
-    record = read_json(path)
-    active = active_record(home)
-    if (not isinstance(record, dict) or record.get("request_id") != claimed_request
-            or active is None):
-        return None
-    conversation_id = str(active["request_id"])
-    if claimed_request == conversation_id:
-        return conversation_id
-    if (record.get("continuation_of") == conversation_id
-            and record.get("continuation_routing") == "pending"):
-        return conversation_id
-    return None
 
 
 def request_order_key(path: Path) -> Tuple[int, int, int, int, str]:
@@ -1028,55 +806,6 @@ def next_admission_sequence_locked(home: Path) -> int:
     return sequence
 
 
-def _desired_request_id_locked(home: Path) -> Optional[str]:
-    inbox, handled = request_dirs(home)
-    paths = list(inbox.glob("*.json"))
-    active = active_request_id(home)
-    if active is not None:
-        active_state = active_record(home)
-        closing = read_json(closing_path(home))
-        direct_closing = (
-            active_state is not None
-            and active_state.get("work_id") is None
-            and isinstance(closing, dict)
-            and closing.get("request_id") == active
-        )
-        routed_paths = []
-        for path in paths + list(handled.glob("*.json")):
-            record = read_json(path, {})
-            if not isinstance(record, dict):
-                continue
-            if (record.get("request_id") == active
-                    and not direct_closing
-                    and active_state is not None
-                    and active_state.get("work_published") is not True
-                    and active_state.get("initial_routing_consumed") is not True):
-                routed_paths.append(path)
-            elif (record.get("continuation_of") == active
-                  and (path.parent == inbox
-                       or record.get("continuation_routing") == "pending")):
-                routed_paths.append(path)
-        paths = routed_paths
-    paths.sort(key=request_order_key)
-    return paths[0].stem if paths else None
-
-
-def _sync_request_wakes_locked(home: Path) -> None:
-    desired = _desired_request_id_locked(home)
-    queued = queued_safe_wake_ids(home)
-    if desired is not None and queued == [desired]:
-        return
-    consume_safe_wakes(home)
-    if desired is not None:
-        append_safe_wake(home, desired)
-
-
-def sync_request_wakes(home: Path) -> None:
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        _sync_request_wakes_locked(home)
-
-
 def owned_atomic_temp(home: Path, path: Path) -> bool:
     name = path.name
     if not name.startswith(".") or "." not in name[1:]:
@@ -1089,14 +818,14 @@ def owned_atomic_temp(home: Path, path: Path) -> bool:
     root = state_dir(home)
     if path.parent == root:
         return target in ATOMIC_STATE_TARGETS
-    if path.parent == root / "responses":
+    if path.parent in {root / "responses", root / "deliveries"}:
         if target.endswith(".json"):
-            response_id = target[:-5]
+            record_id = target[:-5]
         elif target.endswith(".txt"):
-            response_id = target[:-4]
+            record_id = target[:-4]
         else:
             return False
-        return safe_id(response_id)
+        return safe_id(record_id)
     if path.parent not in {root / "inbox", root / "handled"} or not target.endswith(".json"):
         return False
     request_id = target[:-5]
@@ -1117,7 +846,7 @@ def owned_atomic_temp(home: Path, path: Path) -> bool:
 def cleanup_atomic_temps_locked(home: Path) -> None:
     root = state_dir(home)
     paths = []
-    for directory in (root, root / "inbox", root / "handled", root / "responses"):
+    for directory in (root, root / "inbox", root / "handled", root / "responses", root / "deliveries"):
         if not directory.is_dir() or directory.is_symlink():
             continue
         for path in directory.iterdir():
@@ -1141,136 +870,179 @@ def cleanup_atomic_temps_locked(home: Path) -> None:
             pass
 
 
-def response_completed(record: Dict[str, Any]) -> bool:
-    return (record.get("content_status") == "staged"
-            and record.get("terminal_status") == "rendered"
-            and record.get("telegram_status") == "sent")
-
-
-def response_conversation_closed_locked(home: Path, record: Dict[str, Any]) -> bool:
-    conversation_id = record.get("conversation_id")
-    active = active_record(home)
-    closing = read_json(closing_path(home))
-    return ((active is None or active.get("request_id") != conversation_id)
-            and (not isinstance(closing, dict)
-                 or closing.get("request_id") != conversation_id))
-
-
-def mark_oversized_response(metadata_path: Path, record: Dict[str, Any],
-                            refused_bytes: int,
-                            refused_sha256: str) -> None:
-    record["content_status"] = "oversized"
-    record["refused_bytes"] = refused_bytes
-    record["refused_sha256"] = refused_sha256
-    record["refused_at"] = now()
-    atomic_json(metadata_path, record)
-
-
-def cleanup_abandoned_response_locked(metadata_path: Path, body_path: Path,
-                                       record: Dict[str, Any]) -> Dict[str, Any]:
-    if record["content_status"] != "reserved":
-        return record
-    before = body_path.stat()
-    last_activity = max(float(record["created_at"]), before.st_mtime)
-    if (before.st_size <= MAX_RESPONSE_BYTES
-            or time.time() - last_activity < RESPONSE_GENERATION_IDLE_TTL):
-        return record
-    refused_bytes, refused_sha256 = file_sha256(body_path)
-    after = body_path.stat()
-    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-    if (refused_bytes <= MAX_RESPONSE_BYTES
-            or any(getattr(before, field) != getattr(after, field)
-                   for field in stable_fields)):
-        return record
-    mark_oversized_response(
-        metadata_path, record, refused_bytes, refused_sha256,
-    )
-    atomic_bytes(body_path, b"")
-    return record
-
-
-def cleanup_response_journal_locked(home: Path, reserve_slots: int = 0) -> None:
-    root = response_dir(home)
-    records = []
-    referenced_bodies = set()
-    for metadata_path in root.glob("*.json"):
-        try:
-            record = response_record_locked(home, metadata_path.stem)
-        except TelegramError:
-            record = None
-        if record is None:
-            durable_unlink(metadata_path)
-            durable_unlink(root / f"{metadata_path.stem}.txt")
+def cleanup_failed_completion_request_locked(home: Path, record: Dict[str, Any]) -> None:
+    if record.get("status") not in {"rejected", "delivery_unknown"}:
+        return
+    request_id = record.get("completion_request_id")
+    path = request_path(home, request_id) if isinstance(request_id, str) else None
+    request = read_json(path) if path is not None else None
+    if (path is None or path.parent.name != "inbox" or not isinstance(request, dict)
+            or request.get("request_id") != request_id or request.get("status") != "claimed"):
+        return
+    root = mirror_delivery_dir(home)
+    for candidate_path in root.glob("*.json"):
+        candidate = read_json(candidate_path)
+        if (not isinstance(candidate, dict)
+                or candidate.get("delivery_id") == record.get("delivery_id")
+                or candidate.get("completion_request_id") != request_id):
             continue
+        delivery_pid = candidate.get("delivery_owner_pid")
+        delivery_identity = candidate.get("delivery_owner_identity")
+        delivery_live = bool(
+            strict_int(delivery_pid)
+            and isinstance(delivery_identity, str)
+            and process_identity(delivery_pid) == delivery_identity
+        )
+        if candidate.get("status") == "sent" or delivery_live:
+            return
+    consume_safe_wakes(home, effective_wake_state(home), [request_id])
+    durable_unlink(path)
+
+
+def retire_superseded_completion_deliveries_locked(
+        home: Path, request_id: str, delivery_id: str) -> None:
+    root = mirror_delivery_dir(home)
+    for metadata_path in root.glob("*.json"):
+        if metadata_path.stem == delivery_id:
+            continue
+        record = read_json(metadata_path)
+        if (not isinstance(record, dict)
+                or record.get("completion_request_id") != request_id
+                or record.get("status") not in {"rejected", "delivery_unknown"}):
+            continue
+        durable_unlink(metadata_path)
+        durable_unlink(root / f"{metadata_path.stem}.txt")
+
+
+def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> bool:
+    root = state_dir(home) / "deliveries"
+    private_dir(root)
+    records = []
+    bodies = set()
+    cutoff = now() - MIRROR_DELIVERY_TTL
+    for metadata_path in root.glob("*.json"):
         body_path = root / f"{metadata_path.stem}.txt"
-        record = cleanup_abandoned_response_locked(metadata_path, body_path, record)
-        if record["content_status"] == "oversized" and body_path.stat().st_size:
-            atomic_bytes(body_path, b"")
-        referenced_bodies.add(body_path.name)
-        records.append((int(record["created_at"]), metadata_path, body_path, record))
+        record = read_json(metadata_path)
+        created = record.get("created_at") if isinstance(record, dict) else None
+        if (not isinstance(record, dict) or record.get("delivery_id") != metadata_path.stem
+                or not strict_int(created) or not body_path.is_file() or body_path.is_symlink()):
+            durable_unlink(metadata_path)
+            durable_unlink(body_path)
+            continue
+        bodies.add(body_path.name)
+        delivery_pid = record.get("delivery_owner_pid")
+        delivery_identity = record.get("delivery_owner_identity")
+        reservation_pid = record.get("reservation_owner_pid")
+        reservation_identity = record.get("reservation_owner_identity")
+        delivery_live = bool(
+            strict_int(delivery_pid)
+            and isinstance(delivery_identity, str)
+            and process_identity(delivery_pid) == delivery_identity
+        )
+        reservation_live = bool(
+            strict_int(reservation_pid)
+            and isinstance(reservation_identity, str)
+            and process_identity(reservation_pid) == reservation_identity
+        )
+        completion_request = record.get("completion_request_id")
+        completion_path = (request_path(home, completion_request)
+                           if isinstance(completion_request, str) else None)
+        completion_record = read_json(completion_path) if completion_path is not None else None
+        completion_pending = bool(
+            record.get("status") == "sent"
+            and isinstance(completion_record, dict)
+            and completion_record.get("request_id") == completion_request
+            and completion_record.get("status") == "claimed"
+        )
+        protected = delivery_live or reservation_live or completion_pending
+        if record.get("status") == "reserved" and not reservation_live:
+            durable_unlink(metadata_path)
+            durable_unlink(body_path)
+            bodies.discard(body_path.name)
+            continue
+        if created < cutoff and not protected:
+            cleanup_failed_completion_request_locked(home, record)
+            durable_unlink(metadata_path)
+            durable_unlink(body_path)
+            bodies.discard(body_path.name)
+            continue
+        records.append((created, metadata_path, body_path, protected))
     for body_path in root.glob("*.txt"):
-        if body_path.name not in referenced_bodies:
+        if body_path.name not in bodies:
             durable_unlink(body_path)
     records.sort(key=lambda item: item[0], reverse=True)
-    excess = max(0, len(records) + reserve_slots - MAX_RESPONSE_JOURNAL)
-    for _created_at, metadata_path, body_path, record in reversed(records):
-        completed_closed = (response_completed(record)
-                            and response_conversation_closed_locked(home, record))
-        request_missing = request_path(home, str(record["claimed_request_id"])) is None
-        remove = completed_closed and (request_missing or excess > 0)
-        if remove:
-            durable_unlink(metadata_path)
-            durable_unlink(body_path)
-            if excess > 0:
-                excess -= 1
+    keep = max(0, MAX_MIRROR_DELIVERIES - reserve_slots)
+    retained = len(records)
+    for _created, metadata_path, body_path, protected in reversed(records):
+        if retained <= keep:
+            break
+        if protected:
+            continue
+        record = read_json(metadata_path, {})
+        if isinstance(record, dict):
+            cleanup_failed_completion_request_locked(home, record)
+        durable_unlink(metadata_path)
+        durable_unlink(body_path)
+        retained -= 1
+    return retained <= keep
+
+
+def _bounded_cleanup_locked(home: Path, preserve_requests: Iterable[str] = ()) -> None:
+    del preserve_requests
+    inbox, handled = request_dirs(home)
+    cleanup_atomic_temps_locked(home)
+    cutoff = now() - INBOX_TTL
+    inbox_files = sorted(inbox.glob("*.json"), key=request_order_key, reverse=True)
+    queued_index = 0
+    for path in inbox_files:
+        record = read_json(path, {})
+        if isinstance(record, dict) and record.get("status") == "claimed":
+            owner_pid = record.get("claim_owner_pid")
+            owner_identity = record.get("claim_owner_identity")
+            if (strict_int(owner_pid) and isinstance(owner_identity, str)
+                    and process_identity(owner_pid) == owner_identity):
+                continue
+        created = record.get("created_at", 0) if isinstance(record, dict) else 0
+        should_remove = (queued_index >= MAX_INBOX or not strict_int(created)
+                         or created < cutoff)
+        queued_index += 1
+        if should_remove:
+            try:
+                consume_safe_wakes(home, effective_wake_state(home), [path.stem])
+                durable_unlink(path)
+            except (OSError, TelegramError):
+                pass
+    handled_files = sorted(handled.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in handled_files[MAX_HANDLED:]:
+        try:
+            durable_unlink(path)
+        except OSError:
+            pass
+    cleanup_mirror_deliveries_locked(home)
+    pending = state_dir(home) / "pending.json"
+    data = read_json(pending)
+    try:
+        expired = (isinstance(data, dict)
+                   and now() - int(data.get("created_at", 0)) >= PENDING_TTL)
+    except (TypeError, ValueError):
+        expired = True
+    if expired:
+        if isinstance(data, dict):
+            pending_id = data.get("pending_id")
+            finalize_pending_cleanup_locked(home, data)
+            if isinstance(pending_id, str):
+                remove_pending_voice_locked(home, pending_id)
+        else:
+            remove_pending(home)
+    queued_voices, queue_changed = load_pending_voice_queue_locked(home)
+    if queue_changed:
+        save_pending_voice_queue_locked(home, queued_voices)
 
 
 def bounded_cleanup(home: Path) -> None:
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
-        inbox, handled = request_dirs(home)
-        cleanup_atomic_temps_locked(home)
-        active = active_request_id(home)
-        cutoff = now() - INBOX_TTL
-        inbox_files = sorted(inbox.glob("*.json"), key=request_order_key, reverse=True)
-        for index, path in enumerate(inbox_files):
-            record = read_json(path, {})
-            created = record.get("created_at", 0) if isinstance(record, dict) else 0
-            if index >= MAX_INBOX or not strict_int(created) or created < cutoff:
-                try:
-                    consume_safe_wakes(home, [path.stem])
-                    durable_unlink(path)
-                except (OSError, TelegramError):
-                    pass
-        handled_files = sorted(
-            (path for path in handled.glob("*.json") if path.stem != active),
-            key=lambda p: p.stat().st_mtime, reverse=True,
-        )
-        for path in handled_files[MAX_HANDLED:]:
-            try:
-                durable_unlink(path)
-            except OSError:
-                pass
-        cleanup_response_journal_locked(home)
-        pending = state_dir(home) / "pending.json"
-        data = read_json(pending)
-        try:
-            expired = (isinstance(data, dict)
-                       and now() - int(data.get("created_at", 0)) >= PENDING_TTL)
-        except (TypeError, ValueError):
-            expired = True
-        if expired:
-            if isinstance(data, dict):
-                pending_id = data.get("pending_id")
-                finalize_pending_cleanup_locked(home, data)
-                if isinstance(pending_id, str):
-                    remove_pending_voice_locked(home, pending_id)
-            else:
-                remove_pending(home)
-        queued_voices, queue_changed = load_pending_voice_queue_locked(home)
-        if queue_changed:
-            save_pending_voice_queue_locked(home, queued_voices)
-        _sync_request_wakes_locked(home)
+        _bounded_cleanup_locked(home)
 
 
 def deterministic_request_id(source: str, update_id: int, message_id: int) -> str:
@@ -1282,8 +1054,7 @@ def deterministic_request_id(source: str, update_id: int, message_id: int) -> st
 
 
 def _queue_request_locked(home: Path, text: str, chat_id: int, message_id: int,
-                          update_id: Optional[int], source: str, confirmed: bool,
-                          attach_to_active: bool) -> str:
+                          update_id: Optional[int], source: str, confirmed: bool) -> str:
     if (not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT
             or unicode_text_units(text) is None):
         raise TelegramError("request text is empty, too long, or malformed")
@@ -1299,14 +1070,6 @@ def _queue_request_locked(home: Path, text: str, chat_id: int, message_id: int,
         if existing.get("request_id") != request_id or existing.get("origin") != "telegram":
             raise TelegramError("request identifier collision")
         return request_id
-    continuation_of = None
-    if attach_to_active:
-        active = active_record(home)
-        closing = read_json(closing_path(home), {})
-        if (active is not None
-                and (not isinstance(closing, dict)
-                     or closing.get("request_id") != active.get("request_id"))):
-            continuation_of = str(active["request_id"])
     record = {
         "request_id": request_id,
         "origin": "telegram",
@@ -1319,16 +1082,17 @@ def _queue_request_locked(home: Path, text: str, chat_id: int, message_id: int,
         "created_at": now(),
         "admission_sequence": next_admission_sequence_locked(home),
         "status": "queued",
-        "wake_recorded": False,
         "receipt_text": transport_reply(home),
         "receipt_status": "pending",
     }
-    if continuation_of is not None:
-        record["continuation_of"] = continuation_of
-    inbox_files = sorted(inbox.glob("*.json"), key=request_order_key)
-    while len(inbox_files) >= MAX_INBOX:
-        oldest = inbox_files.pop(0)
-        consume_safe_wakes(home, [oldest.stem])
+    queued_files = []
+    for candidate in sorted(inbox.glob("*.json"), key=request_order_key):
+        candidate_record = read_json(candidate, {})
+        if not isinstance(candidate_record, dict) or candidate_record.get("status") != "claimed":
+            queued_files.append(candidate)
+    while len(queued_files) >= MAX_INBOX:
+        oldest = queued_files.pop(0)
+        consume_safe_wakes(home, effective_wake_state(home), [oldest.stem])
         durable_unlink(oldest)
     atomic_json(path, record)
     return request_id
@@ -1336,11 +1100,11 @@ def _queue_request_locked(home: Path, text: str, chat_id: int, message_id: int,
 
 def queue_request(home: Path, text: str, chat_id: int, message_id: int,
                   update_id: Optional[int], source: str = "text",
-                  confirmed: bool = False, attach_to_active: bool = False) -> str:
+                  confirmed: bool = False) -> str:
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
         return _queue_request_locked(
-            home, text, chat_id, message_id, update_id, source, confirmed, attach_to_active
+            home, text, chat_id, message_id, update_id, source, confirmed
         )
 
 
@@ -1363,7 +1127,7 @@ def update_request_record(home: Path, request_id: str, **changes: Any) -> Dict[s
         return _update_request_record_locked(home, request_id, **changes)
 
 
-def reconcile_request(home: Path, request_id: str, sync_wakes: bool = True) -> bool:
+def reconcile_request(home: Path, request_id: str) -> bool:
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
         path = request_path(home, request_id)
@@ -1372,11 +1136,6 @@ def reconcile_request(home: Path, request_id: str, sync_wakes: bool = True) -> b
         record = read_json(path)
         if not isinstance(record, dict) or record.get("origin") != "telegram":
             return False
-        if path.parent.name == "inbox":
-            if sync_wakes:
-                _sync_request_wakes_locked(home)
-            if record.get("wake_recorded") is not True:
-                record = _update_request_record_locked(home, request_id, wake_recorded=True)
         receipt_status = record.get("receipt_status")
         if receipt_status == "sent":
             return True
@@ -1457,18 +1216,163 @@ def reconcile_requests(home: Path) -> None:
             record = read_json(path)
             if isinstance(record, dict) and isinstance(record.get("request_id"), str):
                 request_ids.append(str(record["request_id"]))
-        _sync_request_wakes_locked(home)
     for request_id in request_ids:
         try:
-            reconcile_request(home, request_id, sync_wakes=False)
+            reconcile_request(home, request_id)
         except TelegramError:
             continue
 
 
-def transport_reply(home: Path) -> str:
-    if primary_running(home):
-        return "Bot · Message received."
-    return "Bot · Message received and queued. It will be processed when Firstmate starts."
+def mirror_mode_path(home: Path) -> Path:
+    return home / "config" / MIRROR_MODE_NAME
+
+
+def mirror_mode_enabled(home: Path) -> bool:
+    try:
+        return mirror_mode_path(home).read_text(encoding="ascii").strip() == "on"
+    except (OSError, UnicodeError):
+        return False
+
+
+def set_mirror_mode(home: Path, enabled: bool) -> None:
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        atomic_bytes(mirror_mode_path(home), b"on\n" if enabled else b"off\n")
+
+
+def mirror_command(text: Any) -> Optional[str]:
+    return MIRROR_COMMANDS.get(text) if isinstance(text, str) else None
+
+
+def mirror_mode_reply(home: Path, action: str) -> str:
+    if action == "on":
+        set_mirror_mode(home, True)
+        return "Pi · Telegram mirror mode is on."
+    if action == "off":
+        set_mirror_mode(home, False)
+        return "Pi · Telegram mirror mode is off."
+    return f"Pi · Telegram mirror mode is {'on' if mirror_mode_enabled(home) else 'off'}."
+
+
+def mirror_owner_path(home: Path) -> Path:
+    return state_dir(home) / MIRROR_OWNER_NAME
+
+
+def process_identity(pid: int) -> Optional[str]:
+    if pid <= 0:
+        return None
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        fields = proc_stat.read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        if len(fields) > 19:
+            return f"proc:{pid}:{fields[19]}"
+    except (OSError, UnicodeError, IndexError):
+        pass
+    result = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(pid)], text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    started = result.stdout.strip()
+    return f"ps:{pid}:{started}" if result.returncode == 0 and started else None
+
+
+def process_parent(pid: int) -> Optional[int]:
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        return int(fields[1])
+    except (OSError, UnicodeError, ValueError, IndexError):
+        result = subprocess.run(
+            ["ps", "-o", "ppid=", "-p", str(pid)], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        try:
+            return int(result.stdout.strip()) if result.returncode == 0 else None
+        except ValueError:
+            return None
+
+
+def mirror_owner_holds_lock(home: Path, owner_pid: int) -> bool:
+    try:
+        lock_pid = int((home / "state" / ".lock").read_text(encoding="ascii").strip())
+    except (OSError, UnicodeError, ValueError):
+        return False
+    current = owner_pid
+    for _ in range(32):
+        if current == lock_pid:
+            return process_identity(lock_pid) is not None
+        parent = process_parent(current)
+        if parent is None or parent <= 1 or parent == current:
+            return False
+        current = parent
+    return False
+
+
+def mirror_capability(capability_fd: int) -> Optional[str]:
+    if capability_fd < 3:
+        return None
+    try:
+        value = os.read(capability_fd, MAX_MIRROR_CAPABILITY_BYTES + 1).strip()
+    except OSError:
+        return None
+    if not 32 <= len(value) <= MAX_MIRROR_CAPABILITY_BYTES:
+        return None
+    try:
+        text = value.decode("ascii")
+    except UnicodeError:
+        return None
+    return text if all(character in "0123456789abcdef" for character in text) else None
+
+
+def mirror_open(home: Path, owner_pid: int, capability_fd: int) -> int:
+    capability = mirror_capability(capability_fd)
+    identity = process_identity(owner_pid)
+    if (owner_pid != os.getppid() or capability is None or identity is None
+            or not mirror_owner_holds_lock(home, owner_pid)):
+        return die("Telegram mirror capability was not opened by the lock-owning extension")
+    digest = hashlib.sha256(capability.encode("ascii")).hexdigest()
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        existing = read_json(mirror_owner_path(home), {})
+        existing_pid = existing.get("owner_pid") if isinstance(existing, dict) else None
+        existing_identity = existing.get("owner_identity") if isinstance(existing, dict) else None
+        existing_digest = existing.get("capability_sha256") if isinstance(existing, dict) else None
+        if existing_pid == owner_pid and existing_identity == identity:
+            if existing_digest != digest:
+                return die("Telegram mirror capability is already owned by this Pi process")
+            return 0
+        if (strict_int(existing_pid) and isinstance(existing_identity, str)
+                and process_identity(existing_pid) == existing_identity
+                and mirror_owner_holds_lock(home, existing_pid)):
+            return die("Telegram mirror capability is already owned by the live primary Pi process")
+        atomic_json(mirror_owner_path(home), {
+            "owner_pid": owner_pid,
+            "owner_identity": identity,
+            "capability_sha256": digest,
+            "opened_at": now(),
+        })
+    return 0
+
+
+def mirror_authorized(home: Path, owner_pid: int, capability_fd: int) -> bool:
+    capability = mirror_capability(capability_fd)
+    identity = process_identity(owner_pid)
+    if (owner_pid != os.getppid() or capability is None or identity is None
+            or not mirror_owner_holds_lock(home, owner_pid)):
+        return False
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        record = read_json(mirror_owner_path(home), {})
+    return bool(
+        isinstance(record, dict)
+        and record.get("owner_pid") == owner_pid
+        and record.get("owner_identity") == identity
+        and record.get("capability_sha256")
+        == hashlib.sha256(capability.encode("ascii")).hexdigest()
+    )
+
+
+def transport_reply(_home: Path) -> str:
+    return QUEUED_RECEIPT
 
 
 def send_text(home: Path, chat_id: int, text: str, markup: Optional[Dict[str, Any]] = None) -> Any:
@@ -1476,6 +1380,619 @@ def send_text(home: Path, chat_id: int, text: str, markup: Optional[Dict[str, An
     if markup is not None:
         params["reply_markup"] = markup
     return api_call(home, "sendMessage", params)
+
+
+def mirror_owner_is_child(owner_pid: int) -> bool:
+    return owner_pid == os.getppid()
+
+
+def claim_owner_identity(owner_pid: int) -> Optional[str]:
+    return process_identity(owner_pid) if mirror_owner_is_child(owner_pid) else None
+
+
+def claim_owned_by(record: Dict[str, Any], owner_pid: int) -> bool:
+    identity = claim_owner_identity(owner_pid)
+    return bool(
+        identity is not None
+        and record.get("claim_owner_pid") == owner_pid
+        and record.get("claim_owner_identity") == identity
+    )
+
+
+def bind_claim_owner(record: Dict[str, Any], owner_pid: int, identity: str) -> None:
+    record["claim_owner_pid"] = owner_pid
+    record["claim_owner_identity"] = identity
+    record["claimed_at"] = now()
+
+
+def clear_claim_owner(record: Dict[str, Any]) -> None:
+    record.pop("claim_owner_pid", None)
+    record.pop("claim_owner_identity", None)
+    record.pop("claimed_at", None)
+
+
+def mirror_queue_paths_locked(home: Path) -> List[Path]:
+    inbox, _handled = request_dirs(home)
+    return sorted(inbox.glob("*.json"), key=request_order_key)
+
+
+def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
+                     preserve_requests: Iterable[str] = (), report_held: bool = False,
+                     report_deliveries: Iterable[str] = ()) -> int:
+    marker = state_dir(home) / ".mirror-migration-v2"
+    replacement_identity = None
+    if replacing_owner_pid is not None:
+        replacement_identity = claim_owner_identity(replacing_owner_pid)
+        if replacement_identity is None:
+            return die("Telegram mirror owner is not the invoking extension")
+    preserved = {request_id for request_id in preserve_requests if safe_id(request_id)}
+    reported_delivery_ids = {
+        delivery_id for delivery_id in report_deliveries
+        if safe_id(delivery_id) and len(delivery_id) <= 160
+    }
+    held_records: List[Tuple[str, str]] = []
+    owned_records: List[str] = []
+    delivery_records: List[Tuple[str, Optional[str], Optional[str]]] = []
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        if not marker.is_file():
+            inbox, handled = request_dirs(home)
+            for path in list(handled.glob("*.json")):
+                record = read_json(path)
+                if (not isinstance(record, dict) or record.get("origin") != "telegram"
+                        or record.get("final_sent") is True or record.get("status") == "handled"):
+                    continue
+                target = inbox / path.name
+                if not target.exists():
+                    durable_replace(path, target)
+            for legacy in (active_path(home), closing_path(home)):
+                durable_unlink(legacy)
+            legacy_responses = state_dir(home) / "responses"
+            if legacy_responses.is_dir() and not legacy_responses.is_symlink():
+                durable_rmtree(legacy_responses)
+            for path in mirror_queue_paths_locked(home):
+                record = read_json(path)
+                if not isinstance(record, dict):
+                    continue
+                for field in ("continuation_of", "continuation_routing", "work_id",
+                              "work_published", "initial_routing_consumed", "wake_recorded"):
+                    record.pop(field, None)
+                record["status"] = "queued"
+                clear_claim_owner(record)
+                atomic_json(path, record)
+            atomic_bytes(marker, b"v2\n")
+        _bounded_cleanup_locked(home, preserved)
+        consume_safe_wakes(home, effective_wake_state(home))
+        for path in mirror_queue_paths_locked(home):
+            record = read_json(path)
+            if not isinstance(record, dict):
+                continue
+            status = record.get("status")
+            if status == "held":
+                turn_id = record.get("held_turn_id")
+                if isinstance(turn_id, str) and safe_id(turn_id):
+                    held_records.append((path.stem, turn_id))
+                continue
+            owner = record.get("claim_owner_pid")
+            owner_identity = record.get("claim_owner_identity")
+            owner_alive = bool(
+                strict_int(owner)
+                and isinstance(owner_identity, str)
+                and process_identity(owner) == owner_identity
+            )
+            if (path.stem in preserved and replacing_owner_pid is not None
+                    and replacement_identity is not None and status in {"queued", "claimed"}):
+                record["status"] = "claimed"
+                bind_claim_owner(record, replacing_owner_pid, replacement_identity)
+                atomic_json(path, record)
+                owned_records.append(path.stem)
+            elif status == "claimed" and (
+                    not owner_alive
+                    or (owner == replacing_owner_pid and owner_identity == replacement_identity)):
+                record["status"] = "queued"
+                clear_claim_owner(record)
+                atomic_json(path, record)
+        delivery_root = mirror_delivery_dir(home)
+        for delivery_id in sorted(reported_delivery_ids):
+            record = read_json(delivery_root / f"{delivery_id}.json")
+            status = record.get("status") if isinstance(record, dict) else None
+            completion_request = (record.get("completion_request_id")
+                                  if isinstance(record, dict) else None)
+            completion_path = (request_path(home, completion_request)
+                               if isinstance(completion_request, str) else None)
+            completion_record = read_json(completion_path) if completion_path is not None else None
+            request_missing = completion_request if (
+                isinstance(completion_request, str)
+                and (not isinstance(completion_record, dict)
+                     or completion_record.get("request_id") != completion_request
+                     or completion_record.get("status") != "claimed")
+            ) else None
+            delivery_records.append((
+                delivery_id,
+                status if isinstance(status, str) else None,
+                request_missing,
+            ))
+    if report_held:
+        for request_id in owned_records:
+            print(f"owned\t{request_id}")
+        for request_id, turn_id in held_records[:1]:
+            print(f"held\t{request_id}\t{turn_id}")
+        for delivery_id, status, request_missing in delivery_records:
+            if status is None:
+                print(f"delivery-missing\t{delivery_id}")
+            elif request_missing is not None:
+                print(f"request-missing\t{delivery_id}\t{request_missing}")
+            else:
+                print(f"delivery\t{delivery_id}\t{status}")
+    return 0
+
+
+def mirror_list(home: Path) -> int:
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        paths = mirror_queue_paths_locked(home)
+        for path in paths:
+            record = read_json(path)
+            if isinstance(record, dict) and record.get("status", "queued") == "queued":
+                print(path.stem)
+                return 0
+    return 1
+
+
+def mirror_claim(home: Path, request_id: str, owner_pid: int) -> int:
+    identity = claim_owner_identity(owner_pid)
+    if identity is None:
+        return die("Telegram mirror owner is not the invoking extension")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        if not mirror_mode_enabled(home):
+            return die("Telegram mirror mode is off")
+        path = request_path(home, request_id)
+        if path is None or path.parent.name != "inbox":
+            return die("Telegram request is not queued")
+        record = read_json(path)
+        if not isinstance(record, dict) or record.get("origin") != "telegram":
+            return die("Telegram request is malformed")
+        status = record.get("status", "queued")
+        if status == "claimed":
+            if claim_owned_by(record, owner_pid):
+                return 0
+            current_owner = record.get("claim_owner_pid")
+            current_identity = record.get("claim_owner_identity")
+            if (strict_int(current_owner) and isinstance(current_identity, str)
+                    and process_identity(current_owner) == current_identity):
+                return die("Telegram request is already being processed")
+        elif status != "queued":
+            return die("Telegram request is not queued")
+        record["status"] = "claimed"
+        bind_claim_owner(record, owner_pid, identity)
+        atomic_json(path, record)
+    return 0
+
+
+def mirror_read(home: Path, request_id: str, owner_pid: int) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        path = request_path(home, request_id)
+        record = read_json(path) if path is not None else None
+        if (path is None or path.parent.name != "inbox" or not isinstance(record, dict)
+                or record.get("status") != "claimed" or not claim_owned_by(record, owner_pid)):
+            return die("Telegram request is not owned by this extension")
+        text = record.get("text")
+        if not isinstance(text, str):
+            return die("Telegram request is malformed")
+    sys.stdout.buffer.write(text.encode("utf-8"))
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def mirror_release(home: Path, request_id: str, owner_pid: int) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        path = request_path(home, request_id)
+        record = read_json(path) if path is not None else None
+        if (path is None or path.parent.name != "inbox" or not isinstance(record, dict)
+                or not claim_owned_by(record, owner_pid)):
+            return 1
+        record["status"] = "queued"
+        clear_claim_owner(record)
+        atomic_json(path, record)
+    return 0
+
+
+def mirror_hold(home: Path, request_id: str, turn_id: str, owner_pid: int) -> int:
+    if not safe_id(turn_id) or not mirror_owner_is_child(owner_pid):
+        return die("Telegram interrupted admission identity is invalid")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        path = request_path(home, request_id)
+        record = read_json(path) if path is not None else None
+        if path is None or path.parent.name != "inbox" or not isinstance(record, dict):
+            return die("Telegram interrupted admission was not found")
+        if record.get("status") == "held":
+            return 0 if record.get("held_turn_id") == turn_id else 1
+        if record.get("status") != "claimed" or not claim_owned_by(record, owner_pid):
+            return die("Telegram interrupted admission is not owned by this extension")
+        record["status"] = "held"
+        record["held_at"] = now()
+        record["held_turn_id"] = turn_id
+        clear_claim_owner(record)
+        atomic_json(path, record)
+    return 0
+
+
+def mirror_recover(home: Path, request_id: str, owner_pid: int) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        path = request_path(home, request_id)
+        record = read_json(path) if path is not None else None
+        if path is None:
+            return 0
+        if (path.parent.name != "inbox" or not isinstance(record, dict)
+                or record.get("status") != "held"):
+            return die("Telegram interrupted admission is not held")
+        record["status"] = "queued"
+        record.pop("held_at", None)
+        record.pop("held_turn_id", None)
+        atomic_json(path, record)
+    return 0
+
+
+def mirror_delivered(home: Path, request_id: str, owner_pid: int) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        path = request_path(home, request_id)
+        record = read_json(path) if path is not None else None
+        if (path is None or path.parent.name != "inbox" or not isinstance(record, dict)
+                or record.get("status") != "claimed" or not claim_owned_by(record, owner_pid)):
+            return die("Telegram request is not owned by this extension")
+        if record.get("delivery_status") == "sent":
+            return 0
+        record["delivery_status"] = "sending"
+        atomic_json(path, record)
+        chat_id = record.get("chat_id")
+    try:
+        send_text(home, int(chat_id), PI_DELIVERED_RECEIPT)
+    except TelegramError:
+        with FileLock(state_lock(home)):
+            current = read_json(path)
+            if isinstance(current, dict) and claim_owned_by(current, owner_pid):
+                current["delivery_status"] = "delivery_unknown"
+                atomic_json(path, current)
+        return 1
+    with FileLock(state_lock(home)):
+        current = read_json(path)
+        if isinstance(current, dict) and claim_owned_by(current, owner_pid):
+            current["delivery_status"] = "sent"
+            atomic_json(path, current)
+    return 0
+
+
+def mirror_delivery_dir(home: Path) -> Path:
+    path = state_dir(home) / "deliveries"
+    private_dir(path)
+    return path
+
+
+def mirror_delivery_body(text_file: str) -> Tuple[bytes, List[Dict[str, Any]]]:
+    try:
+        body = text_from_file(text_file).encode("utf-8")
+        chunks = split_telegram_response(body)
+    except (OSError, UnicodeError) as exc:
+        raise TelegramError("Telegram delivery body is not valid UTF-8") from exc
+    if len(body) > MAX_MIRROR_DELIVERY_BYTES:
+        raise TelegramError("Telegram delivery exceeds the response limit")
+    if not chunks or len(chunks) > MAX_MIRROR_DELIVERY_CHUNKS:
+        raise TelegramError("Telegram delivery exceeds the chunk limit")
+    return body, chunks
+
+
+def mirror_validate(text_file: str) -> int:
+    try:
+        mirror_delivery_body(text_file)
+    except TelegramError as exc:
+        return die(str(exc))
+    return 0
+
+
+def mirror_reserve(home: Path, delivery_id: str, owner_pid: int, text_file: str,
+                   accepted_input: bool = False) -> int:
+    identity = claim_owner_identity(owner_pid)
+    if identity is None:
+        return die("Telegram mirror owner is not the invoking extension")
+    if not safe_id(delivery_id) or len(delivery_id) > 160:
+        return die("Telegram delivery identity is invalid")
+    try:
+        body, chunks = mirror_delivery_body(text_file)
+    except TelegramError as exc:
+        return die(str(exc))
+    root = mirror_delivery_dir(home)
+    body_path = root / f"{delivery_id}.txt"
+    metadata_path = root / f"{delivery_id}.json"
+    digest = hashlib.sha256(body).hexdigest()
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        if not accepted_input and not mirror_mode_enabled(home):
+            return die("Telegram mirror mode is off")
+        existing = read_json(metadata_path)
+        if isinstance(existing, dict):
+            if existing.get("sha256") != digest:
+                return die("Telegram delivery identity is already bound to different content")
+            if (existing.get("status") == "reserved"
+                    and existing.get("reservation_owner_pid") == owner_pid
+                    and existing.get("reservation_owner_identity") == identity):
+                return 0
+            return die("Telegram delivery identity is already in use")
+        if not cleanup_mirror_deliveries_locked(home, reserve_slots=1):
+            return die("Telegram delivery journal has no bounded free slot")
+        atomic_bytes(body_path, body)
+        atomic_json(metadata_path, {
+            "delivery_id": delivery_id,
+            "sha256": digest,
+            "status": "reserved",
+            "created_at": now(),
+            "chunks": chunks,
+            "reservation_owner_pid": owner_pid,
+            "reservation_owner_identity": identity,
+        })
+    return 0
+
+
+def mirror_cancel(home: Path, delivery_id: str, owner_pid: int) -> int:
+    identity = claim_owner_identity(owner_pid)
+    if identity is None or not safe_id(delivery_id) or len(delivery_id) > 160:
+        return die("Telegram delivery reservation identity is invalid")
+    root = mirror_delivery_dir(home)
+    body_path = root / f"{delivery_id}.txt"
+    metadata_path = root / f"{delivery_id}.json"
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        record = read_json(metadata_path)
+        if record is None:
+            return 0
+        if (not isinstance(record, dict) or record.get("status") != "reserved"
+                or record.get("reservation_owner_pid") != owner_pid
+                or record.get("reservation_owner_identity") != identity):
+            return die("Telegram delivery reservation is not owned by this extension")
+        durable_unlink(metadata_path)
+        durable_unlink(body_path)
+    return 0
+
+
+def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str,
+                 request_id: Optional[str] = None) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    if (not safe_id(delivery_id) or len(delivery_id) > 160
+            or (request_id is not None and not safe_id(request_id))):
+        return die("Telegram delivery identity is invalid")
+    try:
+        body, chunks = mirror_delivery_body(text_file)
+    except TelegramError as exc:
+        return die(str(exc))
+    root = mirror_delivery_dir(home)
+    body_path = root / f"{delivery_id}.txt"
+    metadata_path = root / f"{delivery_id}.json"
+    digest = hashlib.sha256(body).hexdigest()
+    delivery_pid = os.getpid()
+    delivery_identity = process_identity(delivery_pid)
+    if delivery_identity is None:
+        return die("Telegram delivery process identity is unavailable")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        if request_id is not None:
+            retire_superseded_completion_deliveries_locked(home, request_id, delivery_id)
+        existing = read_json(metadata_path)
+        if isinstance(existing, dict):
+            if existing.get("sha256") != digest:
+                return die("Telegram delivery identity is already bound to different content")
+            existing_request = existing.get("completion_request_id")
+            if request_id is not None and existing_request not in {None, request_id}:
+                return die("Telegram delivery identity is already bound to another request")
+            if request_id is not None and existing_request is None:
+                existing["completion_request_id"] = request_id
+                atomic_json(metadata_path, existing)
+            if existing.get("status") == "sent":
+                return 0
+            if existing.get("status") == "delivery_unknown":
+                return DELIVERY_UNKNOWN_EXIT
+            record = existing
+            if record.get("status") == "reserved":
+                reservation_identity = claim_owner_identity(owner_pid)
+                if (reservation_identity is None
+                        or record.get("reservation_owner_pid") != owner_pid
+                        or record.get("reservation_owner_identity") != reservation_identity):
+                    return die("Telegram delivery reservation is not owned by this extension")
+                record.pop("reservation_owner_pid", None)
+                record.pop("reservation_owner_identity", None)
+                record["status"] = "pending"
+            if not isinstance(record.get("chunks"), list):
+                record["chunks"] = chunks
+            previous_pid = record.get("delivery_owner_pid")
+            previous_identity = record.get("delivery_owner_identity")
+            previous_owner_live = bool(
+                strict_int(previous_pid)
+                and isinstance(previous_identity, str)
+                and process_identity(previous_pid) == previous_identity
+            )
+            if previous_owner_live:
+                return die("Telegram delivery is already in flight")
+            if any(chunk.get("telegram_status") == "sending" for chunk in record["chunks"]):
+                for chunk in record["chunks"]:
+                    if chunk.get("telegram_status") == "sending":
+                        chunk["telegram_status"] = "delivery_unknown"
+                record["status"] = "delivery_unknown"
+                record.pop("delivery_owner_pid", None)
+                record.pop("delivery_owner_identity", None)
+                atomic_json(metadata_path, record)
+                return DELIVERY_UNKNOWN_EXIT
+        else:
+            if not cleanup_mirror_deliveries_locked(home, reserve_slots=1):
+                return die("Telegram delivery journal has no bounded free slot")
+            atomic_bytes(body_path, body)
+            record = {"delivery_id": delivery_id, "sha256": digest, "status": "pending",
+                      "created_at": now(), "chunks": chunks}
+        if request_id is not None:
+            record["completion_request_id"] = request_id
+        record["delivery_owner_pid"] = delivery_pid
+        record["delivery_owner_identity"] = delivery_identity
+        atomic_json(metadata_path, record)
+        config = load_config(home)
+        chat_id = int(config["chat_id"])
+    try:
+        while True:
+            with FileLock(state_lock(home)):
+                record = read_json(metadata_path)
+                if (not isinstance(record, dict) or record.get("sha256") != digest
+                        or record.get("delivery_owner_pid") != delivery_pid
+                        or record.get("delivery_owner_identity") != delivery_identity):
+                    return die("Telegram delivery record changed during delivery")
+                current_chunks = record.get("chunks")
+                if not isinstance(current_chunks, list):
+                    return die("Telegram delivery record is malformed")
+                index = next((position for position, chunk in enumerate(current_chunks)
+                              if chunk.get("telegram_status") in {"pending", "rejected"}), None)
+                if index is None:
+                    record["status"] = aggregate_response_delivery(current_chunks)
+                    atomic_json(metadata_path, record)
+                    return 0 if record["status"] == "sent" else DELIVERY_UNKNOWN_EXIT
+                chunk = current_chunks[index]
+                attempts = chunk.get("telegram_attempts", 0)
+                if not strict_int(attempts) or attempts < 0:
+                    return die("Telegram delivery record is malformed")
+                if attempts >= MAX_MIRROR_DELIVERY_ATTEMPTS:
+                    record["status"] = "rejected"
+                    atomic_json(metadata_path, record)
+                    print("delivery-rejected")
+                    return 1
+                chunk["telegram_attempts"] = attempts + 1
+                chunk["telegram_status"] = "sending"
+                chunk["telegram_attempted_at"] = now()
+                record["status"] = "sending"
+                atomic_json(metadata_path, record)
+                start = chunk.get("start")
+                end = chunk.get("end")
+                if not strict_int(start) or not strict_int(end) or start < 0 or end <= start:
+                    return die("Telegram delivery record is malformed")
+                chunk_text = body[start:end].decode("utf-8")
+            try:
+                send_text(home, chat_id, chunk_text)
+            except TelegramError as exc:
+                with FileLock(state_lock(home)):
+                    record = read_json(metadata_path)
+                    if isinstance(record, dict) and isinstance(record.get("chunks"), list):
+                        chunk = record["chunks"][index]
+                        chunk["telegram_status"] = ("delivery_unknown"
+                                                    if exc.delivery_unknown else "rejected")
+                        record["status"] = aggregate_response_delivery(record["chunks"])
+                        atomic_json(metadata_path, record)
+                if exc.delivery_unknown:
+                    return DELIVERY_UNKNOWN_EXIT
+                if attempts + 1 >= MAX_MIRROR_DELIVERY_ATTEMPTS:
+                    print("delivery-rejected")
+                    return 1
+                continue
+            with FileLock(state_lock(home)):
+                record = read_json(metadata_path)
+                if (not isinstance(record, dict) or not isinstance(record.get("chunks"), list)
+                        or record.get("delivery_owner_pid") != delivery_pid
+                        or record.get("delivery_owner_identity") != delivery_identity):
+                    return die("Telegram delivery record changed during delivery")
+                record["chunks"][index]["telegram_status"] = "sent"
+                record["chunks"][index]["telegram_sent_at"] = now()
+                record["status"] = aggregate_response_delivery(record["chunks"])
+                atomic_json(metadata_path, record)
+    finally:
+        with FileLock(state_lock(home)):
+            record = read_json(metadata_path)
+            if (isinstance(record, dict)
+                    and record.get("delivery_owner_pid") == delivery_pid
+                    and record.get("delivery_owner_identity") == delivery_identity):
+                record.pop("delivery_owner_pid", None)
+                record.pop("delivery_owner_identity", None)
+                atomic_json(metadata_path, record)
+
+
+def mirror_abandon(home: Path, request_id: str, delivery_id: str, owner_pid: int) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    if not safe_id(request_id) or not safe_id(delivery_id):
+        return die("Telegram abandonment identity is invalid")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        inbox, handled = request_dirs(home)
+        source = inbox / f"{request_id}.json"
+        target = handled / source.name
+        if target.is_file() and not target.is_symlink():
+            record = read_json(target)
+            return 0 if isinstance(record, dict) and record.get("request_id") == request_id else 1
+        record = read_json(source)
+        if record is None:
+            return 0
+        status = record.get("status") if isinstance(record, dict) else None
+        owned_claim = status == "claimed" and claim_owned_by(record, owner_pid)
+        if (not isinstance(record, dict) or record.get("request_id") != request_id
+                or not (owned_claim or status == "held")):
+            return die("Telegram request is not owned by this extension")
+        record["status"] = "abandoned"
+        record["failure_delivery_id"] = delivery_id
+        record["abandoned_at"] = now()
+        record.pop("held_at", None)
+        record.pop("held_turn_id", None)
+        clear_claim_owner(record)
+        atomic_json(source, record)
+        durable_replace(source, target)
+        private_file(target)
+        delivery_path = mirror_delivery_dir(home) / f"{delivery_id}.json"
+        delivery = read_json(delivery_path)
+        if (isinstance(delivery, dict)
+                and delivery.get("completion_request_id") == request_id
+                and delivery.get("status") != "sent"):
+            delivery.pop("completion_request_id", None)
+            atomic_json(delivery_path, delivery)
+    return 0
+
+
+def mirror_complete(home: Path, request_id: str, delivery_id: str, owner_pid: int) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    if not safe_id(request_id) or not safe_id(delivery_id):
+        return die("Telegram completion identity is invalid")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        inbox, handled = request_dirs(home)
+        source = inbox / f"{request_id}.json"
+        target = handled / source.name
+        if target.is_file() and not target.is_symlink():
+            record = read_json(target)
+            return 0 if isinstance(record, dict) and record.get("delivery_id") == delivery_id else 1
+        record = read_json(source)
+        delivery = read_json(mirror_delivery_dir(home) / f"{delivery_id}.json")
+        if (not isinstance(record, dict) or record.get("request_id") != request_id
+                or record.get("status") != "claimed" or not claim_owned_by(record, owner_pid)):
+            return die("Telegram request is not owned by this extension")
+        if (not isinstance(delivery, dict) or delivery.get("delivery_id") != delivery_id
+                or delivery.get("status") != "sent"
+                or delivery.get("completion_request_id") != request_id):
+            return die("Telegram assistant delivery is not definitively settled")
+        record["status"] = "handled"
+        record["delivery_id"] = delivery_id
+        record["completed_at"] = now()
+        clear_claim_owner(record)
+        atomic_json(source, record)
+        durable_replace(source, target)
+        private_file(target)
+        delivery.pop("completion_request_id", None)
+        atomic_json(mirror_delivery_dir(home) / f"{delivery_id}.json", delivery)
+    return 0
 
 
 def answer_callback(home: Path, callback_id: str) -> None:
@@ -1882,7 +2399,7 @@ def complete_send(home: Path, pending: Dict[str, Any]) -> bool:
         reconcile_request(home, request_id)
         path = request_path(home, request_id)
         record = read_json(path) if path is not None else None
-        if not isinstance(record, dict) or record.get("wake_recorded") is not True:
+        if not isinstance(record, dict) or record.get("status") not in {"queued", "claimed"}:
             return False
     except (TelegramError, OSError, KeyError, TypeError, ValueError):
         return False
@@ -1901,6 +2418,8 @@ def complete_send(home: Path, pending: Dict[str, Any]) -> bool:
 
 
 def reconcile_pending(home: Path, config: Dict[str, Any]) -> None:
+    if not mirror_mode_enabled(home):
+        return
     pending = read_json(pending_path(home))
     if not isinstance(pending, dict):
         return
@@ -1954,41 +2473,64 @@ def handle_text(home: Path, config: Dict[str, Any], message: Dict[str, Any], upd
     if (not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT
             or unicode_text_units(text) is None):
         return False
-    pending = read_json(pending_path(home))
-    if isinstance(pending, dict):
-        edit_replay = (pending.get("edit_update_id") == update_id
-                       and pending.get("edit_message_id") == message_id)
-        if edit_replay:
-            reconcile_pending(home, config)
-            return True
-        if pending.get("mode") == "edit":
-            text_units = unicode_text_units(text)
-            if text_units is None or text_units > MAX_TRANSCRIPT_UNITS:
-                return False
-            revision = pending.get("revision")
-            if not strict_int(revision) or revision <= 0:
-                return False
-            pending["text"] = text
-            pending["mode"] = "confirm"
-            pending["revision"] = revision + 1
-            pending["edit_update_id"] = update_id
-            pending["edit_message_id"] = message_id
-            pending["heading_sent"] = False
-            pending["transcript_sent"] = False
-            for field in ("heading_delivery", "heading_attempts", "heading_attempted_at",
-                          "transcript_delivery", "transcript_attempts", "transcript_attempted_at",
-                          "edit_prompt_delivery", "edit_prompt_attempts", "edit_prompt_attempted_at"):
-                pending.pop(field, None)
-            pending.pop("edit_prompt_sent", None)
-            save_pending(home, pending)
-            reconcile_pending(home, config)
-            return True
-    request_id = queue_request(home, text, int(config["chat_id"]),
-                               int(message_id), update_id,
-                               attach_to_active=True)
+    action = mirror_command(text)
+    if action is not None:
+        try:
+            send_text(home, int(config["chat_id"]), mirror_mode_reply(home, action))
+        except TelegramError:
+            return False
+        return True
+    operation = ""
+    request_id = ""
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        if not mirror_mode_enabled(home):
+            operation = "refuse"
+        else:
+            pending = read_json(pending_path(home))
+            if isinstance(pending, dict):
+                edit_replay = (pending.get("edit_update_id") == update_id
+                               and pending.get("edit_message_id") == message_id)
+                if edit_replay:
+                    operation = "reconcile"
+                elif pending.get("mode") == "edit":
+                    text_units = unicode_text_units(text)
+                    if text_units is None or text_units > MAX_TRANSCRIPT_UNITS:
+                        return False
+                    revision = pending.get("revision")
+                    if not strict_int(revision) or revision <= 0:
+                        return False
+                    pending["text"] = text
+                    pending["mode"] = "confirm"
+                    pending["revision"] = revision + 1
+                    pending["edit_update_id"] = update_id
+                    pending["edit_message_id"] = message_id
+                    pending["heading_sent"] = False
+                    pending["transcript_sent"] = False
+                    for field in ("heading_delivery", "heading_attempts", "heading_attempted_at",
+                                  "transcript_delivery", "transcript_attempts", "transcript_attempted_at",
+                                  "edit_prompt_delivery", "edit_prompt_attempts", "edit_prompt_attempted_at"):
+                        pending.pop(field, None)
+                    pending.pop("edit_prompt_sent", None)
+                    save_pending(home, pending)
+                    operation = "reconcile"
+            if not operation:
+                request_id = _queue_request_locked(
+                    home, text, int(config["chat_id"]), int(message_id), update_id,
+                    "text", False,
+                )
+    if operation == "refuse":
+        try:
+            send_text(home, int(config["chat_id"]), MIRROR_OFF_REFUSAL)
+        except TelegramError:
+            return False
+        return True
+    if operation == "reconcile":
+        reconcile_pending(home, config)
+        return True
     reconcile_request(home, request_id)
     record = read_json(request_path(home, request_id))
-    return isinstance(record, dict) and record.get("wake_recorded") is True
+    return isinstance(record, dict) and record.get("status") in {"queued", "claimed"}
 
 
 def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any],
@@ -2008,28 +2550,38 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any],
         return False
     message_id = int(message["message_id"])
     pending_id = f"voice-u{update_id}-m{message_id}"
+    refuse = False
     with FileLock(state_lock(home)):
-        pending = read_json(pending_path(home))
-        if isinstance(pending, dict) and pending.get("pending_id") == pending_id:
-            return True
-        records, changed = load_pending_voice_queue_locked(home)
-        if any(record.get("pending_id") == pending_id for record in records):
-            if changed:
-                save_pending_voice_queue_locked(home, records)
-            return True
-        if len(records) >= MAX_PENDING_VOICES:
-            return None
-        records.append({
-            "pending_id": pending_id,
-            "file_id": file_id,
-            "duration": duration,
-            "size": size,
-            "chat_id": int(config["chat_id"]),
-            "message_id": message_id,
-            "update_id": update_id,
-            "queued_at": now(),
-        })
-        save_pending_voice_queue_locked(home, records)
+        require_state_available_locked(home)
+        if not mirror_mode_enabled(home):
+            refuse = True
+        else:
+            pending = read_json(pending_path(home))
+            if isinstance(pending, dict) and pending.get("pending_id") == pending_id:
+                return True
+            records, changed = load_pending_voice_queue_locked(home)
+            if any(record.get("pending_id") == pending_id for record in records):
+                if changed:
+                    save_pending_voice_queue_locked(home, records)
+                return True
+            if len(records) >= MAX_PENDING_VOICES:
+                return None
+            records.append({
+                "pending_id": pending_id,
+                "file_id": file_id,
+                "duration": duration,
+                "size": size,
+                "chat_id": int(config["chat_id"]),
+                "message_id": message_id,
+                "update_id": update_id,
+                "queued_at": now(),
+            })
+            save_pending_voice_queue_locked(home, records)
+    if refuse:
+        try:
+            send_text(home, int(config["chat_id"]), MIRROR_OFF_REFUSAL)
+        except TelegramError:
+            return False
     return True
 
 
@@ -2071,8 +2623,42 @@ def advance_pending_voice(home: Path, config: Dict[str, Any]) -> None:
             }
             save_pending(home, pending)
             save_pending_voice_queue_locked(home, records[1:])
+        try:
+            send_voice_progress(home, pending)
+        except TelegramError:
+            pass
         if complete_initial_transcription(home, config, pending):
             return
+
+
+def send_voice_progress(home: Path, pending: Dict[str, Any]) -> None:
+    pending_id = pending.get("pending_id")
+    if not isinstance(pending_id, str):
+        return
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                or current.get("mode") != "transcribing"):
+            return
+        if current.get("progress_status") == "sent":
+            return
+        current["progress_status"] = "sending"
+        atomic_json(pending_path(home), current)
+        chat_id = int(current["chat_id"])
+    try:
+        send_text(home, chat_id, VOICE_PROGRESS_NOTICE)
+    except TelegramError:
+        with FileLock(state_lock(home)):
+            current = read_json(pending_path(home))
+            if isinstance(current, dict) and current.get("pending_id") == pending_id:
+                current["progress_status"] = "delivery_unknown"
+                atomic_json(pending_path(home), current)
+        raise
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if isinstance(current, dict) and current.get("pending_id") == pending_id:
+            current["progress_status"] = "sent"
+            atomic_json(pending_path(home), current)
 
 
 def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], update_id: int) -> bool:
@@ -2118,6 +2704,13 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
     if revision <= 0 or str(revision) != raw_revision:
         return False
     token = f"{action}:{revision}"
+    if action != "cancel" and not mirror_mode_enabled(home):
+        answer_callback(home, callback_id)
+        try:
+            send_text(home, int(config["chat_id"]), MIRROR_OFF_REFUSAL)
+        except TelegramError:
+            pass
+        return True
     operation = ""
     pending_snapshot: Optional[Dict[str, Any]] = None
     with FileLock(state_lock(home)):
@@ -2164,7 +2757,9 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
             elif already_completed:
                 operation = "acknowledge"
             else:
-                if action == "cancel":
+                if action != "cancel" and not mirror_mode_enabled(home):
+                    operation = "refuse"
+                elif action == "cancel":
                     pending["mode"] = "canceling"
                     pending["cancel_token"] = token
                     save_pending(home, pending)
@@ -2193,7 +2788,7 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
                             request_id = _queue_request_locked(
                                 home, str(pending["text"]), int(pending["chat_id"]),
                                 int(pending["message_id"]), int(pending["update_id"]),
-                                "voice", True, True,
+                                "voice", True,
                             )
                         except (TelegramError, KeyError, TypeError, ValueError):
                             return False
@@ -2203,6 +2798,13 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
                         save_pending(home, pending)
                         operation = "send"
                         pending_snapshot = dict(pending)
+    if operation == "refuse":
+        answer_callback(home, callback_id)
+        try:
+            send_text(home, int(config["chat_id"]), MIRROR_OFF_REFUSAL)
+        except TelegramError:
+            pass
+        return True
     if operation == "acknowledge":
         answer_callback(home, callback_id)
         return True
@@ -2373,12 +2975,7 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
                 except PermanentConfigurationError:
                     clear_stopped_transport_state(home)
                     raise
-                try:
-                    prepare_transport_activation(home)
-                except WatcherPreconditionError:
-                    if systemd_service and service_activation_path(home).is_file():
-                        atomic_bytes(service_activation_path(home), b"watcher-precondition\n")
-                    raise
+                prepare_transport_activation(home)
                 if systemd_service:
                     durable_unlink(service_activation_path(home))
         offset = 0
@@ -2393,7 +2990,6 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
         signal.signal(signal.SIGINT, stop_service)
         try:
             while not stop:
-                reconcile_closing(home)
                 expire_pending(home)
                 bounded_cleanup(home)
                 reconcile_requests(home)
@@ -2447,7 +3043,7 @@ def identity_bound_state_exists(home: Path) -> bool:
         path = root / name
         if path.exists() or path.is_symlink():
             return True
-    for name in ("inbox", "handled", "responses"):
+    for name in ("inbox", "handled", "responses", "deliveries"):
         path = root / name
         if path.is_symlink() or (path.exists() and not path.is_dir()):
             return True
@@ -2525,605 +3121,6 @@ def text_from_file(path: str) -> str:
     return Path(path).read_bytes().decode("utf-8")
 
 
-def request_read(home: Path, request_id: str) -> int:
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        path = request_path(home, request_id)
-        if path is None:
-            return die("request not found")
-        record = read_json(path)
-        if not isinstance(record, dict) or record.get("origin") != "telegram":
-            return die("request is not a Telegram request")
-        text = record.get("text")
-        if not isinstance(text, str):
-            return die("request is malformed")
-    sys.stdout.buffer.write(text.encode("utf-8"))
-    sys.stdout.buffer.flush()
-    return 0
-
-
-def request_handled(home: Path, request_id: str) -> int:
-    reconcile_closing(home)
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        inbox, handled = request_dirs(home)
-        source = inbox / f"{request_id}.json"
-        target = handled / f"{request_id}.json"
-        active = active_request_id(home)
-        record = read_json(source)
-        if not source.is_file() or source.is_symlink():
-            if target.is_file():
-                target_record = read_json(target)
-                active_state = active_record(home)
-                if active == request_id:
-                    if (isinstance(target_record, dict)
-                            and target_record.get("wake_recorded") is not True):
-                        target_record["wake_recorded"] = True
-                        atomic_json(target, target_record)
-                    if active_state is not None:
-                        _sync_request_wakes_locked(home)
-                        return 0
-                    return die("request is already routed")
-                if (isinstance(target_record, dict)
-                        and target_record.get("continuation_of") == active):
-                    if target_record.get("wake_recorded") is not True:
-                        target_record["wake_recorded"] = True
-                        atomic_json(target, target_record)
-                    _sync_request_wakes_locked(home)
-                    return 0
-            return die("request not found")
-        if not isinstance(record, dict) or record.get("request_id") != request_id:
-            return die("request is malformed")
-        continuation_of = record.get("continuation_of")
-        if _desired_request_id_locked(home) != request_id:
-            return die("request is not the ordered Telegram queue head")
-        if active is not None and active != request_id and continuation_of != active:
-            return die("another Telegram conversation is active")
-        if active is None:
-            if isinstance(continuation_of, str):
-                return die("continuation predecessor is no longer active")
-            atomic_json(active_path(home), {"request_id": request_id, "claimed_at": now()})
-        elif continuation_of == active:
-            record["continuation_routing"] = "pending"
-        record["wake_recorded"] = True
-        atomic_json(source, record)
-        durable_replace(source, target)
-        private_file(target)
-        _sync_request_wakes_locked(home)
-    bounded_cleanup(home)
-    return 0
-
-
-def spawn_lock_owned_by_parent(home: Path, work_id: str) -> bool:
-    state = home / "state"
-    lock = state / f".spawn-{work_id}.lock"
-    if not lock.is_symlink():
-        return False
-    try:
-        target = Path(os.readlink(lock))
-    except OSError:
-        return False
-    if (not target.is_absolute() or target.parent != state
-            or not target.name.startswith(f"{lock.name}.owner.")
-            or not target.is_dir() or target.is_symlink()):
-        return False
-    pid_path = target / "pid"
-    if not pid_path.is_file() or pid_path.is_symlink():
-        return False
-    try:
-        owner_pid = int(pid_path.read_text(encoding="ascii").strip())
-    except (OSError, UnicodeError, ValueError):
-        return False
-    return owner_pid == os.getppid()
-
-
-def request_bind_locked(home: Path, request_id: str, work_id: str) -> int:
-    if not lifecycle_task_id_valid(work_id):
-        return die("work identifier is invalid")
-    if not spawn_lock_owned_by_parent(home, work_id):
-        return die("work creation lock is not held by the binding parent")
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        active = active_record(home)
-        if active is None or active.get("request_id") != request_id:
-            return die("request is not the active Telegram conversation")
-        if request_path(home, request_id) is None:
-            return die("request not found")
-        bound = active.get("work_id")
-        if bound is not None and bound != work_id:
-            return die("active Telegram conversation is bound to different work")
-        if bound is None:
-            if work_record_exists(home, work_id):
-                return die("work identifier already has a lifecycle record")
-            active["work_id"] = work_id
-            active["bound_at"] = now()
-            active["work_published"] = False
-            atomic_json(active_path(home), active)
-        _sync_request_wakes_locked(home)
-    print("Telegram work binding recorded.")
-    return 0
-
-
-def request_bind(home: Path, request_id: str, work_id: str) -> int:
-    if not lifecycle_task_id_valid(work_id):
-        return die("work identifier is invalid")
-    wake_lib = Path(__file__).resolve().with_name("fm-wake-lib.sh")
-    lock = home / "state" / f".spawn-{work_id}.lock"
-    command = (
-        '. "$1"; STATE=$2; lock=$3; '
-        'if ! fm_lock_try_acquire "$lock"; then '
-        'echo "error: work creation is already in progress" >&2; exit 1; fi; '
-        'trap \'fm_lock_release "$lock"\' EXIT; '
-        '"$4" --home "$5" request-bind-locked "$6" "$7"'
-    )
-    result = subprocess.run(
-        ["/bin/bash", "-c", command, "_", str(wake_lib), str(home / "state"),
-         str(lock), str(Path(__file__).resolve()), str(home), request_id, work_id],
-        check=False,
-    )
-    return result.returncode
-
-
-def publication_reserved(home: Path, work_id: str) -> int:
-    with FileLock(state_lock(home)):
-        if state_tombstone(home).is_file() or not config_path(home).is_file():
-            return 1
-        active = active_record(home)
-        return 0 if active is not None and active.get("work_id") == work_id else 1
-
-
-def publication_authorize(home: Path, request_id: str, work_id: str) -> int:
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        active = active_record(home)
-        path = request_path(home, request_id)
-        if (active is None or active.get("request_id") != request_id
-                or active.get("work_id") != work_id or path is None
-                or path.parent.name != "handled"):
-            return die("Telegram publication does not match the active work binding")
-    return 0
-
-
-def request_published(home: Path, request_id: str, work_id: str) -> int:
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        active = active_record(home)
-        if (active is None or active.get("request_id") != request_id
-                or active.get("work_id") != work_id):
-            return die("Telegram publication does not match the active work binding")
-        if not telegram_owned_work_record(home, work_id, request_id):
-            return die("work record has no verified Telegram publication owner")
-        if active.get("work_published") is not True:
-            active["work_published"] = True
-            active["work_published_at"] = now()
-            atomic_json(active_path(home), active)
-        _sync_request_wakes_locked(home)
-    return 0
-
-
-def request_routed(home: Path, request_id: str) -> int:
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        active = active_record(home)
-        if active is None or active.get("request_id") != request_id:
-            return die("request is not the active Telegram conversation")
-        path = request_path(home, request_id)
-        if path is None or path.parent.name != "handled":
-            return die("request is not a handled Telegram request")
-        if not isinstance(active.get("work_id"), str):
-            return die("active Telegram conversation is not bound to work")
-        if active.get("work_published") is not True:
-            return die("active Telegram work has no verified lifecycle publication")
-        if active.get("initial_routing_consumed") is not True:
-            active["initial_routing_consumed"] = True
-            active["initial_routing_consumed_at"] = now()
-            atomic_json(active_path(home), active)
-        _sync_request_wakes_locked(home)
-    print("Telegram initial route acknowledged.")
-    return 0
-
-
-def request_active(home: Path, work_id: Optional[str] = None,
-                   claimed_request: Optional[str] = None) -> int:
-    reconcile_closing(home)
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        active = active_record(home)
-        if active is None:
-            return 1
-        request_id = str(active["request_id"])
-        if request_path(home, request_id) is None:
-            return 1
-        if (work_id is not None
-                and (active.get("work_id") != work_id
-                     or active.get("work_published") is not True)):
-            return 1
-        route = request_id
-        if claimed_request is not None:
-            claimed_path = request_path(home, claimed_request)
-            if claimed_path is None or claimed_path.parent.name != "handled":
-                return 1
-            value = read_json(claimed_path)
-            if not isinstance(value, dict) or value.get("request_id") != claimed_request:
-                return 1
-            if claimed_request == request_id:
-                bound_work = active.get("work_id")
-                if isinstance(bound_work, str):
-                    route = f"{request_id}\t{bound_work}"
-            else:
-                bound_work = active.get("work_id")
-                if (value.get("continuation_of") != request_id
-                        or value.get("continuation_routing") != "pending"):
-                    return 1
-                if isinstance(bound_work, str) and safe_id(bound_work):
-                    route = f"{request_id}\t{bound_work}"
-                elif bound_work is None:
-                    route = request_id
-                else:
-                    return 1
-    print(route, flush=True)
-    return 0
-
-
-def continuation_handled(home: Path, claimed_request: str) -> int:
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        path = request_path(home, claimed_request)
-        if path is None or path.parent.name != "handled":
-            return die("continuation request not found")
-        record = read_json(path)
-        if not isinstance(record, dict) or record.get("request_id") != claimed_request:
-            return die("continuation request is malformed")
-        predecessor = record.get("continuation_of")
-        routing = record.get("continuation_routing")
-        if not isinstance(predecessor, str) or not safe_id(predecessor):
-            return die("request is not a Telegram continuation")
-        if routing == "routed":
-            _sync_request_wakes_locked(home)
-            already_routed = True
-        else:
-            already_routed = False
-        active = active_record(home)
-        if not already_routed:
-            if (routing != "pending" or active is None
-                    or active.get("request_id") != predecessor):
-                return die("continuation predecessor is no longer active")
-            record["continuation_routing"] = "routed"
-            record["continuation_routed_at"] = now()
-            atomic_json(path, record)
-            _sync_request_wakes_locked(home)
-    reconcile_closing(home)
-    return 0
-
-
-def wake_next_request(home: Path) -> None:
-    sync_request_wakes(home)
-
-
-def response_reserve(home: Path, claimed_request: str, response_id: str,
-                     final: bool = False) -> int:
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        metadata_path, body_path = response_paths(home, response_id)
-        existing = response_record_locked(home, response_id)
-        if existing is not None:
-            if (existing.get("claimed_request_id") == claimed_request
-                    and existing.get("final") is final):
-                print(str(body_path), flush=True)
-                return 0
-            if (response_completed(existing)
-                    and response_conversation_closed_locked(home, existing)):
-                durable_unlink(metadata_path)
-                durable_unlink(body_path)
-            else:
-                return die("response identity is already bound to a different route")
-        conversation_id = claimed_conversation_locked(home, claimed_request)
-        if conversation_id is None:
-            return die("claimed Telegram response route is not active")
-        if final and claimed_request != conversation_id:
-            return die("a continuation response cannot close its predecessor")
-        cleanup_response_journal_locked(home, reserve_slots=1)
-        if len(list(response_dir(home).glob("*.json"))) >= MAX_RESPONSE_JOURNAL:
-            return die("Telegram response journal is full")
-        atomic_bytes(body_path, b"")
-        atomic_json(metadata_path, {
-            "response_id": response_id,
-            "claimed_request_id": claimed_request,
-            "conversation_id": conversation_id,
-            "final": final,
-            "content_status": "reserved",
-            "created_at": now(),
-            "terminal_status": "pending",
-            "terminal_attempts": 0,
-            "telegram_status": "pending",
-            "telegram_attempts": 0,
-            "chunks": [],
-        })
-    print(str(body_path), flush=True)
-    return 0
-
-
-def refuse_oversized_response(home: Path, metadata_path: Path, body_path: Path,
-                              record: Dict[str, Any], refused_bytes: int,
-                              refused_sha256: str) -> int:
-    mark_oversized_response(
-        metadata_path, record, refused_bytes, refused_sha256,
-    )
-    if (home.resolve() in _TEST_API_BASES
-            and os.environ.get("FM_TELEGRAM_TEST_CRASH_AFTER_OVERSIZE_REFUSAL") == "1"):
-        os._exit(99)
-    atomic_bytes(body_path, b"")
-    return die(f"Telegram response exceeds the {MAX_RESPONSE_BYTES}-byte staging limit")
-
-
-def response_stage(home: Path, claimed_request: str, response_id: str,
-                   text_file: str, final: bool = False) -> int:
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        metadata_path, body_path = response_paths(home, response_id)
-        existing = response_record_locked(home, response_id)
-        if (existing is None
-                or existing.get("claimed_request_id") != claimed_request
-                or existing.get("final") is not final):
-            return die("reserved Telegram response route was not found")
-        if text_file == "-" or Path(text_file).expanduser().absolute() != body_path:
-            return die("response staging must use its reserved private output file")
-        if existing.get("content_status") == "oversized":
-            if body_path.stat().st_size:
-                atomic_bytes(body_path, b"")
-            return die(f"Telegram response exceeds the {MAX_RESPONSE_BYTES}-byte staging limit")
-        try:
-            body_size = body_path.stat().st_size
-            if body_size > MAX_RESPONSE_BYTES:
-                refused_bytes, refused_sha256 = file_sha256(body_path)
-                if refused_bytes > MAX_RESPONSE_BYTES:
-                    return refuse_oversized_response(
-                        home, metadata_path, body_path, existing,
-                        refused_bytes, refused_sha256,
-                    )
-            body = body_path.read_bytes()
-            if len(body) > MAX_RESPONSE_BYTES:
-                return refuse_oversized_response(
-                    home, metadata_path, body_path, existing,
-                    len(body), hashlib.sha256(body).hexdigest(),
-                )
-            text = body.decode("utf-8")
-            chunks = split_telegram_response(body)
-        except (OSError, UnicodeError) as exc:
-            raise TelegramError("Telegram response output is not valid UTF-8") from exc
-        if (not text.startswith(FIRSTMATE_REPLY_LABEL)
-                or unicode_text_units(text) is None):
-            return die("Telegram response must be valid UTF-8 beginning with the static Firstmate label")
-        if not chunks or len(chunks) > MAX_RESPONSE_CHUNKS:
-            return die(f"Telegram response exceeds the {MAX_RESPONSE_CHUNKS}-chunk staging limit")
-        if existing.get("content_status") == "staged":
-            if existing.get("body_sha256") != hashlib.sha256(body).hexdigest():
-                return die("response identity is already bound to different content or route")
-            print(str(body_path), flush=True)
-            return 0
-        atomic_bytes(body_path, body)
-        existing["content_status"] = "staged"
-        existing["body_sha256"] = hashlib.sha256(body).hexdigest()
-        existing["chunks"] = chunks
-        existing["staged_at"] = now()
-        atomic_json(metadata_path, existing)
-    bounded_cleanup(home)
-    print(str(body_path), flush=True)
-    return 0
-
-
-def response_status(home: Path, claimed_request: str, response_id: str) -> int:
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        record = response_record_locked(home, response_id)
-        if record is None or record.get("claimed_request_id") != claimed_request:
-            return 1
-        _metadata_path, body_path = response_paths(home, response_id)
-        final = "final" if record["final"] else "non-final"
-        content = str(record["content_status"])
-        print(f"{body_path}\t{content}\t{record['terminal_status']}\t{record['telegram_status']}\t{final}")
-    return 0
-
-
-def response_render(home: Path, claimed_request: str, response_id: str) -> int:
-    with FileLock(lifecycle_lock(home)):
-        with FileLock(state_lock(home)):
-            require_state_available_locked(home)
-            record = response_record_locked(home, response_id)
-            if (record is None or record.get("claimed_request_id") != claimed_request
-                    or record.get("content_status") != "staged"):
-                return die("staged Telegram response not found")
-            if record["terminal_status"] == "rendered":
-                return 0
-            metadata_path, body_path = response_paths(home, response_id)
-            record["terminal_status"] = "rendering"
-            record["terminal_attempts"] = record.get("terminal_attempts", 0) + 1
-            record["terminal_attempted_at"] = now()
-            atomic_json(metadata_path, record)
-            body = body_path.read_bytes()
-        sys.stdout.buffer.write(body)
-        sys.stdout.buffer.flush()
-    return 0
-
-
-def response_rendered(home: Path, claimed_request: str, response_id: str) -> int:
-    with FileLock(lifecycle_lock(home)):
-        with FileLock(state_lock(home)):
-            require_state_available_locked(home)
-            record = response_record_locked(home, response_id)
-            if (record is None or record.get("claimed_request_id") != claimed_request
-                    or record.get("content_status") != "staged"):
-                return die("staged Telegram response not found")
-            if record["terminal_status"] == "rendered":
-                return 0
-            if record["terminal_status"] != "rendering":
-                return die("Telegram response rendering has not started")
-            metadata_path, _body_path = response_paths(home, response_id)
-            record["terminal_status"] = "rendered"
-            record["terminal_rendered_at"] = now()
-            atomic_json(metadata_path, record)
-    return 0
-
-
-def reconcile_closing(home: Path) -> None:
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        closing = read_json(closing_path(home))
-        if not isinstance(closing, dict):
-            return
-        request_id = closing.get("request_id")
-        if not isinstance(request_id, str) or not safe_id(request_id):
-            raise TelegramError("Telegram closing transition is malformed")
-        active = active_record(home)
-        if active is not None and active.get("request_id") != request_id:
-            raise TelegramError("Telegram closing transition conflicts with active work")
-        inbox, handled = request_dirs(home)
-        continuation_paths = list(inbox.glob("*.json")) + list(handled.glob("*.json"))
-        for path in continuation_paths:
-            record = read_json(path, {})
-            if (isinstance(record, dict) and record.get("continuation_of") == request_id
-                    and (path.parent == inbox or record.get("continuation_routing") == "pending")):
-                _sync_request_wakes_locked(home)
-                return
-        if active is not None:
-            durable_unlink(active_path(home))
-        _sync_request_wakes_locked(home)
-        durable_unlink(closing_path(home))
-
-
-def _send_command_locked(home: Path, text: str) -> int:
-    config = load_config(home)
-    send_text(home, int(config["chat_id"]), text)
-    print("Telegram message sent.")
-    return 0
-
-
-def reconcile_staged_final(home: Path, request_id: str) -> bool:
-    with FileLock(state_lock(home)):
-        current = active_record(home)
-        path = request_path(home, request_id)
-        request = read_json(path) if path is not None else None
-        if current is not None and current.get("request_id") == request_id:
-            _update_request_record_locked(home, request_id, final_sent=True, final_sent_at=now())
-            atomic_json(closing_path(home), {"request_id": request_id, "created_at": now()})
-        elif not isinstance(request, dict) or request.get("final_sent") is not True:
-            raise TelegramError("active Telegram conversation changed during final reply")
-    reconcile_closing(home)
-    with FileLock(state_lock(home)):
-        closing = read_json(closing_path(home))
-        return isinstance(closing, dict) and closing.get("request_id") == request_id
-
-
-def _send_staged_response_locked(home: Path, request_id: str, response_id: str) -> int:
-    with FileLock(state_lock(home)):
-        require_state_available_locked(home)
-        record = response_record_locked(home, response_id)
-        if (record is None or record.get("conversation_id") != request_id
-                or record.get("content_status") != "staged"):
-            return die("staged Telegram response does not match the conversation")
-        if record["terminal_status"] != "rendered":
-            return die("staged Telegram response rendering is not acknowledged")
-        request_path_value = request_path(home, request_id)
-        request = read_json(request_path_value) if request_path_value is not None else None
-        if not isinstance(request, dict) or request.get("origin") != "telegram":
-            return die("request is not a Telegram request")
-        if record["telegram_status"] not in {"sent", "delivery_unknown"}:
-            if active_request_id(home) != request_id:
-                return die("request is not the active Telegram conversation")
-        chat_id = int(request["chat_id"])
-        final = bool(record["final"])
-        initially_settled = record["telegram_status"] in {"sent", "delivery_unknown"}
-    delivery_interrupted = False
-    while True:
-        with FileLock(state_lock(home)):
-            current = response_record_locked(home, response_id)
-            if current is None or current.get("content_status") != "staged":
-                raise TelegramError("Telegram response journal changed during delivery")
-            pending_index = None
-            for index, chunk in enumerate(current["chunks"]):
-                if chunk["telegram_status"] in {"pending", "rejected"}:
-                    pending_index = index
-                    break
-            if pending_index is None:
-                delivery_status = str(current["telegram_status"])
-                break
-            if delivery_interrupted:
-                delivery_status = str(current["telegram_status"])
-                break
-            metadata_path, body_path = response_paths(home, response_id)
-            chunk = current["chunks"][pending_index]
-            chunk["telegram_attempts"] += 1
-            chunk["telegram_status"] = "delivery_unknown"
-            chunk["telegram_attempted_at"] = now()
-            current["telegram_status"] = aggregate_response_delivery(current["chunks"])
-            atomic_json(metadata_path, current)
-            chunk_text = body_path.read_bytes()[chunk["start"]:chunk["end"]].decode("utf-8")
-        try:
-            send_text(home, chat_id, chunk_text)
-        except TelegramError as exc:
-            if exc.delivery_unknown:
-                delivery_interrupted = True
-                continue
-            with FileLock(state_lock(home)):
-                current = response_record_locked(home, response_id)
-                if current is not None:
-                    metadata_path, _body_path = response_paths(home, response_id)
-                    chunk = current["chunks"][pending_index]
-                    if chunk["telegram_status"] == "delivery_unknown":
-                        chunk["telegram_status"] = "rejected"
-                        chunk["telegram_rejected_at"] = now()
-                        current["telegram_status"] = aggregate_response_delivery(current["chunks"])
-                        atomic_json(metadata_path, current)
-            raise
-        with FileLock(state_lock(home)):
-            current = response_record_locked(home, response_id)
-            if current is None:
-                raise TelegramError("Telegram response journal changed during delivery")
-            metadata_path, _body_path = response_paths(home, response_id)
-            chunk = current["chunks"][pending_index]
-            if chunk["telegram_status"] != "delivery_unknown":
-                raise TelegramError("Telegram response journal changed during delivery")
-            chunk["telegram_status"] = "sent"
-            chunk["telegram_sent_at"] = now()
-            current["telegram_status"] = aggregate_response_delivery(current["chunks"])
-            atomic_json(metadata_path, current)
-    settled = delivery_status in {"sent", "delivery_unknown"}
-    if settled and final:
-        continuations_pending = reconcile_staged_final(home, request_id)
-    else:
-        continuations_pending = False
-    if delivery_status == "delivery_unknown":
-        if final and continuations_pending:
-            print("Telegram final reply delivery unknown; continuation handling remains pending.")
-        elif final:
-            print("Telegram final reply delivery unknown; settled chunks were not resent.")
-        else:
-            print("Telegram reply delivery unknown; settled chunks were not resent.")
-        return DELIVERY_UNKNOWN_EXIT
-    if not settled:
-        print("Telegram reply delivery is incomplete; settled chunks were not resent.")
-        return DELIVERY_UNKNOWN_EXIT
-    status = "already sent" if initially_settled else "sent"
-    if final:
-        if continuations_pending:
-            print(f"Telegram final reply {status}; continuation handling remains pending.")
-            return FINAL_CONTINUATION_PENDING_EXIT
-        print(f"Telegram final reply {status}.")
-        return 0
-    print(f"Telegram reply {status}.")
-    return 0
-
-
-def send_command(home: Path, text: str) -> int:
-    with FileLock(lifecycle_lock(home)):
-        return _send_command_locked(home, text)
-
-
-def reply_command(home: Path, request_id: str, response_id: str) -> int:
-    with FileLock(lifecycle_lock(home)):
-        return _send_staged_response_locked(home, request_id, response_id)
-
-
 def telegram_enabled_path(home: Path) -> Path:
     return state_dir(home) / "enabled"
 
@@ -3137,11 +3134,9 @@ def set_telegram_enabled(home: Path, enabled: bool) -> None:
 
 
 def prepare_transport_activation(home: Path) -> None:
+    # The transport is allowed to queue while no primary exists. The project-local
+    # Pi extension, not a watcher or a second route, owns live delivery.
     set_telegram_enabled(home, True)
-    if primary_running(home) and not watcher_running(home):
-        raise WatcherPreconditionError(
-            "a running primary must establish its harness-owned watcher before Telegram starts; retry after supervision is healthy"
-        )
 
 
 def unit_path() -> Path:
@@ -3204,7 +3199,7 @@ def verify_transport_marker(home: Path, expected: bool) -> None:
     while telegram_enabled_path(home).is_file() != expected and time.monotonic() < deadline:
         time.sleep(0.02)
     if telegram_enabled_path(home).is_file() != expected:
-        raise TelegramError("Telegram supervision state did not converge")
+        raise TelegramError("Telegram transport state did not converge")
 
 
 def wait_for_systemd_runtime_ready(home: Path) -> None:
@@ -3218,7 +3213,6 @@ def wait_for_systemd_runtime_ready(home: Path) -> None:
 
 
 def reconcile_failed_activation(home: Path, disable_new_install: bool = False,
-                                preserve_supervision: bool = False,
                                 activation_reserved: bool = False) -> None:
     if activation_reserved:
         systemctl("stop", SERVICE_NAME, check=False)
@@ -3232,18 +3226,9 @@ def reconcile_failed_activation(home: Path, disable_new_install: bool = False,
             active_result = systemctl("is-active", SERVICE_NAME, check=False)
             if active_result.stdout.strip() not in {"inactive", "failed", "unknown", "not-found"}:
                 return
-            activation_state = ""
-            try:
-                activation_state = service_activation_path(home).read_text(encoding="utf-8").strip()
-            except OSError:
-                pass
-            preserve_supervision = preserve_supervision or activation_state == "watcher-precondition"
             durable_unlink(service_activation_path(home))
-            if preserve_supervision:
-                verify_transport_marker(home, True)
-            else:
-                set_telegram_enabled(home, False)
-                verify_transport_marker(home, False)
+            set_telegram_enabled(home, False)
+            verify_transport_marker(home, False)
             if disable_new_install:
                 systemctl("disable", SERVICE_NAME)
                 verify_service(enabled=False)
@@ -3288,9 +3273,7 @@ def install(home: Path) -> int:
                 verify_transport_marker(home, True)
         except (TelegramError, OSError, ValueError) as exc:
             reconcile_failed_activation(
-                home, enabled_by_install,
-                preserve_supervision=isinstance(exc, WatcherPreconditionError),
-                activation_reserved=activation_reserved,
+                home, enabled_by_install, activation_reserved=activation_reserved,
             )
             raise
     print("Telegram service installed and active.")
@@ -3316,10 +3299,7 @@ def start_service(home: Path) -> int:
                 verify_service(active=True)
                 verify_transport_marker(home, True)
         except (TelegramError, OSError, ValueError) as exc:
-            reconcile_failed_activation(
-                home, preserve_supervision=isinstance(exc, WatcherPreconditionError),
-                activation_reserved=activation_reserved,
-            )
+            reconcile_failed_activation(home, activation_reserved=activation_reserved)
             raise
     print("Telegram service active.")
     return 0
@@ -3398,7 +3378,7 @@ def _cleanup_locked(home: Path) -> int:
                 pending = read_json(telegram_state / "pending.json")
                 if isinstance(pending, dict):
                     remove_audio(pending)
-            consume_safe_wakes(home)
+            consume_safe_wakes(home, effective_wake_state(home))
             if telegram_state.is_symlink() or telegram_state.is_file():
                 durable_unlink(telegram_state)
             elif telegram_state.is_dir():
@@ -3406,6 +3386,7 @@ def _cleanup_locked(home: Path) -> int:
             config = config_path(home)
             if config.is_symlink() or config.is_file():
                 durable_unlink(config)
+            durable_unlink(mirror_mode_path(home))
     print("Telegram service and private Telegram state cleaned up.")
     return 0
 
@@ -3419,13 +3400,14 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, request-read, request-handled, request-bind, request-routed, active-request, continuation-handled, response-reserve, response-stage, response-status, response-render, response-rendered, send, reply, install, start, stop, status, disable, cleanup.\n"
-                "Retention limits: 256 queued requests for 7 days, 4096 handled requests, and 256 responses of up to 256 KiB or 64 Telegram chunks each.\n"
-                "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
-                "Voice limits: 10 MiB, 120 seconds, a 4096-unit transcript, and 64 waiting notes. Temporary audio is restricted to /dev/shm.\n"
+        epilog=("Commands: pair, serve, migrate-wakes, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-hold, mirror-recover, mirror-validate, mirror-reserve, mirror-cancel, mirror-reply, mirror-abandon, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
+                "Private mirror commands require the lock-owning extension capability on an inherited file descriptor.\n"
+                f"Retention limits: {MAX_INBOX} queued or interrupted requests for {INBOX_TTL // (24 * 60 * 60)} days, {MAX_HANDLED} handled requests, and {MAX_MIRROR_DELIVERIES} mirror deliveries; unprotected mirror deliveries expire after {MIRROR_DELIVERY_TTL // (24 * 60 * 60)} days and each is at most {MAX_MIRROR_DELIVERY_BYTES // 1024} KiB or {MAX_MIRROR_DELIVERY_CHUNKS} Telegram chunks.\n"
+                f"Receipt delivery makes at most {len(RECEIPT_RETRY_DELAYS)} attempts with bounded backoff.\n"
+                f"Voice limits: {MAX_VOICE_BYTES // (1024 * 1024)} MiB, {MAX_VOICE_SECONDS} seconds, a {MAX_TRANSCRIPT_UNITS}-unit transcript, {MAX_PENDING_VOICES} waiting notes for {INBOX_TTL // (24 * 60 * 60)} days, and one active confirmation for {PENDING_TTL // 60} minutes. Temporary audio is restricted to /dev/shm.\n"
                 "Pairing accepts --parakeet-command and --whisper-command as absolute executable paths; configured paths must be regular executable files.\n"
                 "FM_TELEGRAM_PARAKEET_CMD and FM_TELEGRAM_WHISPER_CMD override the local transcription commands for one process.\n"
-                "Response staging requires its reserved private --text-file; send reads UTF-8 from --text-file or stdin (-), and no recipient argument is accepted."),
+                "Mirror delivery reads UTF-8 from --text-file and accepts no recipient argument."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--home", help="the one Firstmate home to use")
@@ -3433,6 +3415,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     def add_home(command: argparse.ArgumentParser) -> None:
         command.add_argument("--home", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    def add_private(command: argparse.ArgumentParser) -> None:
+        add_home(command)
+        command.add_argument("--owner-pid", type=int, required=True)
+        command.add_argument("--capability-fd", type=int, required=True, help=argparse.SUPPRESS)
     pair_parser = sub.add_parser(
         "pair", help="verify and save one private pairing while its service is inactive"
     )
@@ -3452,88 +3438,64 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--once", action="store_true")
     serve_parser.add_argument("--poll-timeout", type=int, default=POLL_TIMEOUT)
     serve_parser.add_argument("--systemd-service", action="store_true", help=argparse.SUPPRESS)
-    read_parser = sub.add_parser("request-read", help="print one queued Telegram request")
-    add_home(read_parser)
-    read_parser.add_argument("request_id")
-    handled_parser = sub.add_parser("request-handled", help="claim and mark one Telegram request handled")
-    add_home(handled_parser)
-    handled_parser.add_argument("request_id")
-    bind_parser = sub.add_parser("request-bind", help="bind the active request to one lifecycle work id")
-    add_home(bind_parser)
-    bind_parser.add_argument("request_id")
-    bind_parser.add_argument("work_id")
-    bind_locked_parser = sub.add_parser("request-bind-locked", help=argparse.SUPPRESS)
-    add_home(bind_locked_parser)
-    bind_locked_parser.add_argument("request_id")
-    bind_locked_parser.add_argument("work_id")
-    authorize_parser = sub.add_parser("publication-authorize", help=argparse.SUPPRESS)
-    add_home(authorize_parser)
-    authorize_parser.add_argument("request_id")
-    authorize_parser.add_argument("work_id")
-    reserved_parser = sub.add_parser("publication-reserved", help=argparse.SUPPRESS)
-    add_home(reserved_parser)
-    reserved_parser.add_argument("work_id")
-    published_parser = sub.add_parser("request-published", help=argparse.SUPPRESS)
-    add_home(published_parser)
-    published_parser.add_argument("request_id")
-    published_parser.add_argument("work_id")
-    routed_parser = sub.add_parser(
-        "request-routed", help="acknowledge a directly handled initial route"
+    migrate_parser = sub.add_parser(
+        "migrate-wakes", help="retire obsolete Telegram wake rows without reading request content"
     )
-    add_home(routed_parser)
-    routed_parser.add_argument("request_id")
-    active_parser = sub.add_parser(
-        "active-request", help="print the active request route and any claimed work id"
-    )
-    add_home(active_parser)
-    active_group = active_parser.add_mutually_exclusive_group()
-    active_group.add_argument("--work-id", help="require an exact lifecycle work binding")
-    active_group.add_argument("--claimed-request", help="require a recoverably pending handled request route")
-    continuation_parser = sub.add_parser(
-        "continuation-handled", help="acknowledge a handled continuation after its route is consumed"
-    )
-    add_home(continuation_parser)
-    continuation_parser.add_argument("request_id")
-    reserve_parser = sub.add_parser(
-        "response-reserve", help="reserve one private response output file for a claimed route"
-    )
-    add_home(reserve_parser)
-    reserve_parser.add_argument("claimed_request_id")
-    reserve_parser.add_argument("response_id")
-    reserve_parser.add_argument("--final", action="store_true")
-    stage_parser = sub.add_parser(
-        "response-stage", help="durably stage the labeled bytes in a reserved response file"
-    )
-    add_home(stage_parser)
-    stage_parser.add_argument("claimed_request_id")
-    stage_parser.add_argument("response_id")
-    stage_parser.add_argument("--final", action="store_true")
-    stage_parser.add_argument("--text-file", required=True, help="reserved UTF-8 labeled response file")
-    status_parser = sub.add_parser(
-        "response-status", help="print a reserved response path and its content, render, and delivery states"
-    )
-    add_home(status_parser)
-    status_parser.add_argument("claimed_request_id")
-    status_parser.add_argument("response_id")
-    render_parser = sub.add_parser(
-        "response-render", help="attempt to render staged response bytes"
-    )
-    add_home(render_parser)
-    render_parser.add_argument("claimed_request_id")
-    render_parser.add_argument("response_id")
-    rendered_parser = sub.add_parser(
-        "response-rendered", help="acknowledge a successful terminal render"
-    )
-    add_home(rendered_parser)
-    rendered_parser.add_argument("claimed_request_id")
-    rendered_parser.add_argument("response_id")
-    send_parser = sub.add_parser("send", help="send to the paired private chat")
-    add_home(send_parser)
-    send_parser.add_argument("--text-file", required=True, help="UTF-8 text file, or - for stdin")
-    reply_parser = sub.add_parser("reply", help="deliver one staged Telegram response")
-    add_home(reply_parser)
-    reply_parser.add_argument("request_id")
-    reply_parser.add_argument("--response-id", required=True)
+    add_home(migrate_parser)
+    open_parser = sub.add_parser("mirror-open", help="open the lock owner's private extension capability")
+    add_private(open_parser)
+    mode_parser = sub.add_parser("mirror-mode", help="read or set the private Telegram mirror preference")
+    add_private(mode_parser)
+    mode_parser.add_argument("action", choices=("on", "off", "status"))
+    next_parser = sub.add_parser("mirror-next", help="print the next queued mirror request id")
+    add_private(next_parser)
+    claim_parser = sub.add_parser("mirror-claim", help="claim one queued request for this Pi process")
+    add_private(claim_parser)
+    claim_parser.add_argument("request_id")
+    mirror_read_parser = sub.add_parser("mirror-read", help="print one request owned by this Pi process")
+    add_private(mirror_read_parser)
+    mirror_read_parser.add_argument("request_id")
+    delivered_parser = sub.add_parser("mirror-delivered", help="send the zero-token Pi delivery receipt")
+    add_private(delivered_parser)
+    delivered_parser.add_argument("request_id")
+    release_parser = sub.add_parser("mirror-release", help="return a failed live claim to the queue")
+    add_private(release_parser)
+    release_parser.add_argument("request_id")
+    hold_parser = sub.add_parser("mirror-hold", help="hold one interrupted admission without retrying it")
+    add_private(hold_parser)
+    hold_parser.add_argument("request_id")
+    hold_parser.add_argument("turn_id")
+    recover_parser = sub.add_parser("mirror-recover", help="explicitly requeue one held interrupted admission")
+    add_private(recover_parser)
+    recover_parser.add_argument("request_id")
+    validate_parser = sub.add_parser("mirror-validate", help="validate one delivery body without reserving it")
+    add_private(validate_parser)
+    validate_parser.add_argument("--text-file", required=True)
+    reserve_parser = sub.add_parser("mirror-reserve", help="reserve one bounded live terminal delivery")
+    add_private(reserve_parser)
+    reserve_parser.add_argument("delivery_id")
+    reserve_parser.add_argument("--text-file", required=True)
+    reserve_parser.add_argument("--accepted-input", action="store_true", help=argparse.SUPPRESS)
+    cancel_parser = sub.add_parser("mirror-cancel", help="cancel one unaccepted terminal delivery reservation")
+    add_private(cancel_parser)
+    cancel_parser.add_argument("delivery_id")
+    mirror_reply_parser = sub.add_parser("mirror-reply", help="deliver one stable finalized assistant body")
+    add_private(mirror_reply_parser)
+    mirror_reply_parser.add_argument("delivery_id")
+    mirror_reply_parser.add_argument("--text-file", required=True)
+    mirror_reply_parser.add_argument("--request-id", help=argparse.SUPPRESS)
+    abandon_parser = sub.add_parser("mirror-abandon", help="finish an admitted request whose response cannot be delivered")
+    add_private(abandon_parser)
+    abandon_parser.add_argument("request_id")
+    abandon_parser.add_argument("delivery_id")
+    complete_parser = sub.add_parser("mirror-complete", help="complete a request after settled delivery")
+    add_private(complete_parser)
+    complete_parser.add_argument("request_id")
+    complete_parser.add_argument("delivery_id")
+    reconcile_parser = sub.add_parser("mirror-reconcile", help="requeue claims after process or session replacement")
+    add_private(reconcile_parser)
+    reconcile_parser.add_argument("--preserve-request", action="append", default=[])
+    reconcile_parser.add_argument("--report-delivery", action="append", default=[])
     for name, help_text in (("install", "install and start the user service"), ("start", "start the user service"),
                             ("stop", "stop the user service"), ("status", "show user service status"),
                             ("disable", "disable the user service"), ("cleanup", "remove this service and private state")):
@@ -3560,45 +3522,54 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return serve(
                 home, args.once, max(0, min(args.poll_timeout, 50)), args.systemd_service
             )
-        if args.command == "request-read":
-            return request_read(home, args.request_id)
-        if args.command == "request-handled":
-            return request_handled(home, args.request_id)
-        if args.command == "request-bind":
-            return request_bind(home, args.request_id, args.work_id)
-        if args.command == "request-bind-locked":
-            return request_bind_locked(home, args.request_id, args.work_id)
-        if args.command == "publication-authorize":
-            return publication_authorize(home, args.request_id, args.work_id)
-        if args.command == "publication-reserved":
-            return publication_reserved(home, args.work_id)
-        if args.command == "request-published":
-            return request_published(home, args.request_id, args.work_id)
-        if args.command == "request-routed":
-            return request_routed(home, args.request_id)
-        if args.command == "active-request":
-            return request_active(home, args.work_id, args.claimed_request)
-        if args.command == "continuation-handled":
-            return continuation_handled(home, args.request_id)
-        if args.command == "response-reserve":
-            return response_reserve(
-                home, args.claimed_request_id, args.response_id, args.final,
+        if args.command == "migrate-wakes":
+            return migrate_wakes(home)
+        if args.command == "mirror-open":
+            return mirror_open(home, args.owner_pid, args.capability_fd)
+        if args.command.startswith("mirror-"):
+            if not mirror_authorized(home, args.owner_pid, args.capability_fd):
+                return die("Telegram mirror capability is not authorized for this Pi process")
+        if args.command == "mirror-mode":
+            if args.action == "status":
+                print("on" if mirror_mode_enabled(home) else "off")
+                return 0
+            print(mirror_mode_reply(home, args.action))
+            return 0
+        if args.command == "mirror-next":
+            return mirror_list(home)
+        if args.command == "mirror-claim":
+            return mirror_claim(home, args.request_id, args.owner_pid)
+        if args.command == "mirror-read":
+            return mirror_read(home, args.request_id, args.owner_pid)
+        if args.command == "mirror-delivered":
+            return mirror_delivered(home, args.request_id, args.owner_pid)
+        if args.command == "mirror-release":
+            return mirror_release(home, args.request_id, args.owner_pid)
+        if args.command == "mirror-hold":
+            return mirror_hold(home, args.request_id, args.turn_id, args.owner_pid)
+        if args.command == "mirror-recover":
+            return mirror_recover(home, args.request_id, args.owner_pid)
+        if args.command == "mirror-validate":
+            return mirror_validate(args.text_file)
+        if args.command == "mirror-reserve":
+            return mirror_reserve(
+                home, args.delivery_id, args.owner_pid, args.text_file, args.accepted_input
             )
-        if args.command == "response-stage":
-            return response_stage(
-                home, args.claimed_request_id, args.response_id,
-                args.text_file, args.final,
+        if args.command == "mirror-cancel":
+            return mirror_cancel(home, args.delivery_id, args.owner_pid)
+        if args.command == "mirror-reply":
+            return mirror_reply(
+                home, args.delivery_id, args.owner_pid, args.text_file, args.request_id
             )
-        if args.command == "response-status":
-            return response_status(home, args.claimed_request_id, args.response_id)
-        if args.command == "response-render":
-            return response_render(home, args.claimed_request_id, args.response_id)
-        if args.command == "response-rendered":
-            return response_rendered(home, args.claimed_request_id, args.response_id)
-        if args.command == "send":
-            return send_command(home, text_from_file(args.text_file))
-        if args.command == "reply":
-            return reply_command(home, args.request_id, args.response_id)
+        if args.command == "mirror-abandon":
+            return mirror_abandon(home, args.request_id, args.delivery_id, args.owner_pid)
+        if args.command == "mirror-complete":
+            return mirror_complete(home, args.request_id, args.delivery_id, args.owner_pid)
+        if args.command == "mirror-reconcile":
+            return mirror_reconcile(
+                home, args.owner_pid, args.preserve_request,
+                report_held=True, report_deliveries=args.report_delivery,
+            )
         if args.command == "install":
             return install(home)
         if args.command == "start":

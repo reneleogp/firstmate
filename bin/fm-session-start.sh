@@ -713,11 +713,22 @@ else
   if [ -n "$INACTIVE_OUT" ]; then
     printf 'inactive outcome reconciliation: %s\n' "$INACTIVE_OUT"
   fi
-  DRAIN_OUT=$("$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
-  if [ -n "$DRAIN_OUT" ]; then
-    printf '%s\n' "$DRAIN_OUT"
+  TELEGRAM_MIGRATION_OUT=
+  TELEGRAM_MIGRATION_RC=0
+  if [ ! -e "$FM_HOME/.fm-secondmate-home" ] && [ ! -L "$FM_HOME/.fm-secondmate-home" ]; then
+    TELEGRAM_MIGRATION_OUT=$(env FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-telegram.py" --home "$FM_HOME" migrate-wakes 2>&1)
+    TELEGRAM_MIGRATION_RC=$?
+  fi
+  if [ "$TELEGRAM_MIGRATION_RC" -ne 0 ]; then
+    printf 'Telegram wake migration failed; wake queue left undrained: %s\n' "$TELEGRAM_MIGRATION_OUT"
   else
-    printf '(no queued wakes)\n'
+    DRAIN_OUT=$("$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
+    if [ -n "$DRAIN_OUT" ]; then
+      printf '%s\n' "$DRAIN_OUT"
+    else
+      printf '(no queued wakes)\n'
+    fi
   fi
 fi
 
