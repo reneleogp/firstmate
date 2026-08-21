@@ -40,6 +40,7 @@ MAX_MIRROR_DELIVERY_BYTES = 256 * 1024
 MAX_MIRROR_DELIVERY_CHUNKS = 64
 MAX_MIRROR_DELIVERY_ATTEMPTS = 3
 MAX_TELEGRAM_TEXT_UNITS = 4096
+MAX_MIRROR_CAPABILITY_BYTES = 128
 MAX_ATOMIC_TEMPS = 256
 MAX_TEXT = 12000
 MAX_TRANSCRIPT_UNITS = 4096
@@ -68,6 +69,7 @@ MIRROR_OFF_REFUSAL = (
 )
 MIRROR_COMMANDS = {"/telegram on": "on", "/telegram off": "off", "/telegram status": "status"}
 MIRROR_MODE_NAME = "telegram-mirror"
+MIRROR_OWNER_NAME = "mirror-owner.json"
 MESSAGE_ENVELOPE_FIELDS = frozenset({
     "author_signature", "business_connection_id", "chat", "date", "direct_messages_topic",
     "edit_date", "effect_id", "external_reply", "forward_origin", "from",
@@ -84,7 +86,7 @@ CALLBACK_QUERY_FIELDS = frozenset({"chat_instance", "data", "from", "id", "messa
 CALLBACK_MESSAGE_FIELDS = TEXT_MESSAGE_FIELDS
 ATOMIC_STATE_TARGETS = frozenset({
     "active.json", "admission-sequence.json", "callback-actions.json", "closing.json",
-    "enabled", "pending.json", "pending-voice-queue.json", "seen.json",
+    "enabled", "mirror-owner.json", "pending.json", "pending-voice-queue.json", "seen.json",
 })
 _PROCESS_TOKENS: Dict[Path, str] = {}
 _VERIFIED_BOT_IDS: Dict[Path, int] = {}
@@ -100,10 +102,6 @@ class TelegramError(RuntimeError):
 
 
 class PermanentConfigurationError(TelegramError):
-    pass
-
-
-class WatcherPreconditionError(TelegramError):
     pass
 
 
@@ -494,39 +492,6 @@ def systemctl(*arguments: str, check: bool = True) -> subprocess.CompletedProces
     return result
 
 
-def primary_running(home: Path) -> bool:
-    lock = home / "state" / ".lock"
-    try:
-        value = lock.read_text(encoding="utf-8").strip()
-        pid = int(value)
-        if pid <= 0:
-            return False
-    except (OSError, ValueError):
-        return False
-    library = Path(__file__).resolve().parent / "fm-session-lock-lib.sh"
-    result = subprocess.run(
-        ["/bin/bash", "-c", '. "$1"; fm_harness_pid_alive "$2"',
-         "fm-telegram", str(library), str(pid)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    return result.returncode == 0
-
-
-def watcher_running(home: Path) -> bool:
-    root = Path(__file__).resolve().parent
-    library = root / "fm-wake-lib.sh"
-    watcher = root / "fm-watch.sh"
-    environment = os.environ.copy()
-    environment["FM_HOME"] = str(home)
-    environment["FM_STATE_OVERRIDE"] = str(home / "state")
-    result = subprocess.run(
-        ["/bin/bash", "-c", '. "$1"; fm_watcher_healthy "$2" "$3" "${FM_GUARD_GRACE:-300}" "$4"',
-         "fm-telegram", str(library), str(home / "state"), str(watcher), str(home)],
-        env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    return result.returncode == 0
-
-
 def now() -> int:
     return int(time.time())
 
@@ -909,7 +874,12 @@ def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> None
             durable_unlink(body_path)
             continue
         bodies.add(body_path.name)
-        records.append((created, metadata_path, body_path))
+        if record.get("status") in {"sent", "delivery_unknown", "rejected"}:
+            records.append((created, metadata_path, body_path))
+        elif created < cutoff:
+            durable_unlink(metadata_path)
+            durable_unlink(body_path)
+            bodies.discard(body_path.name)
     for body_path in root.glob("*.txt"):
         if body_path.name not in bodies:
             durable_unlink(body_path)
@@ -928,10 +898,16 @@ def bounded_cleanup(home: Path) -> None:
         cleanup_atomic_temps_locked(home)
         cutoff = now() - INBOX_TTL
         inbox_files = sorted(inbox.glob("*.json"), key=request_order_key, reverse=True)
-        for index, path in enumerate(inbox_files):
+        queued_index = 0
+        for path in inbox_files:
             record = read_json(path, {})
+            if isinstance(record, dict) and record.get("status") == "claimed":
+                continue
             created = record.get("created_at", 0) if isinstance(record, dict) else 0
-            if index >= MAX_INBOX or not strict_int(created) or created < cutoff:
+            should_remove = (queued_index >= MAX_INBOX or not strict_int(created)
+                             or created < cutoff)
+            queued_index += 1
+            if should_remove:
                 try:
                     consume_safe_wakes(home, [path.stem])
                     durable_unlink(path)
@@ -1004,9 +980,13 @@ def _queue_request_locked(home: Path, text: str, chat_id: int, message_id: int,
         "receipt_text": transport_reply(home),
         "receipt_status": "pending",
     }
-    inbox_files = sorted(inbox.glob("*.json"), key=request_order_key)
-    while len(inbox_files) >= MAX_INBOX:
-        oldest = inbox_files.pop(0)
+    queued_files = []
+    for candidate in sorted(inbox.glob("*.json"), key=request_order_key):
+        candidate_record = read_json(candidate, {})
+        if not isinstance(candidate_record, dict) or candidate_record.get("status") != "claimed":
+            queued_files.append(candidate)
+    while len(queued_files) >= MAX_INBOX:
+        oldest = queued_files.pop(0)
         consume_safe_wakes(home, [oldest.stem])
         durable_unlink(oldest)
     atomic_json(path, record)
@@ -1150,7 +1130,9 @@ def mirror_mode_enabled(home: Path) -> bool:
 
 
 def set_mirror_mode(home: Path, enabled: bool) -> None:
-    atomic_bytes(mirror_mode_path(home), b"on\n" if enabled else b"off\n")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        atomic_bytes(mirror_mode_path(home), b"on\n" if enabled else b"off\n")
 
 
 def mirror_command(text: Any) -> Optional[str]:
@@ -1165,6 +1147,123 @@ def mirror_mode_reply(home: Path, action: str) -> str:
         set_mirror_mode(home, False)
         return "Pi · Telegram mirror mode is off."
     return f"Pi · Telegram mirror mode is {'on' if mirror_mode_enabled(home) else 'off'}."
+
+
+def mirror_owner_path(home: Path) -> Path:
+    return state_dir(home) / MIRROR_OWNER_NAME
+
+
+def process_identity(pid: int) -> Optional[str]:
+    if pid <= 0:
+        return None
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        fields = proc_stat.read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        if len(fields) > 19:
+            return f"proc:{pid}:{fields[19]}"
+    except (OSError, UnicodeError, IndexError):
+        pass
+    result = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(pid)], text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    started = result.stdout.strip()
+    return f"ps:{pid}:{started}" if result.returncode == 0 and started else None
+
+
+def process_parent(pid: int) -> Optional[int]:
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        return int(fields[1])
+    except (OSError, UnicodeError, ValueError, IndexError):
+        result = subprocess.run(
+            ["ps", "-o", "ppid=", "-p", str(pid)], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        try:
+            return int(result.stdout.strip()) if result.returncode == 0 else None
+        except ValueError:
+            return None
+
+
+def mirror_owner_holds_lock(home: Path, owner_pid: int) -> bool:
+    try:
+        lock_pid = int((home / "state" / ".lock").read_text(encoding="ascii").strip())
+    except (OSError, UnicodeError, ValueError):
+        return False
+    current = owner_pid
+    for _ in range(32):
+        if current == lock_pid:
+            return process_identity(lock_pid) is not None
+        parent = process_parent(current)
+        if parent is None or parent <= 1 or parent == current:
+            return False
+        current = parent
+    return False
+
+
+def mirror_capability(capability_fd: int) -> Optional[str]:
+    if capability_fd < 3:
+        return None
+    try:
+        value = os.read(capability_fd, MAX_MIRROR_CAPABILITY_BYTES + 1).strip()
+    except OSError:
+        return None
+    if not 32 <= len(value) <= MAX_MIRROR_CAPABILITY_BYTES:
+        return None
+    try:
+        text = value.decode("ascii")
+    except UnicodeError:
+        return None
+    return text if all(character in "0123456789abcdef" for character in text) else None
+
+
+def mirror_open(home: Path, owner_pid: int, capability_fd: int) -> int:
+    capability = mirror_capability(capability_fd)
+    identity = process_identity(owner_pid)
+    if (owner_pid != os.getppid() or capability is None or identity is None
+            or not mirror_owner_holds_lock(home, owner_pid)):
+        return die("Telegram mirror capability was not opened by the lock-owning extension")
+    digest = hashlib.sha256(capability.encode("ascii")).hexdigest()
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        existing = read_json(mirror_owner_path(home), {})
+        existing_pid = existing.get("owner_pid") if isinstance(existing, dict) else None
+        existing_identity = existing.get("owner_identity") if isinstance(existing, dict) else None
+        existing_digest = existing.get("capability_sha256") if isinstance(existing, dict) else None
+        if existing_pid == owner_pid and existing_identity == identity:
+            if existing_digest != digest:
+                return die("Telegram mirror capability is already owned by this Pi process")
+            return 0
+        if (strict_int(existing_pid) and isinstance(existing_identity, str)
+                and process_identity(existing_pid) == existing_identity
+                and mirror_owner_holds_lock(home, existing_pid)):
+            return die("Telegram mirror capability is already owned by the live primary Pi process")
+        atomic_json(mirror_owner_path(home), {
+            "owner_pid": owner_pid,
+            "owner_identity": identity,
+            "capability_sha256": digest,
+            "opened_at": now(),
+        })
+    return 0
+
+
+def mirror_authorized(home: Path, owner_pid: int, capability_fd: int) -> bool:
+    capability = mirror_capability(capability_fd)
+    identity = process_identity(owner_pid)
+    if (owner_pid != os.getppid() or capability is None or identity is None
+            or not mirror_owner_holds_lock(home, owner_pid)):
+        return False
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        record = read_json(mirror_owner_path(home), {})
+    return bool(
+        isinstance(record, dict)
+        and record.get("owner_pid") == owner_pid
+        and record.get("owner_identity") == identity
+        and record.get("capability_sha256")
+        == hashlib.sha256(capability.encode("ascii")).hexdigest()
+    )
 
 
 def transport_reply(_home: Path) -> str:
@@ -1187,7 +1286,8 @@ def mirror_queue_paths_locked(home: Path) -> List[Path]:
     return sorted(inbox.glob("*.json"), key=request_order_key)
 
 
-def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None) -> int:
+def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
+                     preserve_requests: Iterable[str] = ()) -> int:
     marker = state_dir(home) / ".mirror-migration-v2"
     if replacing_owner_pid is not None and not mirror_owner_is_child(replacing_owner_pid):
         return die("Telegram mirror owner is not the invoking extension")
@@ -1221,17 +1321,25 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None) -> i
                 record.pop("claimed_at", None)
                 atomic_json(path, record)
             atomic_bytes(marker, b"v2\n")
+        preserved = {request_id for request_id in preserve_requests if safe_id(request_id)}
         for path in mirror_queue_paths_locked(home):
             record = read_json(path)
             if not isinstance(record, dict):
                 continue
             owner = record.get("claim_owner_pid")
-            if record.get("status") == "claimed" and strict_int(owner):
-                try:
-                    alive = os.kill(owner, 0) is None
-                except OSError:
-                    alive = False
-                if not alive or owner == replacing_owner_pid:
+            if (path.stem in preserved and replacing_owner_pid is not None
+                    and record.get("status") == "queued"):
+                record["status"] = "claimed"
+                record["claim_owner_pid"] = replacing_owner_pid
+                record["claimed_at"] = now()
+                atomic_json(path, record)
+            elif record.get("status") == "claimed" and strict_int(owner):
+                alive = process_identity(owner) is not None
+                if path.stem in preserved and replacing_owner_pid is not None:
+                    record["claim_owner_pid"] = replacing_owner_pid
+                    record["claimed_at"] = now()
+                    atomic_json(path, record)
+                elif not alive or owner == replacing_owner_pid:
                     record["status"] = "queued"
                     record.pop("claim_owner_pid", None)
                     record.pop("claimed_at", None)
@@ -1257,6 +1365,8 @@ def mirror_claim(home: Path, request_id: str, owner_pid: int) -> int:
         return die("Telegram mirror owner is not the invoking extension")
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
+        if not mirror_mode_enabled(home):
+            return die("Telegram mirror mode is off")
         path = request_path(home, request_id)
         if path is None or path.parent.name != "inbox":
             return die("Telegram request is not queued")
@@ -1442,7 +1552,11 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -
                     chunk["telegram_status"] = "delivery_unknown" if exc.delivery_unknown else "rejected"
                     record["status"] = aggregate_response_delivery(record["chunks"])
                     atomic_json(metadata_path, record)
-            return DELIVERY_UNKNOWN_EXIT if exc.delivery_unknown else 1
+            if exc.delivery_unknown:
+                return DELIVERY_UNKNOWN_EXIT
+            if attempts + 1 >= MAX_MIRROR_DELIVERY_ATTEMPTS:
+                return 1
+            continue
         with FileLock(state_lock(home)):
             record = read_json(metadata_path)
             if not isinstance(record, dict) or not isinstance(record.get("chunks"), list):
@@ -2449,12 +2563,7 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
                 except PermanentConfigurationError:
                     clear_stopped_transport_state(home)
                     raise
-                try:
-                    prepare_transport_activation(home)
-                except WatcherPreconditionError:
-                    if systemd_service and service_activation_path(home).is_file():
-                        atomic_bytes(service_activation_path(home), b"watcher-precondition\n")
-                    raise
+                prepare_transport_activation(home)
                 if systemd_service:
                     durable_unlink(service_activation_path(home))
         offset = 0
@@ -2678,7 +2787,7 @@ def verify_transport_marker(home: Path, expected: bool) -> None:
     while telegram_enabled_path(home).is_file() != expected and time.monotonic() < deadline:
         time.sleep(0.02)
     if telegram_enabled_path(home).is_file() != expected:
-        raise TelegramError("Telegram supervision state did not converge")
+        raise TelegramError("Telegram transport state did not converge")
 
 
 def wait_for_systemd_runtime_ready(home: Path) -> None:
@@ -2692,7 +2801,6 @@ def wait_for_systemd_runtime_ready(home: Path) -> None:
 
 
 def reconcile_failed_activation(home: Path, disable_new_install: bool = False,
-                                preserve_supervision: bool = False,
                                 activation_reserved: bool = False) -> None:
     if activation_reserved:
         systemctl("stop", SERVICE_NAME, check=False)
@@ -2706,18 +2814,9 @@ def reconcile_failed_activation(home: Path, disable_new_install: bool = False,
             active_result = systemctl("is-active", SERVICE_NAME, check=False)
             if active_result.stdout.strip() not in {"inactive", "failed", "unknown", "not-found"}:
                 return
-            activation_state = ""
-            try:
-                activation_state = service_activation_path(home).read_text(encoding="utf-8").strip()
-            except OSError:
-                pass
-            preserve_supervision = preserve_supervision or activation_state == "watcher-precondition"
             durable_unlink(service_activation_path(home))
-            if preserve_supervision:
-                verify_transport_marker(home, True)
-            else:
-                set_telegram_enabled(home, False)
-                verify_transport_marker(home, False)
+            set_telegram_enabled(home, False)
+            verify_transport_marker(home, False)
             if disable_new_install:
                 systemctl("disable", SERVICE_NAME)
                 verify_service(enabled=False)
@@ -2762,9 +2861,7 @@ def install(home: Path) -> int:
                 verify_transport_marker(home, True)
         except (TelegramError, OSError, ValueError) as exc:
             reconcile_failed_activation(
-                home, enabled_by_install,
-                preserve_supervision=isinstance(exc, WatcherPreconditionError),
-                activation_reserved=activation_reserved,
+                home, enabled_by_install, activation_reserved=activation_reserved,
             )
             raise
     print("Telegram service installed and active.")
@@ -2790,10 +2887,7 @@ def start_service(home: Path) -> int:
                 verify_service(active=True)
                 verify_transport_marker(home, True)
         except (TelegramError, OSError, ValueError) as exc:
-            reconcile_failed_activation(
-                home, preserve_supervision=isinstance(exc, WatcherPreconditionError),
-                activation_reserved=activation_reserved,
-            )
+            reconcile_failed_activation(home, activation_reserved=activation_reserved)
             raise
     print("Telegram service active.")
     return 0
@@ -2894,7 +2988,8 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-reply, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
+        epilog=("Commands: pair, serve, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-reply, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
+                "Private mirror commands require the lock-owning extension capability on an inherited file descriptor.\n"
                 "Retention limits: 256 queued requests for 7 days, 4096 handled requests, and 256 mirror deliveries of up to 256 KiB.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
                 "Voice limits: 10 MiB, 120 seconds, a 4096-unit transcript, and 64 waiting notes. Temporary audio is restricted to /dev/shm.\n"
@@ -2908,6 +3003,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     def add_home(command: argparse.ArgumentParser) -> None:
         command.add_argument("--home", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    def add_private(command: argparse.ArgumentParser) -> None:
+        add_home(command)
+        command.add_argument("--owner-pid", type=int, required=True)
+        command.add_argument("--capability-fd", type=int, required=True, help=argparse.SUPPRESS)
     pair_parser = sub.add_parser(
         "pair", help="verify and save one private pairing while its service is inactive"
     )
@@ -2927,41 +3026,36 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--once", action="store_true")
     serve_parser.add_argument("--poll-timeout", type=int, default=POLL_TIMEOUT)
     serve_parser.add_argument("--systemd-service", action="store_true", help=argparse.SUPPRESS)
+    open_parser = sub.add_parser("mirror-open", help="open the lock owner's private extension capability")
+    add_private(open_parser)
     mode_parser = sub.add_parser("mirror-mode", help="read or set the private Telegram mirror preference")
-    add_home(mode_parser)
+    add_private(mode_parser)
     mode_parser.add_argument("action", choices=("on", "off", "status"))
-    mode_parser.add_argument("--owner-pid", type=int, required=True)
     next_parser = sub.add_parser("mirror-next", help="print the next queued mirror request id")
-    add_home(next_parser)
+    add_private(next_parser)
     claim_parser = sub.add_parser("mirror-claim", help="claim one queued request for this Pi process")
-    add_home(claim_parser)
+    add_private(claim_parser)
     claim_parser.add_argument("request_id")
-    claim_parser.add_argument("--owner-pid", type=int, required=True)
     mirror_read_parser = sub.add_parser("mirror-read", help="print one request owned by this Pi process")
-    add_home(mirror_read_parser)
+    add_private(mirror_read_parser)
     mirror_read_parser.add_argument("request_id")
-    mirror_read_parser.add_argument("--owner-pid", type=int, required=True)
     delivered_parser = sub.add_parser("mirror-delivered", help="send the zero-token Pi delivery receipt")
-    add_home(delivered_parser)
+    add_private(delivered_parser)
     delivered_parser.add_argument("request_id")
-    delivered_parser.add_argument("--owner-pid", type=int, required=True)
     release_parser = sub.add_parser("mirror-release", help="return a failed live claim to the queue")
-    add_home(release_parser)
+    add_private(release_parser)
     release_parser.add_argument("request_id")
-    release_parser.add_argument("--owner-pid", type=int, required=True)
     mirror_reply_parser = sub.add_parser("mirror-reply", help="deliver one stable finalized assistant body")
-    add_home(mirror_reply_parser)
+    add_private(mirror_reply_parser)
     mirror_reply_parser.add_argument("delivery_id")
-    mirror_reply_parser.add_argument("--owner-pid", type=int, required=True)
     mirror_reply_parser.add_argument("--text-file", required=True)
     complete_parser = sub.add_parser("mirror-complete", help="complete a request after settled delivery")
-    add_home(complete_parser)
+    add_private(complete_parser)
     complete_parser.add_argument("request_id")
     complete_parser.add_argument("delivery_id")
-    complete_parser.add_argument("--owner-pid", type=int, required=True)
     reconcile_parser = sub.add_parser("mirror-reconcile", help="requeue claims after process or session replacement")
-    add_home(reconcile_parser)
-    reconcile_parser.add_argument("--owner-pid", type=int)
+    add_private(reconcile_parser)
+    reconcile_parser.add_argument("--preserve-request", action="append", default=[])
     for name, help_text in (("install", "install and start the user service"), ("start", "start the user service"),
                             ("stop", "stop the user service"), ("status", "show user service status"),
                             ("disable", "disable the user service"), ("cleanup", "remove this service and private state")):
@@ -2988,9 +3082,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return serve(
                 home, args.once, max(0, min(args.poll_timeout, 50)), args.systemd_service
             )
+        if args.command == "mirror-open":
+            return mirror_open(home, args.owner_pid, args.capability_fd)
+        if args.command.startswith("mirror-"):
+            if not mirror_authorized(home, args.owner_pid, args.capability_fd):
+                return die("Telegram mirror capability is not authorized for this Pi process")
         if args.command == "mirror-mode":
-            if not mirror_owner_is_child(args.owner_pid):
-                return die("Telegram mirror owner is not the invoking extension")
             if args.action == "status":
                 print("on" if mirror_mode_enabled(home) else "off")
                 return 0
@@ -3011,7 +3108,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if args.command == "mirror-complete":
             return mirror_complete(home, args.request_id, args.delivery_id, args.owner_pid)
         if args.command == "mirror-reconcile":
-            return mirror_reconcile(home, args.owner_pid)
+            return mirror_reconcile(home, args.owner_pid, args.preserve_request)
         if args.command == "install":
             return install(home)
         if args.command == "start":

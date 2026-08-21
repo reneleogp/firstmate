@@ -152,25 +152,56 @@ run_tg "$home" serve --once >/dev/null
 [ ! -e "$home/state/telegram/pending.json" ] || fail "mode-off Cancel did not clean up pending voice state"
 
 # The real mirror delivery interface chunks Unicode safely, retries definite rejection, and completes only sent requests.
+printf 'on\n' >"$home/config/telegram-mirror"
+rm -f "$home/state/telegram/.mirror-migration-v2"
+printf '1\t1\tcheck\ttelegram:legacy-request\ttelegram legacy-request\n' >"$home/state/.wake-queue"
 owner_script="$TMP_ROOT/mirror-owner.py"
 cat >"$owner_script" <<'PY'
 import json, os, subprocess, sys, time
+from pathlib import Path
 script, home, base = sys.argv[1:]
-owner = str(os.getpid())
+owner = str(os.getpid()); capability = b'b' * 64 + b'\n'
+Path(home, 'state', '.lock').write_text(owner + '\n')
 def run(*args, api=base):
-    return subprocess.run([script, '--home', home, '--test-api-base', api, *args], text=True, capture_output=True)
+    reader, writer = os.pipe()
+    os.write(writer, capability); os.close(writer)
+    try:
+        return subprocess.run(
+            [script, '--home', home, '--test-api-base', api, *args,
+             '--owner-pid', owner, '--capability-fd', str(reader)],
+            text=True, capture_output=True, pass_fds=(reader,),
+        )
+    finally:
+        os.close(reader)
 request = 'tg-text-u3-m3'
-assert run('mirror-reconcile', '--owner-pid', owner).returncode == 0
-assert run('mirror-claim', request, '--owner-pid', owner).returncode == 0
+assert run('mirror-open').returncode == 0
+assert run('mirror-reconcile').returncode == 0
+assert run('mirror-claim', request).returncode == 0
+inbox = Path(home, 'state', 'telegram', 'inbox')
+for index in range(260):
+    queued_id = f'tg-text-u{1000 + index}-m{1000 + index}'
+    Path(inbox, queued_id + '.json').write_text(json.dumps({
+        'request_id': queued_id, 'origin': 'telegram', 'text': f'queued {index}',
+        'chat_id': 77, 'message_id': 1000 + index, 'update_id': 1000 + index,
+        'created_at': int(time.time()), 'admission_sequence': 1000 + index,
+        'status': 'queued', 'receipt_text': 'queued', 'receipt_status': 'pending',
+    }))
+cleaned = subprocess.run(
+    [script, '--home', home, '--test-api-base', base, 'serve', '--once'],
+    text=True, capture_output=True,
+)
+assert cleaned.returncode == 0, cleaned.stderr
+claimed_record = json.loads(Path(inbox, request + '.json').read_text())
+assert claimed_record['status'] == 'claimed' and claimed_record['claim_owner_pid'] == int(owner)
 body = 'Firstmate · ' + ('😀' * 3000)
 body_path = os.path.join(home, 'long-reply.txt')
 open(body_path, 'w').write(body)
 open(os.path.join(home, 'reject-send'), 'w').close()
-first = run('mirror-reply', 'delivery-long', '--owner-pid', owner, '--text-file', body_path)
-assert first.returncode == 1, first.stderr
-second = run('mirror-reply', 'delivery-long', '--owner-pid', owner, '--text-file', body_path)
+first = run('mirror-reply', 'delivery-long', '--text-file', body_path)
+assert first.returncode == 0, first.stderr
+second = run('mirror-reply', 'delivery-long', '--text-file', body_path)
 assert second.returncode == 0, second.stderr
-complete = run('mirror-complete', request, 'delivery-long', '--owner-pid', owner)
+complete = run('mirror-complete', request, 'delivery-long')
 assert complete.returncode == 0, complete.stderr
 delivery_root = os.path.join(home, 'state', 'telegram', 'deliveries')
 for index in range(260):
@@ -182,11 +213,10 @@ for index in range(260):
               open(os.path.join(delivery_root, delivery_id + '.json'), 'w'))
 unknown_path = os.path.join(home, 'unknown-reply.txt')
 open(unknown_path, 'w').write('You · Terminal\n\nuncertain')
-unknown = run('mirror-reply', 'delivery-unknown', '--owner-pid', owner,
+unknown = run('mirror-reply', 'delivery-unknown',
               '--text-file', unknown_path, api='http://127.0.0.1:1')
 assert unknown.returncode == 3, unknown.stderr
-again = run('mirror-reply', 'delivery-unknown', '--owner-pid', owner,
-            '--text-file', unknown_path)
+again = run('mirror-reply', 'delivery-unknown', '--text-file', unknown_path)
 assert again.returncode == 3, again.stderr
 assert len([name for name in os.listdir(delivery_root) if name.endswith('.json')]) <= 256
 PY
@@ -205,9 +235,6 @@ assert all(len(chunk.encode('utf-16-le')) // 2 <= 4096 for chunk in chunks)
 PY
 
 # One-time migration consumes legacy Telegram wakes without publishing replacements.
-rm -f "$home/state/telegram/.mirror-migration-v2"
-printf '1\t1\tcheck\ttelegram:legacy-request\ttelegram legacy-request\n' >"$home/state/.wake-queue"
-run_tg "$home" mirror-reconcile >/dev/null
 if grep -q $'\ttelegram:' "$home/state/.wake-queue"; then
   fail "legacy Telegram wake survived mirror migration"
 fi

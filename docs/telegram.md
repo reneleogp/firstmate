@@ -4,6 +4,8 @@ This optional transport connects one pinned private Telegram bot DM to one First
 It uses one Python systemd user service and one project-local Pi extension.
 Python owns pairing, authentication, deduplication, voice confirmation, offline queueing, retention, service lifecycle, and Telegram delivery.
 The extension acts only in the current Pi process that owns the exact home session lock.
+Its private transport commands require a per-process capability passed on an inherited file descriptor, so model tools and accidental shell calls cannot claim or deliver mirror traffic.
+A deliberately hostile same-UID process is outside this boundary.
 Telegram never starts or hosts a second Pi, RPC or SDK agent, Telegram agent, shadow orchestrator, secondmate route, or fallback model.
 
 ## Setup
@@ -48,7 +50,8 @@ These statuses are zero-token transport messages and do not enter the conversati
 Stable request and message identities prevent ordinary duplicate injection and delivery within one live process.
 A request moves to bounded handled state only after every Unicode-safe Telegram chunk of its assistant response is definitively sent.
 Definite Telegram rejection is retried at most three times, while delivery-unknown state is not resent or marked complete automatically.
-Startup, reload, session replacement, and a bounded rescan reconcile missed notifications.
+Startup, reload, session replacement, and a bounded rescan reconcile missed notifications from extension-owned session admission entries.
+Telegram transport state alone never requires or routes through the Firstmate watcher.
 Terminal mirroring is live-only and never replays historical messages after startup, resume, clone, or retention expiry.
 
 ## Accepted crash boundary

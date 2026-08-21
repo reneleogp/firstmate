@@ -25,28 +25,58 @@ printf 'on\n' >"$home/config/telegram-mirror"
 chmod 600 "$home/config/telegram-mirror"
 printf '%s\n' '{"request_id":"tg-text-u1-m1","origin":"telegram","text":"same text","chat_id":77,"status":"queued"}' >"$home/state/telegram/inbox/tg-text-u1-m1.json"
 
-next=$(FM_HOME="$home" "$SCRIPT" mirror-next)
-[ "$next" = tg-text-u1-m1 ] || fail "mirror-next did not return the durable queue head"
-if FM_HOME="$home" "$SCRIPT" mirror-claim tg-text-u1-m1 --owner-pid "$(( $$ + 1 ))" >/dev/null 2>&1; then
-  fail "a non-parent owner identity was accepted"
+if FM_HOME="$home" "$SCRIPT" mirror-next --owner-pid "$$" --capability-fd 3 3</dev/null >/dev/null 2>&1; then
+  fail "mirror queue access succeeded without an opened extension capability"
 fi
-# A direct child of this test shell is the supported owner shape.
+cat >"$TMP_ROOT/attacker.py" <<'PY'
+import os, subprocess, sys
+script, home = sys.argv[1:]
+reader, writer = os.pipe()
+os.write(writer, b'c' * 64 + b'\n'); os.close(writer)
+try:
+    result = subprocess.run(
+        [script, '--home', home, 'mirror-open', '--owner-pid', str(os.getpid()),
+         '--capability-fd', str(reader)], pass_fds=(reader,), capture_output=True,
+    )
+finally:
+    os.close(reader)
+raise SystemExit(result.returncode)
+PY
 owner_script="$TMP_ROOT/owner.py"
 cat >"$owner_script" <<PY
-import json, os, subprocess, sys
-script = sys.argv[1]; home = sys.argv[2]
-owner = os.getpid()
+import os, subprocess, sys
+from pathlib import Path
+script = sys.argv[1]; home = sys.argv[2]; attacker = sys.argv[3]
+owner = os.getpid(); capability = b'a' * 64 + b'\\n'
+Path(home, 'state', '.lock').write_text(str(owner) + '\\n')
 def run(*args):
-    return subprocess.run([script, '--home', home, *args], text=True, capture_output=True)
-claimed = run('mirror-claim', 'tg-text-u1-m1', '--owner-pid', str(owner))
+    reader, writer = os.pipe()
+    os.write(writer, capability); os.close(writer)
+    try:
+        return subprocess.run(
+            [script, '--home', home, *args, '--owner-pid', str(owner),
+             '--capability-fd', str(reader)], text=True, capture_output=True,
+            pass_fds=(reader,),
+        )
+    finally:
+        os.close(reader)
+opened = run('mirror-open')
+assert opened.returncode == 0, opened.stderr
+stolen = subprocess.run([sys.executable, attacker, script, home])
+assert stolen.returncode != 0
+next_request = run('mirror-next')
+assert next_request.returncode == 0 and next_request.stdout.strip() == 'tg-text-u1-m1'
+claimed = run('mirror-claim', 'tg-text-u1-m1')
 assert claimed.returncode == 0, claimed.stderr
-body = run('mirror-read', 'tg-text-u1-m1', '--owner-pid', str(owner))
+body = run('mirror-read', 'tg-text-u1-m1')
 assert body.returncode == 0 and body.stdout == 'same text'
+second = Path(home, 'state', 'telegram', 'inbox', 'tg-text-u2-m2.json')
+second.write_text('{"request_id":"tg-text-u2-m2","origin":"telegram","text":"off","status":"queued"}')
+Path(home, 'config', 'telegram-mirror').write_text('off\\n')
+refused = run('mirror-claim', 'tg-text-u2-m2')
+assert refused.returncode != 0 and 'mode is off' in refused.stderr
 PY
-# The helper intentionally cannot pass an arbitrary claimed owner through a
-# shell wrapper; this assertion checks the transport's direct-child boundary.
-# The remainder of the contract is exercised by the full fake-Bot suite.
-$PYTHON "$owner_script" "$SCRIPT" "$home" || fail "mirror claim/read public interface failed"
+$PYTHON "$owner_script" "$SCRIPT" "$home" "$TMP_ROOT/attacker.py" || fail "private mirror capability claim/read interface failed"
 
 printf 'off\n' >"$home/config/telegram-mirror"
 [ "$(cat "$home/config/telegram-mirror")" = off ] || fail "mode preference did not persist"
