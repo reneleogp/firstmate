@@ -115,6 +115,11 @@ elif command == 'mirror-recover':
     if not request or request.get('id') != rest[0] or request.get('status') != 'held': code = 1
     else:
         request['status'] = 'queued'; request.pop('turn_id', None)
+elif command == 'mirror-validate':
+    body = sys.stdin.read() if option('--text-file') == '-' else Path(option('--text-file')).read_text()
+    units = sum(2 if ord(character) > 0xffff else 1 for character in body)
+    chunks = (units + 4095) // 4096
+    if not body or len(body.encode()) > 256 * 1024 or chunks > 64: code = 1
 elif command == 'mirror-reserve':
     delivery_id = rest[0]
     body = sys.stdin.read() if option('--text-file') == '-' else Path(option('--text-file')).read_text()
@@ -142,6 +147,12 @@ elif command == 'mirror-reply':
     elif code == 0:
         state['deliveries'][delivery_id] = body
         state['reservations'].pop(delivery_id, None)
+        if body == 'Firstmate · slow settlement A answer' and (home / 'delay-assistant-reply').exists():
+            save(); skip_final_save = True
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            (home / 'assistant-reply-delayed').touch()
+            time.sleep(0.6)
+            (home / 'assistant-reply-delayed').unlink(missing_ok=True)
 elif command == 'mirror-complete':
     request_id, delivery_id = rest[:2]
     request = state.get('request')
@@ -235,6 +246,7 @@ process.env.FM_TELEGRAM_TRANSPORT = transport;
 process.env.FM_TELEGRAM_SESSION_LOCK_LIB = lockLib;
 process.env.FM_TELEGRAM_ADMISSION_TIMEOUT_MS = '150';
 process.env.FM_TELEGRAM_RECONCILE_INTERVAL_MS = '500';
+process.env.FM_TELEGRAM_MAX_INPUT_CANDIDATES = '4';
 const {
   ModelRuntime,
   SessionManager,
@@ -453,6 +465,15 @@ assert.equal(Object.values(state().deliveries)
 assert.equal(Object.values(state().deliveries)
   .filter((body) => body === 'Firstmate · valid turn after handled flood').length, 1);
 
+const usersBeforeOversizedTerminal = userTexts(initialManager).length;
+const callsBeforeOversizedTerminal = faux.state.callCount;
+await runtime.session.prompt('x'.repeat(256 * 1024), { source: 'interactive' });
+assert.equal(userTexts(initialManager).length, usersBeforeOversizedTerminal,
+  'oversized terminal input entered Pi');
+assert.equal(faux.state.callCount, callsBeforeOversizedTerminal,
+  'oversized terminal input started a model turn');
+assert.equal(notices.some(([message]) => message.includes('within its delivery limits')), true);
+
 faux.appendResponses([fauxAssistantMessage('long preflight answer')]);
 globalThis.__telegramMirrorDelayInteractiveInput = true;
 const callsBeforeLongPreflight = faux.state.callCount;
@@ -472,6 +493,57 @@ assert.equal(Object.values(state().deliveries)
   .filter((body) => body === 'You · Terminal\n\nlong preflight terminal').length, 1);
 assert.equal(Object.values(state().deliveries)
   .filter((body) => body === 'Firstmate · long preflight answer').length, 1);
+
+const callsBeforeCandidateCap = faux.state.callCount;
+faux.appendResponses([
+  async () => {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    return fauxAssistantMessage('candidate cap root answer');
+  },
+  fauxAssistantMessage('candidate cap follow-up 0 answer'),
+  fauxAssistantMessage('candidate cap follow-up 1 answer'),
+  fauxAssistantMessage('candidate cap follow-up 2 answer'),
+]);
+const candidateCapRoot = runtime.session.prompt('candidate cap root', { source: 'interactive' });
+await waitFor(() => userTexts(initialManager).some((text) => text.includes('candidate cap root')),
+  'candidate cap root did not start');
+for (let index = 0; index < 4; index += 1) {
+  await runtime.session.prompt(`candidate cap follow-up ${index}`, {
+    source: 'interactive', streamingBehavior: 'followUp',
+  });
+}
+await candidateCapRoot;
+await waitFor(() => Object.values(state().deliveries)
+  .some((body) => body === 'Firstmate · candidate cap follow-up 2 answer'),
+'accepted candidate-cap follow-ups did not settle');
+assert.equal(faux.state.callCount, callsBeforeCandidateCap + 4,
+  'candidate cap admitted an excess model turn');
+assert.equal(userTexts(initialManager)
+  .some((text) => text.includes('candidate cap follow-up 3')), false,
+'excess candidate-cap follow-up entered Pi');
+assert.equal(notices.some(([message]) => message.includes('cannot accept another mirrored terminal turn')), true);
+
+writeFileSync(`${home}/delay-assistant-reply`, '');
+faux.appendResponses([
+  fauxAssistantMessage('slow settlement A answer'),
+  fauxAssistantMessage('slow settlement B answer'),
+]);
+const slowSettlementA = runtime.session.prompt('slow settlement A', { source: 'interactive' });
+await waitFor(() => existsSync(`${home}/assistant-reply-delayed`),
+  'assistant A delivery did not enter the delayed settlement window');
+const slowState = state();
+slowState.request = {
+  id: 'tg-text-u18-m18', text: 'slow settlement B', status: 'queued',
+};
+save(slowState);
+await slowSettlementA;
+await waitFor(() => state().handled?.includes('tg-text-u18-m18'),
+  'Telegram B was stranded behind assistant A settlement');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · slow settlement A answer').length, 1);
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · slow settlement B answer').length, 1);
+unlinkSync(`${home}/delay-assistant-reply`);
 
 writeFileSync(`${home}/reject-assistant-reply`, '');
 faux.appendResponses([fauxAssistantMessage('blocked terminal answer')]);

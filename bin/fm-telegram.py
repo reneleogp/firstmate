@@ -1601,6 +1601,14 @@ def mirror_delivery_body(text_file: str) -> Tuple[bytes, List[Dict[str, Any]]]:
     return body, chunks
 
 
+def mirror_validate(text_file: str) -> int:
+    try:
+        mirror_delivery_body(text_file)
+    except TelegramError as exc:
+        return die(str(exc))
+    return 0
+
+
 def mirror_reserve(home: Path, delivery_id: str, owner_pid: int, text_file: str,
                    accepted_input: bool = False) -> int:
     identity = claim_owner_identity(owner_pid)
@@ -3254,7 +3262,7 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-hold, mirror-recover, mirror-reserve, mirror-cancel, mirror-reply, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
+        epilog=("Commands: pair, serve, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-hold, mirror-recover, mirror-validate, mirror-reserve, mirror-cancel, mirror-reply, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
                 "Private mirror commands require the lock-owning extension capability on an inherited file descriptor.\n"
                 "Retention limits: 256 queued or interrupted requests for 7 days, 4096 handled requests, and 256 mirror deliveries of up to 256 KiB.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
@@ -3318,6 +3326,9 @@ def build_parser() -> argparse.ArgumentParser:
     recover_parser = sub.add_parser("mirror-recover", help="explicitly requeue one held interrupted admission")
     add_private(recover_parser)
     recover_parser.add_argument("request_id")
+    validate_parser = sub.add_parser("mirror-validate", help="validate one delivery body without reserving it")
+    add_private(validate_parser)
+    validate_parser.add_argument("--text-file", required=True)
     reserve_parser = sub.add_parser("mirror-reserve", help="reserve one bounded live terminal delivery")
     add_private(reserve_parser)
     reserve_parser.add_argument("delivery_id")
@@ -3389,6 +3400,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return mirror_hold(home, args.request_id, args.turn_id, args.owner_pid)
         if args.command == "mirror-recover":
             return mirror_recover(home, args.request_id, args.owner_pid)
+        if args.command == "mirror-validate":
+            return mirror_validate(args.text_file)
         if args.command == "mirror-reserve":
             return mirror_reserve(
                 home, args.delivery_id, args.owner_pid, args.text_file, args.accepted_input

@@ -64,7 +64,10 @@ const transport = resolve(process.env.FM_TELEGRAM_TRANSPORT || resolve(extension
 const sessionLockLib = resolve(process.env.FM_TELEGRAM_SESSION_LOCK_LIB || resolve(extensionRoot, "bin", "fm-session-lock-lib.sh"));
 const statusKey = "firstmate-telegram";
 const admissionType = "firstmate-telegram-admission";
-const maxInputCandidates = 256;
+const configuredMaxInputCandidates = Number(process.env.FM_TELEGRAM_MAX_INPUT_CANDIDATES || "256");
+const maxInputCandidates = Number.isFinite(configuredMaxInputCandidates)
+  ? Math.max(1, Math.min(Math.trunc(configuredMaxInputCandidates), 256))
+  : 256;
 const configuredAdmissionTimeout = Number(process.env.FM_TELEGRAM_ADMISSION_TIMEOUT_MS || "30000");
 const admissionTimeoutMs = Number.isFinite(configuredAdmissionTimeout)
   ? Math.max(100, Math.min(configuredAdmissionTimeout, 30_000))
@@ -347,6 +350,9 @@ export default function (pi: ExtensionAPI) {
     pi.appendEntry(admissionType, { requestId, turnId, sessionId, state });
   };
 
+  const validateDelivery = async (body: string, ctx: ExtensionContext) =>
+    exec(["mirror-validate", "--text-file", "-"], ctx, body);
+
   const reserve = async (deliveryId: string, body: string, ctx: ExtensionContext) =>
     exec(["mirror-reserve", safeIdentity(deliveryId), "--accepted-input", "--text-file", "-"], ctx, body);
 
@@ -443,22 +449,30 @@ export default function (pi: ExtensionAPI) {
   const flushSettledTurns = async (ctx: ExtensionContext): Promise<boolean> => {
     if (settleRunning || deliveryBlocked || !ownsHomeLock()) return false;
     settleRunning = true;
+    let completed = true;
     try {
       while (settledTurns.length > 0) {
         const turn = settledTurns[0];
-        if (!await deliverSettledTurn(turn, ctx)) return false;
+        if (!await deliverSettledTurn(turn, ctx)) {
+          completed = false;
+          break;
+        }
         settledTurns.shift();
       }
-      deliveryBlocked = false;
-      await updateFooter(ctx);
-      return true;
     } finally {
       settleRunning = false;
     }
+    if (!completed) return false;
+    if (settledTurns.length > 0) return flushSettledTurns(ctx);
+    deliveryBlocked = false;
+    await updateFooter(ctx);
+    void drain(ctx);
+    return true;
   };
 
   const settle = async (ctx: ExtensionContext): Promise<void> => {
-    if (!ownsHomeLock() || !queueActiveTurn() || deliveryBlocked) return;
+    if (!ownsHomeLock()) return;
+    queueActiveTurn();
     await flushSettledTurns(ctx);
   };
 
@@ -567,7 +581,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const drain = async (ctx: ExtensionContext): Promise<void> => {
-    if (drainRunning || reconcileRunning || !transportOpen) return;
+    if (drainRunning || reconcileRunning || settleRunning || settledTurns.length > 0 || !transportOpen) return;
     const startedGeneration = generation;
     const primary = ownsHomeLock();
     if (!primary || pendingAdmission || heldAdmission || deliveryBlocked) return;
@@ -755,17 +769,40 @@ export default function (pi: ExtensionAPI) {
       }
       return { action: "continue" as const };
     }
+    if (event.source === "interactive" && ctx.isIdle() && !ctx.hasPendingMessages()) {
+      for (const [marker, candidate] of inputCandidates) {
+        if (candidate.segment.origin === "terminal") inputCandidates.delete(marker);
+      }
+    }
     if (event.source === "interactive" && event.text && !event.text.startsWith("/") &&
         transportOpen && ownsHomeLock() && await readMode(ctx) === "on") {
       if (deliveryBlocked) {
         ctx.ui.notify("Telegram delivery needs attention; use /telegram off before continuing.", "error");
         return { action: "handled" as const };
       }
-      if (settledTurns.length + (active ? 1 : 0) >= maxInputCandidates) {
+      const terminalCandidates = [...inputCandidates.values()].filter(
+        (candidate) => candidate.segment.origin === "terminal",
+      ).length;
+      if (terminalCandidates + settledTurns.length + (active ? 1 : 0) >= maxInputCandidates) {
         ctx.ui.notify("Telegram cannot accept another mirrored terminal turn yet.", "error");
         return { action: "handled" as const };
       }
+      const body = `You · Terminal\n\n${event.text}`;
+      const validated = await validateDelivery(body, ctx);
+      if (validated.code !== 0) {
+        ctx.ui.notify("Telegram cannot mirror this terminal input within its delivery limits.", "error");
+        return { action: "handled" as const };
+      }
       const marker = newOriginMarker();
+      const turnId = `terminal-${marker}`;
+      inputCandidates.set(marker, {
+        segment: {
+          origin: "terminal",
+          turnId,
+          text: event.text,
+          deliveryId: safeIdentity(`user-${turnId}`),
+        },
+      });
       return { action: "transform" as const, text: markedInput(marker, "terminal", event.text) };
     }
     return { action: "continue" as const };
@@ -834,18 +871,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
+    if (active && activeOrigin) {
+      if (suspended) return;
+      if (!lastAssistantBody) {
+        await holdInterrupted(ctx);
+        await updateFooter(ctx);
+        return;
+      }
+      queueActiveTurn();
+    }
     if (!await flushSettledTurns(ctx)) return;
-    if (!active || !activeOrigin) {
-      void drain(ctx);
-      return;
-    }
-    if (suspended) return;
-    if (!lastAssistantBody) {
-      await holdInterrupted(ctx);
-      await updateFooter(ctx);
-      return;
-    }
-    await settle(ctx);
-    if (!active) void drain(ctx);
+    void drain(ctx);
   });
 }

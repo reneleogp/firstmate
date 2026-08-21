@@ -259,6 +259,16 @@ assert isinstance(claimed_record['claim_owner_identity'], str)
 terminal_body = 'You · Terminal\n\nreserved until Pi acceptance'
 terminal_path = os.path.join(home, 'terminal-reserved.txt')
 open(terminal_path, 'w').write(terminal_body)
+delivery_root = os.path.join(home, 'state', 'telegram', 'deliveries')
+records_before_validation = list(Path(delivery_root).glob('*.json')) if Path(delivery_root).exists() else []
+validated = run('mirror-validate', '--text-file', terminal_path)
+assert validated.returncode == 0, validated.stderr
+oversized_path = os.path.join(home, 'terminal-oversized.txt')
+open(oversized_path, 'w').write('You · Terminal\n\n' + ('x' * (256 * 1024)))
+oversized = run('mirror-validate', '--text-file', oversized_path)
+assert oversized.returncode != 0 and 'response limit' in oversized.stderr
+records_after_validation = list(Path(delivery_root).glob('*.json')) if Path(delivery_root).exists() else []
+assert records_after_validation == records_before_validation
 calls_path = Path(home, 'calls.jsonl')
 def send_count():
     return sum(1 for line in calls_path.read_text().splitlines()
@@ -278,7 +288,6 @@ first = run('mirror-reply', 'delivery-long', '--request-id', request, '--text-fi
 assert first.returncode == 0, first.stderr
 second = run('mirror-reply', 'delivery-long', '--request-id', request, '--text-file', body_path)
 assert second.returncode == 0, second.stderr
-delivery_root = os.path.join(home, 'state', 'telegram', 'deliveries')
 try:
     owner_fields = Path(f'/proc/{owner}/stat').read_text().rsplit(')', 1)[1].split()
     owner_identity = f'proc:{owner}:{owner_fields[19]}'
