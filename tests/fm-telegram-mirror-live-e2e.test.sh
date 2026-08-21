@@ -57,6 +57,7 @@ state = json.loads(path.read_text()) if path.exists() else {'request': None, 'de
 state.setdefault('reservations', {})
 state.setdefault('delivery_records', {})
 state.setdefault('completion_requests', {})
+state.setdefault('represented_requests', {})
 state.setdefault('log', []).append([command, *rest])
 def save():
     temporary = path.with_name(f'.{path.name}.{os.getpid()}')
@@ -85,6 +86,15 @@ elif command == 'mirror-reconcile':
             request['status'] = 'queued'; request.pop('owner', None)
     if request and request.get('status') == 'held':
         print(f"held\t{request['id']}\t{request['turn_id']}")
+    for request_id, represented in state['represented_requests'].items():
+        if represented.get('status') != 'claimed':
+            continue
+        if request_id in preserved:
+            represented['owner'] = int(option('--owner-pid'))
+            print(f"owned\t{request_id}")
+        else:
+            represented['status'] = 'queued'
+            represented.pop('owner', None)
     expired_deliveries = set(state.pop('expire_deliveries', []))
     for delivery_id in expired_deliveries:
         status = state['delivery_records'].pop(delivery_id, None)
@@ -183,12 +193,17 @@ elif command == 'mirror-reply':
 elif command == 'mirror-abandon':
     request_id, delivery_id = rest[:2]
     request = state.get('request')
+    represented = state['represented_requests'].get(request_id)
     if request and request.get('id') == request_id and request.get('status') == 'claimed':
         state.setdefault('handled', []).append(request_id)
         state.setdefault('abandoned', []).append([request_id, delivery_id])
         state['request'] = None
         state['completion_requests'].pop(delivery_id, None)
-    elif request is not None:
+    elif represented and represented.get('status') == 'claimed':
+        state.setdefault('handled', []).append(request_id)
+        state.setdefault('abandoned', []).append([request_id, delivery_id])
+        del state['represented_requests'][request_id]
+    elif request is not None or represented is not None:
         code = 1
 elif command == 'mirror-complete':
     request_id, delivery_id = rest[:2]
@@ -244,10 +259,18 @@ export default function (pi: ExtensionAPI): void {
     },
   });
   pi.on("input", async (event) => {
-    const state = globalThis as typeof globalThis & { __telegramMirrorInjectNested?: boolean };
+    const state = globalThis as typeof globalThis & {
+      __telegramMirrorInjectNested?: boolean;
+      __telegramMirrorInjectNestedSlash?: boolean;
+    };
     if (state.__telegramMirrorInjectNested && event.source === "extension" && !nested) {
       nested = true;
       pi.sendUserMessage("nested extension input");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (state.__telegramMirrorInjectNestedSlash && event.source === "interactive" &&
+        event.text.startsWith("/")) {
+      pi.sendUserMessage("nested slash extension input");
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   });
@@ -501,20 +524,26 @@ current = state();
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'You · Terminal\n\nterminal request').length, 1);
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · terminal\nanswer').length, 1);
 
+const deliveriesBeforeSlash = Object.keys(state().deliveries).length;
+globalThis.__telegramMirrorInjectNestedSlash = true;
 faux.appendResponses([
   (context) => {
     const user = context.messages.findLast((message) => message.role === 'user');
-    assert.equal(user.content.map((part) => part.text || '').join(''),
-      'You · Terminal\n\nExpanded slash prompt body\n');
+    assert.equal(user.content.map((part) => part.text || '').join(''), 'nested slash extension input');
+    return fauxAssistantMessage('nested slash extension answer');
+  },
+  (context) => {
+    const user = context.messages.findLast((message) => message.role === 'user');
+    assert.equal(user.content.map((part) => part.text || '').join(''), 'Expanded slash prompt body\n');
     return fauxAssistantMessage('slash prompt answer');
   },
 ]);
 await runtime.session.prompt('/slash-mirror', { source: 'interactive' });
-assert.equal(userTexts(initialManager).at(-1), 'You · Terminal\n\nExpanded slash prompt body\n');
-assert.equal(Object.values(state().deliveries)
-  .filter((body) => body === 'You · Terminal\n\n/slash-mirror').length, 1);
-assert.equal(Object.values(state().deliveries)
-  .filter((body) => body === 'Firstmate · slash prompt answer').length, 1);
+globalThis.__telegramMirrorInjectNestedSlash = false;
+assert.equal(userTexts(initialManager).at(-1), 'Expanded slash prompt body\n');
+assert.equal(userTexts(initialManager).includes('nested slash extension input'), true);
+assert.equal(Object.keys(state().deliveries).length, deliveriesBeforeSlash,
+  'slash or nested extension lifecycle was mirrored');
 
 faux.appendResponses([
   async () => {
@@ -977,9 +1006,7 @@ assert.equal(state().log.filter((call) =>
 assert.equal(faux.state.callCount, callsBeforeExpiringSteer + 2,
   'expired carried terminal delivery reinjected its Telegram request');
 
-const competing = state();
-competing.request = { id: 'tg-text-u9-m9', text: 'paired Telegram request', status: 'queued' };
-save(competing);
+const competingRequest = { id: 'tg-text-u9-m9', text: 'paired Telegram request', status: 'queued' };
 globalThis.__telegramMirrorInjectOperational = true;
 faux.appendResponses([
   (context) => {
@@ -999,6 +1026,15 @@ faux.appendResponses([
     return fauxAssistantMessage('operational answer');
   },
 ]);
+await waitFor(() => {
+  const observed = state();
+  if (observed.request?.id === competingRequest.id || observed.handled?.includes(competingRequest.id)) {
+    return true;
+  }
+  observed.request = competingRequest;
+  save(observed);
+  return false;
+}, 'competing Telegram request was not retained for admission');
 await waitFor(() => state().handled?.includes('tg-text-u9-m9'), 'competing extension turn prevented Telegram settlement');
 await waitFor(() => initialManager.getEntries().some((entry) =>
   entry.type === 'custom_message' && entry.content === 'operational follow-up'),
@@ -1123,6 +1159,20 @@ faux.appendResponses([fauxAssistantMessage('explicit provider recovery answer')]
 await runtime.session.prompt('/telegram on', { source: 'interactive' });
 await waitFor(() => state().handled?.includes('tg-text-u11-m11'), 'explicit mode-on recovery did not settle the held request');
 
+const providerFailureLogStart = state().log.length;
+faux.appendResponses(Array.from({ length: 12 }, () =>
+  fauxAssistantMessage([], { stopReason: 'error', errorMessage: 'terminal provider failed' })));
+for (let index = 0; index < 12; index += 1) {
+  await runtime.session.prompt(`terminal provider failure ${index}`, { source: 'interactive' });
+}
+await new Promise((resolve) => setTimeout(resolve, 700));
+const providerFailureReconciles = state().log.slice(providerFailureLogStart)
+  .filter((call) => call[0] === 'mirror-reconcile');
+assert.ok(providerFailureReconciles.length > 0, 'terminal provider failures were not reconciled');
+assert.equal(providerFailureReconciles.every((call) =>
+  call.filter((argument) => argument === '--report-delivery').length <= 1), true,
+  'interrupted terminal delivery identities accumulated in reconciliation');
+
 const expiringHold = state();
 expiringHold.request = { id: 'tg-text-u15-m15', text: 'expiring provider failure', status: 'queued' };
 save(expiringHold);
@@ -1138,6 +1188,7 @@ assert.equal(faux.state.callCount, callsAfterHeldExpiry, 'expired interrupted ad
 
 const replacement = state();
 replacement.request = { id: 'tg-text-u2-m2', text: 'replacement request', status: 'claimed', owner: process.pid };
+replacement.represented_requests['tg-text-stale-current'] = { status: 'claimed', owner: process.pid };
 save(replacement);
 const turnId = 'telegram-tg-text-u2-m2-persisted';
 initialManager.appendCustomEntry('firstmate-telegram-admission', {
@@ -1172,6 +1223,11 @@ assert.equal(userTexts(runtime.session.sessionManager)
 'session replacement reinjected represented Telegram input');
 assert.equal(Object.values(state().deliveries).filter((body) => body === 'Firstmate · replacement answer').length, 1);
 assert.equal(Object.values(state().deliveries).some((body) => body.includes('later operational answer')), false);
+assert.equal(state().abandoned?.some(([id]) => id === 'tg-text-stale-current'), true,
+  'additional represented admission was not abandoned without reinjection');
+assert.equal(userTexts(runtime.session.sessionManager)
+  .some((text) => text.includes('stale current admission')), true,
+  'current represented admission unexpectedly disappeared from persisted history');
 
 const carriedManager = runtime.session.sessionManager;
 const carriedRequestId = 'tg-text-u24-m24';

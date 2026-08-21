@@ -45,7 +45,6 @@ type InputSegment =
 type InputCandidate = {
   segment: InputSegment;
   busyGeneration?: number;
-  unmarked?: boolean;
 };
 type TerminalDelivery = {
   deliveryId: string;
@@ -308,7 +307,7 @@ export default function (pi: ExtensionAPI) {
   let heldAdmission: HeldAdmission | undefined;
   const inputCandidates = new Map<string, InputCandidate>();
   const committedMarkers = new Set<string>();
-  const knownDeliveryRecords = new Set<string>();
+  const recoveryAbandons = new Map<string, RecoveredAdmission>();
   let settledTurns: SettledTurn[] = [];
   let lastAssistantBody = "";
   let scanTimer: ReturnType<typeof setInterval> | undefined;
@@ -327,7 +326,6 @@ export default function (pi: ExtensionAPI) {
     inputGeneration: number;
     sessionGeneration: number;
   } | undefined;
-  let unmarkedUserMessages = new WeakSet<object>();
 
   const exec = async (args: string[], ctx?: ExtensionContext, body?: string): Promise<TransportResult> => {
     const signal = ctx?.signal;
@@ -478,7 +476,6 @@ export default function (pi: ExtensionAPI) {
     const deliveryId = safeIdentity(`assistant-${turn.turnId}`);
     if (turn.terminalDelivery && !turn.terminalDelivery.sent) {
       turn.terminalDelivery.attempted = true;
-      knownDeliveryRecords.add(turn.terminalDelivery.deliveryId);
       const terminalResult = await deliver(
         turn.terminalDelivery.deliveryId,
         turn.terminalDelivery.body,
@@ -492,7 +489,6 @@ export default function (pi: ExtensionAPI) {
         return false;
       }
       turn.terminalDelivery.sent = true;
-      knownDeliveryRecords.add(turn.terminalDelivery.deliveryId);
     }
     const assistantBody = `Firstmate · ${turn.body}`;
     const validated = await validateDelivery(assistantBody, ctx);
@@ -508,10 +504,8 @@ export default function (pi: ExtensionAPI) {
       return true;
     }
     turn.assistantAttempted = true;
-    knownDeliveryRecords.add(deliveryId);
     const result = await deliver(deliveryId, assistantBody, ctx, turn.request);
     if (startedGeneration !== generation) return false;
-    if (result.code === 0) knownDeliveryRecords.add(deliveryId);
     if (result.code !== 0 && result.stdout.trim() === "delivery-rejected") {
       if (turn.request && !await abandonRequest(
         turn.request,
@@ -568,8 +562,6 @@ export default function (pi: ExtensionAPI) {
           completed = false;
           break;
         }
-        if (turn.terminalDelivery) knownDeliveryRecords.delete(turn.terminalDelivery.deliveryId);
-        knownDeliveryRecords.delete(safeIdentity(`assistant-${turn.turnId}`));
         settledTurns.shift();
       }
     } finally {
@@ -592,6 +584,7 @@ export default function (pi: ExtensionAPI) {
   const holdInterrupted = async (ctx: ExtensionContext): Promise<void> => {
     const requestId = activeRequest;
     const turnId = activeTurnId;
+    const terminalDelivery = activeTerminalDelivery;
     if (requestId && turnId) {
       heldAdmission = { requestId, turnId };
       await exec(["mirror-hold", requestId, turnId], ctx);
@@ -601,6 +594,12 @@ export default function (pi: ExtensionAPI) {
         ctx.sessionManager.getSessionId?.() || "session",
         "interrupted",
       );
+    }
+    if (terminalDelivery && !terminalDelivery.sent) {
+      await cancelReservation(terminalDelivery.deliveryId, ctx);
+    }
+    if (terminalDelivery && !requestId) {
+      ctx.ui.notify("A terminal mirror turn ended without a response and was abandoned.", "warning");
     }
     resetTurn();
   };
@@ -657,14 +656,10 @@ export default function (pi: ExtensionAPI) {
         );
       }
       const reserved = await reserve(terminalDelivery.deliveryId, terminalDelivery.body, ctx);
-      if (reserved.code === 0) knownDeliveryRecords.add(terminalDelivery.deliveryId);
       if (reserved.code === 0 && !deliveryBlocked && settledTurns.length === 0) {
         terminalDelivery.attempted = true;
         const result = await deliver(terminalDelivery.deliveryId, terminalDelivery.body, ctx);
-        if (result.code === 0) {
-          terminalDelivery.sent = true;
-          knownDeliveryRecords.add(terminalDelivery.deliveryId);
-        }
+        if (result.code === 0) terminalDelivery.sent = true;
         else deliveryBlocked = true;
       } else if (reserved.code !== 0) {
         deliveryBlocked = true;
@@ -708,12 +703,12 @@ export default function (pi: ExtensionAPI) {
       for (const turn of settledTurns) {
         if (turn.request) preserved.add(turn.request);
       }
-      const reportedDeliveries = new Set<string>(knownDeliveryRecords);
-      if (activeOrigin === "terminal" && !activeRequest && activeTerminalDelivery?.attempted) {
+      for (const requestId of recoveryAbandons.keys()) preserved.add(requestId);
+      const reportedDeliveries = new Set<string>();
+      if (activeTerminalDelivery?.attempted) {
         reportedDeliveries.add(activeTerminalDelivery.deliveryId);
       }
       for (const turn of settledTurns) {
-        if (turn.origin !== "terminal" || turn.request) continue;
         if (turn.terminalDelivery?.attempted) reportedDeliveries.add(turn.terminalDelivery.deliveryId);
         if (turn.assistantAttempted) reportedDeliveries.add(safeIdentity(`assistant-${turn.turnId}`));
       }
@@ -733,12 +728,23 @@ export default function (pi: ExtensionAPI) {
           .filter((line) => line.startsWith("delivery-missing\t"))
           .map((line) => line.slice("delivery-missing\t".length))
           .filter((deliveryId) => reportedDeliveries.has(deliveryId)));
-        for (const line of lines) {
-          const fields = line.split("\t");
-          if (fields[0] === "delivery" && fields.length === 3) knownDeliveryRecords.add(fields[1]);
+        const ownedRequestIds = new Set(lines
+          .filter((line) => line.startsWith("owned\t"))
+          .map((line) => line.split("\t")[1])
+          .filter((requestId): requestId is string => !!requestId));
+        for (const [requestId, candidate] of recoveryAbandons) {
+          if (!ownedRequestIds.has(requestId)) {
+            recoveryAbandons.delete(requestId);
+            continue;
+          }
+          if (await abandonRequest(
+            requestId,
+            candidate.turnId,
+            `assistant-${candidate.turnId}`,
+            ctx,
+          )) recoveryAbandons.delete(requestId);
         }
         if (missing.size > 0) {
-          const abandonedDeliveryIds = new Set<string>();
           let abandoned = false;
           const activeExpired = activeOrigin === "terminal" &&
             !!activeTerminalDelivery && missing.has(activeTerminalDelivery.deliveryId);
@@ -752,7 +758,6 @@ export default function (pi: ExtensionAPI) {
               ctx,
             );
             if (requestAbandoned) {
-              abandonedDeliveryIds.add(activeTerminalDelivery.deliveryId);
               resetTurn();
               abandoned = true;
             }
@@ -779,13 +784,10 @@ export default function (pi: ExtensionAPI) {
               retained.push(turn);
               continue;
             }
-            if (turn.terminalDelivery) abandonedDeliveryIds.add(turn.terminalDelivery.deliveryId);
-            abandonedDeliveryIds.add(assistantId);
             abandoned = true;
           }
           if (abandoned) {
             settledTurns = retained;
-            for (const deliveryId of abandonedDeliveryIds) knownDeliveryRecords.delete(deliveryId);
             deliveryBlocked = false;
             ctx.ui.notify("An expired blocked mirror turn was abandoned without replay.", "warning");
             void flushSettledTurns(ctx);
@@ -905,14 +907,13 @@ export default function (pi: ExtensionAPI) {
     heldAdmission = undefined;
     inputCandidates.clear();
     committedMarkers.clear();
-    knownDeliveryRecords.clear();
+    recoveryAbandons.clear();
     settledTurns = [];
     deliveryBlocked = false;
     transportOpen = false;
     mirrorMode = "off";
     inputGeneration = 0;
     deferredSettlement = undefined;
-    unmarkedUserMessages = new WeakSet<object>();
     if (!ownsHomeLock()) {
       ctx.ui.setStatus(statusKey, "telegram: not the primary session");
       return;
@@ -949,8 +950,21 @@ export default function (pi: ExtensionAPI) {
     const ownedRequestIds = new Set(reconciliation
       .filter((fields) => fields[0] === "owned" && fields.length >= 2)
       .map((fields) => fields[1]));
-    const provenance = [...provenanceByRequest.values()]
-      .find((candidate) => ownedRequestIds.has(candidate.requestId));
+    const ownedProvenance = [...provenanceByRequest.values()]
+      .filter((candidate) => ownedRequestIds.has(candidate.requestId));
+    const provenance = ownedProvenance[0];
+    for (const candidate of ownedProvenance.slice(1)) {
+      recoveryAbandons.set(candidate.requestId, candidate);
+      if (await abandonRequest(
+        candidate.requestId,
+        candidate.turnId,
+        `assistant-${candidate.turnId}`,
+        ctx,
+      )) recoveryAbandons.delete(candidate.requestId);
+    }
+    if (ownedProvenance.length > 1) {
+      ctx.ui.notify("Extra persisted Telegram admissions were abandoned without reinjection.", "warning");
+    }
     const interrupted = transportHeld ? interruptedByRequest.get(transportHeld[1]) : undefined;
     if (interrupted && transportHeld?.[2] === interrupted.turnId) {
       heldAdmission = interrupted;
@@ -1004,13 +1018,12 @@ export default function (pi: ExtensionAPI) {
     await Promise.all(reservations.map((delivery) => cancelReservation(delivery.deliveryId)));
     inputCandidates.clear();
     committedMarkers.clear();
-    knownDeliveryRecords.clear();
+    recoveryAbandons.clear();
     settledTurns = [];
     deliveryBlocked = false;
     transportOpen = false;
     mirrorMode = "off";
     deferredSettlement = undefined;
-    unmarkedUserMessages = new WeakSet<object>();
     resetTurn();
   });
 
@@ -1036,8 +1049,7 @@ export default function (pi: ExtensionAPI) {
         if (candidate.segment.origin === "terminal") inputCandidates.delete(marker);
       }
     }
-    const telegramCommand = /^\/telegram(?:\s|$)/.test(event.text);
-    if (event.source === "interactive" && event.text && !telegramCommand &&
+    if (event.source === "interactive" && event.text && !event.text.startsWith("/") &&
         transportOpen && ownsHomeLock()) {
       interactivePreflights += 1;
       try {
@@ -1066,12 +1078,10 @@ export default function (pi: ExtensionAPI) {
         }
         const marker = newOriginMarker();
         const turnId = `terminal-${marker}`;
-        const slashInput = event.text.startsWith("/");
         inputCandidates.set(marker, {
           busyGeneration: ctx.isIdle() && event.streamingBehavior === undefined
             ? undefined
             : inputGeneration,
-          unmarked: slashInput,
           segment: {
             origin: "terminal",
             turnId,
@@ -1079,9 +1089,7 @@ export default function (pi: ExtensionAPI) {
             deliveryId: safeIdentity(`user-${turnId}`),
           },
         });
-        return slashInput
-          ? { action: "continue" as const }
-          : { action: "transform" as const, text: markedInput(marker, "terminal", event.text) };
+        return { action: "transform" as const, text: markedInput(marker, "terminal", event.text) };
       } finally {
         interactivePreflights -= 1;
         if (interactivePreflights === 0 && deferredSettlement) {
@@ -1137,14 +1145,6 @@ export default function (pi: ExtensionAPI) {
       }, ctx);
       return;
     }
-    const unmarked = [...inputCandidates.entries()]
-      .find(([, inputCandidate]) => inputCandidate.unmarked && inputCandidate.segment.origin === "terminal");
-    if (unmarked) {
-      inputCandidates.delete(unmarked[0]);
-      unmarkedUserMessages.add(message as object);
-      await transitionSegment(unmarked[1].segment, ctx);
-      return;
-    }
     await transitionSegment({ origin: "excluded" }, ctx);
   });
 
@@ -1169,17 +1169,6 @@ export default function (pi: ExtensionAPI) {
     if (message.role === "user") {
       const token = originMarkerToken(inputTextOf(message));
       if (token && committedMarkers.delete(token)) return { message: stripMessageOrigin(message) };
-      if (unmarkedUserMessages.delete(message as object)) {
-        const content = Array.isArray(message.content)
-          ? message.content.map((part, index) => {
-            if (index !== 0 || !part || typeof part !== "object" ||
-                (part as { type?: string }).type !== "text" ||
-                typeof (part as { text?: unknown }).text !== "string") return part;
-            return { ...part, text: `You · Terminal\n\n${(part as { text: string }).text}` };
-          })
-          : `You · Terminal\n\n${message.content || ""}`;
-        return { message: { ...message, content } };
-      }
       return;
     }
     if (message.role !== "assistant" || !active || suspended ||
