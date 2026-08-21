@@ -147,9 +147,14 @@ Every button action is bound to the current transcript revision, so a stale or r
 
 - One paired account, one private chat, one Firstmate session.
 - The bot owns mirror mode and delivery confirmations for both surfaces; the terminal only shows and changes what the bot publishes.
+- Stopping or restarting the service is bounded: a running transcription and everything it started are ended, the connected terminal session is released, and the bot exits rather than waiting on work it cannot interrupt.
+  The installed unit sets `TimeoutStopSec=20` to match.
+- At most 32 untouched voice transcripts are kept; older ones are dropped with their temporary audio, so cards you never answer cannot pile up.
 - Transport statuses stay attached to the exact message they describe, while Firstmate's replies are never threaded (see Reply threading).
 - The service unit holds no token and no message content; the token stays in `~/.firstmate-telegram/env` and pairing stays in `config.json`.
 - Temporary voice audio is owner-only and is deleted after send, cancel, failure, and at bot start and stop.
+- Transcription memory belongs to the local speech model, not the bot: the bot stays around 34 MB while a transcription child can hold well over a gigabyte for its model.
+  A service memory figure covers the whole service, children included, and its peak stays at that high-water mark for the rest of the run even after the child exits.
 - `FM_TELEGRAM_DIR` moves the private directory; `bin/fm-telegram.py --help` owns the remaining flags and environment.
 
 The wire protocol between the bot and the Pi extension is stated once in `bin/fm-telegram.py`'s header.

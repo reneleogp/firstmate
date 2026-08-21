@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -351,6 +352,125 @@ class MirrorTestCase(unittest.TestCase):
                                  "text": "Mirror is on. Firstmate is connected. Confirmations are on."})
         pi.send({"t": "command", "id": 8, "command": "off"})
         self.assertIn("Mirror is off", pi.read()["text"])
+
+    def processes_matching(self, needle: str) -> list[int]:
+        found = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
+            except OSError:
+                continue
+            if needle in cmdline:
+                found.append(int(entry.name))
+        return found
+
+    def reap_by_cmdline(self, needle: str) -> None:
+        """Kill fixture leftovers so a regression fails loudly instead of hanging."""
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
+            except OSError:
+                continue
+            if needle in cmdline:
+                try:
+                    os.kill(int(entry.name), signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+
+    def test_stop_is_bounded_while_a_transcription_is_running(self) -> None:
+        # The field failure: a local speech model was still running when the
+        # service was restarted, the stop never completed, and systemd killed
+        # the bot after its stop timeout.
+        slow = Path(self.tmp.name) / "slow-parakeet"
+        slow.write_text(
+            "#!/bin/sh\n"
+            # A wrapper driving a heavier child, exactly like the real command:
+            # signalling only this shell leaves that child holding the pipe.
+            'python3 -c "import sys, time; sys.argv[0]; time.sleep(300)" ' + str(slow) + " &\n"
+            "wait\n",
+            encoding="utf-8",
+        )
+        slow.chmod(0o755)
+        self.addCleanup(self.reap_by_cmdline, str(slow))
+        config = json.loads((self.home / "config.json").read_text())
+        config["transcribe_command"] = str(slow)
+        (self.home / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        self.stop_bot()
+        self.start_bot()
+
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.telegram.push_voice(401)
+        self.telegram.wait_sent(lambda m: m.get("text") == "Transcribing…")
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline and not (self.home / "audio" / "401.ogg").exists():
+            time.sleep(0.05)
+        time.sleep(1.0)
+
+        started = time.time()
+        self.bot.terminate()
+        try:
+            self.bot.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.bot.kill()
+            self.bot.wait(timeout=10)
+            self.reap_by_cmdline(str(slow))
+            self.fail("the bot did not stop within 20s while a transcription was running")
+        elapsed = time.time() - started
+        self.assertLess(elapsed, 15, f"the stop took {elapsed:.1f}s while transcribing")
+        # A stop that merely walks away would leave the transcription running:
+        # the real command is a wrapper whose heavy child outlives it.
+        time.sleep(1.0)
+        survivors = self.processes_matching(str(slow))
+        self.reap_by_cmdline(str(slow))
+        self.assertEqual(
+            survivors, [], f"the stop orphaned {len(survivors)} transcription process(es)"
+        )
+        self.assertFalse(self.socket_path.exists(), "the stopped bot left its socket behind")
+        self.assertFalse(
+            (self.home / "audio" / "401.ogg").exists(),
+            "the stopped bot left its temporary voice audio behind",
+        )
+
+    def test_stop_is_bounded_while_a_long_poll_is_open(self) -> None:
+        # The ordinary state: parked in a long poll with nothing to do. That
+        # wait must not delay the stop either.
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        time.sleep(1.0)
+        started = time.time()
+        self.bot.terminate()
+        try:
+            self.bot.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.bot.kill()
+            self.fail("the bot did not stop within 20s while parked in a long poll")
+        elapsed = time.time() - started
+        self.assertLess(elapsed, 5, f"the stop took {elapsed:.1f}s while polling")
+
+    def test_abandoned_transcripts_do_not_accumulate(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        # Cards nobody taps must not retain their text and audio forever.
+        for index in range(40):
+            self.telegram.push_voice(500 + index)
+        self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 539
+            and m.get("reply_markup") is not None
+        )
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline:
+            if len(list((self.home / "audio").glob("*.ogg"))) <= 32:
+                break
+            time.sleep(0.1)
+        retained = sorted(path.stem for path in (self.home / "audio").glob("*.ogg"))
+        self.assertLessEqual(len(retained), 32, f"retained {len(retained)} voice files")
+        self.assertIn("539", retained, "the newest transcript was dropped instead of the oldest")
+        self.assertNotIn("500", retained, "the oldest transcript was never retired")
 
     def test_menu_aliases_are_published_and_switch_the_mirror(self) -> None:
         pi = self.connect_pi()
@@ -754,6 +874,9 @@ class ServiceUnitTestCase(unittest.TestCase):
         self.assertIn("WantedBy=default.target", unit)
         self.assertIn(f"{BOT} run", unit)
         self.assertIn(f"Environment=FM_TELEGRAM_DIR={tmp}", unit)
+        # The bot's own stop is bounded; the unit must not fall back to the 90s
+        # default that killed it in the field.
+        self.assertIn("TimeoutStopSec=20", unit)
         self.assertNotIn(TOKEN, unit)
 
     def test_service_install_refuses_outside_wsl(self) -> None:

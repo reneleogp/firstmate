@@ -85,6 +85,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -139,6 +140,14 @@ COPY_TEXT_LIMIT = 256
 TRANSCRIBE_TIMEOUT = 180
 POLL_TIMEOUT = 25
 MAX_VOICE_BYTES = 20 * 1024 * 1024
+# Transcripts nobody acted on are dropped oldest-first, with their audio, so an
+# abandoned card cannot retain its text and temporary file for the whole run.
+MAX_PENDING_VOICES = 32
+# The graceful stop must finish well inside the unit's TimeoutStopSec. Nothing
+# durable is buffered at exit: the inbound queue is documented as memory-only,
+# and every setting is written when it changes.
+STOP_GRACE_SECONDS = 5
+TRANSCRIBE_STOP_GRACE = 2
 
 
 class TelegramError(RuntimeError):
@@ -329,6 +338,7 @@ class MirrorBot:
     prompts: dict[int, int] = field(default_factory=dict)
     client: Optional[asyncio.StreamWriter] = None
     background: set = field(default_factory=set)
+    transcribers: set = field(default_factory=set)
     _sequence: int = 0
     _stopping: bool = False
 
@@ -521,17 +531,27 @@ class MirrorBot:
         voice_id = int(message["message_id"])
         await self.send(TRANSCRIBING_REPLY, reply_to=voice_id)
         audio = audio_dir(self.config.home) / f"{voice_id}.ogg"
+        started: list[Any] = []
         try:
             file_id = (message.get("voice") or {}).get("file_id")
             info = await self.api.call("getFile", {"file_id": file_id})
             private_dir(audio_dir(self.config.home))
             await self.api.download(str((info or {}).get("file_path", "")), audio)
-            transcript = await transcribe(self.config.transcribe_command, audio)
+            transcript = await transcribe(
+                self.config.transcribe_command, audio, self.register_transcriber(started),
+            )
         except TelegramError as exc:
-            log(str(exc))
             remove_file(audio)
+            if self._stopping:
+                # Its child was ended by the stop; that is not a captain-facing
+                # failure and the chat is going quiet anyway.
+                return
+            log(str(exc))
             await self.send(TRANSCRIBE_FAILED_REPLY, reply_to=voice_id)
             return
+        finally:
+            for process in started:
+                self.transcribers.discard(process)
         card = await self.send(transcript, reply_to=voice_id, markup=main_markup(voice_id, 1))
         if card is None:
             remove_file(audio)
@@ -539,6 +559,29 @@ class MirrorBot:
         self.voices[voice_id] = Voice(
             voice_id=voice_id, card_id=int(card["message_id"]), text=transcript, audio=audio
         )
+        self.retire_stale_voices()
+
+    def register_transcriber(self, started: list) -> Any:
+        def register(process: Any) -> None:
+            started.append(process)
+            self.transcribers.add(process)
+            if self._stopping:
+                # Raced the stop: end it immediately rather than outliving us.
+                self.stop_transcribers()
+        return register
+
+    def stop_transcribers(self) -> None:
+        for process in list(self.transcribers):
+            end_process_group(process)
+        self.transcribers.clear()
+
+    def retire_stale_voices(self) -> None:
+        """Keep the newest transcripts only; an untouched card is not durable."""
+        while len(self.voices) > MAX_PENDING_VOICES:
+            oldest = min(self.voices)
+            entry = self.voices.pop(oldest)
+            self.clear_prompt(entry)
+            remove_file(entry.audio)
 
     async def handle_callback(self, callback: dict[str, Any]) -> None:
         callback_id = str(callback.get("id"))
@@ -763,17 +806,38 @@ class MirrorBot:
         self.background.add(menu)
         menu.add_done_callback(self.background.discard)
         try:
-            async with server:
-                await asyncio.wait({poller, waiter}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait({poller, waiter}, return_when=asyncio.FIRST_COMPLETED)
         finally:
+            # Bounded by construction, against three separate waits that each
+            # outlast a service manager's stop timeout:
+            #  - a connected Pi session parks handle_client in readline, and
+            #    Server.wait_closed() waits for every live connection handler,
+            #  - a running transcription owns a worker thread that cancelling
+            #    its task cannot interrupt, and
+            #  - CPython joins leftover worker threads for up to 300s at exit.
+            # Nothing durable is buffered: the queue is documented as
+            # memory-only and settings are written when they change.
             self._stopping = True
-            for task in (poller, waiter, *list(self.background)):
+            self.stop_transcribers()
+            client = self.client
+            self.client = None
+            if client is not None:
+                with contextlib.suppress(OSError):
+                    client.close()
+            server.close()
+            with contextlib.suppress(asyncio.TimeoutError, OSError):
+                await asyncio.wait_for(server.wait_closed(), timeout=STOP_GRACE_SECONDS)
+            tasks = [poller, waiter, *list(self.background)]
+            for task in tasks:
                 task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.gather(poller, waiter, *list(self.background),
-                                     return_exceptions=True)
+            await asyncio.wait(tasks, timeout=STOP_GRACE_SECONDS)
             remove_file(path)
             clear_audio(self.config.home)
+            log("stopped")
+            sys.stderr.flush()
+            if any(thread is not threading.main_thread() and thread.is_alive()
+                   and not thread.daemon for thread in threading.enumerate()):
+                os._exit(0)
 
 
 # --- pure helpers -----------------------------------------------------------
@@ -855,26 +919,68 @@ def transcribe_argv(command: str, audio: Path) -> list[str]:
     return [*parts, str(audio)]
 
 
-def run_transcribe(command: str, audio: Path) -> str:
+def run_transcribe(command: str, audio: Path, register: Optional[Any] = None) -> str:
     argv = transcribe_argv(command, audio)
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            timeout=TRANSCRIBE_TIMEOUT, check=False,
+            # Its own process group: a transcriber is usually a wrapper script
+            # driving heavier children, and signalling only the wrapper leaves
+            # those children alive holding this pipe open.
+            start_new_session=True,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError) as exc:
         raise TelegramError(f"transcription command failed: {exc}") from exc
-    if completed.returncode != 0:
-        detail = (completed.stderr or "").strip()[:200]
-        raise TelegramError(f"transcription command exited {completed.returncode}: {detail}")
-    transcript = (completed.stdout or "").strip()
+    # Published before the wait so a stopping bot can end this child instead of
+    # blocking on it: a local speech model can hold the CPU for minutes.
+    if register is not None:
+        register(process)
+    try:
+        stdout, stderr = process.communicate(timeout=TRANSCRIBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        end_process_group(process)
+        process.communicate()
+        raise TelegramError("transcription timed out") from None
+    if process.returncode != 0:
+        detail = (stderr or "").strip()[:200]
+        raise TelegramError(f"transcription command exited {process.returncode}: {detail}")
+    transcript = (stdout or "").strip()
     if not transcript:
         raise TelegramError("transcription produced no text")
     return transcript
 
 
-async def transcribe(command: str, audio: Path) -> str:
-    return await asyncio.to_thread(run_transcribe, command, audio)
+def end_process_group(process: Any) -> None:
+    """Stop a transcriber and everything it started, then stop waiting."""
+    for signal_name in (signal.SIGTERM, signal.SIGKILL):
+        if process.poll() is not None:
+            return
+        try:
+            group = os.getpgid(process.pid)
+        except (OSError, ProcessLookupError):
+            group = None
+        # Only ever signal a group the child leads. A transcriber that failed to
+        # get its own session shares ours, and signalling that group would take
+        # down this service with it.
+        if group is not None and group != os.getpgrp():
+            try:
+                os.killpg(group, signal_name)
+            except (OSError, ProcessLookupError):
+                pass
+        else:
+            try:
+                process.send_signal(signal_name)
+            except (OSError, ValueError, ProcessLookupError):
+                return
+        try:
+            process.wait(timeout=TRANSCRIBE_STOP_GRACE)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+async def transcribe(command: str, audio: Path, register: Optional[Any] = None) -> str:
+    return await asyncio.to_thread(run_transcribe, command, audio, register)
 
 
 # --- service and CLI --------------------------------------------------------
@@ -910,6 +1016,9 @@ def unit_text(home: Path) -> str:
         f"ExecStart={sys.executable} {shlex.quote(str(script))} run\n"
         "Restart=always\n"
         "RestartSec=5\n"
+        # The bot's own stop is bounded by STOP_GRACE_SECONDS; this leaves room
+        # for it without inviting the 90s default when something goes wrong.
+        "TimeoutStopSec=20\n"
         "\n"
         "[Install]\n"
         "WantedBy=default.target\n"
