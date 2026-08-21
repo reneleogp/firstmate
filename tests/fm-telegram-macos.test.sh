@@ -231,7 +231,7 @@ server = HTTPServer(('127.0.0.1', 0), Handler)
 (home / 'port').write_text(str(server.server_port)); server.serve_forever()
 PY
   SERVER_PID=$!
-  for _ in $(seq 1 50); do [ -s "$home/port" ] && return; sleep .02; done
+  for _ in $(seq 1 200); do [ -s "$home/port" ] && return; sleep .05; done
   fail "fake Telegram server did not start"
 }
 
