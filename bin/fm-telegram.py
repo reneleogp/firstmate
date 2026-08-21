@@ -3402,9 +3402,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Private one-home Telegram transport for Firstmate.",
         epilog=("Commands: pair, serve, migrate-wakes, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-hold, mirror-recover, mirror-validate, mirror-reserve, mirror-cancel, mirror-reply, mirror-abandon, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
                 "Private mirror commands require the lock-owning extension capability on an inherited file descriptor.\n"
-                "Retention limits: 256 queued or interrupted requests for 7 days, 4096 handled requests, and 256 mirror deliveries of up to 256 KiB.\n"
-                "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
-                "Voice limits: 10 MiB, 120 seconds, a 4096-unit transcript, and 64 waiting notes. Temporary audio is restricted to /dev/shm.\n"
+                f"Retention limits: {MAX_INBOX} queued or interrupted requests for {INBOX_TTL // (24 * 60 * 60)} days, {MAX_HANDLED} handled requests, and {MAX_MIRROR_DELIVERIES} mirror deliveries; unprotected mirror deliveries expire after {MIRROR_DELIVERY_TTL // (24 * 60 * 60)} days and each is at most {MAX_MIRROR_DELIVERY_BYTES // 1024} KiB or {MAX_MIRROR_DELIVERY_CHUNKS} Telegram chunks.\n"
+                f"Receipt delivery makes at most {len(RECEIPT_RETRY_DELAYS)} attempts with bounded backoff.\n"
+                f"Voice limits: {MAX_VOICE_BYTES // (1024 * 1024)} MiB, {MAX_VOICE_SECONDS} seconds, a {MAX_TRANSCRIPT_UNITS}-unit transcript, {MAX_PENDING_VOICES} waiting notes for {INBOX_TTL // (24 * 60 * 60)} days, and one active confirmation for {PENDING_TTL // 60} minutes. Temporary audio is restricted to /dev/shm.\n"
                 "Pairing accepts --parakeet-command and --whisper-command as absolute executable paths; configured paths must be regular executable files.\n"
                 "FM_TELEGRAM_PARAKEET_CMD and FM_TELEGRAM_WHISPER_CMD override the local transcription commands for one process.\n"
                 "Mirror delivery reads UTF-8 from --text-file and accepts no recipient argument."),
