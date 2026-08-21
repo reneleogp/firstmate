@@ -390,6 +390,24 @@ jobs:
             exit 1
           }
 
+  telegram-macos:
+    name: Telegram macOS lifecycle smoke
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run macOS Telegram transport smoke
+        env:
+          # The test's fake launchctl is deliberately disposable and never
+          # contacts Telegram; plutil is the runner's real validator.
+          FM_TELEGRAM_PLUTIL: plutil
+        run: |
+          set -eu
+          python3 --version
+          python3 -m py_compile bin/fm-telegram.py
+          python3 bin/fm-telegram.py --help
+          bash tests/fm-telegram-macos.test.sh
+
   invariants:
     name: Repo invariants
     runs-on: ubuntu-latest

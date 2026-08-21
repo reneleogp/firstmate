@@ -1,7 +1,9 @@
 # Telegram mirror mode
 
-This optional Linux/WSL transport connects one pinned private Telegram bot DM to one Firstmate home.
-It uses one Python systemd user service and one project-local Pi extension.
+This optional transport connects one pinned private Telegram bot DM to one Firstmate home.
+It uses one Python user service and one project-local Pi extension.
+Linux and WSL use one systemd user service, while macOS uses one owned user LaunchAgent.
+The transport never starts Firstmate, a second Pi, an RPC or SDK session, a Telegram-only agent, or a shadow orchestrator.
 The service uses Python's standard library and outbound Telegram Bot API long polling, with no webhook, public ingress, tunnel, hosted service, or third-party Telegram package.
 Python owns pairing, authentication, deduplication, voice confirmation, offline queueing, retention, service lifecycle, and Telegram delivery.
 The extension acts only in the current Pi process that owns the exact home session lock.
@@ -12,13 +14,28 @@ Telegram never starts or hosts a second Pi, RPC or SDK agent, Telegram agent, sh
 ## Setup
 
 Put one `FM_TELEGRAM_BOT_TOKEN` entry in the selected home's regular, non-symlink, gitignored `.env`.
-Do not copy the token into a unit file, tracked file, command argument, or diagnostic output.
+Do not copy the token into a unit file, LaunchAgent plist, tracked file, command argument, or diagnostic output.
 Pair one private user and chat with `bin/fm-telegram.py --home "$FM_HOME" pair --user-id <private-user-id> --chat-id <private-dm-id>`.
 Pairing verifies the bot identity and private chat, then stores the pinned user, chat, and bot identifiers in private `config/telegram.json`.
-Use both `pair` transcriber options together when Parakeet and Whisper wrappers are outside the systemd service PATH; `--help` owns their exact flags and constraints.
+Use `--parakeet-command <absolute-path> --whisper-command <absolute-path>` together when local transcribers are outside the service PATH.
+Use optional `--ffmpeg-command <absolute-path>` for local Ogg/Opus conversion when the transcriber needs PCM input.
+The executable `bin/fm-telegram.py --help` owns the exact flags, limits, and command configuration rules.
 Stop the installed service before replacing its pairing, and run `cleanup` first when changing an identity that still has private Telegram state.
-Install and start the service with `bin/fm-telegram.py --home "$FM_HOME" install`.
-Use `start`, `stop`, `status`, `disable`, and `cleanup` for the service lifecycle.
+
+### Linux and WSL
+
+Install and start the systemd user service with `bin/fm-telegram.py --home "$FM_HOME" install`.
+The unit is written under the user systemd configuration and contains only stable program, Python, and home paths plus non-secret environment.
+Use `bin/fm-telegram.py --home "$FM_HOME" start`, `stop`, `status`, `disable`, and `cleanup` for its lifecycle.
+
+### macOS
+
+Install and start exactly one user LaunchAgent with `bin/fm-telegram.py --home "$FM_HOME" install`.
+The owned plist is `~/Library/LaunchAgents/com.reneleogp.firstmate.telegram.plist` and uses `launchctl bootstrap`, `kickstart`, `print`, `kill`, `disable`, and `bootout` without sudo or a system daemon.
+Use `bin/fm-telegram.py --home "$FM_HOME" start`, `stop`, `status`, `disable`, and `cleanup` for its lifecycle.
+The plist is validated with `plutil` before publication and contains no bot token, pinned identifiers, transcript, audio, model path secret, or message content.
+Apple Silicon Parakeet and Whisper wrappers must be configured as absolute executable paths, and no Homebrew location is assumed.
+
 Stopping or disabling abandons pending voice confirmations and waiting voice notes and removes temporary audio.
 Cleanup removes this service's unit, pairing, preference, and private Telegram state without editing `.env` or unrelated home records.
 The service may run while Pi is absent and queues authenticated content until the lock-owning primary extension is live.

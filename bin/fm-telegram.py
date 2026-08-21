@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import json
 import os
+import plistlib
 import secrets
 import shlex
 import shutil
@@ -30,6 +31,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 SERVICE_NAME = "firstmate-telegram.service"
+LAUNCHD_LABEL = "com.reneleogp.firstmate.telegram"
+LAUNCHD_PLIST_NAME = f"{LAUNCHD_LABEL}.plist"
 CONFIG_NAME = "telegram.json"
 MAX_SEEN = 4096
 MAX_HANDLED = 4096
@@ -327,7 +330,7 @@ def state_dir(home: Path) -> Path:
 
 
 def normalize_transcriber_command(value: Any, kind: str) -> str:
-    label = "Parakeet" if kind == "parakeet" else "Whisper"
+    label = {"parakeet": "Parakeet", "whisper": "Whisper", "ffmpeg": "FFmpeg"}.get(kind, kind)
     if not isinstance(value, str) or not value.strip():
         raise TelegramError(f"configured {label} command is missing or unsafe")
     try:
@@ -353,7 +356,8 @@ def normalize_transcriber_command(value: Any, kind: str) -> str:
 
 def validate_transcriber_config(config: Dict[str, Any]) -> Dict[str, Any]:
     validated = dict(config)
-    for kind, key in (("parakeet", "parakeet_command"), ("whisper", "whisper_command")):
+    for kind, key in (("parakeet", "parakeet_command"), ("whisper", "whisper_command"),
+                      ("ffmpeg", "ffmpeg_command")):
         if key in validated:
             validated[key] = normalize_transcriber_command(validated[key], kind)
     return validated
@@ -491,6 +495,177 @@ def systemctl(*arguments: str, check: bool = True) -> subprocess.CompletedProces
     if check and result.returncode != 0:
         raise TelegramError("systemd user service command failed")
     return result
+
+
+def is_macos() -> bool:
+    # The explicit override is only for the semantic lifecycle tests.
+    return os.environ.get("FM_TELEGRAM_PLATFORM", sys.platform) == "darwin"
+
+
+def launchd_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def launchd_target() -> str:
+    return f"{launchd_domain()}/{LAUNCHD_LABEL}"
+
+
+def launchd_command(*arguments: str, check: bool = True) -> subprocess.CompletedProcess:
+    command = os.environ.get("FM_TELEGRAM_LAUNCHCTL", "launchctl")
+    result = subprocess.run([command, *arguments], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode != 0:
+        raise TelegramError("launchd user agent command failed")
+    return result
+
+
+def launchd_plutil(*arguments: str, check: bool = True) -> subprocess.CompletedProcess:
+    command = os.environ.get("FM_TELEGRAM_PLUTIL", "plutil")
+    result = subprocess.run([command, *arguments], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode != 0:
+        raise TelegramError("LaunchAgent property list validation failed")
+    return result
+
+
+def launchd_path() -> Path:
+    override = os.environ.get("FM_TELEGRAM_LAUNCHD_DIR")
+    if override:
+        return Path(override).expanduser() / LAUNCHD_PLIST_NAME
+    return Path.home() / "Library" / "LaunchAgents" / LAUNCHD_PLIST_NAME
+
+
+def launchd_audio_root() -> Path:
+    override = os.environ.get("FM_TELEGRAM_AUDIO_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path(tempfile.gettempdir()) / "firstmate-telegram"
+
+
+def launchd_print(home: Path) -> subprocess.CompletedProcess:
+    del home
+    return launchd_command("print", launchd_target(), check=False)
+
+
+def launchd_output_has_path(home: Path, result: subprocess.CompletedProcess) -> bool:
+    expected = str(launchd_path())
+    output = f"{result.stdout}\n{result.stderr}"
+    return any(expected == line.split("=", 1)[1].strip().strip('"')
+               for line in output.splitlines()
+               if "=" in line and line.split("=", 1)[0].strip() == "path")
+
+
+def launchd_unit_loaded(home: Path) -> bool:
+    result = launchd_print(home)
+    return result.returncode == 0 and launchd_output_has_path(home, result)
+
+
+def launchd_unit_active(home: Path, result: Optional[subprocess.CompletedProcess] = None) -> bool:
+    result = result or launchd_print(home)
+    if result.returncode != 0 or not launchd_output_has_path(home, result):
+        return False
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    return any(marker in output for marker in ("state = running", "state = active", "pid = "))
+
+
+def launchd_unit_inactive(home: Path) -> bool:
+    result = launchd_print(home)
+    if result.returncode != 0:
+        output = f"{result.stdout}\n{result.stderr}".lower()
+        return any(marker in output for marker in (
+            "could not find service", "service not found", "no such process", "unknown service"
+        ))
+    return launchd_output_has_path(home, result) and not launchd_unit_active(home, result)
+
+
+def launchd_plist_contents(home: Path) -> bytes:
+    script = Path(__file__).resolve()
+    python = Path(sys.executable).resolve()
+    for path in (script, python, home):
+        if any(ord(character) < 32 or ord(character) == 127 for character in str(path)):
+            raise TelegramError("LaunchAgent paths contain unsupported control characters")
+    value = {
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": [str(python), str(script), "--home", str(home),
+                              "serve", "--launchd-service"],
+        "EnvironmentVariables": {"FM_HOME": str(home)},
+        "RunAtLoad": True,
+    }
+    return plistlib.dumps(value, fmt=plistlib.FMT_XML, sort_keys=False)
+
+
+def validate_launchd_plist(path: Path) -> None:
+    launchd_plutil("-lint", str(path))
+    try:
+        value = plistlib.loads(path.read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        raise TelegramError("LaunchAgent property list is malformed") from exc
+    if not isinstance(value, dict) or value.get("Label") != LAUNCHD_LABEL:
+        raise TelegramError("LaunchAgent property list has an unexpected label")
+
+
+def launchd_owned_by(home: Path) -> bool:
+    path = launchd_path()
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        return path.read_bytes() == launchd_plist_contents(home)
+    except OSError:
+        return False
+
+
+def require_launchd_owner(home: Path) -> None:
+    if not launchd_owned_by(home) or not launchd_unit_loaded(home):
+        raise TelegramError("Telegram LaunchAgent is not installed for this home")
+
+
+def launchd_runtime_reserved(home: Path) -> bool:
+    path = launchd_path()
+    if (path.exists() or path.is_symlink()) and not launchd_owned_by(home):
+        return True
+    result = launchd_print(home)
+    if result.returncode == 0:
+        return not launchd_owned_by(home) or not launchd_output_has_path(home, result)
+    return False
+
+
+def launchd_bootstrap(home: Path) -> None:
+    result = launchd_command("bootstrap", launchd_domain(), str(launchd_path()), check=False)
+    if result.returncode != 0:
+        output = f"{result.stdout}\n{result.stderr}".lower()
+        if not any(marker in output for marker in ("already bootstrapped", "already loaded")):
+            raise TelegramError("launchd user agent bootstrap failed")
+        if not launchd_unit_loaded(home):
+            raise TelegramError("Telegram LaunchAgent ownership could not be verified after bootstrap race")
+    if not launchd_unit_loaded(home):
+        raise TelegramError("Telegram LaunchAgent ownership could not be verified after bootstrap")
+
+
+def launchd_bootout_owned(home: Path, tolerate_missing: bool = False) -> None:
+    del tolerate_missing
+    if not launchd_unit_loaded(home):
+        if launchd_unit_inactive(home):
+            return
+        raise TelegramError("Telegram LaunchAgent ownership could not be verified")
+    result = launchd_command("bootout", launchd_target(), check=False)
+    if result.returncode != 0:
+        output = f"{result.stdout}\n{result.stderr}".lower()
+        if not any(marker in output for marker in (
+                "could not find service", "service not found", "no such process")):
+            raise TelegramError("launchd user agent bootout failed")
+    if not launchd_unit_inactive(home):
+        raise TelegramError("Telegram LaunchAgent did not become inactive")
+
+
+def launchd_enable(home: Path) -> None:
+    del home
+    launchd_command("enable", launchd_target())
+
+
+def launchd_disable(home: Path) -> None:
+    if not launchd_unit_loaded(home):
+        raise TelegramError("Telegram LaunchAgent ownership could not be verified")
+    launchd_command("disable", launchd_target())
 
 
 def now() -> int:
@@ -1034,6 +1209,7 @@ def _bounded_cleanup_locked(home: Path, preserve_requests: Iterable[str] = ()) -
                 remove_pending_voice_locked(home, pending_id)
         else:
             remove_pending(home)
+    cleanup_audio_files_locked(home)
     queued_voices, queue_changed = load_pending_voice_queue_locked(home)
     if queue_changed:
         save_pending_voice_queue_locked(home, queued_voices)
@@ -2091,17 +2267,55 @@ def remember_callback_locked(home: Path, pending_id: str, token: str) -> None:
     atomic_json(callback_history_path(home), values[-MAX_SEEN:])
 
 
+def audio_path_allowed(path: Path) -> bool:
+    if not path.name.startswith("firstmate-telegram-") or path.is_symlink():
+        return False
+    root = launchd_audio_root() if is_macos() else Path("/dev/shm")
+    try:
+        if root.is_symlink() or not root.is_dir():
+            return False
+        path.resolve().relative_to(root.resolve())
+        details = root.stat()
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISDIR(details.st_mode) and details.st_uid == os.getuid()
+
+
 def remove_audio(data: Dict[str, Any]) -> None:
     value = data.get("audio_path")
     if not isinstance(value, str):
         return
     path = Path(value)
-    try:
-        path.resolve().relative_to(Path("/dev/shm").resolve())
-    except (OSError, ValueError):
-        return
-    if path.name.startswith("firstmate-telegram-"):
+    if audio_path_allowed(path):
         durable_unlink(path)
+
+
+def cleanup_audio_files_locked(home: Path) -> None:
+    if not is_macos():
+        return
+    root = launchd_audio_root()
+    if root.is_symlink() or not root.is_dir():
+        return
+    pending = read_json(pending_path(home), {})
+    preserved = Path(pending["audio_path"]).resolve() if isinstance(pending, dict) and isinstance(
+        pending.get("audio_path"), str) else None
+    for path in root.iterdir():
+        if (path.is_file() and not path.is_symlink() and path.name.startswith("firstmate-telegram-")
+                and (preserved is None or path.resolve() != preserved)):
+            durable_unlink(path)
+
+
+def new_audio_path() -> Path:
+    if is_macos():
+        root = launchd_audio_root()
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            raise TelegramError("macOS temporary audio storage is not a private directory")
+        private_dir(root)
+        details = root.stat()
+        if details.st_uid != os.getuid() or stat.S_IMODE(details.st_mode) != 0o700:
+            raise TelegramError("macOS temporary audio storage is not private")
+        return root / f"firstmate-telegram-{secrets.token_hex(16)}.oga"
+    return Path("/dev/shm") / f"firstmate-telegram-{secrets.token_hex(16)}.oga"
 
 
 def remove_pending(home: Path, data: Optional[Dict[str, Any]] = None) -> None:
@@ -2135,32 +2349,70 @@ def save_pending(home: Path, data: Dict[str, Any]) -> None:
 
 
 def command_for(config: Dict[str, Any], kind: str) -> Tuple[str, bool]:
-    env_key = "FM_TELEGRAM_PARAKEET_CMD" if kind == "parakeet" else "FM_TELEGRAM_WHISPER_CMD"
+    if kind == "ffmpeg":
+        env_key = "FM_TELEGRAM_FFMPEG_CMD"
+        config_key = "ffmpeg_command"
+        default = shutil.which("ffmpeg") or ""
+    else:
+        env_key = "FM_TELEGRAM_PARAKEET_CMD" if kind == "parakeet" else "FM_TELEGRAM_WHISPER_CMD"
+        config_key = "parakeet_command" if kind == "parakeet" else "whisper_command"
+        default = "parakeet-tdt-0.6b-v3" if kind == "parakeet" else "whisper-small-q8"
     value = os.environ.get(env_key)
     environment_override = value is not None
     if value is None:
-        value = config.get("parakeet_command" if kind == "parakeet" else "whisper_command")
+        value = config.get(config_key)
     if not value:
-        value = "parakeet-tdt-0.6b-v3" if kind == "parakeet" else "whisper-small-q8"
+        value = default
     return str(value), environment_override
 
 
+def convert_audio(config: Dict[str, Any], audio: Path) -> Optional[Path]:
+    if not is_macos():
+        return None
+    command, environment_override = command_for(config, "ffmpeg")
+    if not command:
+        return None
+    parts = shlex.split(command) if environment_override else [command]
+    if not parts or any("\x00" in part for part in parts):
+        return None
+    output = audio.with_name(f"firstmate-telegram-{secrets.token_hex(16)}.wav")
+    try:
+        completed = subprocess.run(
+            [*parts, "-y", "-i", str(audio), "-vn", "-acodec", "pcm_s16le", str(output)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180, check=False,
+        )
+        if completed.returncode != 0 or not output.is_file() or output.is_symlink():
+            durable_unlink(output)
+            return None
+        private_file(output)
+        return output
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        durable_unlink(output)
+        return None
+
+
 def transcribe(home: Path, config: Dict[str, Any], audio: Path, kind: str) -> str:
+    del home
     command, environment_override = command_for(config, kind)
     parts = shlex.split(command) if environment_override else (
         [command] if command.startswith("/") else shlex.split(command)
     )
     if not parts:
         raise TelegramError("voice transcription command is empty")
-    if any("{audio}" in part for part in parts):
-        parts = [part.replace("{audio}", str(audio)) for part in parts]
-    else:
-        parts.append(str(audio))
+    converted = convert_audio(config, audio)
+    input_audio = converted or audio
     try:
+        if any("{audio}" in part for part in parts):
+            parts = [part.replace("{audio}", str(input_audio)) for part in parts]
+        else:
+            parts.append(str(input_audio))
         completed = subprocess.run(parts, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    text=True, timeout=180, check=True)
     except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
         raise TelegramError("voice transcription failed") from exc
+    finally:
+        if converted is not None:
+            durable_unlink(converted)
     transcript = completed.stdout.strip()
     units = len(transcript.encode("utf-16-le")) // 2
     if not transcript or units > MAX_TRANSCRIPT_UNITS:
@@ -2609,9 +2861,7 @@ def advance_pending_voice(home: Path, config: Dict[str, Any]) -> None:
             pending = {
                 "pending_id": record["pending_id"],
                 "mode": "transcribing",
-                "audio_path": str(
-                    Path("/dev/shm") / f"firstmate-telegram-{secrets.token_hex(16)}.oga"
-                ),
+                "audio_path": str(new_audio_path()),
                 "file_id": record["file_id"],
                 "chat_id": record["chat_id"],
                 "message_id": record["message_id"],
@@ -2947,21 +3197,29 @@ def clear_stopped_transport_state(home: Path) -> None:
         if isinstance(pending, dict):
             finalize_pending_cleanup_locked(home, pending)
         durable_unlink(pending_voice_queue_path(home))
+    if is_macos():
+        clear_macos_pending_audio(home)
     set_telegram_enabled(home, False)
 
 
 def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
-          systemd_service: bool = False) -> int:
+          systemd_service: bool = False, launchd_service: bool = False) -> int:
+    managed_service = systemd_service or launchd_service
     with contextlib.ExitStack() as runtime:
-        unit_guard = contextlib.nullcontext() if systemd_service else FileLock(unit_lock())
+        unit_guard = contextlib.nullcontext() if managed_service else FileLock(unit_lock())
         with unit_guard:
             with FileLock(lifecycle_lock(home)):
                 if systemd_service:
                     require_unit_owner(home)
+                elif launchd_service:
+                    require_launchd_owner(home)
+                elif is_macos():
+                    if launchd_runtime_reserved(home):
+                        raise ServiceRuntimeOwnedError("Telegram LaunchAgent owns the singleton transport")
                 elif systemd_runtime_reserved(home):
                     raise ServiceRuntimeOwnedError("Telegram systemd service owns the singleton transport")
-                if service_activation_path(home).is_file() and not systemd_service:
-                    raise ServiceRuntimeOwnedError("Telegram systemd service activation is in progress")
+                if service_activation_path(home).is_file() and not managed_service:
+                    raise ServiceRuntimeOwnedError("Telegram service activation is in progress")
                 runtime.enter_context(FileLock(global_service_lock(), blocking=False))
                 runtime.enter_context(FileLock(service_lock(home), blocking=False))
                 try:
@@ -2976,7 +3234,7 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
                     clear_stopped_transport_state(home)
                     raise
                 prepare_transport_activation(home)
-                if systemd_service:
+                if managed_service:
                     durable_unlink(service_activation_path(home))
         offset = 0
         stop = False
@@ -3029,6 +3287,10 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
 def require_pairing_service_inactive(home: Path) -> None:
     if telegram_enabled_path(home).is_file():
         raise TelegramError("stop the Telegram service before changing its pairing")
+    if is_macos():
+        if launchd_runtime_reserved(home):
+            raise TelegramError("stop the Telegram service before changing its pairing")
+        return
     if not unit_owned_by(home):
         return
     result = systemctl("is-active", SERVICE_NAME, check=False)
@@ -3058,7 +3320,8 @@ def identity_bound_state_exists(home: Path) -> bool:
 
 def pair(home: Path, user_id: int, chat_id: int,
          parakeet_command: Optional[str] = None,
-         whisper_command: Optional[str] = None) -> int:
+         whisper_command: Optional[str] = None,
+         ffmpeg_command: Optional[str] = None) -> int:
     if (not telegram_numeric_id(user_id, positive=True)
             or not telegram_numeric_id(chat_id, positive=True)):
         raise TelegramError("user and chat ids must be positive Telegram identifiers")
@@ -3070,6 +3333,10 @@ def pair(home: Path, user_id: int, chat_id: int,
             "parakeet_command": normalize_transcriber_command(parakeet_command, "parakeet"),
             "whisper_command": normalize_transcriber_command(whisper_command, "whisper"),
         }
+        if ffmpeg_command is not None:
+            configured_commands["ffmpeg_command"] = normalize_transcriber_command(
+                ffmpeg_command, "ffmpeg"
+            )
     with FileLock(lifecycle_lock(home)):
         require_pairing_service_inactive(home)
         config_existing = read_json(config_path(home), {})
@@ -3140,6 +3407,8 @@ def prepare_transport_activation(home: Path) -> None:
 
 
 def unit_path() -> Path:
+    if is_macos():
+        return launchd_path()
     override = os.environ.get("FM_TELEGRAM_UNIT_DIR")
     if override:
         return Path(override).expanduser() / SERVICE_NAME
@@ -3234,7 +3503,214 @@ def reconcile_failed_activation(home: Path, disable_new_install: bool = False,
                 verify_service(enabled=False)
 
 
+def wait_for_launchd_active(home: Path) -> None:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if launchd_unit_active(home):
+            return
+        time.sleep(0.02)
+    raise TelegramError("Telegram LaunchAgent did not become active")
+
+
+def launchd_stop_owned(home: Path) -> None:
+    if not launchd_unit_loaded(home):
+        if launchd_unit_inactive(home):
+            return
+        raise TelegramError("Telegram LaunchAgent ownership could not be verified")
+    if launchd_unit_active(home):
+        launchd_command("kill", "SIGTERM", launchd_target())
+    if not launchd_unit_inactive(home):
+        raise TelegramError("Telegram LaunchAgent did not become inactive")
+
+
+def publish_launchd_plist(home: Path) -> None:
+    path = launchd_path()
+    private_dir(path.parent)
+    if (path.exists() or path.is_symlink()) and not launchd_owned_by(home):
+        raise TelegramError("Telegram LaunchAgent belongs to another home or installation")
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{LAUNCHD_PLIST_NAME}.", dir=str(path.parent))
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(launchd_plist_contents(home))
+            stream.flush()
+            os.fsync(stream.fileno())
+        validate_launchd_plist(temporary_path)
+        if (path.exists() or path.is_symlink()) and not launchd_owned_by(home):
+            raise TelegramError("Telegram LaunchAgent changed ownership during installation")
+        durable_replace(temporary_path, path)
+        private_file(path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def clear_macos_pending_audio(home: Path) -> None:
+    root = launchd_audio_root()
+    try:
+        if root.is_symlink() or not root.is_dir():
+            return
+        if root.stat().st_uid != os.getuid():
+            return
+        for path in root.iterdir():
+            if path.is_file() and not path.is_symlink() and path.name.startswith("firstmate-telegram-"):
+                durable_unlink(path)
+    except OSError:
+        return
+
+
+def cleanup_macos_private_state(home: Path) -> None:
+    with FileLock(service_lock(home), blocking=False, timeout=1):
+        durable_unlink(service_activation_path(home))
+        clear_stopped_transport_state(home)
+
+
+def install_macos(home: Path) -> int:
+    with FileLock(unit_lock()):
+        with FileLock(lifecycle_lock(home)):
+            owned_loaded = launchd_owned_by(home) and launchd_unit_loaded(home)
+            if launchd_runtime_reserved(home) and not owned_loaded:
+                raise TelegramError("Telegram LaunchAgent belongs to another home or installation")
+            config = load_config(home)
+            verified_token_for(home, config)
+            if launchd_unit_loaded(home):
+                if not launchd_owned_by(home):
+                    raise TelegramError("Telegram LaunchAgent ownership could not be verified")
+                launchd_stop_owned(home)
+                launchd_bootout_owned(home)
+            publish_launchd_plist(home)
+            launchd_enable(home)
+            prepare_transport_activation(home)
+            atomic_bytes(service_activation_path(home), b"launchd\n")
+            try:
+                launchd_bootstrap(home)
+                launchd_command("kickstart", "-k", launchd_target())
+                wait_for_launchd_active(home)
+                durable_unlink(service_activation_path(home))
+                verify_transport_marker(home, True)
+            except (TelegramError, OSError, ValueError):
+                launchd_stop_owned(home)
+                launchd_bootout_owned(home, tolerate_missing=True)
+                durable_unlink(service_activation_path(home))
+                set_telegram_enabled(home, False)
+                raise
+    print("Telegram service installed and active.")
+    return 0
+
+
+def start_macos(home: Path) -> int:
+    with FileLock(unit_lock()):
+        with FileLock(lifecycle_lock(home)):
+            if not launchd_owned_by(home):
+                raise TelegramError("Telegram LaunchAgent is not installed for this home")
+            config = load_config(home)
+            verified_token_for(home, config)
+            if launchd_unit_loaded(home):
+                launchd_enable(home)
+            else:
+                launchd_enable(home)
+                launchd_bootstrap(home)
+            prepare_transport_activation(home)
+            atomic_bytes(service_activation_path(home), b"launchd\n")
+            try:
+                launchd_command("kickstart", "-k", launchd_target())
+                wait_for_launchd_active(home)
+                durable_unlink(service_activation_path(home))
+                verify_transport_marker(home, True)
+            except (TelegramError, OSError, ValueError):
+                launchd_stop_owned(home)
+                durable_unlink(service_activation_path(home))
+                set_telegram_enabled(home, False)
+                raise
+    print("Telegram service active.")
+    return 0
+
+
+def stop_macos(home: Path) -> int:
+    with FileLock(unit_lock()):
+        with FileLock(lifecycle_lock(home)):
+            if not launchd_owned_by(home):
+                raise TelegramError("Telegram LaunchAgent is not installed for this home")
+            launchd_stop_owned(home)
+            cleanup_macos_private_state(home)
+            verify_transport_marker(home, False)
+    print("Telegram service stopped.")
+    return 0
+
+
+def status_macos(home: Path) -> int:
+    with FileLock(unit_lock()):
+        if not launchd_owned_by(home):
+            raise TelegramError("Telegram LaunchAgent is not installed for this home")
+        result = launchd_print(home)
+        if result.returncode != 0 or not launchd_output_has_path(home, result):
+            print("inactive")
+            return 1
+        print(result.stdout.strip() or "inactive")
+        return 0 if launchd_unit_active(home, result) else 1
+
+
+def disable_macos(home: Path) -> int:
+    with FileLock(unit_lock()):
+        with FileLock(lifecycle_lock(home)):
+            if not launchd_owned_by(home):
+                raise TelegramError("Telegram LaunchAgent is not installed for this home")
+            if launchd_unit_loaded(home):
+                launchd_disable(home)
+                launchd_stop_owned(home)
+                launchd_bootout_owned(home)
+            cleanup_macos_private_state(home)
+            verify_transport_marker(home, False)
+    print("Telegram service disabled.")
+    return 0
+
+
+def cleanup_macos(home: Path) -> int:
+    with FileLock(unit_lock()):
+        with FileLock(lifecycle_lock(home)):
+            path = launchd_path()
+            owned = launchd_owned_by(home)
+            result = launchd_print(home)
+            loaded = result.returncode == 0
+            if loaded and not launchd_output_has_path(home, result):
+                raise TelegramError("Telegram LaunchAgent ownership could not be verified")
+            if (path.exists() or path.is_symlink()) and not owned:
+                raise TelegramError("Telegram LaunchAgent ownership could not be verified")
+            if owned and loaded:
+                launchd_disable(home)
+                launchd_stop_owned(home)
+                launchd_bootout_owned(home)
+            if owned:
+                if not launchd_owned_by(home):
+                    raise TelegramError("Telegram LaunchAgent changed ownership during cleanup")
+                durable_unlink(path)
+            cleanup_macos_private_state(home)
+            with FileLock(state_lock(home)):
+                telegram_state = home / "state" / "telegram"
+                consume_safe_wakes(home, effective_wake_state(home))
+                if telegram_state.is_symlink() or telegram_state.is_file():
+                    durable_unlink(telegram_state)
+                elif telegram_state.is_dir():
+                    durable_rmtree(telegram_state)
+                config = config_path(home)
+                if config.is_symlink() or config.is_file():
+                    durable_unlink(config)
+                durable_unlink(mirror_mode_path(home))
+                atomic_bytes(state_tombstone(home), b"cleaned\n")
+            clear_macos_pending_audio(home)
+    print("Telegram service and private Telegram state cleaned up.")
+    return 0
+
+
 def install(home: Path) -> int:
+    if is_macos():
+        return install_macos(home)
     with FileLock(unit_lock()):
         enabled_by_install = False
         activation_reserved = False
@@ -3281,6 +3757,8 @@ def install(home: Path) -> int:
 
 
 def start_service(home: Path) -> int:
+    if is_macos():
+        return start_macos(home)
     with FileLock(unit_lock()):
         activation_reserved = False
         try:
@@ -3306,6 +3784,8 @@ def start_service(home: Path) -> int:
 
 
 def stop_service(home: Path) -> int:
+    if is_macos():
+        return stop_macos(home)
     with FileLock(unit_lock()):
         with FileLock(lifecycle_lock(home)):
             require_unit_owner(home)
@@ -3325,6 +3805,8 @@ def stop_service(home: Path) -> int:
 
 
 def status_service(home: Path) -> int:
+    if is_macos():
+        return status_macos(home)
     with FileLock(unit_lock()):
         require_unit_owner(home)
         result = systemctl("is-active", SERVICE_NAME, check=False)
@@ -3333,6 +3815,8 @@ def status_service(home: Path) -> int:
 
 
 def disable_service(home: Path) -> int:
+    if is_macos():
+        return disable_macos(home)
     with FileLock(unit_lock()):
         with FileLock(lifecycle_lock(home)):
             require_unit_owner(home)
@@ -3392,6 +3876,8 @@ def _cleanup_locked(home: Path) -> int:
 
 
 def cleanup(home: Path) -> int:
+    if is_macos():
+        return cleanup_macos(home)
     with FileLock(unit_lock()):
         with FileLock(lifecycle_lock(home)):
             return _cleanup_locked(home)
@@ -3404,9 +3890,9 @@ def build_parser() -> argparse.ArgumentParser:
                 "Private mirror commands require the lock-owning extension capability on an inherited file descriptor.\n"
                 f"Retention limits: {MAX_INBOX} queued or interrupted requests for {INBOX_TTL // (24 * 60 * 60)} days, {MAX_HANDLED} handled requests, and {MAX_MIRROR_DELIVERIES} mirror deliveries; unprotected mirror deliveries expire after {MIRROR_DELIVERY_TTL // (24 * 60 * 60)} days and each is at most {MAX_MIRROR_DELIVERY_BYTES // 1024} KiB or {MAX_MIRROR_DELIVERY_CHUNKS} Telegram chunks.\n"
                 f"Receipt delivery makes at most {len(RECEIPT_RETRY_DELAYS)} attempts with bounded backoff.\n"
-                f"Voice limits: {MAX_VOICE_BYTES // (1024 * 1024)} MiB, {MAX_VOICE_SECONDS} seconds, a {MAX_TRANSCRIPT_UNITS}-unit transcript, {MAX_PENDING_VOICES} waiting notes for {INBOX_TTL // (24 * 60 * 60)} days, and one active confirmation for {PENDING_TTL // 60} minutes. Temporary audio is restricted to /dev/shm.\n"
-                "Pairing accepts --parakeet-command and --whisper-command as absolute executable paths; configured paths must be regular executable files.\n"
-                "FM_TELEGRAM_PARAKEET_CMD and FM_TELEGRAM_WHISPER_CMD override the local transcription commands for one process.\n"
+                f"Voice limits: {MAX_VOICE_BYTES // (1024 * 1024)} MiB, {MAX_VOICE_SECONDS} seconds, a {MAX_TRANSCRIPT_UNITS}-unit transcript, {MAX_PENDING_VOICES} waiting notes for {INBOX_TTL // (24 * 60 * 60)} days, and one active confirmation for {PENDING_TTL // 60} minutes. Temporary audio uses /dev/shm on Linux and a private per-user macOS temporary root.\n"
+                "Pairing accepts --parakeet-command and --whisper-command as absolute executable paths, plus optional --ffmpeg-command; configured paths must be regular executable files.\n"
+                "FM_TELEGRAM_PARAKEET_CMD, FM_TELEGRAM_WHISPER_CMD, and FM_TELEGRAM_FFMPEG_CMD override local transcription commands for one process.\n"
                 "Mirror delivery reads UTF-8 from --text-file and accepts no recipient argument."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -3433,11 +3919,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--whisper-command",
         help="absolute executable for Whisper Small Q8; configure with --parakeet-command too",
     )
+    pair_parser.add_argument(
+        "--ffmpeg-command",
+        help="optional absolute executable for FFmpeg Ogg/Opus conversion",
+    )
     serve_parser = sub.add_parser("serve", help="run the outbound Bot API long-poll service")
     add_home(serve_parser)
     serve_parser.add_argument("--once", action="store_true")
     serve_parser.add_argument("--poll-timeout", type=int, default=POLL_TIMEOUT)
     serve_parser.add_argument("--systemd-service", action="store_true", help=argparse.SUPPRESS)
+    serve_parser.add_argument("--launchd-service", action="store_true", help=argparse.SUPPRESS)
     migrate_parser = sub.add_parser(
         "migrate-wakes", help="retire obsolete Telegram wake rows without reading request content"
     )
@@ -3516,11 +4007,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if args.command == "pair":
             return pair(
                 home, args.user_id, args.chat_id,
-                args.parakeet_command, args.whisper_command,
+                args.parakeet_command, args.whisper_command, args.ffmpeg_command,
             )
         if args.command == "serve":
             return serve(
-                home, args.once, max(0, min(args.poll_timeout, 50)), args.systemd_service
+                home, args.once, max(0, min(args.poll_timeout, 50)), args.systemd_service,
+                args.launchd_service,
             )
         if args.command == "migrate-wakes":
             return migrate_wakes(home)
