@@ -34,6 +34,12 @@ queue is an in-memory FIFO with no durable queue, expiry, replay journal, or
 retention subsystem: a queued message that has not reached Pi is lost when the
 bot or WSL stops.
 
+Reply threading: every transport status the bot itself produces replies to the
+exact Telegram message it describes, because the bot knows that message. A
+mirrored Firstmate reply is always sent as a normal unthreaded message. Pi
+batches back-to-back submissions into one run, so a reply has no single source
+message, and a guessed target would attach answers to the wrong one.
+
 Usage:
   fm-telegram.py run                run the bot in the foreground (the service)
   fm-telegram.py pair               record the first private sender as the pair
@@ -281,7 +287,6 @@ class MirrorBot:
     voices: dict[int, Voice] = field(default_factory=dict)
     prompts: dict[int, int] = field(default_factory=dict)
     client: Optional[asyncio.StreamWriter] = None
-    reply_target: Optional[int] = None
     background: set = field(default_factory=set)
     _sequence: int = 0
     _stopping: bool = False
@@ -433,7 +438,6 @@ class MirrorBot:
         item = self.pending.pop(message_id, None)
         if item is None:
             return
-        self.reply_target = item.reply_to
         await self.send(ACCEPTED_REPLY, reply_to=item.reply_to)
 
     # --- voice ---
@@ -584,13 +588,16 @@ class MirrorBot:
             return
         if kind == "terminal":
             if self.mirror_on and isinstance(frame.get("text"), str):
-                self.reply_target = None
                 await self.send(f"{TERMINAL_LABEL}\n{frame['text']}")
             return
         if kind == "reply":
+            # Never threaded. Pi batches back-to-back submissions into one run,
+            # so a reply cannot be attributed to one source message; guessing a
+            # target would attach answers to the wrong message. Transport
+            # statuses below still reply to the exact message they describe,
+            # because the bot knows those precisely.
             if self.mirror_on and isinstance(frame.get("text"), str):
-                target, self.reply_target = self.reply_target, None
-                await self.send(frame["text"], reply_to=target)
+                await self.send(frame["text"])
             return
         if kind == "command":
             command = str(frame.get("command"))

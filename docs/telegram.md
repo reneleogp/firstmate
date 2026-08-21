@@ -80,6 +80,15 @@ A queued message that has not reached Pi is lost if the bot restarts or WSL stop
 If Pi disappears between accepting a message and confirming it, that one message is sent again when the session returns.
 Both are deliberate limitations of this version rather than bugs.
 
+## Reply threading
+
+Every status the bot itself produces replies to the exact Telegram message it describes: `Transcribing…`, the transcript card, `Pi · Sent to Firstmate.`, and the mirror-off and offline notices.
+
+Firstmate's own replies are always sent as ordinary unthreaded messages.
+Pi batches back-to-back submissions into one run, so a reply belongs to no single source message, and threading it would attach answers to the wrong one.
+This supersedes the original design note that a Telegram-originated message should receive its reply threaded; the captain approved always-unthreaded replies after live testing.
+Threading is presentation only either way, and never changes what Firstmate sees or how Pi processes input.
+
 ## Voice notes
 
 1. Send a voice note; the bot replies `Transcribing…` to it.
@@ -101,7 +110,7 @@ Every button action is bound to the current transcript revision, so a stale or r
 ## Boundaries
 
 - One paired account, one private chat, one Firstmate session.
-- Reply threading is presentation only and never changes what Firstmate sees or how Pi processes input.
+- Transport statuses stay attached to the exact message they describe, while Firstmate's replies are never threaded (see Reply threading).
 - The service unit holds no token and no message content; the token stays in `~/.firstmate-telegram/env` and pairing stays in `config.json`.
 - Temporary voice audio is owner-only and is deleted after send, cancel, failure, and at bot start and stop.
 - `FM_TELEGRAM_DIR` moves the private directory; `bin/fm-telegram.py --help` owns the remaining flags and environment.

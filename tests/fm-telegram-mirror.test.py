@@ -392,16 +392,53 @@ class MirrorTestCase(unittest.TestCase):
         reply = self.telegram.wait_sent(lambda m: m.get("text") == "The logs are clean.")
         self.assertNotIn("reply_parameters", reply)
 
-    def test_firstmate_reply_threads_back_to_the_telegram_message(self) -> None:
+    def test_firstmate_replies_are_never_threaded_while_statuses_are(self) -> None:
         pi = self.connect_pi()
         self.enable_mirror(pi)
         self.telegram.push_text("what is the status", 61)
         frame = pi.read()
         pi.send({"t": "accepted", "id": frame["id"]})
-        self.telegram.wait_sent(lambda m: m.get("text") == "Pi · Sent to Firstmate.")
+        confirmation = self.telegram.wait_sent(lambda m: m.get("text") == "Pi · Sent to Firstmate.")
+        self.assertEqual(confirmation["reply_parameters"]["message_id"], 61)
         pi.send({"t": "reply", "text": "Everything is green."})
         reply = self.telegram.wait_sent(lambda m: m.get("text") == "Everything is green.")
-        self.assertEqual(reply["reply_parameters"]["message_id"], 61)
+        self.assertNotIn("reply_parameters", reply)
+
+    def test_a_burst_never_threads_replies_but_keeps_every_status_attached(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        # Pi answers a back-to-back burst inside one run, so no reply belongs to
+        # any single source message.
+        for index, text in enumerate(["burst one", "burst two", "burst three"]):
+            self.telegram.push_text(text, 101 + index)
+        sources = []
+        for _ in range(3):
+            frame = pi.read()
+            sources.append(frame["text"])
+            pi.send({"t": "accepted", "id": frame["id"]})
+        self.assertEqual(sources, ["burst one", "burst two", "burst three"])
+        for text in ["Reply 1", "Reply 2", "Reply 3", "Reply 4", "Reply 5"]:
+            pi.send({"t": "reply", "text": text})
+            mirrored = self.telegram.wait_sent(lambda m, want=text: m.get("text") == want)
+            self.assertNotIn("reply_parameters", mirrored)
+        pi.send({"t": "terminal", "text": "typed while bursting"})
+        echoed = self.telegram.wait_sent(lambda m: "typed while bursting" in str(m.get("text")))
+        self.assertNotIn("reply_parameters", echoed)
+
+        # Every transport status still names the exact message it describes.
+        confirmations = [
+            message["reply_parameters"]["message_id"]
+            for message in self.telegram.sent
+            if message.get("text") == "Pi · Sent to Firstmate."
+        ]
+        self.assertEqual(sorted(confirmations), [101, 102, 103])
+        pi.send({"t": "command", "id": 9, "command": "off"})
+        self.assertIn("Mirror is off", pi.read()["text"])
+        self.telegram.push_text("after the burst", 110)
+        refusal = self.telegram.wait_sent(
+            lambda m: m.get("text") == "Telegram mirror is off. Send /telegram on to enable it."
+        )
+        self.assertEqual(refusal["reply_parameters"]["message_id"], 110)
 
     def test_voice_note_edit_then_send(self) -> None:
         pi = self.connect_pi()
