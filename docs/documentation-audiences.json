@@ -154,6 +154,10 @@
       "audience": "agent-runtime"
     },
     {
+      "path": ".agents/skills/telegram-respond/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": ".agents/skills/harness-adapters/SKILL.md",
       "audience": "agent-runtime"
     },
@@ -367,10 +371,6 @@
     },
     {
       "path": "docs/verification/supervision.md",
-      "audience": "maintainer-verification"
-    },
-    {
-      "path": "docs/verification/telegram-mirror.md",
       "audience": "maintainer-verification"
     },
     {

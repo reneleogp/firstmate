@@ -398,15 +398,15 @@ test_hook_x_mode_only_blocks_in_default_mode() {
   pass "fm-turnend-guard: X-mode-only supervision remains guarded in default mode"
 }
 
-test_hook_telegram_transport_does_not_need_watcher() {
+test_hook_telegram_only_names_transport() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-telegram-only")
   mkdir -p "$dir/state/telegram"
   : > "$dir/state/telegram/enabled"
   out=$(run_hook "$dir" false); status=$?
-  expect_code 0 "$status" "Telegram transport alone must not require watcher supervision"
-  [ -z "$out" ] || fail "Telegram-only quiet turn produced watcher output: $out"
-  pass "fm-turnend-guard: Telegram transport does not require watcher supervision"
+  expect_code 2 "$status" "default hook mode must block a Telegram-only blind turn"
+  assert_contains "$out" "Telegram transport needs supervision" "Telegram-only blind stop must identify its supervision need"
+  pass "fm-turnend-guard: Telegram-only supervision names its transport"
 }
 
 test_hook_ignores_repo_state_when_fm_home_set() {
@@ -1630,7 +1630,7 @@ test_hook_blocks_when_unhealthy_in_primary
 test_hook_blocks_from_fm_home_state
 test_hook_x_mode_reason_sources_cadence
 test_hook_x_mode_only_blocks_in_default_mode
-test_hook_telegram_transport_does_not_need_watcher
+test_hook_telegram_only_names_transport
 test_hook_ignores_repo_state_when_fm_home_set
 test_hook_uses_state_override
 test_hook_loop_guard_allows_retry

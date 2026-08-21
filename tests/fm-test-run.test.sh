@@ -37,16 +37,11 @@ test_list_all_exact_suite_coverage() {
 }
 
 test_family_selection() {
-  local listed live_listed line
+  local listed line
   listed=$("$RUNNER" --list --family pure-contract-unit)
   [ -n "$listed" ] || fail "--family pure-contract-unit selected nothing"
   printf '%s\n' "$listed" | grep -Fq 'tests/fm-test-run.test.sh' \
     || fail "pure-contract-unit must include fm-test-run.test.sh"
-  printf '%s\n' "$listed" | grep -Fq 'tests/fm-telegram-mirror-live-e2e.test.sh' \
-    && fail "pure-contract-unit must exclude the installed-Pi Telegram mirror regression"
-  live_listed=$("$RUNNER" --list --family live-harness-optin)
-  printf '%s\n' "$live_listed" | grep -Fq 'tests/fm-telegram-mirror-live-e2e.test.sh' \
-    || fail "live-harness-optin must include the installed-Pi Telegram mirror regression"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     case "$line" in
@@ -61,16 +56,6 @@ test_family_selection() {
   [ "$fam_count" -lt "$all_count" ] \
     || fail "pure-contract-unit must be a proper subset of --all"
   pass "family selection returns a proper subset of the suite"
-}
-
-test_telegram_mirror_live_test_is_opt_in() {
-  local output
-  output=$(env -u FM_TELEGRAM_MIRROR_LIVE_E2E \
-    bash "$ROOT/tests/fm-telegram-mirror-live-e2e.test.sh") \
-    || fail "installed-Pi Telegram mirror regression must self-skip without opt-in"
-  [ "$output" = "skip: set FM_TELEGRAM_MIRROR_LIVE_E2E=1 to run the installed Pi Telegram mirror regression" ] \
-    || fail "installed-Pi Telegram mirror regression reported an unexpected opt-in skip: $output"
-  pass "installed-Pi Telegram mirror regression is explicitly opt-in"
 }
 
 test_single_script_selection() {
@@ -720,7 +705,6 @@ assert len(doc["scripts"])==3
 
 test_list_all_exact_suite_coverage
 test_family_selection
-test_telegram_mirror_live_test_is_opt_in
 test_single_script_selection
 test_changed_file_selection_is_conservative
 test_changed_dependency_selection_and_unmapped_failure
