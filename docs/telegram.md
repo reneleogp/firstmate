@@ -28,6 +28,7 @@ The Pi footer shows `telegram: on`, `telegram: off`, or a non-primary warning.
 When mode is on, authenticated text and confirmed voice transcripts enter Pi through `pi.sendUserMessage()` as one visible `You · Telegram` user turn.
 Ordinary non-command interactive terminal input remains `You · Terminal` and is mirrored to Telegram as one user message.
 Slash commands and their expanded prompt lifecycles are excluded from mirroring.
+A self-identifying slash-continuation marker is stripped from the accepted user content while preserving an already-active mirrored tool loop through that excluded lifecycle.
 Input handling attaches only a live provenance marker, and the exact user-message lifecycle creates the bounded transport reservation and sends it after Pi accepts the turn.
 Turning mirror mode off blocks future admissions without discarding an already accepted turn or its pending response delivery.
 After `agent_settled`, one finalized user-facing assistant body is delivered as `Firstmate ·`.

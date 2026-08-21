@@ -6,10 +6,15 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { stripFrontmatter, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type Origin = "terminal" | "telegram";
-type AssistantMessage = { role?: string; content?: unknown; stopReason?: string };
+type AssistantMessage = {
+  role?: string;
+  content?: unknown;
+  stopReason?: string;
+  firstmateExcludedSlash?: string;
+};
 type TransportResult = { code: number; stdout: string; stderr: string; killed: boolean };
 type FooterSnapshot = {
   primary: boolean;
@@ -41,7 +46,7 @@ type PendingAdmission = {
 type InputSegment =
   | { origin: "telegram"; pending: PendingAdmission }
   | { origin: "terminal"; turnId: string; text: string; deliveryId: string }
-  | { origin: "excluded"; preserveRequest?: boolean };
+  | { origin: "excluded"; slashContinuation?: boolean };
 type InputCandidate = {
   segment: InputSegment;
   busyGeneration?: number;
@@ -131,9 +136,14 @@ function safeIdentity(value: string): string {
 }
 
 const originMarkerPattern = /^\u2063firstmate-origin:([a-f0-9]{128})\u2063\n/;
+const excludedSlashMarkerPattern = /^\u2063firstmate-excluded-slash:([a-f0-9]{128})\u2063\n/;
 
 function originMarkerToken(text: string): string | undefined {
   return originMarkerPattern.exec(text)?.[1];
+}
+
+function excludedSlashMarkerToken(text: string): string | undefined {
+  return excludedSlashMarkerPattern.exec(text)?.[1];
 }
 
 function newOriginMarker(): string {
@@ -160,8 +170,12 @@ function markedInput(marker: string, label: Origin, text: string): string {
   return `\u2063firstmate-origin:${marker}\u2063\nYou · ${title}\n\n${text}`;
 }
 
+function markedExcludedSlash(marker: string, text: string): string {
+  return `\u2063firstmate-excluded-slash:${marker}\u2063\n${text}`;
+}
+
 function stripOriginMarker(text: string): string {
-  return text.replace(originMarkerPattern, "");
+  return text.replace(originMarkerPattern, "").replace(excludedSlashMarkerPattern, "");
 }
 
 function stripMessageOrigin(message: AssistantMessage): AssistantMessage {
@@ -180,6 +194,72 @@ function stripMessageOrigin(message: AssistantMessage): AssistantMessage {
       return { ...part, text: stripOriginMarker((part as { text: string }).text) };
     }),
   };
+}
+
+function parseCommandArgs(value: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let quote: string | undefined;
+  for (const character of value) {
+    if (quote) {
+      if (character === quote) quote = undefined;
+      else current += character;
+    } else if (character === "\"" || character === "'") {
+      quote = character;
+    } else if (/\s/.test(character)) {
+      if (current) {
+        args.push(current);
+        current = "";
+      }
+    } else {
+      current += character;
+    }
+  }
+  if (current) args.push(current);
+  return args;
+}
+
+function substitutePromptArgs(content: string, args: string[]): string {
+  const allArgs = args.join(" ");
+  return content.replace(
+    /\$\{(\d+|ARGUMENTS|@):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)/g,
+    (_match, defaultTarget, defaultValue, sliceStart, sliceLength, simple) => {
+      if (defaultTarget) {
+        const value = defaultTarget === "@" || defaultTarget === "ARGUMENTS"
+          ? allArgs
+          : args[Number.parseInt(defaultTarget, 10) - 1];
+        return value || defaultValue;
+      }
+      if (sliceStart) {
+        const start = Math.max(0, Number.parseInt(sliceStart, 10) - 1);
+        return sliceLength
+          ? args.slice(start, start + Number.parseInt(sliceLength, 10)).join(" ")
+          : args.slice(start).join(" ");
+      }
+      if (simple === "ARGUMENTS" || simple === "@") return allArgs;
+      return args[Number.parseInt(simple, 10) - 1] ?? "";
+    },
+  );
+}
+
+function expandExcludedSlash(text: string, pi: ExtensionAPI): string | undefined {
+  const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(text);
+  if (!match) return undefined;
+  const command = pi.getCommands().find((candidate) => candidate.name === match[1]);
+  if (!command || (command.source !== "prompt" && command.source !== "skill")) return text;
+  try {
+    const content = stripFrontmatter(readFileSync(command.sourceInfo.path, "utf8"));
+    const args = parseCommandArgs(match[2] ?? "");
+    if (command.source === "prompt") return substitutePromptArgs(content, args);
+    const body = content.trim();
+    const skillName = command.name.startsWith("skill:") ? command.name.slice(6) : command.name;
+    const baseDir = command.sourceInfo.baseDir ?? dirname(command.sourceInfo.path);
+    const skillBlock = `<skill name="${skillName}" location="${command.sourceInfo.path}">\nReferences are relative to ${baseDir}.\n\n${body}\n</skill>`;
+    const argumentText = (match[2] ?? "").trim();
+    return argumentText ? `${skillBlock}\n\n${argumentText}` : skillBlock;
+  } catch {
+    return undefined;
+  }
 }
 
 function activeBranch(entries: SessionEntry[]): SessionEntry[] {
@@ -263,7 +343,11 @@ function unresolvedAdmissions(entries: SessionEntry[]): RecoveredAdmission[] {
       const message = entry.message;
       if (entry.type !== "message" || !message?.role) continue;
       if (message.role === "user") {
-        if (userSeen) break;
+        if (userSeen) {
+          const slashToken = message.firstmateExcludedSlash;
+          if (typeof slashToken === "string" && validOriginMarker(slashToken)) continue;
+          break;
+        }
         userSeen = true;
         continue;
       }
@@ -307,6 +391,7 @@ export default function (pi: ExtensionAPI) {
   let heldAdmission: HeldAdmission | undefined;
   const inputCandidates = new Map<string, InputCandidate>();
   const committedMarkers = new Set<string>();
+  const committedExcludedSlashMarkers = new Set<string>();
   const recoveryAbandons = new Map<string, RecoveredAdmission>();
   let settledTurns: SettledTurn[] = [];
   let lastAssistantBody = "";
@@ -621,7 +706,7 @@ export default function (pi: ExtensionAPI) {
     let carriedRequest: string | undefined;
     let carriedRequestTurnId: string | undefined;
     if (active) {
-      if (segment.origin === "excluded" && segment.preserveRequest && activeRequest &&
+      if (segment.origin === "excluded" && segment.slashContinuation &&
           !suspended && !lastAssistantBody) return;
       if (!queueActiveTurn()) {
         if (segment.origin === "terminal" && !suspended) {
@@ -909,6 +994,7 @@ export default function (pi: ExtensionAPI) {
     heldAdmission = undefined;
     inputCandidates.clear();
     committedMarkers.clear();
+    committedExcludedSlashMarkers.clear();
     recoveryAbandons.clear();
     settledTurns = [];
     deliveryBlocked = false;
@@ -1019,6 +1105,7 @@ export default function (pi: ExtensionAPI) {
     await Promise.all(reservations.map((delivery) => cancelReservation(delivery.deliveryId)));
     inputCandidates.clear();
     committedMarkers.clear();
+    committedExcludedSlashMarkers.clear();
     recoveryAbandons.clear();
     settledTurns = [];
     deliveryBlocked = false;
@@ -1031,7 +1118,9 @@ export default function (pi: ExtensionAPI) {
   pi.registerMarkdownTransformer((markdown, { messageType }) => {
     if (messageType !== "user") return markdown;
     const token = originMarkerToken(markdown);
-    return token && (validOriginMarker(token) || inputCandidates.has(token) || committedMarkers.has(token))
+    const slashToken = excludedSlashMarkerToken(markdown);
+    return (token && (validOriginMarker(token) || inputCandidates.has(token) || committedMarkers.has(token))) ||
+      (slashToken && (validOriginMarker(slashToken) || committedExcludedSlashMarkers.has(slashToken)))
       ? stripOriginMarker(markdown)
       : markdown;
   });
@@ -1048,6 +1137,16 @@ export default function (pi: ExtensionAPI) {
     if (event.source === "interactive" && ctx.isIdle() && !ctx.hasPendingMessages()) {
       for (const [marker, candidate] of inputCandidates) {
         if (candidate.segment.origin === "terminal") inputCandidates.delete(marker);
+      }
+    }
+    if (event.source === "interactive" && event.text.startsWith("/") && active &&
+        !suspended && !lastAssistantBody && transportOpen && ownsHomeLock()) {
+      const expanded = expandExcludedSlash(event.text, pi);
+      if (expanded !== undefined) {
+        return {
+          action: "transform" as const,
+          text: markedExcludedSlash(newOriginMarker(), expanded),
+        };
       }
     }
     if (event.source === "interactive" && event.text && !event.text.startsWith("/") &&
@@ -1126,6 +1225,12 @@ export default function (pi: ExtensionAPI) {
     }
     if (message.role !== "user") return;
     const markedText = inputTextOf(message);
+    const slashToken = excludedSlashMarkerToken(markedText);
+    if (slashToken && validOriginMarker(slashToken)) {
+      committedExcludedSlashMarkers.add(slashToken);
+      await transitionSegment({ origin: "excluded", slashContinuation: true }, ctx);
+      return;
+    }
     const token = originMarkerToken(markedText);
     const candidate = token ? inputCandidates.get(token) : undefined;
     if (token && candidate) {
@@ -1146,7 +1251,7 @@ export default function (pi: ExtensionAPI) {
       }, ctx);
       return;
     }
-    await transitionSegment({ origin: "excluded", preserveRequest: true }, ctx);
+    await transitionSegment({ origin: "excluded" }, ctx);
   });
 
   pi.on("context", (event) => {
@@ -1168,8 +1273,18 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", (event) => {
     const message = event.message as AssistantMessage;
     if (message.role === "user") {
-      const token = originMarkerToken(inputTextOf(message));
+      const text = inputTextOf(message);
+      const token = originMarkerToken(text);
       if (token && committedMarkers.delete(token)) return { message: stripMessageOrigin(message) };
+      const slashToken = excludedSlashMarkerToken(text);
+      if (slashToken && committedExcludedSlashMarkers.delete(slashToken)) {
+        return {
+          message: {
+            ...stripMessageOrigin(message),
+            firstmateExcludedSlash: slashToken,
+          },
+        };
+      }
       return;
     }
     if (message.role !== "assistant" || !active || suspended ||

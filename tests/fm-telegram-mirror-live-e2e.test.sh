@@ -238,6 +238,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 export default function (pi: ExtensionAPI): void {
   let injected = false;
   let nested = false;
+  const state = globalThis as typeof globalThis & {
+    __telegramMirrorSendOtherExtension?: () => void;
+  };
+  state.__telegramMirrorSendOtherExtension = () => {
+    pi.sendUserMessage("other extension competing segment", { deliverAs: "steer" });
+  };
   pi.registerTool({
     name: "mirror_test_tool",
     label: "Mirror test tool",
@@ -998,6 +1004,76 @@ assert.equal(faux.state.callCount, callsBeforeSlashSteer + 2,
 assert.equal(initialManager.getEntries().some((entry) =>
   entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
     && entry.data.requestId === 'tg-text-u27-m27' && entry.data.state === 'interrupted'), false);
+const persistedSlash = initialManager.getEntries().findLast((entry) =>
+  entry.type === 'message' && entry.message.role === 'user' &&
+  entry.message.content.map?.((part) => part.text || '').join('') === 'Expanded slash prompt body\n');
+assert.match(persistedSlash?.message.firstmateExcludedSlash || '', /^[a-f0-9]{128}$/,
+  'excluded slash lifecycle did not persist self-identifying provenance');
+
+const terminalSlashDeliveries = Object.keys(state().deliveries).length;
+globalThis.__telegramMirrorHoldTool = true;
+globalThis.__telegramMirrorTerminateTool = true;
+globalThis.__telegramMirrorToolStarted = false;
+faux.appendResponses([
+  fauxAssistantMessage([
+    fauxToolCall('mirror_test_tool', {}, { id: 'terminal-slash-tool-call' }),
+  ], { stopReason: 'toolUse' }),
+  fauxAssistantMessage('terminal answer after excluded slash'),
+]);
+const terminalSlashRoot = runtime.session.prompt('terminal tool loop before excluded slash', {
+  source: 'interactive',
+});
+await waitFor(() => globalThis.__telegramMirrorToolStarted === true,
+  'terminal slash tool loop did not reach tool execution');
+const terminalSlash = runtime.session.prompt('/slash-mirror', {
+  source: 'interactive', streamingBehavior: 'steer',
+});
+globalThis.__telegramMirrorHoldTool = false;
+await Promise.all([terminalSlashRoot, terminalSlash]);
+globalThis.__telegramMirrorTerminateTool = false;
+await waitFor(() => Object.values(state().deliveries)
+  .some((body) => body === 'Firstmate · terminal answer after excluded slash'),
+'excluded slash did not preserve the terminal-origin tool loop');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'You · Terminal\n\nterminal tool loop before excluded slash').length, 1);
+assert.equal(Object.keys(state().deliveries).length, terminalSlashDeliveries + 2,
+  'excluded slash lifecycle was mirrored during a terminal-origin tool loop');
+
+const competingState = state();
+competingState.request = {
+  id: 'tg-text-u29-m29', text: 'Telegram tool loop before other extension', status: 'queued',
+};
+save(competingState);
+globalThis.__telegramMirrorHoldTool = true;
+globalThis.__telegramMirrorTerminateTool = true;
+globalThis.__telegramMirrorToolStarted = false;
+const competingDeliveries = Object.keys(state().deliveries).length;
+const competingCalls = faux.state.callCount;
+faux.appendResponses([
+  fauxAssistantMessage([
+    fauxToolCall('mirror_test_tool', {}, { id: 'other-extension-tool-call' }),
+  ], { stopReason: 'toolUse' }),
+  fauxAssistantMessage('other extension answer must stay local'),
+]);
+await waitFor(() => globalThis.__telegramMirrorToolStarted === true,
+  'other-extension exclusion tool loop did not reach tool execution');
+globalThis.__telegramMirrorSendOtherExtension();
+globalThis.__telegramMirrorHoldTool = false;
+globalThis.__telegramMirrorTerminateTool = false;
+await waitFor(() => state().request?.status === 'held',
+  'unmarked other-extension lifecycle did not freeze Telegram capture');
+await waitFor(() => faux.state.callCount === competingCalls + 2,
+  'other-extension lifecycle did not finish its model turn');
+await runtime.session.waitForIdle();
+assert.equal(Object.values(state().deliveries)
+  .some((body) => body.includes('other extension answer must stay local')), false,
+  'other-extension assistant was mirrored as the Telegram response');
+assert.equal(Object.keys(state().deliveries).length, competingDeliveries,
+  'other-extension lifecycle produced mirror delivery');
+const clearedCompetingState = state();
+clearedCompetingState.request = null;
+save(clearedCompetingState);
+await runtime.session.reload();
 
 const expiringSteer = state();
 expiringSteer.request = {
@@ -1301,6 +1377,43 @@ assert.equal(Object.values(state().deliveries)
 assert.equal(state().receipt_unknown?.filter((id) => id === receiptFailureRequestId).length, 1);
 assert.equal(faux.state.callCount, callsBeforeReceiptFailureRestart,
   'failed admission receipt started a second model pass');
+
+const slashRecoveryManager = runtime.session.sessionManager;
+const slashRecoveryRequestId = 'tg-text-u30-m30';
+const slashRecoveryTurnId = 'telegram-tg-text-u30-m30-persisted';
+const slashRecoveryState = state();
+slashRecoveryState.request = {
+  id: slashRecoveryRequestId, text: 'persisted Telegram before excluded slash',
+  status: 'claimed', owner: process.pid,
+};
+save(slashRecoveryState);
+slashRecoveryManager.appendCustomEntry('firstmate-telegram-admission', {
+  requestId: slashRecoveryRequestId, turnId: slashRecoveryTurnId,
+  sessionId: slashRecoveryManager.getSessionId(), state: 'admitted',
+});
+slashRecoveryManager.appendMessage({
+  role: 'user', content: [{ type: 'text', text: 'You · Telegram\n\npersisted Telegram before excluded slash' }],
+  timestamp: Date.now(),
+});
+slashRecoveryManager.appendMessage(fauxAssistantMessage([
+  fauxToolCall('mirror_test_tool', {}, { id: 'persisted-slash-tool-call' }),
+], { stopReason: 'toolUse' }));
+slashRecoveryManager.appendMessage({
+  role: 'user', content: [{ type: 'text', text: 'Expanded slash prompt body\n' }],
+  firstmateExcludedSlash: persistedSlash.message.firstmateExcludedSlash,
+  timestamp: Date.now(),
+});
+slashRecoveryManager.appendMessage(fauxAssistantMessage('persisted answer after excluded slash'));
+const callsBeforeSlashRecovery = faux.state.callCount;
+await runtime.newSession({ parentSession: slashRecoveryManager.getSessionFile() });
+await waitFor(() => state().handled?.includes(slashRecoveryRequestId),
+  'restart did not settle a persisted response after an excluded slash continuation');
+assert.equal(userTexts(runtime.session.sessionManager).length, 0,
+  'restart reinjected a persisted Telegram conversation with an excluded slash continuation');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · persisted answer after excluded slash').length, 1);
+assert.equal(faux.state.callCount, callsBeforeSlashRecovery,
+  'restart ran the model for a persisted excluded-slash conversation');
 
 const carriedManager = runtime.session.sessionManager;
 const carriedRequestId = 'tg-text-u24-m24';
