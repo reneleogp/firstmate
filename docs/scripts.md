@@ -82,7 +82,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-tangle-lib.sh`       | Shared default-branch resolution and primary-checkout tangle classification          |
 | `fm-timeout-lib.sh`      | Single owner of hard-bounded command execution and its fallback watchdog |
 | `fm-timing-lib.sh`       | Single owner of the deferred network stage's per-step elapsed-time records, inert unless a run asks for them |
-| `fm-supervision-lib.sh`  | Shared home-needs-supervision and fresh-watcher-beacon predicate                     |
+| `fm-supervision-lib.sh`  | Shared in-flight-work-without-fresh-watcher-beacon predicate                         |
 | `fm-ff-lib.sh`           | Shared guarded fast-forward helper for origin pulls and local secondmate syncs       |
 | `fm-lock-lib.sh`         | Shared "is this git lock provably abandoned?" proof used by teardown and fleet-sync   |
 | `fm-config-inherit-lib.sh` | Shared primary-to-secondmate inherited local-material propagation and config-reread delivery |
@@ -116,8 +116,6 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-x-dismiss.sh`        | Dismiss a skipped Relay mention at the relay without replying                        |
 | `fm-x-link.sh`           | Link a spawned task to its originating Relay mention in task meta                    |
 | `fm-x-followup.sh`       | Detect, post, and cap completion follow-ups for a Relay-linked task                  |
-| `fm-telegram.py`         | Operate one home's pinned private Telegram transport, queue, and user service        |
-| `fm-telegram-agent-request.sh` | Render one authenticated Telegram request with its trusted authority boundary  |
 | `fm-public-followup-lib.sh` | Shared relay-activation gate, O(1) presence checks, and private transport paths for promised public replies |
 | `fm-public-followup.sh`  | Reconcile typed terminal work results into a public commitment and deliver its final reply once |
 | `fm-public-followup-emit.sh` | Report one typed terminal work result into the home that owes the public reply    |

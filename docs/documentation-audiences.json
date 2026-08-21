@@ -31,8 +31,7 @@
     "docs/zellij-backend.md",
     "docs/orca-backend.md",
     "docs/cmux-backend.md",
-    "docs/remote-secondmates.md",
-    "docs/telegram.md"
+    "docs/remote-secondmates.md"
   ],
   "requiredOwnerPointers": [
     {
@@ -151,10 +150,6 @@
     },
     {
       "path": ".agents/skills/fmx-respond/SKILL.md",
-      "audience": "agent-runtime"
-    },
-    {
-      "path": ".agents/skills/telegram-respond/SKILL.md",
       "audience": "agent-runtime"
     },
     {
@@ -331,10 +326,6 @@
     },
     {
       "path": "docs/tmux-backend.md",
-      "audience": "operator-current"
-    },
-    {
-      "path": "docs/telegram.md",
       "audience": "operator-current"
     },
     {
