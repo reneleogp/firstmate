@@ -546,6 +546,52 @@ procevent_surface_queued() {
   wake "$reason"
 }
 
+telegram_surfaced_marker() { # <queue-key>
+  printf '%s/.seen-telegram-%s' "$STATE" "${1#telegram:}"
+}
+
+telegram_surface_after_output() {
+  local output_status=$1 key marker tmp status=0
+  if [ "$output_status" -eq 0 ]; then
+    for key in $TELEGRAM_SURFACED; do
+      marker=$(telegram_surfaced_marker "$key")
+      tmp=$(umask 077; mktemp "$STATE/.seen-telegram.XXXXXX") || { status=1; continue; }
+      if ! mv -f -- "$tmp" "$marker"; then
+        rm -f -- "$tmp"
+        status=1
+      fi
+    done
+  fi
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  return "$status"
+}
+
+telegram_surface_queued() {
+  local key reason id marker
+  TELEGRAM_SURFACED=
+  [ -s "$FM_WAKE_QUEUE" ] || return 0
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  while IFS= read -r marker; do
+    id=${marker##*.seen-telegram-}
+    [ -n "$id" ] || continue
+    grep -Fqx "telegram:$id" <(fm_wake_queued_keys_locked check) || rm -f -- "$marker"
+  done < <(find "$STATE" -maxdepth 1 -name '.seen-telegram-*' -type f -print 2>/dev/null)
+  while IFS= read -r key; do
+    case "$key" in telegram:*) ;; *) continue ;; esac
+    [ -e "$(telegram_surfaced_marker "$key")" ] && continue
+    TELEGRAM_SURFACED=$key
+    break
+  done < <(fm_wake_queued_keys_locked check)
+  if [ -z "$TELEGRAM_SURFACED" ]; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 0
+  fi
+  reason="check: telegram ${TELEGRAM_SURFACED#telegram:}"
+  # shellcheck disable=SC2034 # Consumed by wake() in the separately linted transition owner.
+  FM_WAKE_POST_OUTPUT_ACTION=telegram_surface_after_output
+  wake "$reason"
+}
+
 run_check_process() {
   local c=$1
   shift
@@ -884,6 +930,7 @@ while :; do
   # Then deliver any queued-but-unsurfaced result, including one a runner
   # published while this watcher was between cycles.
   procevent_surface_queued
+  telegram_surface_queued
 
   # A process-event result carries richer adapter-owned wake context than the
   # generic recovery reason, so give that owner first refusal.

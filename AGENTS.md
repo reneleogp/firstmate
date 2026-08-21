@@ -532,6 +532,7 @@ These skills are not captain-invocable; load them only at their precise triggers
   Never run a registered source's blocking command yourself in a conversational turn.
 - `fmx-respond` - load on an `x-mention <request_id>` `check:` wake to handle the mention, on an `x-mode-error ...` `check:` wake to report the Relay configuration blocker, on a `public-followup ...` `check:` wake or a startup-surfaced public commitment, and on any milestone or terminal wake for a Relay-linked task before posting its completion follow-up; relevant only when Relay is on.
 - `firstmate-codexapp` - load before coordinating a visible Codex Desktop thread, evaluating a Codex App backend request, or reconciling Codex Desktop host-tool smoke evidence for Firstmate work.
+- `telegram-respond` - load on a `check: telegram <local-request-id>` wake, and on a decision, blocker, terminal-confirmation, PR-ready, or terminal lifecycle wake carrying `<work-id>` only when `bin/fm-telegram.py active-request --work-id <work-id>` succeeds, to route only the required replies to the durably bound pinned chat.
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
 
 ## 14. Relay

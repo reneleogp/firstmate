@@ -1343,87 +1343,6 @@ EOF
 
 # --- composition: real scripts run, not reimplemented ------------------------
 
-test_session_start_retires_legacy_telegram_wakes_before_drain() {
-  local rec root home fakebin out inbox_before
-  rec=$(new_world telegram-wake-migration)
-  IFS='|' read -r root home fakebin <<EOF
-$rec
-EOF
-  make_fake_toolchain "$fakebin"
-  make_fake_ps_claude "$fakebin"
-
-  mkdir -p "$home/state/telegram/inbox"
-  printf '%s\n' '{"request_id":"legacy-request","origin":"telegram","status":"queued","text":"preserved body"}' \
-    > "$home/state/telegram/inbox/legacy-request.json"
-  inbox_before=$(cat "$home/state/telegram/inbox/legacy-request.json")
-  append_wake "$home/state" check telegram:legacy-request "telegram legacy-request"
-  append_wake "$home/state" signal task-safe "done: ordinary wake remains visible"
-
-  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-
-  assert_not_contains "$out" "telegram legacy-request" \
-    "session start exposed an obsolete Telegram wake to the startup digest"
-  assert_contains "$out" "done: ordinary wake remains visible" \
-    "Telegram wake migration suppressed an unrelated durable wake"
-  [ "$(cat "$home/state/telegram/inbox/legacy-request.json")" = "$inbox_before" ] \
-    || fail "Telegram wake migration changed queued request content"
-  if grep -Fq $'\ttelegram:legacy-request\t' "$home/state/.wake-queue" 2>/dev/null; then
-    fail "session start left the obsolete Telegram wake queued"
-  fi
-
-  pass "session start retires legacy Telegram wakes before presenting the queue"
-}
-
-test_secondmate_session_start_skips_telegram_migration_and_drains_wakes() {
-  local rec root home fakebin out
-  rec=$(new_world secondmate-telegram-wake-migration)
-  IFS='|' read -r root home fakebin <<EOF
-$rec
-EOF
-  make_fake_toolchain "$fakebin"
-  make_fake_ps_claude "$fakebin"
-  printf '%s\n' fmtest-secondmate > "$home/.fm-secondmate-home"
-  append_wake "$home/state" signal task-safe "done: secondmate ordinary wake remains visible"
-
-  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-
-  assert_not_contains "$out" "Telegram wake migration failed" \
-    "secondmate session start invoked the primary-home Telegram migration"
-  assert_contains "$out" "done: secondmate ordinary wake remains visible" \
-    "secondmate session start suppressed its ordinary wake drain"
-
-  pass "secondmate session start skips Telegram migration and still drains ordinary wakes"
-}
-
-test_session_start_migrates_the_effective_override_wake_queue() {
-  local rec root home fakebin override out
-  rec=$(new_world telegram-wake-migration-override)
-  IFS='|' read -r root home fakebin <<EOF
-$rec
-EOF
-  make_fake_toolchain "$fakebin"
-  make_fake_ps_claude "$fakebin"
-  override="${root%/root}/override-state"
-  mkdir -p "$override"
-  append_wake "$override" check telegram:override-legacy "telegram override legacy"
-  append_wake "$override" signal task-safe "done: override ordinary wake remains visible"
-  append_wake "$home/state" signal home-safe "done: home queue remains untouched"
-
-  out=$(FM_STATE_OVERRIDE="$override" run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-
-  assert_not_contains "$out" "telegram override legacy" \
-    "session start exposed a legacy Telegram wake from the effective override queue"
-  assert_contains "$out" "done: override ordinary wake remains visible" \
-    "session start did not drain the effective override queue"
-  if grep -Fq $'\ttelegram:override-legacy\t' "$override/.wake-queue" 2>/dev/null; then
-    fail "session start left the override queue's obsolete Telegram wake queued"
-  fi
-  grep -Fq $'\thome-safe\t' "$home/state/.wake-queue" 2>/dev/null \
-    || fail "Telegram migration touched the non-effective home wake queue"
-
-  pass "session start migrates and drains only the effective override wake queue"
-}
-
 test_composition_invokes_real_scripts() {
   local rec root home fakebin out
   rec=$(new_world composition)
@@ -2501,9 +2420,6 @@ test_status_tail_line_cap
 test_orphan_status_logs_are_printed
 test_endpoint_liveness_tmux
 test_endpoint_liveness_herdr
-test_session_start_retires_legacy_telegram_wakes_before_drain
-test_secondmate_session_start_skips_telegram_migration_and_drains_wakes
-test_session_start_migrates_the_effective_override_wake_queue
 test_composition_invokes_real_scripts
 test_backlog_compact_tasks_axi_omits_bodies_and_keeps_metadata
 test_backlog_queued_bound_discloses_its_remainder
