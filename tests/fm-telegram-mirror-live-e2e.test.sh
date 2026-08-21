@@ -42,6 +42,8 @@ reconcile_active = home / 'reconcile-active'
 if command in ('mirror-next', 'mirror-claim') and reconcile_active.exists():
     (home / 'drain-overlapped-reconcile').touch()
 reconcile_trigger = home / 'delay-next-reconcile'
+if command == 'mirror-validate' and (home / 'delay-mirror-validate').exists():
+    time.sleep(0.5)
 if command == 'mirror-reconcile' and reconcile_trigger.exists():
     reconcile_trigger.unlink()
     reconcile_active.touch()
@@ -53,6 +55,7 @@ path = home / 'fake-state.json'
 state = json.loads(path.read_text()) if path.exists() else {'request': None, 'deliveries': {}, 'log': []}
 state.setdefault('reservations', {})
 state.setdefault('delivery_records', {})
+state.setdefault('completion_requests', {})
 state.setdefault('log', []).append([command, *rest])
 def save():
     temporary = path.with_name(f'.{path.name}.{os.getpid()}')
@@ -83,9 +86,14 @@ elif command == 'mirror-reconcile':
         print(f"held\t{request['id']}\t{request['turn_id']}")
     expired_deliveries = set(state.pop('expire_deliveries', []))
     for delivery_id in expired_deliveries:
-        state['delivery_records'].pop(delivery_id, None)
+        status = state['delivery_records'].pop(delivery_id, None)
+        request_id = state['completion_requests'].pop(delivery_id, None)
         state['deliveries'].pop(delivery_id, None)
         state['reservations'].pop(delivery_id, None)
+        request = state.get('request')
+        if (status in ('rejected', 'delivery_unknown') and request_id and request
+                and request.get('id') == request_id and request.get('status') == 'claimed'):
+            state['request'] = None
     for delivery_id in options('--report-delivery'):
         status = state['delivery_records'].get(delivery_id)
         if status is None: print(f"delivery-missing\t{delivery_id}")
@@ -158,6 +166,8 @@ elif command == 'mirror-reply':
     existing = state['deliveries'].get(delivery_id)
     if code == 0 and existing is not None and existing != body: code = 1
     state['delivery_records'][delivery_id] = 'rejected' if code != 0 else 'sent'
+    request_id = option('--request-id')
+    if request_id is not None: state['completion_requests'][delivery_id] = request_id
     if code == 0:
         state['deliveries'][delivery_id] = body
         state['reservations'].pop(delivery_id, None)
@@ -175,6 +185,7 @@ elif command == 'mirror-complete':
         code = 1
     else:
         state.setdefault('handled', []).append(request_id); state['request'] = None
+        state['completion_requests'].pop(delivery_id, None)
 elif command == 'mirror-mode':
     action = rest[0]
     preference_path = mode_path()
@@ -619,7 +630,7 @@ const expiringDeliveryState = state();
 expiringDeliveryState.expire_deliveries = [expiringDeliveryId];
 save(expiringDeliveryState);
 await waitFor(() => notices.some(([message]) =>
-  message === 'An expired blocked terminal mirror turn was abandoned without replay.'),
+  message === 'An expired blocked mirror turn was abandoned without replay.'),
 'expired blocked terminal turn was not abandoned visibly');
 unlinkSync(`${home}/reject-assistant-reply`);
 const expiredDeliveryAttempts = state().log.filter((call) =>
@@ -632,6 +643,41 @@ assert.equal(state().log.filter((call) =>
 'expired terminal delivery was recreated and replayed');
 assert.equal(faux.state.callCount, callsAfterTerminalDeliveryExpiry,
   'expired terminal delivery recovery invoked the model');
+
+const expiredTelegram = state();
+expiredTelegram.request = {
+  id: 'tg-text-u20-m20', text: 'Telegram response whose delivery expires', status: 'queued',
+};
+save(expiredTelegram);
+writeFileSync(`${home}/reject-assistant-reply`, '');
+const callsBeforeExpiredTelegram = faux.state.callCount;
+faux.appendResponses([fauxAssistantMessage('expired blocked Telegram answer')]);
+await waitFor(() => statuses.at(-1)?.[1] === 'telegram: delivery needs attention',
+  'expiring Telegram response did not enter blocked state');
+const expiredTelegramCall = [...state().log].reverse().find((call) =>
+  call[0] === 'mirror-reply' && call[1].startsWith('assistant-telegram-tg-text-u20-m20-'));
+assert.ok(expiredTelegramCall, 'expiring Telegram response had no stable delivery identity');
+const expiredTelegramDeliveryId = expiredTelegramCall[1];
+await waitFor(() => state().log.some((call) =>
+  call[0] === 'mirror-reconcile' && call.includes(expiredTelegramDeliveryId)),
+'expiring Telegram response was not tracked by reconciliation');
+const expiredTelegramState = state();
+expiredTelegramState.expire_deliveries = [expiredTelegramDeliveryId];
+save(expiredTelegramState);
+await waitFor(() => state().request === null,
+  'expired failed Telegram response retained its claimed request');
+const expiredTelegramAttempts = state().log.filter((call) =>
+  call[0] === 'mirror-reply' && call[1] === expiredTelegramDeliveryId).length;
+unlinkSync(`${home}/reject-assistant-reply`);
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await new Promise((resolve) => setTimeout(resolve, 600));
+assert.equal(state().log.filter((call) =>
+  call[0] === 'mirror-reply' && call[1] === expiredTelegramDeliveryId).length,
+expiredTelegramAttempts, 'expired Telegram response was recreated and replayed');
+assert.equal(faux.state.callCount, callsBeforeExpiredTelegram + 1,
+  'expired Telegram response invoked another model pass');
+assert.equal(userTexts(initialManager)
+  .filter((text) => text.includes('Telegram response whose delivery expires')).length, 1);
 
 writeFileSync(`${home}/reject-assistant-reply`, '');
 const callsBeforeOrderedBlock = faux.state.callCount;
@@ -837,6 +883,40 @@ current = state();
 assert.equal(userTexts(initialManager).filter((text) => text === 'You · Telegram\n\nconfirmed voice text').length, 1);
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · confirmed voice answer').length, 1);
 assert.equal(current.receipts.filter((id) => id === 'tg-voice-u10-m10').length, 1);
+
+const preflightSettlement = state();
+preflightSettlement.request = {
+  id: 'tg-text-u21-m21', text: 'response settles during unrelated preflight', status: 'queued',
+};
+save(preflightSettlement);
+const callsBeforePreflightSettlement = faux.state.callCount;
+faux.appendResponses([
+  async () => {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    return fauxAssistantMessage('response settled during handled preflight');
+  },
+]);
+await waitFor(() => userTexts(initialManager)
+  .some((text) => text.includes('response settles during unrelated preflight')),
+'preflight settlement Telegram turn did not start');
+writeFileSync(`${home}/delay-mirror-validate`, '');
+globalThis.__telegramMirrorDelayInteractiveInput = true;
+globalThis.__telegramMirrorHandleInteractiveInput = true;
+const handledDuringSettlement = runtime.session.prompt('handled while prior response settles', {
+  source: 'interactive', streamingBehavior: 'followUp',
+});
+await handledDuringSettlement;
+unlinkSync(`${home}/delay-mirror-validate`);
+globalThis.__telegramMirrorDelayInteractiveInput = false;
+globalThis.__telegramMirrorHandleInteractiveInput = false;
+await waitFor(() => state().handled?.includes('tg-text-u21-m21'),
+  'handled unrelated preflight stranded the finalized Telegram response');
+assert.equal(userTexts(initialManager)
+  .some((text) => text.includes('handled while prior response settles')), false);
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · response settled during handled preflight').length, 1);
+assert.equal(faux.state.callCount, callsBeforePreflightSettlement + 1,
+  'handled unrelated preflight caused another model pass');
 
 const failedTurn = state();
 failedTurn.request = { id: 'tg-text-u11-m11', text: 'provider failure request', status: 'queued' };

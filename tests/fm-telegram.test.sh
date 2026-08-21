@@ -319,6 +319,28 @@ assert 'completion_request_id' not in completed_delivery
 for delivery_id in capacity_ids:
     Path(delivery_root, delivery_id + '.json').unlink()
     Path(delivery_root, delivery_id + '.txt').unlink()
+for index, status in enumerate(('rejected', 'delivery_unknown'), start=201):
+    request_id = f'tg-text-u{index}-m{index}'
+    request_path = Path(home, 'state', 'telegram', 'inbox', request_id + '.json')
+    request_path.write_text(json.dumps({
+        'request_id': request_id, 'origin': 'telegram', 'text': 'expired failed response',
+        'chat_id': 77, 'status': 'claimed', 'created_at': 1,
+        'claim_owner_pid': int(owner), 'claim_owner_identity': owner_identity,
+    }))
+    delivery_id = f'expired-{status}'
+    delivery_text = f'Firstmate · expired {status}'
+    Path(delivery_root, delivery_id + '.txt').write_text(delivery_text)
+    Path(delivery_root, delivery_id + '.json').write_text(json.dumps({
+        'delivery_id': delivery_id,
+        'sha256': __import__('hashlib').sha256(delivery_text.encode()).hexdigest(),
+        'status': status, 'created_at': 1, 'chunks': [],
+        'completion_request_id': request_id,
+    }))
+    cleaned = run('mirror-reconcile', '--preserve-request', request_id)
+    assert cleaned.returncode == 0, cleaned.stderr
+    assert not request_path.exists(), f'expired {status} request remained claimed'
+    assert not Path(delivery_root, delivery_id + '.json').exists()
+    assert not Path(delivery_root, delivery_id + '.txt').exists()
 for index in range(260):
     delivery_id = f'retained-{index}'
     text = f'retained {index}'

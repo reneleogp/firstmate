@@ -417,6 +417,7 @@ export default function (pi: ExtensionAPI) {
     const deliveryId = safeIdentity(`assistant-${turn.turnId}`);
     if (turn.terminalDelivery && !turn.terminalDelivery.sent) {
       turn.terminalDelivery.attempted = true;
+      knownDeliveryRecords.add(turn.terminalDelivery.deliveryId);
       const terminalResult = await deliver(
         turn.terminalDelivery.deliveryId,
         turn.terminalDelivery.body,
@@ -433,6 +434,7 @@ export default function (pi: ExtensionAPI) {
       knownDeliveryRecords.add(turn.terminalDelivery.deliveryId);
     }
     turn.assistantAttempted = true;
+    knownDeliveryRecords.add(deliveryId);
     const result = await deliver(deliveryId, `Firstmate · ${turn.body}`, ctx, turn.request);
     if (startedGeneration !== generation) return false;
     if (result.code === 0) knownDeliveryRecords.add(deliveryId);
@@ -606,6 +608,7 @@ export default function (pi: ExtensionAPI) {
     if (reconcileRunning || drainRunning || settleRunning || !transportOpen || !ownsHomeLock()) return;
     reconcileRunning = true;
     const startedGeneration = generation;
+    const reportedHeldAdmission = heldAdmission;
     try {
       const preserved = new Set<string>();
       if (pendingAdmission) preserved.add(pendingAdmission.requestId);
@@ -629,15 +632,15 @@ export default function (pi: ExtensionAPI) {
       if (startedGeneration !== generation) return;
       if (result.code === 0) {
         const lines = result.stdout.split("\n");
-        if (heldAdmission) {
+        if (reportedHeldAdmission && heldAdmission === reportedHeldAdmission) {
           const held = lines.some((line) =>
-            line === `held\t${heldAdmission?.requestId}\t${heldAdmission?.turnId}`);
+            line === `held\t${reportedHeldAdmission.requestId}\t${reportedHeldAdmission.turnId}`);
           if (!held) heldAdmission = undefined;
         }
         const missing = new Set(lines
           .filter((line) => line.startsWith("delivery-missing\t"))
           .map((line) => line.slice("delivery-missing\t".length))
-          .filter((deliveryId) => knownDeliveryRecords.has(deliveryId)));
+          .filter((deliveryId) => reportedDeliveries.has(deliveryId)));
         for (const line of lines) {
           const fields = line.split("\t");
           if (fields[0] === "delivery" && fields.length === 3) knownDeliveryRecords.add(fields[1]);
@@ -651,11 +654,10 @@ export default function (pi: ExtensionAPI) {
             resetTurn();
           }
           const retained = settledTurns.filter((turn) => {
-            if (turn.origin !== "terminal" || turn.request) return true;
-            const terminalExpired = !!turn.terminalDelivery &&
-              missing.has(turn.terminalDelivery.deliveryId);
+            const terminalExpired = turn.origin === "terminal" && !turn.request &&
+              !!turn.terminalDelivery && missing.has(turn.terminalDelivery.deliveryId);
             const assistantId = safeIdentity(`assistant-${turn.turnId}`);
-            const assistantExpired = missing.has(assistantId);
+            const assistantExpired = !!turn.assistantAttempted && missing.has(assistantId);
             if (!terminalExpired && !assistantExpired) return true;
             if (turn.terminalDelivery) abandonedDeliveryIds.add(turn.terminalDelivery.deliveryId);
             abandonedDeliveryIds.add(assistantId);
@@ -665,7 +667,7 @@ export default function (pi: ExtensionAPI) {
             settledTurns = retained;
             for (const deliveryId of abandonedDeliveryIds) knownDeliveryRecords.delete(deliveryId);
             deliveryBlocked = false;
-            ctx.ui.notify("An expired blocked terminal mirror turn was abandoned without replay.", "warning");
+            ctx.ui.notify("An expired blocked mirror turn was abandoned without replay.", "warning");
             void flushSettledTurns(ctx);
           }
         }
@@ -749,6 +751,7 @@ export default function (pi: ExtensionAPI) {
         const recovered = await exec(["mirror-recover", heldAdmission.requestId], ctx);
         if (recovered.code === 0) heldAdmission = undefined;
       }
+      if (action === "on" && deliveryBlocked) await reconcile(ctx);
       if (action === "on" && deliveryBlocked) deliveryBlocked = false;
       if (action === "on" && !await flushSettledTurns(ctx)) return;
       if (action === "on") await settle(ctx);
@@ -995,7 +998,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
       if (active && activeOrigin) {
-        if (interactivePreflights > 0 || suspended) return;
+        if (suspended) return;
         if (!lastAssistantBody) {
           await holdInterrupted(ctx);
           await updateFooter(ctx);
@@ -1009,7 +1012,8 @@ export default function (pi: ExtensionAPI) {
     const pendingBusyInput = [...inputCandidates.values()].some((candidate) =>
       candidate.segment.origin === "terminal" && candidate.busyGeneration !== undefined &&
       candidate.busyGeneration <= settledInputGeneration);
-    if (pendingBusyInput && ctx.hasPendingMessages()) return;
+    if (active && !lastAssistantBody &&
+        (interactivePreflights > 0 || (pendingBusyInput && ctx.hasPendingMessages()))) return;
     return finishSettlement();
   });
 }

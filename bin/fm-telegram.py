@@ -858,6 +858,19 @@ def cleanup_atomic_temps_locked(home: Path) -> None:
             pass
 
 
+def cleanup_failed_completion_request_locked(home: Path, record: Dict[str, Any]) -> None:
+    if record.get("status") not in {"rejected", "delivery_unknown"}:
+        return
+    request_id = record.get("completion_request_id")
+    path = request_path(home, request_id) if isinstance(request_id, str) else None
+    request = read_json(path) if path is not None else None
+    if (path is None or path.parent.name != "inbox" or not isinstance(request, dict)
+            or request.get("request_id") != request_id or request.get("status") != "claimed"):
+        return
+    consume_safe_wakes(home, [request_id])
+    durable_unlink(path)
+
+
 def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> bool:
     root = state_dir(home) / "deliveries"
     private_dir(root)
@@ -893,7 +906,8 @@ def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> bool
                            if isinstance(completion_request, str) else None)
         completion_record = read_json(completion_path) if completion_path is not None else None
         completion_pending = bool(
-            isinstance(completion_record, dict)
+            record.get("status") == "sent"
+            and isinstance(completion_record, dict)
             and completion_record.get("request_id") == completion_request
             and completion_record.get("status") == "claimed"
         )
@@ -904,6 +918,7 @@ def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> bool
             bodies.discard(body_path.name)
             continue
         if created < cutoff and not protected:
+            cleanup_failed_completion_request_locked(home, record)
             durable_unlink(metadata_path)
             durable_unlink(body_path)
             bodies.discard(body_path.name)
@@ -920,6 +935,9 @@ def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> bool
             break
         if protected:
             continue
+        record = read_json(metadata_path, {})
+        if isinstance(record, dict):
+            cleanup_failed_completion_request_locked(home, record)
         durable_unlink(metadata_path)
         durable_unlink(body_path)
         retained -= 1
@@ -931,11 +949,21 @@ def _bounded_cleanup_locked(home: Path, preserve_requests: Iterable[str] = ()) -
     inbox, handled = request_dirs(home)
     cleanup_atomic_temps_locked(home)
     cutoff = now() - INBOX_TTL
+    failed_completion_requests = set()
+    delivery_root = state_dir(home) / "deliveries"
+    if delivery_root.is_dir() and not delivery_root.is_symlink():
+        for metadata_path in delivery_root.glob("*.json"):
+            delivery = read_json(metadata_path, {})
+            request_id = delivery.get("completion_request_id") if isinstance(delivery, dict) else None
+            if (isinstance(request_id, str)
+                    and delivery.get("status") in {"rejected", "delivery_unknown"}):
+                failed_completion_requests.add(request_id)
     inbox_files = sorted(inbox.glob("*.json"), key=request_order_key, reverse=True)
     queued_index = 0
     for path in inbox_files:
         record = read_json(path, {})
-        if isinstance(record, dict) and record.get("status") == "claimed":
+        if (isinstance(record, dict) and record.get("status") == "claimed"
+                and path.stem not in failed_completion_requests):
             owner_pid = record.get("claim_owner_pid")
             owner_identity = record.get("claim_owner_identity")
             if (strict_int(owner_pid) and isinstance(owner_identity, str)
