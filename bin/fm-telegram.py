@@ -27,19 +27,27 @@ Wire protocol (newline-delimited JSON, both directions):
   extension -> bot  {"t":"hello"}
                     {"t":"terminal","text":...}     terminal submission
                     {"t":"reply","text":...}        final visible Firstmate text
-                    {"t":"command","id":N,"command":"on"|"off"|"status"}
+                    {"t":"command","id":N,"command":"toggle"|"on"|"off"|"status"}
+                    {"t":"set","id":N,"setting":"confirmations","value":bool}
                     {"t":"accepted","id":"..."}     Pi accepted that message
   bot -> extension  {"t":"deliver","id":"...","text":...}
                     {"t":"command_result","id":N,"text":...}
+                    {"t":"state","mirror":bool,"confirmations":bool}
+
+The bot owns mirror mode and the confirmations setting and pushes a state frame
+on connect and after every change from either surface, so Pi's footer and its
+settings UI never hold a stale copy.
 
 These commands work from both Telegram and the Pi terminal and never reach
 Firstmate as conversation text:
 
-  /telegram on | off | status        both surfaces
+  /telegram on | off | status        Telegram
   /telegram_on | /telegram_off | /telegram_status
                                      Telegram menu aliases, published to the
                                      paired chat with setMyCommands because
                                      Telegram's menu rejects a space
+  /telegram                          Pi, toggles mirror mode
+  /telegram-settings                 Pi, native settings UI
 
 Mirror mode starts off on every start and lives in memory only. The inbound
 queue is an in-memory FIFO with no durable queue, expiry, replay journal, or
@@ -411,6 +419,7 @@ class MirrorBot:
             if command:
                 await self.send(self.apply_command(command), reply_to=message_id,
                                 markup=self.control_markup())
+                await self.broadcast_state()
                 return
             head = text.strip().split(" ", 1)[0].split("@", 1)[0]
             if head in ("/start", "/help", "/telegram"):
@@ -445,6 +454,8 @@ class MirrorBot:
             self.mirror_on = True
         elif command == "off":
             self.mirror_on = False
+        elif command == "toggle":
+            self.mirror_on = not self.mirror_on
         return self.status_text()
 
     def status_text(self) -> str:
@@ -470,6 +481,14 @@ class MirrorBot:
         except OSError as exc:
             # The choice still applies to this run; only its persistence failed.
             log(f"could not persist the confirmations setting: {exc}")
+
+    async def broadcast_state(self) -> None:
+        """Push the state Pi's footer and settings render, after every change."""
+        await self.write_frame({
+            "t": "state",
+            "mirror": self.mirror_on,
+            "confirmations": self.config.confirmations,
+        })
 
     async def accept_text(self, text: str, reply_to: int) -> None:
         item = Queued(id=self.next_id(), text=text, reply_to=reply_to)
@@ -531,6 +550,7 @@ class MirrorBot:
             message_id = card.get("message_id")
             if isinstance(message_id, int):
                 await self.edit_card(message_id, self.status_text(), self.control_markup())
+            await self.broadcast_state()
             return
         parsed = parse_callback(data)
         if parsed is None:
@@ -626,6 +646,7 @@ class MirrorBot:
         if previous is not None:
             await self.drop_client(previous)
         self.client = writer
+        await self.broadcast_state()
         await self.pump()
         try:
             while True:
@@ -646,6 +667,7 @@ class MirrorBot:
     async def handle_frame(self, frame: dict[str, Any]) -> None:
         kind = frame.get("t")
         if kind == "hello":
+            # State already went out when the connection was accepted.
             await self.pump()
             return
         if kind == "accepted":
@@ -666,10 +688,21 @@ class MirrorBot:
             return
         if kind == "command":
             command = str(frame.get("command"))
-            text = self.apply_command(command) if command in MIRROR_COMMANDS else (
-                f"Unknown command {command!r}."
-            )
+            if command in MIRROR_COMMANDS or command == "toggle":
+                text = self.apply_command(command)
+            else:
+                text = f"Unknown command {command!r}."
             await self.write_frame({"t": "command_result", "id": frame.get("id"), "text": text})
+            await self.broadcast_state()
+            return
+        if kind == "set":
+            if frame.get("setting") == "confirmations" and isinstance(frame.get("value"), bool):
+                self.set_confirmations(bool(frame["value"]))
+                text = self.status_text()
+            else:
+                text = f"Unknown setting {frame.get('setting')!r}."
+            await self.write_frame({"t": "command_result", "id": frame.get("id"), "text": text})
+            await self.broadcast_state()
 
     # --- run loop ---
 

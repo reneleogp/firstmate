@@ -17,10 +17,27 @@ if ! node -e 'import(process.argv[1]).catch(() => process.exit(1))' "$TMP_ROOT/p
   exit 0
 fi
 
+# The settings UI imports Pi's own TUI components, so the extension runs from a
+# fixture whose node_modules point at the installed Pi package, the same way the
+# tracked Pi extensions resolve them in a real session.
+PI_PACKAGE_DIR=${FM_PI_PACKAGE_DIR:-"$(npm root -g 2>/dev/null)/@earendil-works/pi-coding-agent"}
+if [ ! -f "$PI_PACKAGE_DIR/package.json" ]; then
+  echo "skip: installed @earendil-works/pi-coding-agent package not found"
+  exit 0
+fi
+FIXTURE="$TMP_ROOT/ext"
+mkdir -p "$FIXTURE/lib" "$FIXTURE/node_modules/@earendil-works"
+cp "$ROOT/.pi/extensions/fm-telegram-mirror.ts" "$FIXTURE/fm-telegram-mirror.ts"
+cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$FIXTURE/lib/fm-operational-input.ts"
+ln -s "$PI_PACKAGE_DIR" "$FIXTURE/node_modules/@earendil-works/pi-coding-agent"
+ln -s "$PI_PACKAGE_DIR/node_modules/@earendil-works/pi-tui" "$FIXTURE/node_modules/@earendil-works/pi-tui"
+printf '%s\n' '{"type":"module"}' >"$FIXTURE/package.json"
+
 OUT="$TMP_ROOT/node-output"
-if ! (cd "$TMP_ROOT" && \
-  EXT="$ROOT/.pi/extensions/fm-telegram-mirror.ts" \
+if ! (cd "$FIXTURE" && \
+  EXT="$FIXTURE/fm-telegram-mirror.ts" \
   OPERATIONAL_INPUT="$ROOT/bin/fm-operational-input.sh" \
+  FM_OPERATIONAL_INPUT_SCRIPT="$ROOT/bin/fm-operational-input.sh" \
   FM_TELEGRAM_DIR="$TMP_ROOT/home" \
   node --input-type=module >"$OUT" 2>&1) <<'JS'
 import { execFileSync } from "node:child_process";
@@ -64,13 +81,16 @@ const submissions = [];
 const notifications = [];
 const handlers = new Map();
 let commandDefinition;
+let settingsDefinition;
 let idle = true;
+const footer = new Map();
 const pi = {
   on(event, handler) {
     handlers.set(event, handler);
   },
   registerCommand(name, definition) {
     if (name === "telegram") commandDefinition = definition;
+    if (name === "telegram-settings") settingsDefinition = definition;
   },
   sendUserMessage(content, options) {
     submissions.push({ content, options });
@@ -78,8 +98,16 @@ const pi = {
 };
 const ctx = {
   isIdle: () => idle,
-  ui: { notify: (message, level) => notifications.push({ message, level }) },
+  mode: "print",
+  ui: {
+    notify: (message, level) => notifications.push({ message, level }),
+    setStatus: (key, value) => {
+      if (value === undefined) footer.delete(key);
+      else footer.set(key, value);
+    },
+  },
 };
+const footerText = () => footer.get("firstmate-telegram");
 
 const extension = await import(pathToFileURL(process.env.EXT).href);
 extension.default(pi);
@@ -202,27 +230,50 @@ await waitFor(
 );
 idle = true;
 
-// 5. /telegram from Pi is transport, never conversation text.
+// 5. /telegram is transport, never conversation text: bare, it toggles.
 const submissionsBeforeCommand = submissions.length;
 onFrame = (frame) => {
-  if (frame.t === "command") botWrite({ t: "command_result", id: frame.id, text: "Mirror is on. Firstmate is connected." });
+  if (frame.t === "command") botWrite({ t: "command_result", id: frame.id, text: "Mirror is on. Firstmate is connected. Confirmations are on." });
 };
-await commandDefinition.handler("status", ctx);
+await commandDefinition.handler("", ctx);
 const command = received.find((frame) => frame.t === "command");
-if (!command || command.command !== "status") {
-  fail(`the /telegram command did not reach the bot: ${JSON.stringify(received)}`);
+if (!command || command.command !== "toggle") {
+  fail(`bare /telegram did not toggle through the bot: ${JSON.stringify(received)}`);
 }
 if (submissions.length !== submissionsBeforeCommand) {
   fail("/telegram was sent to Firstmate as conversation text");
 }
-if (notifications.at(-1)?.message !== "Mirror is on. Firstmate is connected.") {
+if (notifications.at(-1)?.message !== "Mirror is on. Firstmate is connected. Confirmations are on.") {
   fail(`the bot status was not reported in Pi: ${JSON.stringify(notifications)}`);
 }
 
-// 6. Shutdown releases the connection and stops reconnecting, and a later
+// 6. The footer tracks whatever the bot last published, from either surface.
+if (footerText() !== "telegram: off") {
+  fail(`the footer did not start from the bot's state: ${footerText()}`);
+}
+botWrite({ t: "state", mirror: true, confirmations: true });
+await waitFor(() => footerText() === "telegram: on", "the footer to follow a mirror change");
+botWrite({ t: "state", mirror: false, confirmations: false });
+await waitFor(() => footerText() === "telegram: off", "the footer to follow a mirror change back");
+
+// The settings surface reads the same published values, with no Pi command for
+// the individual mirror states any more.
+if (commandDefinition.getArgumentCompletions) {
+  fail("/telegram still advertises on/off/status arguments");
+}
+if (!settingsDefinition) fail("/telegram-settings was not registered");
+await settingsDefinition.handler("", ctx);
+if (!notifications.at(-1)?.message.includes("delivery confirmations off")) {
+  fail(`settings did not report the published confirmations value: ${JSON.stringify(notifications.at(-1))}`);
+}
+
+// 7. Shutdown releases the connection and stops reconnecting, and a later
 //    session start (/new, /resume, /fork, reload) reconnects.
 handlers.get("session_shutdown")({ reason: "quit" }, ctx);
 await new Promise((resolve) => setTimeout(resolve, 100));
+if (footerText() !== undefined) {
+  fail(`the footer survived session shutdown: ${footerText()}`);
+}
 const connectionsAfterShutdown = connections;
 await new Promise((resolve) => setTimeout(resolve, 400));
 if (connections !== connectionsAfterShutdown) {
@@ -230,12 +281,17 @@ if (connections !== connectionsAfterShutdown) {
 }
 handlers.get("session_start")({ reason: "resume" }, ctx);
 await waitFor(() => connections > connectionsAfterShutdown, "a reconnect on the next session");
-handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+
+// 8. While the bot is unreachable the footer says so rather than guessing.
+await waitFor(() => footerText() === "telegram: unavailable" || footerText() === "telegram: off",
+  "the footer to report the reconnected session");
 server.close();
+await new Promise((resolve) => setTimeout(resolve, 50));
+handlers.get("session_shutdown")({ reason: "quit" }, ctx);
 JS
 then
   fail "Telegram mirror extension checks failed: $(cat "$OUT")"
 fi
 [ -s "$OUT" ] && fail "Telegram mirror extension test printed output: $(cat "$OUT")"
 
-pass "the Pi mirror bridge mirrors terminal submissions and final replies only, hides thinking, tools, and operational input, and submits queued Telegram text through Pi's own input path in order"
+pass "the Pi mirror bridge mirrors terminal submissions and final replies only, hides thinking, tools, and operational input, submits queued Telegram text through Pi's own input path in order, toggles with bare /telegram, and keeps the footer on the bot's published state"

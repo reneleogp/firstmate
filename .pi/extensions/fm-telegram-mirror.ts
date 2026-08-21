@@ -17,16 +17,21 @@
 // The bot owns the Unix socket (bin/fm-telegram.py's "bot.sock") and this
 // extension is the client, because the bot outlives every Pi session. The wire
 // protocol is stated once in that script's header.
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getSettingsListTheme, type ExtensionAPI, type ExtensionContext }
+  from "@earendil-works/pi-coding-agent";
+import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import { classifyFirstmateOperationalText } from "./lib/fm-operational-input.ts";
 
 type BotFrame = {
   t?: string;
   id?: unknown;
   text?: unknown;
+  mirror?: unknown;
+  confirmations?: unknown;
 };
 
 type AssistantPart = { type?: unknown; text?: unknown };
@@ -39,7 +44,11 @@ type FinalizedMessage = {
 const RECONNECT_MS = positiveInteger("FM_TELEGRAM_RECONNECT_MS", 2000);
 const RECONNECT_MAX_MS = positiveInteger("FM_TELEGRAM_RECONNECT_MAX_MS", 60000);
 const COMMAND_TIMEOUT_MS = positiveInteger("FM_TELEGRAM_COMMAND_TIMEOUT_MS", 5000);
-const MIRROR_COMMANDS = ["on", "off", "status"];
+// The footer item Pi renders, and the only Pi-side preference: whether that
+// item is shown. It is stored beside the bot's private directory so it survives
+// a restart and can still be read while the bot is unreachable.
+const FOOTER_KEY = "firstmate-telegram";
+const DISPLAY_SETTING_FILE = "pi-display-status";
 
 function positiveInteger(name: string, fallback: number): number {
   const value = Number(process.env[name]);
@@ -47,9 +56,31 @@ function positiveInteger(name: string, fallback: number): number {
   return Math.floor(value);
 }
 
+function botHome(): string {
+  return process.env.FM_TELEGRAM_DIR || join(homedir(), ".firstmate-telegram");
+}
+
 function botSocketPath(): string {
-  const home = process.env.FM_TELEGRAM_DIR || join(homedir(), ".firstmate-telegram");
-  return join(home, "bot.sock");
+  return join(botHome(), "bot.sock");
+}
+
+function readDisplayStatus(): boolean {
+  try {
+    return readFileSync(join(botHome(), DISPLAY_SETTING_FILE), "utf8").trim() !== "off";
+  } catch {
+    return true;
+  }
+}
+
+function writeDisplayStatus(shown: boolean): void {
+  try {
+    const home = botHome();
+    if (!existsSync(home)) mkdirSync(home, { recursive: true, mode: 0o700 });
+    writeFileSync(join(home, DISPLAY_SETTING_FILE), shown ? "on\n" : "off\n", { mode: 0o600 });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`fm-telegram-mirror: could not persist the status display choice: ${detail}`);
+  }
 }
 
 function assistantText(message: unknown): string {
@@ -99,6 +130,23 @@ export default function (pi: ExtensionAPI) {
   let commandSequence = 0;
   const commandWaiters = new Map<number, (text: string) => void>();
 
+  // Footer state. "unavailable" is the honest answer whenever the bot's socket
+  // is not connected, because mirror mode then has no reachable owner.
+  let activeCtx: ExtensionContext | null = null;
+  let connected = false;
+  let mirrorOn = false;
+  let confirmations = true;
+  let displayStatus = readDisplayStatus();
+
+  function footerText(): string {
+    if (!connected) return "telegram: unavailable";
+    return mirrorOn ? "telegram: on" : "telegram: off";
+  }
+
+  function refreshFooter(): void {
+    activeCtx?.ui?.setStatus?.(FOOTER_KEY, displayStatus ? footerText() : undefined);
+  }
+
   function write(frame: Record<string, unknown>): boolean {
     if (!socket || socket.destroyed) return false;
     try {
@@ -139,6 +187,8 @@ export default function (pi: ExtensionAPI) {
     socket = client;
     client.on("connect", () => {
       reconnectDelay = RECONNECT_MS;
+      connected = true;
+      refreshFooter();
       write({ t: "hello" });
     });
     client.on("data", (chunk: Buffer) => {
@@ -154,6 +204,8 @@ export default function (pi: ExtensionAPI) {
     const drop = (): void => {
       if (socket !== client) return;
       closeSocket();
+      connected = false;
+      refreshFooter();
       scheduleReconnect();
     };
     client.on("error", drop);
@@ -169,6 +221,12 @@ export default function (pi: ExtensionAPI) {
     }
     if (frame.t === "deliver" && typeof frame.text === "string" && typeof frame.id === "string") {
       queueDelivery(frame.id, frame.text);
+      return;
+    }
+    if (frame.t === "state") {
+      if (typeof frame.mirror === "boolean") mirrorOn = frame.mirror;
+      if (typeof frame.confirmations === "boolean") confirmations = frame.confirmations;
+      refreshFooter();
       return;
     }
     if (frame.t === "command_result" && typeof frame.id === "number") {
@@ -219,9 +277,12 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  pi.on?.("session_start", () => {
+  pi.on?.("session_start", (_event, ctx) => {
+    activeCtx = ctx;
     stopped = false;
     reconnectDelay = RECONNECT_MS;
+    displayStatus = readDisplayStatus();
+    refreshFooter();
     openSocket();
   });
 
@@ -230,6 +291,9 @@ export default function (pi: ExtensionAPI) {
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = null;
     closeSocket();
+    connected = false;
+    activeCtx?.ui?.setStatus?.(FOOTER_KEY, undefined);
+    activeCtx = null;
   });
 
   // Ordinary captain submissions typed in the terminal. Telegram-originated
@@ -250,20 +314,73 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand?.("telegram", {
-    description: "Turn the Telegram terminal mirror on or off, or show its status.",
-    getArgumentCompletions: (prefix: string) => {
-      const items = MIRROR_COMMANDS
-        .filter((value) => value.startsWith(prefix))
-        .map((value) => ({ value, label: value }));
-      return items.length > 0 ? items : null;
+    description: "Toggle the Telegram terminal mirror.",
+    handler: async (_args, ctx) => {
+      activeCtx = ctx;
+      ctx.ui.notify(await sendCommand("toggle"), "info");
     },
-    handler: async (args, ctx) => {
-      const command = (args || "").trim().split(/\s+/)[0] || "status";
-      if (!MIRROR_COMMANDS.includes(command)) {
-        ctx.ui.notify("Usage: /telegram on | off | status", "warning");
+  });
+
+  pi.registerCommand?.("telegram-settings", {
+    description: "Show and change the Telegram mirror settings.",
+    handler: async (_args, ctx) => {
+      activeCtx = ctx;
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify(
+          `Telegram settings: display status ${displayStatus ? "on" : "off"}, ` +
+          `delivery confirmations ${connected ? (confirmations ? "on" : "off") : "unavailable"}.`,
+          "info",
+        );
         return;
       }
-      ctx.ui.notify(await sendCommand(command), "info");
+      const items: SettingItem[] = [
+        {
+          id: "display",
+          label: "Display Telegram status",
+          currentValue: displayStatus ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "confirmations",
+          label: "Delivery confirmations",
+          currentValue: connected ? (confirmations ? "on" : "off") : "unavailable",
+          values: connected ? ["on", "off"] : ["unavailable"],
+        },
+      ];
+      await ctx.ui.custom((_tui, theme, _keybindings, done) => {
+        const container = new Container();
+        container.addChild(new Text(theme.fg("accent", theme.bold("Telegram mirror")), 1, 1));
+        const list = new SettingsList(
+          items,
+          Math.min(items.length + 2, 15),
+          getSettingsListTheme(),
+          (id, value) => {
+            if (id === "display") {
+              displayStatus = value === "on";
+              writeDisplayStatus(displayStatus);
+              refreshFooter();
+              return;
+            }
+            if (id === "confirmations") {
+              if (!connected) {
+                ctx.ui.notify("The Telegram mirror bot is not running.", "warning");
+                return;
+              }
+              // The bot owns this setting for both surfaces; its state frame is
+              // what updates the local copy.
+              write({ t: "set", setting: "confirmations", value: value === "on" });
+            }
+          },
+          () => done(undefined),
+          { enableSearch: false },
+        );
+        container.addChild(list);
+        return {
+          render: (width: number) => container.render(width),
+          invalidate: () => container.invalidate(),
+          handleInput: (data: string) => list.handleInput?.(data),
+        };
+      });
     },
   });
 }

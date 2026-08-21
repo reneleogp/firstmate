@@ -204,12 +204,14 @@ class FakePi:
         self.sock.settimeout(DEADLINE)
         self.sock.connect(str(path))
         self.buffer = b""
+        self.states: list[dict[str, Any]] = []
         self.send({"t": "hello"})
 
     def send(self, frame: dict[str, Any]) -> None:
         self.sock.sendall((json.dumps(frame) + "\n").encode("utf-8"))
 
-    def read(self, timeout: float = DEADLINE) -> dict[str, Any]:
+    def read_frame(self, timeout: float = DEADLINE) -> dict[str, Any]:
+        """Next frame of any kind, including the bot's state broadcasts."""
         deadline = time.time() + timeout
         while b"\n" not in self.buffer:
             self.sock.settimeout(max(0.05, deadline - time.time()))
@@ -220,15 +222,28 @@ class FakePi:
         line, _, self.buffer = self.buffer.partition(b"\n")
         return json.loads(line.decode("utf-8"))
 
+    def read(self, timeout: float = DEADLINE) -> dict[str, Any]:
+        """Next frame that is not a state broadcast; states are recorded."""
+        deadline = time.time() + timeout
+        while True:
+            frame = self.read_frame(max(0.05, deadline - time.time()))
+            if frame.get("t") == "state":
+                self.states.append(frame)
+                continue
+            return frame
+
     def expect_nothing(self, seconds: float = 0.5) -> None:
-        self.sock.settimeout(seconds)
-        try:
-            chunk = self.sock.recv(65536)
-        except (socket.timeout, TimeoutError):
-            return
-        if chunk:
-            self.buffer += chunk
-            raise AssertionError(f"unexpected frame from bot: {self.buffer!r}")
+        """No work frame arrives; a state broadcast is not work."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            try:
+                frame = self.read_frame(max(0.05, deadline - time.time()))
+            except (socket.timeout, TimeoutError):
+                return
+            if frame.get("t") == "state":
+                self.states.append(frame)
+                continue
+            raise AssertionError(f"unexpected frame from bot: {frame}")
 
     def close(self) -> None:
         try:
@@ -451,6 +466,67 @@ class MirrorTestCase(unittest.TestCase):
         time.sleep(0.6)
         self.assertNotIn("Pi · Sent to Firstmate.", self.telegram.sent_texts())
         self.assertFalse((self.home / "audio" / "212.ogg").exists())
+
+    def test_state_frames_track_both_surfaces_and_the_pi_toggle(self) -> None:
+        pi = self.connect_pi()
+        # A connecting session is told the current state without asking.
+        first = pi.read_frame()
+        self.assertEqual(first, {"t": "state", "mirror": False, "confirmations": True})
+
+        # Telegram turning the mirror on must reach Pi's footer.
+        self.telegram.push_text("/telegram_on", 301)
+        self.assertEqual(pi.read_frame(), {"t": "state", "mirror": True, "confirmations": True})
+
+        # Bare /telegram in Pi toggles, and answers with the same status line.
+        pi.send({"t": "command", "id": 1, "command": "toggle"})
+        result = pi.read_frame()
+        self.assertEqual(result["t"], "command_result")
+        self.assertIn("Mirror is off", result["text"])
+        self.assertEqual(pi.read_frame(), {"t": "state", "mirror": False, "confirmations": True})
+        pi.send({"t": "command", "id": 2, "command": "toggle"})
+        self.assertIn("Mirror is on", pi.read_frame()["text"])
+        self.assertEqual(pi.read_frame(), {"t": "state", "mirror": True, "confirmations": True})
+
+        # A toggle from Pi is visible to Telegram too.
+        self.telegram.push_text("/telegram_status", 302)
+        card = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 302
+        )
+        self.assertIn("Mirror is on", card["text"])
+
+    def test_confirmations_toggle_from_pi_settings_matches_telegram(self) -> None:
+        pi = self.connect_pi()
+        self.assertEqual(pi.read_frame(), {"t": "state", "mirror": False, "confirmations": True})
+
+        # Pi's settings UI writes through the same owner as the Telegram button.
+        pi.send({"t": "set", "id": 5, "setting": "confirmations", "value": False})
+        result = pi.read_frame()
+        self.assertEqual(result["t"], "command_result")
+        self.assertIn("Confirmations are off", result["text"])
+        self.assertEqual(pi.read_frame(), {"t": "state", "mirror": False, "confirmations": False})
+        self.assertIs(json.loads((self.home / "config.json").read_text())["confirmations"], False)
+
+        # Telegram shows the same value, and its button now offers the opposite.
+        self.telegram.push_text("/telegram_status", 311)
+        card = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 311
+        )
+        self.assertIn("Confirmations are off", card["text"])
+        self.assertEqual(
+            card["reply_markup"]["inline_keyboard"][0][0]["text"], "Enable confirmations"
+        )
+
+        # Toggling back from Telegram publishes the new value to Pi.
+        self.telegram.push_callback("c:confirmations", int(card["message_id"]), "cb-back-on")
+        deadline = time.time() + DEADLINE
+        published = None
+        while time.time() < deadline:
+            frame = pi.read_frame(timeout=2)
+            if frame.get("t") == "state" and frame.get("confirmations") is True:
+                published = frame
+                break
+        self.assertIsNotNone(published, "the Telegram toggle was never published to Pi")
+        self.assertIs(json.loads((self.home / "config.json").read_text())["confirmations"], True)
 
     def test_telegram_text_reaches_pi_unchanged_and_is_confirmed(self) -> None:
         pi = self.connect_pi()

@@ -48,7 +48,8 @@ It connects to the bot when a Pi session starts and retries on a widening delay 
 ## Mirror mode
 
 Mirror mode starts off every time the bot starts and is never persisted.
-These work from Telegram and from the Pi terminal, and are handled by the bot rather than sent to Firstmate:
+
+In Telegram, these switch it and are never sent to Firstmate as conversation text:
 
 - `/telegram on` - start mirroring in both directions.
 - `/telegram off` - stop new mirroring.
@@ -57,13 +58,34 @@ These work from Telegram and from the Pi terminal, and are handled by the bot ra
 Telegram's own command menu cannot contain a space, so the same three commands are published to the paired chat as `/telegram_on`, `/telegram_off`, and `/telegram_status`.
 Both spellings do the same thing; the menu aliases exist so the commands are visible and tappable in Telegram.
 
+In the Pi terminal there are two commands: `/telegram` toggles mirror mode, and `/telegram-settings` opens the settings.
+
+## The terminal footer
+
+Pi's footer shows `telegram: on`, `telegram: off`, or `telegram: unavailable`.
+`unavailable` means this Pi session cannot reach the bot service or its local socket, so mirror mode has no reachable owner to report.
+
+The bot owns mirror mode and publishes every change, so the footer updates promptly whether you switch from Telegram or from the terminal, and when the bot starts or stops.
+
+## Settings
+
+`/telegram-settings` opens a settings list with two toggles.
+
+`Display Telegram status` shows or hides the footer item.
+It is a terminal-side preference stored as `~/.firstmate-telegram/pi-display-status`, so it survives a restart and still applies while the bot is unavailable.
+
+`Delivery confirmations` is the same setting as the Telegram button described below, and both surfaces always show the same value.
+While the bot is unavailable it reads `unavailable` and cannot be changed there, because the bot owns it.
+
 ## Delivery confirmations
 
-`Pi · Sent to Firstmate.` is on by default and can be turned off.
-Every reply to `/telegram on`, `/telegram off`, or `/telegram status` carries one button that reads `Disable confirmations` while they are on and `Enable confirmations` while they are off; tapping it switches the setting and updates that same message.
-The current state is part of the status line, and the choice is stored in `~/.firstmate-telegram/config.json` as `confirmations`, so it survives a bot or WSL restart.
+`Pi · Sent to Firstmate.` is on by default and can be turned off from either surface.
+In Telegram, every reply to `/telegram on`, `/telegram off`, or `/telegram status` carries one button that reads `Disable confirmations` while they are on and `Enable confirmations` while they are off; tapping it switches the setting and updates that same message.
+In the terminal it is the second toggle in `/telegram-settings`.
 
-This setting is deliberately Telegram-only: it changes what Telegram shows you, so it has no Pi terminal command.
+The current state is part of the status line, and the choice is stored in `~/.firstmate-telegram/config.json` as `confirmations`, so it survives a bot or WSL restart.
+Because the bot owns the setting and publishes every change, the two surfaces cannot drift apart.
+
 Turning it off hides only the receipt.
 Messages still reach Firstmate exactly as before, and an accepted message still leaves the queue, so nothing is delivered twice.
 
@@ -124,6 +146,7 @@ Every button action is bound to the current transcript revision, so a stale or r
 ## Boundaries
 
 - One paired account, one private chat, one Firstmate session.
+- The bot owns mirror mode and delivery confirmations for both surfaces; the terminal only shows and changes what the bot publishes.
 - Transport statuses stay attached to the exact message they describe, while Firstmate's replies are never threaded (see Reply threading).
 - The service unit holds no token and no message content; the token stays in `~/.firstmate-telegram/env` and pairing stays in `config.json`.
 - Temporary voice audio is owner-only and is deleted after send, cancel, failure, and at bot start and stop.
