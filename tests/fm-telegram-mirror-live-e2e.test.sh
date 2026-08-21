@@ -119,6 +119,12 @@ export default function (pi: ExtensionAPI): void {
       return { content: [{ type: "text" as const, text: "tool diagnostic payload" }], details: {} };
     },
   });
+  pi.on("input", (event) => {
+    const state = globalThis as typeof globalThis & { __telegramMirrorHandleExtensionInput?: boolean };
+    if (state.__telegramMirrorHandleExtensionInput && event.source === "extension") {
+      return { action: "handled" as const };
+    }
+  });
   pi.on("agent_end", () => {
     const state = globalThis as typeof globalThis & { __telegramMirrorInjectOperational?: boolean };
     if (!state.__telegramMirrorInjectOperational || injected) return;
@@ -232,7 +238,20 @@ current = state();
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'You · Terminal\n\nterminal request').length, 1);
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · terminal answer').length, 1);
 
-const beforeRpc = Object.keys(current.deliveries).length;
+writeFileSync(`${home}/config/telegram-mirror`, 'off\n');
+const beforeModeOff = Object.keys(current.deliveries).length;
+faux.appendResponses([
+  (context) => {
+    const user = context.messages.findLast((message) => message.role === 'user');
+    assert.equal(user.content.map((part) => part.text || '').join(''), 'ordinary mode-off terminal');
+    return fauxAssistantMessage('ordinary mode-off answer');
+  },
+]);
+await runtime.session.prompt('ordinary mode-off terminal', { source: 'interactive' });
+assert.equal(Object.keys(state().deliveries).length, beforeModeOff, 'mode-off terminal turn was mirrored');
+writeFileSync(`${home}/config/telegram-mirror`, 'on\n');
+
+const beforeRpc = Object.keys(state().deliveries).length;
 faux.appendResponses([fauxAssistantMessage('rpc diagnostic answer')]);
 await runtime.session.prompt('rpc diagnostic', { source: 'rpc' });
 assert.equal(Object.keys(state().deliveries).length, beforeRpc, 'RPC input was mirrored');
@@ -265,6 +284,30 @@ assert.equal(userTexts(initialManager).filter((text) => text.includes('busy Tele
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · busy terminal answer').length, 1);
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · busy Telegram answer').length, 1);
 assert.equal(current.receipts.filter((id) => id === 'tg-text-u8-m8').length, 1);
+
+const consumed = state();
+consumed.request = {
+  id: 'tg-text-u12-m12', text: 'handled by later extension', status: 'queued', claim_delay_ms: 250,
+};
+save(consumed);
+globalThis.__telegramMirrorHandleExtensionInput = true;
+faux.appendResponses([
+  async (context) => {
+    const user = context.messages.findLast((message) => message.role === 'user');
+    assert.match(user.content.map((part) => part.text || '').join(''), /^You · Terminal/);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return fauxAssistantMessage('terminal during consumed admission');
+  },
+]);
+await waitFor(() => state().request?.status === 'claimed', 'consumed admission claim did not begin');
+await runtime.session.prompt('race a consumed admission', { source: 'interactive' });
+await waitFor(() => state().request?.status === 'queued', 'later-handler-consumed admission was not released');
+globalThis.__telegramMirrorHandleExtensionInput = false;
+current = state();
+current.request = null;
+save(current);
+assert.equal(userTexts(initialManager).some((text) => text.includes('handled by later extension')), false);
+assert.equal(current.receipts?.includes('tg-text-u12-m12') ?? false, false);
 
 const competing = state();
 competing.request = { id: 'tg-text-u9-m9', text: 'paired Telegram request', status: 'queued' };
@@ -322,6 +365,14 @@ current = state();
 assert.equal(current.request?.status, 'claimed', 'provider failure released its admitted request');
 assert.equal(faux.state.callCount, callsBeforeFailure + 1, 'provider failure hot-looped another model turn');
 assert.equal(userTexts(initialManager).filter((text) => text.includes('provider failure request')).length, 1);
+faux.appendResponses([fauxAssistantMessage('terminal after interrupted answer')]);
+await runtime.session.prompt('terminal after interrupted Telegram', { source: 'interactive' });
+current = state();
+assert.equal(current.request?.status, 'claimed', 'terminal recovery released the interrupted Telegram claim');
+assert.equal(Object.values(current.deliveries).filter((body) =>
+  body === 'You · Terminal\n\nterminal after interrupted Telegram').length, 1);
+assert.equal(Object.values(current.deliveries).filter((body) =>
+  body === 'Firstmate · terminal after interrupted answer').length, 1);
 current.request = null;
 save(current);
 
@@ -336,11 +387,16 @@ initialManager.appendMessage({
   role: 'user', content: [{ type: 'text', text: 'You · Telegram\n\nreplacement request' }], timestamp: Date.now(),
 });
 initialManager.appendMessage(fauxAssistantMessage('replacement answer'));
+initialManager.appendMessage({
+  role: 'user', content: [{ type: 'text', text: 'operational after represented admission' }], timestamp: Date.now(),
+});
+initialManager.appendMessage(fauxAssistantMessage('later operational answer'));
 const previousFile = initialManager.getSessionFile();
 await runtime.newSession({ parentSession: previousFile });
 await waitFor(() => state().handled?.includes('tg-text-u2-m2'), 'session replacement did not reconcile persisted admission provenance');
 assert.equal(userTexts(runtime.session.sessionManager).length, 0, 'session replacement reinjected represented Telegram input');
 assert.equal(Object.values(state().deliveries).filter((body) => body === 'Firstmate · replacement answer').length, 1);
+assert.equal(Object.values(state().deliveries).some((body) => body.includes('later operational answer')), false);
 
 const crash = state();
 crash.request = { id: 'tg-text-u3-m3', text: 'accepted without persistence', status: 'claimed', owner: process.pid };
@@ -355,6 +411,16 @@ await runtime.session.reload();
 const lockCount = userTexts(runtime.session.sessionManager).length;
 await new Promise((resolve) => setTimeout(resolve, 100));
 assert.equal(userTexts(runtime.session.sessionManager).length, lockCount, 'non-primary runtime admitted Telegram input');
+faux.appendResponses([
+  (context) => {
+    const user = context.messages.findLast((message) => message.role === 'user');
+    assert.equal(user.content.map((part) => part.text || '').join(''), 'ordinary non-primary terminal');
+    return fauxAssistantMessage('ordinary non-primary answer');
+  },
+]);
+const nonPrimaryDeliveries = Object.keys(state().deliveries).length;
+await runtime.session.prompt('ordinary non-primary terminal', { source: 'interactive' });
+assert.equal(Object.keys(state().deliveries).length, nonPrimaryDeliveries, 'non-primary terminal turn was mirrored');
 
 await runtime.dispose();
 

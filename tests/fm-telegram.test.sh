@@ -232,6 +232,25 @@ for index in range(260):
                'status': ('pending' if index % 2 else 'sent'),
                'created_at': int(time.time()), 'chunks': []},
               open(os.path.join(delivery_root, delivery_id + '.json'), 'w'))
+protector = subprocess.Popen(['sleep', '30'])
+try:
+    fields = Path(f'/proc/{protector.pid}/stat').read_text().rsplit(')', 1)[1].split()
+    protector_identity = f'proc:{protector.pid}:{fields[19]}'
+except OSError:
+    started = subprocess.run(
+        ['ps', '-o', 'lstart=', '-p', str(protector.pid)], text=True, capture_output=True,
+    ).stdout.strip()
+    protector_identity = f'ps:{protector.pid}:{started}'
+protected_id = 'retained-live-pending'
+protected_text = 'protected pending delivery'
+open(os.path.join(delivery_root, protected_id + '.txt'), 'w').write(protected_text)
+json.dump({
+    'delivery_id': protected_id,
+    'sha256': __import__('hashlib').sha256(protected_text.encode()).hexdigest(),
+    'status': 'pending', 'created_at': 1, 'chunks': [],
+    'delivery_owner_pid': protector.pid,
+    'delivery_owner_identity': protector_identity,
+}, open(os.path.join(delivery_root, protected_id + '.json'), 'w'))
 unknown_path = os.path.join(home, 'unknown-reply.txt')
 open(unknown_path, 'w').write('You · Terminal\n\nuncertain')
 unknown = run('mirror-reply', 'delivery-unknown',
@@ -239,6 +258,8 @@ unknown = run('mirror-reply', 'delivery-unknown',
 assert unknown.returncode == 3, unknown.stderr
 again = run('mirror-reply', 'delivery-unknown', '--text-file', unknown_path)
 assert again.returncode == 3, again.stderr
+assert os.path.exists(os.path.join(delivery_root, protected_id + '.json'))
+protector.terminate(); protector.wait()
 assert len([name for name in os.listdir(delivery_root) if name.endswith('.json')]) <= 256
 PY
 base="http://127.0.0.1:$(cat "$home/port")"

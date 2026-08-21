@@ -877,8 +877,7 @@ def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> bool
         delivery_pid = record.get("delivery_owner_pid")
         delivery_identity = record.get("delivery_owner_identity")
         protected = bool(
-            record.get("status") == "sending"
-            and strict_int(delivery_pid)
+            strict_int(delivery_pid)
             and isinstance(delivery_identity, str)
             and process_identity(delivery_pid) == delivery_identity
         )
@@ -1496,6 +1495,10 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -
     body_path = root / f"{delivery_id}.txt"
     metadata_path = root / f"{delivery_id}.json"
     digest = hashlib.sha256(body).hexdigest()
+    delivery_pid = os.getpid()
+    delivery_identity = process_identity(delivery_pid)
+    if delivery_identity is None:
+        return die("Telegram delivery process identity is unavailable")
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
         existing = read_json(metadata_path)
@@ -1509,30 +1512,17 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -
             record = existing
             if not isinstance(record.get("chunks"), list):
                 record["chunks"] = chunks
-        else:
-            if not cleanup_mirror_deliveries_locked(home, reserve_slots=1):
-                return die("Telegram delivery journal has no bounded free slot")
-            atomic_bytes(body_path, body)
-            record = {"delivery_id": delivery_id, "sha256": digest, "status": "pending",
-                      "created_at": now(), "chunks": chunks}
-            atomic_json(metadata_path, record)
-        config = load_config(home)
-        chat_id = int(config["chat_id"])
-    while True:
-        with FileLock(state_lock(home)):
-            record = read_json(metadata_path)
-            if not isinstance(record, dict) or record.get("sha256") != digest:
-                return die("Telegram delivery record changed during delivery")
-            current_chunks = record.get("chunks")
-            if not isinstance(current_chunks, list):
-                return die("Telegram delivery record is malformed")
-            if any(chunk.get("telegram_status") == "sending" for chunk in current_chunks):
-                delivery_pid = record.get("delivery_owner_pid")
-                delivery_identity = record.get("delivery_owner_identity")
-                if (strict_int(delivery_pid) and isinstance(delivery_identity, str)
-                        and process_identity(delivery_pid) == delivery_identity):
-                    return die("Telegram delivery is already in flight")
-                for chunk in current_chunks:
+            previous_pid = record.get("delivery_owner_pid")
+            previous_identity = record.get("delivery_owner_identity")
+            previous_owner_live = bool(
+                strict_int(previous_pid)
+                and isinstance(previous_identity, str)
+                and process_identity(previous_pid) == previous_identity
+            )
+            if previous_owner_live:
+                return die("Telegram delivery is already in flight")
+            if any(chunk.get("telegram_status") == "sending" for chunk in record["chunks"]):
+                for chunk in record["chunks"]:
                     if chunk.get("telegram_status") == "sending":
                         chunk["telegram_status"] = "delivery_unknown"
                 record["status"] = "delivery_unknown"
@@ -1540,59 +1530,87 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -
                 record.pop("delivery_owner_identity", None)
                 atomic_json(metadata_path, record)
                 return DELIVERY_UNKNOWN_EXIT
-            index = next((position for position, chunk in enumerate(current_chunks)
-                          if chunk.get("telegram_status") in {"pending", "rejected"}), None)
-            if index is None:
-                record["status"] = aggregate_response_delivery(current_chunks)
-                atomic_json(metadata_path, record)
-                return 0 if record["status"] == "sent" else DELIVERY_UNKNOWN_EXIT
-            chunk = current_chunks[index]
-            attempts = chunk.get("telegram_attempts", 0)
-            if not strict_int(attempts) or attempts < 0:
-                return die("Telegram delivery record is malformed")
-            if attempts >= MAX_MIRROR_DELIVERY_ATTEMPTS:
-                record["status"] = "rejected"
-                atomic_json(metadata_path, record)
-                return 1
-            chunk["telegram_attempts"] = attempts + 1
-            chunk["telegram_status"] = "sending"
-            chunk["telegram_attempted_at"] = now()
-            record["status"] = "sending"
-            record["delivery_owner_pid"] = os.getpid()
-            record["delivery_owner_identity"] = process_identity(os.getpid())
-            atomic_json(metadata_path, record)
-            start = chunk.get("start")
-            end = chunk.get("end")
-            if not strict_int(start) or not strict_int(end) or start < 0 or end <= start:
-                return die("Telegram delivery record is malformed")
-            chunk_text = body[start:end].decode("utf-8")
-        try:
-            send_text(home, chat_id, chunk_text)
-        except TelegramError as exc:
+        else:
+            if not cleanup_mirror_deliveries_locked(home, reserve_slots=1):
+                return die("Telegram delivery journal has no bounded free slot")
+            atomic_bytes(body_path, body)
+            record = {"delivery_id": delivery_id, "sha256": digest, "status": "pending",
+                      "created_at": now(), "chunks": chunks}
+        record["delivery_owner_pid"] = delivery_pid
+        record["delivery_owner_identity"] = delivery_identity
+        atomic_json(metadata_path, record)
+        config = load_config(home)
+        chat_id = int(config["chat_id"])
+    try:
+        while True:
             with FileLock(state_lock(home)):
                 record = read_json(metadata_path)
-                if isinstance(record, dict) and isinstance(record.get("chunks"), list):
-                    chunk = record["chunks"][index]
-                    chunk["telegram_status"] = "delivery_unknown" if exc.delivery_unknown else "rejected"
-                    record["status"] = aggregate_response_delivery(record["chunks"])
-                    record.pop("delivery_owner_pid", None)
-                    record.pop("delivery_owner_identity", None)
+                if (not isinstance(record, dict) or record.get("sha256") != digest
+                        or record.get("delivery_owner_pid") != delivery_pid
+                        or record.get("delivery_owner_identity") != delivery_identity):
+                    return die("Telegram delivery record changed during delivery")
+                current_chunks = record.get("chunks")
+                if not isinstance(current_chunks, list):
+                    return die("Telegram delivery record is malformed")
+                index = next((position for position, chunk in enumerate(current_chunks)
+                              if chunk.get("telegram_status") in {"pending", "rejected"}), None)
+                if index is None:
+                    record["status"] = aggregate_response_delivery(current_chunks)
                     atomic_json(metadata_path, record)
-            if exc.delivery_unknown:
-                return DELIVERY_UNKNOWN_EXIT
-            if attempts + 1 >= MAX_MIRROR_DELIVERY_ATTEMPTS:
-                return 1
-            continue
+                    return 0 if record["status"] == "sent" else DELIVERY_UNKNOWN_EXIT
+                chunk = current_chunks[index]
+                attempts = chunk.get("telegram_attempts", 0)
+                if not strict_int(attempts) or attempts < 0:
+                    return die("Telegram delivery record is malformed")
+                if attempts >= MAX_MIRROR_DELIVERY_ATTEMPTS:
+                    record["status"] = "rejected"
+                    atomic_json(metadata_path, record)
+                    return 1
+                chunk["telegram_attempts"] = attempts + 1
+                chunk["telegram_status"] = "sending"
+                chunk["telegram_attempted_at"] = now()
+                record["status"] = "sending"
+                atomic_json(metadata_path, record)
+                start = chunk.get("start")
+                end = chunk.get("end")
+                if not strict_int(start) or not strict_int(end) or start < 0 or end <= start:
+                    return die("Telegram delivery record is malformed")
+                chunk_text = body[start:end].decode("utf-8")
+            try:
+                send_text(home, chat_id, chunk_text)
+            except TelegramError as exc:
+                with FileLock(state_lock(home)):
+                    record = read_json(metadata_path)
+                    if isinstance(record, dict) and isinstance(record.get("chunks"), list):
+                        chunk = record["chunks"][index]
+                        chunk["telegram_status"] = ("delivery_unknown"
+                                                    if exc.delivery_unknown else "rejected")
+                        record["status"] = aggregate_response_delivery(record["chunks"])
+                        atomic_json(metadata_path, record)
+                if exc.delivery_unknown:
+                    return DELIVERY_UNKNOWN_EXIT
+                if attempts + 1 >= MAX_MIRROR_DELIVERY_ATTEMPTS:
+                    return 1
+                continue
+            with FileLock(state_lock(home)):
+                record = read_json(metadata_path)
+                if (not isinstance(record, dict) or not isinstance(record.get("chunks"), list)
+                        or record.get("delivery_owner_pid") != delivery_pid
+                        or record.get("delivery_owner_identity") != delivery_identity):
+                    return die("Telegram delivery record changed during delivery")
+                record["chunks"][index]["telegram_status"] = "sent"
+                record["chunks"][index]["telegram_sent_at"] = now()
+                record["status"] = aggregate_response_delivery(record["chunks"])
+                atomic_json(metadata_path, record)
+    finally:
         with FileLock(state_lock(home)):
             record = read_json(metadata_path)
-            if not isinstance(record, dict) or not isinstance(record.get("chunks"), list):
-                return die("Telegram delivery record changed during delivery")
-            record["chunks"][index]["telegram_status"] = "sent"
-            record["chunks"][index]["telegram_sent_at"] = now()
-            record["status"] = aggregate_response_delivery(record["chunks"])
-            record.pop("delivery_owner_pid", None)
-            record.pop("delivery_owner_identity", None)
-            atomic_json(metadata_path, record)
+            if (isinstance(record, dict)
+                    and record.get("delivery_owner_pid") == delivery_pid
+                    and record.get("delivery_owner_identity") == delivery_identity):
+                record.pop("delivery_owner_pid", None)
+                record.pop("delivery_owner_identity", None)
+                atomic_json(metadata_path, record)
 
 
 def mirror_complete(home: Path, request_id: str, delivery_id: str, owner_pid: int) -> int:

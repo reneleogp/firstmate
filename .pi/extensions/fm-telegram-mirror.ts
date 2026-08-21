@@ -19,6 +19,8 @@ type AdmissionData = {
 };
 type SessionEntry = {
   type?: string;
+  id?: string;
+  parentId?: string | null;
   customType?: string;
   data?: AdmissionData;
   message?: AssistantMessage;
@@ -26,13 +28,13 @@ type SessionEntry = {
 type PendingAdmission = {
   requestId: string;
   turnId: string;
-  inputSeen: boolean;
   accepted: boolean;
+  queuedInput: boolean;
   timer?: ReturnType<typeof setTimeout>;
 };
 type InputSegment =
   | { origin: "telegram"; pending: PendingAdmission }
-  | { origin: "terminal"; turnId: string; mirrored: boolean }
+  | { origin: "terminal"; turnId: string; text: string }
   | { origin: "excluded" };
 type SettledTurn = {
   origin: Origin;
@@ -99,13 +101,30 @@ function safeIdentity(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 160);
 }
 
+function activeBranch(entries: SessionEntry[]): SessionEntry[] {
+  const byId = new Map(entries
+    .filter((entry): entry is SessionEntry & { id: string } => typeof entry.id === "string")
+    .map((entry) => [entry.id, entry]));
+  let current = [...entries].reverse().find((entry) => typeof entry.id === "string");
+  if (!current) return entries;
+  const branch: SessionEntry[] = [];
+  const seen = new Set<string>();
+  while (current?.id && !seen.has(current.id)) {
+    branch.push(current);
+    seen.add(current.id);
+    current = typeof current.parentId === "string" ? byId.get(current.parentId) : undefined;
+  }
+  return branch.reverse();
+}
+
 function entriesFromFile(path: string | undefined): SessionEntry[] {
   if (!path) return [];
   try {
-    return readFileSync(path, "utf8")
+    const entries = readFileSync(path, "utf8")
       .split("\n")
       .filter(Boolean)
       .map((line) => JSON.parse(line) as SessionEntry);
+    return activeBranch(entries);
   } catch {
     return [];
   }
@@ -131,15 +150,22 @@ function unresolvedAdmission(entries: SessionEntry[]): {
     .sort((left, right) => right[1].index - left[1].index)[0];
   if (!unresolved) return undefined;
   const [requestId, value] = unresolved;
+  let userSeen = false;
   let assistantBody = "";
   for (const entry of entries.slice(value.index + 1)) {
     const message = entry.message;
-    if (entry.type !== "message" || message?.role !== "assistant" ||
+    if (entry.type !== "message" || !message?.role) continue;
+    if (message.role === "user") {
+      if (userSeen) break;
+      userSeen = true;
+      continue;
+    }
+    if (!userSeen || message.role !== "assistant" ||
         !["stop", "length"].includes(message.stopReason || "")) continue;
     const body = textOf(message);
     if (body) assistantBody = body;
   }
-  return { requestId, turnId: value.turnId, assistantBody };
+  return userSeen ? { requestId, turnId: value.turnId, assistantBody } : undefined;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -309,24 +335,23 @@ export default function (pi: ExtensionAPI) {
   };
 
   const holdInterrupted = (ctx: ExtensionContext): void => {
-    if (activeRequest && activeTurnId) {
-      if (!suspended) {
-        appendAdmission(
-          activeRequest,
-          activeTurnId,
-          ctx.sessionManager.getSessionId?.() || "session",
-          "interrupted",
-        );
-      }
-      suspended = true;
-      lastAssistantBody = "";
-      return;
+    if (activeRequest && activeTurnId && !suspended) {
+      appendAdmission(
+        activeRequest,
+        activeTurnId,
+        ctx.sessionManager.getSessionId?.() || "session",
+        "interrupted",
+      );
     }
     resetTurn();
   };
 
   const releasePending = async (ctx: ExtensionContext, pending: PendingAdmission): Promise<void> => {
     if (pendingAdmission !== pending || pending.accepted) return;
+    if (pending.queuedInput && ctx.hasPendingMessages()) {
+      pending.timer = setTimeout(() => void releasePending(ctx, pending), admissionTimeoutMs);
+      return;
+    }
     const startedGeneration = generation;
     pendingAdmission = undefined;
     awaitingInjectedInput = false;
@@ -354,7 +379,8 @@ export default function (pi: ExtensionAPI) {
     }
     if (segment.origin === "excluded") return;
     if (segment.origin === "terminal") {
-      if (!segment.mirrored) return;
+      const result = await deliver(`user-${segment.turnId}`, `You · Terminal\n\n${segment.text}`, ctx);
+      if (result.code !== 0) return;
       active = true;
       activeOrigin = "terminal";
       activeTurnId = segment.turnId;
@@ -364,7 +390,8 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const pending = segment.pending;
-    if (!pending.accepted || pendingAdmission !== pending) return;
+    if (pendingAdmission !== pending) return;
+    pending.accepted = true;
     if (pending.timer) clearTimeout(pending.timer);
     appendAdmission(
       pending.requestId,
@@ -406,8 +433,8 @@ export default function (pi: ExtensionAPI) {
       const pending: PendingAdmission = {
         requestId,
         turnId: `telegram-${safeIdentity(requestId)}-${randomUUID()}`,
-        inputSeen: false,
         accepted: false,
+        queuedInput: false,
       };
       pendingAdmission = pending;
       awaitingInjectedInput = true;
@@ -464,7 +491,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     transportOpen = true;
-    const currentEntries = ctx.sessionManager.getEntries?.() as SessionEntry[] | undefined;
+    const currentEntries = ctx.sessionManager.getBranch?.() as SessionEntry[] | undefined;
     const previousEntries = entriesFromFile(event.previousSessionFile);
     const provenance = unresolvedAdmission(currentEntries || []) || unresolvedAdmission(previousEntries);
     const reconcileArgs = ["mirror-reconcile"];
@@ -479,6 +506,7 @@ export default function (pi: ExtensionAPI) {
       suspended = !lastAssistantBody;
       await exec(["mirror-delivered", provenance.requestId]);
       if (lastAssistantBody) void settle(ctx);
+      else holdInterrupted(ctx);
     }
     await updateFooter(ctx);
     scanTimer = setInterval(() => void drain(ctx), 750);
@@ -498,38 +526,24 @@ export default function (pi: ExtensionAPI) {
     resetTurn();
   });
 
-  pi.on("input", async (event, ctx) => {
+  pi.on("input", (event) => {
     if (event.source === "interactive" && event.text && !event.text.startsWith("/")) {
-      const turnId = `terminal-${randomUUID()}`;
-      const mirrored = transportOpen && ownsHomeLock() && mode() === "on";
-      let delivered = false;
-      if (mirrored) {
-        const result = await deliver(`user-${turnId}`, `You · Terminal\n\n${event.text}`, ctx);
-        delivered = result.code === 0;
+      if (!transportOpen || !ownsHomeLock() || mode() !== "on") {
+        return { action: "continue" as const };
       }
-      inputSegments.push({ origin: "terminal", turnId, mirrored: delivered });
+      const turnId = `terminal-${randomUUID()}`;
+      inputSegments.push({ origin: "terminal", turnId, text: event.text });
       return { action: "transform" as const, text: `You · Terminal\n\n${event.text}` };
     }
     if (event.source === "extension" && awaitingInjectedInput && pendingAdmission) {
       const pending = pendingAdmission;
       awaitingInjectedInput = false;
-      pending.inputSeen = true;
-      if (event.streamingBehavior) {
-        pending.accepted = true;
-        if (pending.timer) clearTimeout(pending.timer);
-      }
+      pending.queuedInput = event.streamingBehavior === "followUp";
       inputSegments.push({ origin: "telegram", pending });
       return { action: "transform" as const, text: `You · Telegram\n\n${event.text}` };
     }
     inputSegments.push({ origin: "excluded" });
     return { action: "continue" as const };
-  });
-
-  pi.on("before_agent_start", () => {
-    const pending = pendingAdmission;
-    if (!pending?.inputSeen) return;
-    pending.accepted = true;
-    if (pending.timer) clearTimeout(pending.timer);
   });
 
   pi.on("message_start", async (event, ctx) => {
