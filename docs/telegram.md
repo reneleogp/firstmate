@@ -53,11 +53,13 @@ Turn mode off whenever content should remain local.
 
 ## Delivery states
 
-`Bot · Queued for Firstmate.` means the authenticated request is durably queued.
-`Pi · Delivered to Firstmate.` means the lock-owning Pi extension accepted it through `sendUserMessage()`.
-`Bot · Transcribing…` is sent only when that exact voice note starts local transcription.
+`Bot · Queued for Firstmate.` means the authenticated request is durably queued and replies to the exact inbound message that created it.
+`Pi · Delivered to Firstmate.` means the lock-owning Pi extension accepted it through `sendUserMessage()` and replies to that request's source message.
+`Bot · Voice note queued.` and `Bot · Transcribing…` retain the original voice-note message as their native Telegram reply target, including when several notes are waiting.
+The first `Firstmate ·` response replies to its source request, and subsequent chunks form a bounded reply chain when Telegram returns stable outbound message IDs.
+Every target is validated against the pinned private chat, and a deleted target falls back first to the exact triggering inbound message and then to an unthreaded send so content is not lost.
 These statuses are zero-token transport messages and do not enter the conversation.
-Stable request, session, and delivery identities prevent ordinary duplicate injection and delivery outside the accepted crash boundary below.
+Stable request, session, delivery, and bounded reply-journal identities prevent ordinary duplicate injection and delivery outside the accepted crash boundary below.
 A successful Telegram-origin request moves to bounded handled state only after every Unicode-safe chunk of its assistant response is definitively sent.
 An oversized, malformed, or definitely rejected Telegram-origin response is instead abandoned without another model turn; a retryable or delivery-unknown response remains blocked for explicit recovery.
 Definite Telegram rejection is retried at most three times, while delivery-unknown chunks are not resent or marked complete automatically.
@@ -76,6 +78,16 @@ If Pi or its host crashes after `sendUserMessage()` acceptance but before durabl
 No cross-store exactly-once protocol is added to remove this accepted anomaly.
 The Bot API delivery-unknown window can also repeat a transport message after Telegram accepted it but before local delivery state settled.
 
+## Voice confirmation
+
+Voice confirmation controls are revision-bound and are removed or replaced as soon as an action starts.
+Send shows `Sent to Firstmate` only after the transcript is durably admitted, while Cancel shows `Cancelled` and removes temporary audio and pending state.
+Edit shows `Editing transcript…`, offers Telegram's `copy_text` button when supported, and sends a `ForceReply` prompt with the placeholder `Paste and edit the transcript`.
+The bot cannot prefill the ordinary Telegram composer, so it does not add a Web App or inline-mode subsystem.
+If a client does not support `copy_text`, the transcript remains available as copyable fallback text alongside the ForceReply prompt.
+Retry shows `Retrying with Whisper…` and either presents fresh revision-bound controls or a recoverable failure state.
+Only a reply to the active ForceReply prompt is accepted as corrected text, and stale or duplicate revisions never enqueue unconfirmed text.
+
 ## Voice and retention
 
 Only authenticated private text and voice notes are accepted.
@@ -92,6 +104,6 @@ The one-time mirror migration removes obsolete routed conversation and response-
 Every primary session start and bounded extension reconciliation also retires obsolete Telegram wake rows without reading Telegram request bodies.
 If session-start wake migration fails, the effective wake queue remains undrained so an obsolete Telegram wake cannot be presented as model work.
 There is no permanent fallback route or AI-facing Telegram response choreography.
-Native reply and status UX is reserved for issue 6.
+Native reply and status UX is implemented by the bounded Python transport and is covered by the fake-Telegram verification below.
 macOS support is reserved for issue 4.
 One-primary auto-start is reserved for issue 7.

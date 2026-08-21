@@ -48,6 +48,14 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps({'ok': False, 'error_code': 400}).encode()
             self.send_response(200); self.send_header('Content-Length', str(len(body)))
             self.end_headers(); self.wfile.write(body); return
+        if method == 'sendMessage':
+            next_id = int((home / 'next-message-id').read_text()) if (home / 'next-message-id').exists() else 1000
+            (home / 'next-message-id').write_text(str(next_id + 1))
+            return self.reply({'message_id': next_id, 'chat': {'id': params.get('chat_id')}})
+        if method in {'editMessageText', 'editMessageReplyMarkup'}:
+            return self.reply({'message_id': params.get('message_id'), 'chat': {'id': params.get('chat_id')}})
+        if method == 'answerCallbackQuery':
+            return self.reply(True)
         return self.reply({})
     def do_GET(self):
         if '/file/' in self.path:
@@ -84,8 +92,9 @@ run_tg "$home" serve --once >/dev/null
 python3 - "$home/calls.jsonl" <<'PY'
 import json, sys
 calls = [json.loads(line) for line in open(sys.argv[1])]
-sent = [x['params']['text'] for x in calls if x['path'].endswith('/sendMessage')]
-assert sent[-1].startswith('Bot · Telegram mirror mode is off')
+sent = [x for x in calls if x['path'].endswith('/sendMessage')]
+assert sent[-1]['params']['text'].startswith('Bot · Telegram mirror mode is off')
+assert sent[-1]['params']['reply_parameters'] == {'message_id': 1}
 PY
 
 # Exact bot command works without a model and enables the private preference.
@@ -107,8 +116,9 @@ PY
 python3 - "$home/calls.jsonl" <<'PY'
 import json, sys
 calls = [json.loads(line) for line in open(sys.argv[1])]
-sent = [x['params']['text'] for x in calls if x['path'].endswith('/sendMessage')]
-assert 'Bot · Queued for Firstmate.' in sent
+sent = [x for x in calls if x['path'].endswith('/sendMessage')]
+queued = [x for x in sent if x['params']['text'] == 'Bot · Queued for Firstmate.'][-1]
+assert queued['params']['reply_parameters'] == {'message_id': 3}
 PY
 
 # Replayed Bot API delivery is deduplicated by update/message identity.
@@ -469,6 +479,8 @@ chunks = [call['params']['text'] for call in calls if call['path'].endswith('/se
 assert len(chunks) == 3
 assert ''.join(chunks[1:]) == body
 assert all(len(chunk.encode('utf-16-le')) // 2 <= 4096 for chunk in chunks)
+chunk_calls = [call for call in calls if call['path'].endswith('/sendMessage') and call['params'].get('text') != fallback and call['params'].get('text', '').startswith(('Firstmate · ', '😀'))]
+assert any(call['params'].get('reply_parameters') == {'message_id': 3} for call in chunk_calls), chunk_calls
 PY
 
 # Every bounded reconciliation consumes legacy Telegram wakes, including rows published after migration.
