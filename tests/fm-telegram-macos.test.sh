@@ -211,7 +211,7 @@ JSON
 
 start_server() {
   local home=$1
-  "$PYTHON" - "$home" <<'PY' &
+  "$PYTHON" -u - "$home" >"$home/server.log" 2>&1 <<'PY' &
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -232,7 +232,7 @@ server = HTTPServer(('127.0.0.1', 0), Handler)
 PY
   SERVER_PID=$!
   for _ in $(seq 1 200); do [ -s "$home/port" ] && return; sleep .05; done
-  fail "fake Telegram server did not start"
+  fail "fake Telegram server did not start: $(cat "$home/server.log" 2>/dev/null || true)"
 }
 
 SERVER_PID=
