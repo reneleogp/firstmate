@@ -1128,7 +1128,11 @@ faux.appendResponses([
   fauxAssistantMessage([
     fauxToolCall('mirror_test_tool', {}, { id: 'mirror-carried-mode-off-root-tool' }),
   ], { stopReason: 'toolUse' }),
-  async () => {
+  async (context) => {
+    assert.match(context.systemPrompt + JSON.stringify(context.messages),
+      /conversation segment originated from the authenticated Telegram mirror/);
+    assert.match(context.systemPrompt + JSON.stringify(context.messages),
+      /terminal steer authorizes only the concrete action it explicitly confirms/);
     while (globalThis.__telegramMirrorHoldProvider) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -1448,7 +1452,10 @@ const holdsBeforeFailure = state().log.filter((call) => call[0] === 'mirror-hold
 faux.appendResponses([
   fauxAssistantMessage([], { stopReason: 'error', errorMessage: 'provider failed before hold transition' }),
 ]);
-await waitFor(() => state().abandoned?.some(([id]) => id === 'tg-text-u30-m30'),
+await waitFor(() => state().abandoned?.some(([id]) => id === 'tg-text-u30-m30') &&
+  initialManager.getEntries().some((entry) =>
+    entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission' &&
+      entry.data.requestId === 'tg-text-u30-m30' && entry.data.state === 'abandoned'),
   'persistent hold failure did not reach a bounded non-requeue outcome');
 unlinkSync(`${home}/reject-mirror-hold`);
 const boundedHoldAttempts = state().log.filter((call) => call[0] === 'mirror-hold').length - holdsBeforeFailure;
@@ -1584,6 +1591,12 @@ initialManager.appendMessage({
 });
 initialManager.appendMessage(fauxAssistantMessage('later operational answer'));
 const previousFile = initialManager.getSessionFile();
+writeFileSync(`${home}/reject-mirror-abandon`, '');
+const extraRecoveryAbandonsBefore = state().log.filter((call) =>
+  call[0] === 'mirror-abandon' && call[1] === 'tg-text-stale-current').length;
+const extraRecoveryCallsBefore = faux.state.callCount;
+const fatalNoticesBeforeExtraRecovery = notices.filter(([message]) =>
+  message === 'Telegram mirror state storage is unavailable; restore it and restart Pi before continuing.').length;
 await runtime.newSession({
   parentSession: previousFile,
   setup: async (manager) => {
@@ -1595,7 +1608,6 @@ await runtime.newSession({
       role: 'user', content: [{ type: 'text', text: 'You · Telegram\n\nstale current admission' }],
       timestamp: Date.now(),
     });
-    manager.appendMessage(fauxAssistantMessage('stale current answer'));
   },
 });
 await waitFor(() => state().handled?.includes('tg-text-u2-m2'), 'session replacement did not reconcile persisted admission provenance');
@@ -1604,11 +1616,80 @@ assert.equal(userTexts(runtime.session.sessionManager)
 'session replacement reinjected represented Telegram input');
 assert.equal(Object.values(state().deliveries).filter((body) => body === 'Firstmate · replacement answer').length, 1);
 assert.equal(Object.values(state().deliveries).some((body) => body.includes('later operational answer')), false);
-assert.equal(state().abandoned?.some(([id]) => id === 'tg-text-stale-current'), true,
-  'additional represented admission was not abandoned without reinjection');
+await waitFor(() => state().log.filter((call) =>
+  call[0] === 'mirror-abandon' && call[1] === 'tg-text-stale-current').length -
+  extraRecoveryAbandonsBefore === 3,
+'failed extra startup abandonment did not exhaust its bounded retry budget');
+await new Promise((resolve) => setTimeout(resolve, 700));
+assert.equal(state().log.filter((call) =>
+  call[0] === 'mirror-abandon' && call[1] === 'tg-text-stale-current').length -
+  extraRecoveryAbandonsBefore, 3,
+  'failed extra startup abandonment kept retrying');
+assert.equal(state().represented_requests['tg-text-stale-current']?.status, 'claimed',
+  'failed extra startup abandonment discarded its recovery evidence');
+assert.equal(statuses.at(-1)?.[1], 'telegram: state storage needs recovery');
+assert.equal(notices.filter(([message]) =>
+  message === 'Telegram mirror state storage is unavailable; restore it and restart Pi before continuing.').length,
+  fatalNoticesBeforeExtraRecovery + 1,
+  'failed extra startup abandonment did not enter the fatal storage boundary exactly once');
+assert.equal(faux.state.callCount, extraRecoveryCallsBefore,
+  'failed extra startup abandonment ran another model turn');
 assert.equal(userTexts(runtime.session.sessionManager)
   .some((text) => text.includes('stale current admission')), true,
   'current represented admission unexpectedly disappeared from persisted history');
+unlinkSync(`${home}/reject-mirror-abandon`);
+await runtime.session.reload();
+await waitFor(() => state().abandoned?.some(([id]) => id === 'tg-text-stale-current'),
+  'storage recovery did not abandon the extra represented admission');
+
+const primaryRecoveryRequestId = 'tg-text-startup-abandon-primary';
+const primaryRecoveryTurnId = 'telegram-startup-abandon-primary';
+const primaryRecoveryState = state();
+primaryRecoveryState.request = {
+  id: primaryRecoveryRequestId, text: 'persisted provider failure requiring startup abandonment',
+  status: 'claimed', owner: process.pid,
+};
+save(primaryRecoveryState);
+writeFileSync(`${home}/reject-mirror-abandon`, '');
+const primaryRecoveryAbandonsBefore = state().log.filter((call) =>
+  call[0] === 'mirror-abandon' && call[1] === primaryRecoveryRequestId).length;
+const primaryRecoveryCallsBefore = faux.state.callCount;
+const fatalNoticesBeforePrimaryRecovery = notices.filter(([message]) =>
+  message === 'Telegram mirror state storage is unavailable; restore it and restart Pi before continuing.').length;
+await runtime.newSession({
+  setup: async (manager) => {
+    manager.appendCustomEntry('firstmate-telegram-admission', {
+      requestId: primaryRecoveryRequestId, turnId: primaryRecoveryTurnId,
+      sessionId: manager.getSessionId(), state: 'admitted',
+    });
+    manager.appendMessage({
+      role: 'user', content: [{ type: 'text', text: 'You · Telegram\n\npersisted provider failure requiring startup abandonment' }],
+      timestamp: Date.now(),
+    });
+  },
+});
+await waitFor(() => state().log.filter((call) =>
+  call[0] === 'mirror-abandon' && call[1] === primaryRecoveryRequestId).length -
+  primaryRecoveryAbandonsBefore === 3,
+'failed primary startup abandonment did not exhaust its bounded retry budget');
+await new Promise((resolve) => setTimeout(resolve, 700));
+assert.equal(state().log.filter((call) =>
+  call[0] === 'mirror-abandon' && call[1] === primaryRecoveryRequestId).length -
+  primaryRecoveryAbandonsBefore, 3,
+  'failed primary startup abandonment kept retrying');
+assert.equal(state().request?.id, primaryRecoveryRequestId,
+  'failed primary startup abandonment discarded its recovery evidence');
+assert.equal(statuses.at(-1)?.[1], 'telegram: state storage needs recovery');
+assert.equal(notices.filter(([message]) =>
+  message === 'Telegram mirror state storage is unavailable; restore it and restart Pi before continuing.').length,
+  fatalNoticesBeforePrimaryRecovery + 1,
+  'failed primary startup abandonment did not enter the fatal storage boundary exactly once');
+assert.equal(faux.state.callCount, primaryRecoveryCallsBefore,
+  'failed primary startup abandonment ran another model turn');
+unlinkSync(`${home}/reject-mirror-abandon`);
+await runtime.session.reload();
+await waitFor(() => state().abandoned?.some(([id]) => id === primaryRecoveryRequestId),
+  'storage recovery did not abandon the primary represented admission');
 
 const receiptFailureManager = runtime.session.sessionManager;
 const receiptFailureRequestId = 'tg-text-u28-m28';
