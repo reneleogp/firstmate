@@ -888,7 +888,16 @@ def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> bool
             and isinstance(reservation_identity, str)
             and process_identity(reservation_pid) == reservation_identity
         )
-        protected = delivery_live or reservation_live
+        completion_request = record.get("completion_request_id")
+        completion_path = (request_path(home, completion_request)
+                           if isinstance(completion_request, str) else None)
+        completion_record = read_json(completion_path) if completion_path is not None else None
+        completion_pending = bool(
+            isinstance(completion_record, dict)
+            and completion_record.get("request_id") == completion_request
+            and completion_record.get("status") == "claimed"
+        )
+        protected = delivery_live or reservation_live or completion_pending
         if record.get("status") == "reserved" and not reservation_live:
             durable_unlink(metadata_path)
             durable_unlink(body_path)
@@ -1592,7 +1601,8 @@ def mirror_delivery_body(text_file: str) -> Tuple[bytes, List[Dict[str, Any]]]:
     return body, chunks
 
 
-def mirror_reserve(home: Path, delivery_id: str, owner_pid: int, text_file: str) -> int:
+def mirror_reserve(home: Path, delivery_id: str, owner_pid: int, text_file: str,
+                   accepted_input: bool = False) -> int:
     identity = claim_owner_identity(owner_pid)
     if identity is None:
         return die("Telegram mirror owner is not the invoking extension")
@@ -1608,7 +1618,7 @@ def mirror_reserve(home: Path, delivery_id: str, owner_pid: int, text_file: str)
     digest = hashlib.sha256(body).hexdigest()
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
-        if not mirror_mode_enabled(home):
+        if not accepted_input and not mirror_mode_enabled(home):
             return die("Telegram mirror mode is off")
         existing = read_json(metadata_path)
         if isinstance(existing, dict):
@@ -1655,10 +1665,12 @@ def mirror_cancel(home: Path, delivery_id: str, owner_pid: int) -> int:
     return 0
 
 
-def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -> int:
+def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str,
+                 request_id: Optional[str] = None) -> int:
     if not mirror_owner_is_child(owner_pid):
         return die("Telegram mirror owner is not the invoking extension")
-    if not safe_id(delivery_id) or len(delivery_id) > 160:
+    if (not safe_id(delivery_id) or len(delivery_id) > 160
+            or (request_id is not None and not safe_id(request_id))):
         return die("Telegram delivery identity is invalid")
     try:
         body, chunks = mirror_delivery_body(text_file)
@@ -1678,6 +1690,12 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -
         if isinstance(existing, dict):
             if existing.get("sha256") != digest:
                 return die("Telegram delivery identity is already bound to different content")
+            existing_request = existing.get("completion_request_id")
+            if request_id is not None and existing_request not in {None, request_id}:
+                return die("Telegram delivery identity is already bound to another request")
+            if request_id is not None and existing_request is None:
+                existing["completion_request_id"] = request_id
+                atomic_json(metadata_path, existing)
             if existing.get("status") == "sent":
                 return 0
             if existing.get("status") == "delivery_unknown":
@@ -1718,6 +1736,8 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -
             atomic_bytes(body_path, body)
             record = {"delivery_id": delivery_id, "sha256": digest, "status": "pending",
                       "created_at": now(), "chunks": chunks}
+        if request_id is not None:
+            record["completion_request_id"] = request_id
         record["delivery_owner_pid"] = delivery_pid
         record["delivery_owner_identity"] = delivery_identity
         atomic_json(metadata_path, record)
@@ -1814,7 +1834,8 @@ def mirror_complete(home: Path, request_id: str, delivery_id: str, owner_pid: in
                 or record.get("status") != "claimed" or not claim_owned_by(record, owner_pid)):
             return die("Telegram request is not owned by this extension")
         if (not isinstance(delivery, dict) or delivery.get("delivery_id") != delivery_id
-                or delivery.get("status") != "sent"):
+                or delivery.get("status") != "sent"
+                or delivery.get("completion_request_id") != request_id):
             return die("Telegram assistant delivery is not definitively settled")
         record["status"] = "handled"
         record["delivery_id"] = delivery_id
@@ -1823,6 +1844,8 @@ def mirror_complete(home: Path, request_id: str, delivery_id: str, owner_pid: in
         atomic_json(source, record)
         durable_replace(source, target)
         private_file(target)
+        delivery.pop("completion_request_id", None)
+        atomic_json(mirror_delivery_dir(home) / f"{delivery_id}.json", delivery)
     return 0
 
 
@@ -3299,6 +3322,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_private(reserve_parser)
     reserve_parser.add_argument("delivery_id")
     reserve_parser.add_argument("--text-file", required=True)
+    reserve_parser.add_argument("--accepted-input", action="store_true", help=argparse.SUPPRESS)
     cancel_parser = sub.add_parser("mirror-cancel", help="cancel one unaccepted terminal delivery reservation")
     add_private(cancel_parser)
     cancel_parser.add_argument("delivery_id")
@@ -3306,6 +3330,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_private(mirror_reply_parser)
     mirror_reply_parser.add_argument("delivery_id")
     mirror_reply_parser.add_argument("--text-file", required=True)
+    mirror_reply_parser.add_argument("--request-id", help=argparse.SUPPRESS)
     complete_parser = sub.add_parser("mirror-complete", help="complete a request after settled delivery")
     add_private(complete_parser)
     complete_parser.add_argument("request_id")
@@ -3365,11 +3390,15 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if args.command == "mirror-recover":
             return mirror_recover(home, args.request_id, args.owner_pid)
         if args.command == "mirror-reserve":
-            return mirror_reserve(home, args.delivery_id, args.owner_pid, args.text_file)
+            return mirror_reserve(
+                home, args.delivery_id, args.owner_pid, args.text_file, args.accepted_input
+            )
         if args.command == "mirror-cancel":
             return mirror_cancel(home, args.delivery_id, args.owner_pid)
         if args.command == "mirror-reply":
-            return mirror_reply(home, args.delivery_id, args.owner_pid, args.text_file)
+            return mirror_reply(
+                home, args.delivery_id, args.owner_pid, args.text_file, args.request_id
+            )
         if args.command == "mirror-complete":
             return mirror_complete(home, args.request_id, args.delivery_id, args.owner_pid)
         if args.command == "mirror-reconcile":

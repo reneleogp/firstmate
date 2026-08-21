@@ -118,7 +118,8 @@ elif command == 'mirror-recover':
 elif command == 'mirror-reserve':
     delivery_id = rest[0]
     body = sys.stdin.read() if option('--text-file') == '-' else Path(option('--text-file')).read_text()
-    if mode_path().read_text().strip() != 'on' or (home / 'reject-user-reserve').exists(): code = 1
+    if (mode_path().read_text().strip() != 'on' and '--accepted-input' not in rest): code = 1
+    elif (home / 'reject-user-reserve').exists(): code = 1
     elif delivery_id in state['reservations'] and state['reservations'][delivery_id] != body: code = 1
     elif delivery_id in state['deliveries'] and state['deliveries'][delivery_id] != body: code = 1
     else: state['reservations'][delivery_id] = body
@@ -360,15 +361,18 @@ assert.equal(userTexts(initialManager).filter((text) => text.includes('reconcile
 assert.equal(Object.values(state().deliveries).filter((body) => body === 'Firstmate · reconcile race answer').length, 1);
 
 writeFileSync(`${home}/reject-user-reserve`, '');
-const usersBeforeRejectedTerminal = userTexts(initialManager).length;
 const callsBeforeRejectedTerminal = faux.state.callCount;
+faux.appendResponses([fauxAssistantMessage('answer after accepted reservation block')]);
 await runtime.session.prompt('terminal reservation rejection', { source: 'interactive' });
-assert.equal(userTexts(initialManager).length, usersBeforeRejectedTerminal,
-  'terminal input entered Pi after its Telegram reservation was rejected');
-assert.equal(faux.state.callCount, callsBeforeRejectedTerminal,
-  'terminal reservation rejection started a model turn');
-assert.equal(notices.some(([message]) => message.includes('Pi turn was not started')), true);
+await waitFor(() => statuses.at(-1)?.[1] === 'telegram: delivery needs attention',
+  'accepted terminal reservation failure was not retained');
 unlinkSync(`${home}/reject-user-reserve`);
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await waitFor(() => Object.values(state().deliveries)
+  .some((body) => body === 'Firstmate · answer after accepted reservation block'),
+'accepted terminal reservation failure did not settle after retry');
+assert.equal(faux.state.callCount, callsBeforeRejectedTerminal + 1,
+  'terminal reservation recovery invoked another model turn');
 
 writeFileSync(`${home}/reject-user-reply`, '');
 faux.appendResponses([fauxAssistantMessage('answer after accepted user delivery block')]);
@@ -387,6 +391,34 @@ assert.equal(Object.values(state().deliveries)
 assert.equal(faux.state.callCount, callsAfterAcceptedUserBlock,
   'accepted terminal delivery retry invoked the model');
 
+writeFileSync(`${home}/reject-user-reply`, '');
+globalThis.__telegramMirrorDelayInteractiveInput = true;
+const callsBeforeQueuedUserBlock = faux.state.callCount;
+faux.appendResponses([
+  fauxAssistantMessage('queued user block A answer'),
+  fauxAssistantMessage('queued user block B answer'),
+]);
+const queuedUserBlockA = runtime.session.prompt('queued user block A', { source: 'interactive' });
+const queuedUserBlockB = runtime.session.prompt('queued user block B', {
+  source: 'interactive', streamingBehavior: 'followUp',
+});
+await Promise.all([queuedUserBlockA, queuedUserBlockB]);
+globalThis.__telegramMirrorDelayInteractiveInput = false;
+await waitFor(() => statuses.at(-1)?.[1] === 'telegram: delivery needs attention',
+  'queued terminal user delivery failure did not pause ordered settlement');
+unlinkSync(`${home}/reject-user-reply`);
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await waitFor(() => Object.values(state().deliveries)
+  .some((body) => body === 'Firstmate · queued user block B answer'),
+'queued terminal B did not settle after A user delivery recovered');
+const queuedBodies = Object.values(state().deliveries);
+assert.equal(queuedBodies.filter((body) => body === 'You · Terminal\n\nqueued user block A').length, 1);
+assert.equal(queuedBodies.filter((body) => body === 'Firstmate · queued user block A answer').length, 1);
+assert.equal(queuedBodies.filter((body) => body === 'You · Terminal\n\nqueued user block B').length, 1);
+assert.equal(queuedBodies.filter((body) => body === 'Firstmate · queued user block B answer').length, 1);
+assert.equal(faux.state.callCount, callsBeforeQueuedUserBlock + 2,
+  'queued terminal delivery recovery invoked another model turn');
+
 faux.appendResponses([
   (context) => {
     assert.doesNotMatch(context.systemPrompt, /authenticated Telegram mirror/);
@@ -402,21 +434,24 @@ assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstm
 
 const usersBeforeHandledTerminal = userTexts(initialManager).length;
 const callsBeforeHandledTerminal = faux.state.callCount;
+const reservationsBeforeHandledFlood = Object.keys(state().reservations).length;
 globalThis.__telegramMirrorHandleInteractiveInput = true;
-await runtime.session.prompt('handled terminal reservation', { source: 'interactive' });
+for (let index = 0; index < 260; index += 1) {
+  await runtime.session.prompt(`handled terminal candidate ${index}`, { source: 'interactive' });
+}
 globalThis.__telegramMirrorHandleInteractiveInput = false;
 assert.equal(userTexts(initialManager).length, usersBeforeHandledTerminal,
-  'later handler did not consume the reserved terminal input');
+  'later handler did not consume terminal inputs');
 assert.equal(faux.state.callCount, callsBeforeHandledTerminal,
-  'later-handler-consumed terminal input started a model turn');
+  'later-handler-consumed terminal inputs started a model turn');
+assert.equal(Object.keys(state().reservations).length, reservationsBeforeHandledFlood,
+  'consumed terminal inputs used bounded Python delivery capacity');
+faux.appendResponses([fauxAssistantMessage('valid turn after handled flood')]);
+await runtime.session.prompt('valid terminal after handled flood', { source: 'interactive' });
 assert.equal(Object.values(state().deliveries)
-  .some((body) => body === 'You · Terminal\n\nhandled terminal reservation'), false);
-assert.equal(Object.values(state().reservations)
-  .filter((body) => body === 'You · Terminal\n\nhandled terminal reservation').length, 1);
-await runtime.session.reload();
-await waitFor(() => Object.values(state().reservations)
-  .every((body) => body !== 'You · Terminal\n\nhandled terminal reservation'),
-'handled terminal reservation was not cancelled on lifecycle cleanup');
+  .filter((body) => body === 'You · Terminal\n\nvalid terminal after handled flood').length, 1);
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · valid turn after handled flood').length, 1);
 
 faux.appendResponses([fauxAssistantMessage('long preflight answer')]);
 globalThis.__telegramMirrorDelayInteractiveInput = true;
@@ -424,8 +459,8 @@ const callsBeforeLongPreflight = faux.state.callCount;
 const longPreflight = runtime.session.prompt('long preflight terminal', { source: 'interactive' });
 await new Promise((resolve) => setTimeout(resolve, 250));
 assert.equal(Object.values(state().reservations)
-  .filter((body) => body === 'You · Terminal\n\nlong preflight terminal').length, 1,
-  'long input preflight lost its bounded reservation');
+  .filter((body) => body === 'You · Terminal\n\nlong preflight terminal').length, 0,
+  'long input preflight reserved Python delivery capacity before acceptance');
 assert.equal(Object.values(state().deliveries)
   .some((body) => body === 'You · Terminal\n\nlong preflight terminal'), false,
   'terminal input was delivered before Pi accepted it');
@@ -723,7 +758,7 @@ faux.appendResponses([fauxAssistantMessage('blocked delivery answer')]);
 await waitFor(() => state().log.some((call) =>
   call[0] === 'mirror-reply' && call[1].startsWith('assistant-telegram-tg-text-u17-m17-')),
 'assistant delivery failure was not attempted');
-assert.equal(statuses.at(-1)?.[1], 'telegram: delivery needs attention',
+await waitFor(() => statuses.at(-1)?.[1] === 'telegram: delivery needs attention',
   'assistant delivery failure was not surfaced');
 const usersBeforeBlockedPrompt = userTexts(runtime.session.sessionManager).length;
 const callsBeforeBlockedPrompt = faux.state.callCount;

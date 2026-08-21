@@ -274,13 +274,42 @@ body = 'Firstmate · ' + ('😀' * 3000)
 body_path = os.path.join(home, 'long-reply.txt')
 open(body_path, 'w').write(body)
 open(os.path.join(home, 'reject-send'), 'w').close()
-first = run('mirror-reply', 'delivery-long', '--text-file', body_path)
+first = run('mirror-reply', 'delivery-long', '--request-id', request, '--text-file', body_path)
 assert first.returncode == 0, first.stderr
-second = run('mirror-reply', 'delivery-long', '--text-file', body_path)
+second = run('mirror-reply', 'delivery-long', '--request-id', request, '--text-file', body_path)
 assert second.returncode == 0, second.stderr
+delivery_root = os.path.join(home, 'state', 'telegram', 'deliveries')
+try:
+    owner_fields = Path(f'/proc/{owner}/stat').read_text().rsplit(')', 1)[1].split()
+    owner_identity = f'proc:{owner}:{owner_fields[19]}'
+except OSError:
+    owner_started = subprocess.run(
+        ['ps', '-o', 'lstart=', '-p', owner], text=True, capture_output=True,
+    ).stdout.strip()
+    owner_identity = f'ps:{owner}:{owner_started}'
+capacity_ids = []
+for index in range(255):
+    delivery_id = f'capacity-reservation-{index}'
+    capacity_ids.append(delivery_id)
+    text = f'capacity reservation {index}'
+    Path(delivery_root, delivery_id + '.txt').write_text(text)
+    Path(delivery_root, delivery_id + '.json').write_text(json.dumps({
+        'delivery_id': delivery_id,
+        'sha256': __import__('hashlib').sha256(text.encode()).hexdigest(),
+        'status': 'reserved', 'created_at': int(time.time()), 'chunks': [],
+        'reservation_owner_pid': int(owner),
+        'reservation_owner_identity': owner_identity,
+    }))
+capacity = run('mirror-reserve', 'capacity-overflow', '--text-file', terminal_path)
+assert capacity.returncode != 0 and 'no bounded free slot' in capacity.stderr
+assert Path(delivery_root, 'delivery-long.json').exists()
 complete = run('mirror-complete', request, 'delivery-long')
 assert complete.returncode == 0, complete.stderr
-delivery_root = os.path.join(home, 'state', 'telegram', 'deliveries')
+completed_delivery = json.loads(Path(delivery_root, 'delivery-long.json').read_text())
+assert 'completion_request_id' not in completed_delivery
+for delivery_id in capacity_ids:
+    Path(delivery_root, delivery_id + '.json').unlink()
+    Path(delivery_root, delivery_id + '.txt').unlink()
 for index in range(260):
     delivery_id = f'retained-{index}'
     text = f'retained {index}'

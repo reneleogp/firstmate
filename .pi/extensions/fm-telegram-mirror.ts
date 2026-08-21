@@ -3,7 +3,7 @@
 // This extension only admits one live Pi conversation turn and fans out its settled body.
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -43,10 +43,10 @@ type InputSegment =
   | { origin: "terminal"; turnId: string; text: string; deliveryId: string }
   | { origin: "excluded" };
 type InputCandidate = { segment: InputSegment };
-type BlockedTerminalDelivery = {
-  turnId: string;
+type TerminalDelivery = {
   deliveryId: string;
   body: string;
+  sent: boolean;
 };
 type HeldAdmission = { requestId: string; turnId: string };
 type SettledTurn = {
@@ -54,6 +54,7 @@ type SettledTurn = {
   request?: string;
   turnId: string;
   body: string;
+  terminalDelivery?: TerminalDelivery;
 };
 
 const extensionRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -106,14 +107,43 @@ function textOf(message: AssistantMessage): string {
     .join("\n");
 }
 
+function inputTextOf(message: AssistantMessage): string {
+  if (!Array.isArray(message.content)) return typeof message.content === "string" ? message.content : "";
+  return message.content
+    .filter((part): part is { type: "text"; text: string } =>
+      !!part && typeof part === "object" && (part as { type?: string }).type === "text" &&
+      typeof (part as { text?: unknown }).text === "string")
+    .map((part) => part.text)
+    .join("");
+}
+
 function safeIdentity(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 160);
 }
 
-const originMarkerPattern = /^\u2063firstmate-origin:([a-f0-9]{64})\u2063\n/;
+const originMarkerPattern = /^\u2063firstmate-origin:([a-f0-9]{128})\u2063\n/;
 
 function originMarkerToken(text: string): string | undefined {
   return originMarkerPattern.exec(text)?.[1];
+}
+
+function newOriginMarker(): string {
+  const nonce = randomBytes(32).toString("hex");
+  return nonce + createHmac("sha256", capability).update(nonce).digest("hex");
+}
+
+function validOriginMarker(token: string): boolean {
+  if (!/^[a-f0-9]{128}$/.test(token)) return false;
+  const nonce = token.slice(0, 64);
+  const supplied = Buffer.from(token.slice(64), "hex");
+  const expected = createHmac("sha256", capability).update(nonce).digest();
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
+
+function terminalText(text: string): string | undefined {
+  const stripped = stripOriginMarker(text);
+  const prefix = "You · Terminal\n\n";
+  return stripped.startsWith(prefix) ? stripped.slice(prefix.length) : undefined;
 }
 
 function markedInput(marker: string, label: Origin, text: string): string {
@@ -229,6 +259,7 @@ export default function (pi: ExtensionAPI) {
   let activeRequest: string | undefined;
   let activeTurnId: string | undefined;
   let suspended = false;
+  let activeTerminalDelivery: TerminalDelivery | undefined;
   let pendingAdmission: PendingAdmission | undefined;
   let heldAdmission: HeldAdmission | undefined;
   const inputCandidates = new Map<string, InputCandidate>();
@@ -241,8 +272,6 @@ export default function (pi: ExtensionAPI) {
   let reconcileRunning = false;
   let settleRunning = false;
   let deliveryBlocked = false;
-  let blockedTurn: SettledTurn | undefined;
-  let blockedTerminalDelivery: BlockedTerminalDelivery | undefined;
   let transportOpen = false;
   let mirrorMode: "on" | "off" = "off";
   let generation = 0;
@@ -305,6 +334,7 @@ export default function (pi: ExtensionAPI) {
     activeRequest = undefined;
     activeTurnId = undefined;
     suspended = false;
+    activeTerminalDelivery = undefined;
     lastAssistantBody = "";
   };
 
@@ -318,13 +348,21 @@ export default function (pi: ExtensionAPI) {
   };
 
   const reserve = async (deliveryId: string, body: string, ctx: ExtensionContext) =>
-    exec(["mirror-reserve", safeIdentity(deliveryId), "--text-file", "-"], ctx, body);
+    exec(["mirror-reserve", safeIdentity(deliveryId), "--accepted-input", "--text-file", "-"], ctx, body);
 
   const cancelReservation = async (deliveryId: string, ctx?: ExtensionContext) =>
     exec(["mirror-cancel", safeIdentity(deliveryId)], ctx);
 
-  const deliver = async (deliveryId: string, body: string, ctx: ExtensionContext) =>
-    exec(["mirror-reply", safeIdentity(deliveryId), "--text-file", "-"], ctx, body);
+  const deliver = async (
+    deliveryId: string,
+    body: string,
+    ctx: ExtensionContext,
+    requestId?: string,
+  ) => exec([
+    "mirror-reply", safeIdentity(deliveryId),
+    ...(requestId ? ["--request-id", requestId] : []),
+    "--text-file", "-",
+  ], ctx, body);
 
   const updateFooter = async (ctx: ExtensionContext, snapshot?: FooterSnapshot): Promise<void> => {
     const startedGeneration = generation;
@@ -351,7 +389,22 @@ export default function (pi: ExtensionAPI) {
   const deliverSettledTurn = async (turn: SettledTurn, ctx: ExtensionContext): Promise<boolean> => {
     const startedGeneration = generation;
     const deliveryId = safeIdentity(`assistant-${turn.turnId}`);
-    const result = await deliver(deliveryId, `Firstmate · ${turn.body}`, ctx);
+    if (turn.terminalDelivery && !turn.terminalDelivery.sent) {
+      const terminalResult = await deliver(
+        turn.terminalDelivery.deliveryId,
+        turn.terminalDelivery.body,
+        ctx,
+      );
+      if (startedGeneration !== generation) return false;
+      if (terminalResult.code !== 0) {
+        deliveryBlocked = true;
+        ctx.ui.notify("Telegram delivery needs attention; mirrored terminal input is paused.", "error");
+        await updateFooter(ctx);
+        return false;
+      }
+      turn.terminalDelivery.sent = true;
+    }
+    const result = await deliver(deliveryId, `Firstmate · ${turn.body}`, ctx, turn.request);
     if (startedGeneration !== generation) return false;
     if (result.code === 0 && turn.request) {
       const completed = await exec(["mirror-complete", turn.request, deliveryId], ctx);
@@ -368,32 +421,33 @@ export default function (pi: ExtensionAPI) {
     } else if (result.code === 0) {
       return true;
     }
-    blockedTurn = turn;
     deliveryBlocked = true;
     ctx.ui.notify("Telegram delivery needs attention; mirrored terminal input is paused.", "error");
     await updateFooter(ctx);
     return false;
   };
 
-  const retryBlockedDeliveries = async (ctx: ExtensionContext): Promise<boolean> => {
-    if (settleRunning || !ownsHomeLock()) return false;
-    if (!blockedTerminalDelivery && !blockedTurn) return true;
+  const queueActiveTurn = (): boolean => {
+    if (!active || suspended || !activeOrigin || !activeTurnId || !lastAssistantBody) return false;
+    settledTurns.push({
+      origin: activeOrigin,
+      request: activeRequest,
+      turnId: activeTurnId,
+      body: lastAssistantBody,
+      terminalDelivery: activeTerminalDelivery,
+    });
+    resetTurn();
+    return true;
+  };
+
+  const flushSettledTurns = async (ctx: ExtensionContext): Promise<boolean> => {
+    if (settleRunning || deliveryBlocked || !ownsHomeLock()) return false;
     settleRunning = true;
     try {
-      if (blockedTerminalDelivery) {
-        const pending = blockedTerminalDelivery;
-        const result = await deliver(pending.deliveryId, pending.body, ctx);
-        if (result.code !== 0) {
-          deliveryBlocked = true;
-          await updateFooter(ctx);
-          return false;
-        }
-        if (blockedTerminalDelivery === pending) blockedTerminalDelivery = undefined;
-      }
-      if (blockedTurn) {
-        const turn = blockedTurn;
+      while (settledTurns.length > 0) {
+        const turn = settledTurns[0];
         if (!await deliverSettledTurn(turn, ctx)) return false;
-        if (blockedTurn === turn) blockedTurn = undefined;
+        settledTurns.shift();
       }
       deliveryBlocked = false;
       await updateFooter(ctx);
@@ -404,45 +458,8 @@ export default function (pi: ExtensionAPI) {
   };
 
   const settle = async (ctx: ExtensionContext): Promise<void> => {
-    if (settleRunning || deliveryBlocked || !active || suspended || !activeOrigin ||
-        !activeTurnId || !lastAssistantBody || !ownsHomeLock()) return;
-    settleRunning = true;
-    try {
-      const turn = {
-        origin: activeOrigin,
-        request: activeRequest,
-        turnId: activeTurnId,
-        body: lastAssistantBody,
-      };
-      if (!await deliverSettledTurn(turn, ctx)) {
-        resetTurn();
-        return;
-      }
-      resetTurn();
-      deliveryBlocked = false;
-      await updateFooter(ctx);
-    } finally {
-      settleRunning = false;
-    }
-  };
-
-  const flushSettledTurns = async (ctx: ExtensionContext): Promise<boolean> => {
-    if (settleRunning || deliveryBlocked || !ownsHomeLock()) return false;
-    settleRunning = true;
-    try {
-      while (settledTurns.length > 0) {
-        const turn = settledTurns[0];
-        if (!await deliverSettledTurn(turn, ctx)) {
-          if (blockedTurn === turn) settledTurns.shift();
-          return false;
-        }
-        settledTurns.shift();
-      }
-      await updateFooter(ctx);
-      return true;
-    } finally {
-      settleRunning = false;
-    }
+    if (!ownsHomeLock() || !queueActiveTurn() || deliveryBlocked) return;
+    await flushSettledTurns(ctx);
   };
 
   const holdInterrupted = async (ctx: ExtensionContext): Promise<void> => {
@@ -476,18 +493,7 @@ export default function (pi: ExtensionAPI) {
 
   const transitionSegment = async (segment: InputSegment, ctx: ExtensionContext): Promise<void> => {
     if (active) {
-      if (deliveryBlocked) return;
-      if (lastAssistantBody && activeOrigin && activeTurnId) {
-        settledTurns.push({
-          origin: activeOrigin,
-          request: activeRequest,
-          turnId: activeTurnId,
-          body: lastAssistantBody,
-        });
-        resetTurn();
-      } else {
-        await holdInterrupted(ctx);
-      }
+      if (!queueActiveTurn()) await holdInterrupted(ctx);
     }
     if (segment.origin === "excluded") return;
     if (segment.origin === "terminal") {
@@ -496,15 +502,21 @@ export default function (pi: ExtensionAPI) {
       activeTurnId = segment.turnId;
       suspended = false;
       lastAssistantBody = "";
-      const body = `You · Terminal\n\n${segment.text}`;
-      const result = await deliver(segment.deliveryId, body, ctx);
-      if (result.code !== 0) {
-        blockedTerminalDelivery = {
-          turnId: segment.turnId,
-          deliveryId: segment.deliveryId,
-          body,
-        };
+      const terminalDelivery: TerminalDelivery = {
+        deliveryId: segment.deliveryId,
+        body: `You · Terminal\n\n${segment.text}`,
+        sent: false,
+      };
+      activeTerminalDelivery = terminalDelivery;
+      const reserved = await reserve(terminalDelivery.deliveryId, terminalDelivery.body, ctx);
+      if (reserved.code === 0 && !deliveryBlocked && settledTurns.length === 0) {
+        const result = await deliver(terminalDelivery.deliveryId, terminalDelivery.body, ctx);
+        if (result.code === 0) terminalDelivery.sent = true;
+        else deliveryBlocked = true;
+      } else if (reserved.code !== 0) {
         deliveryBlocked = true;
+      }
+      if (deliveryBlocked) {
         ctx.ui.notify("Telegram delivery needs attention; this accepted terminal turn is retained.", "error");
         await updateFooter(ctx);
       }
@@ -526,7 +538,6 @@ export default function (pi: ExtensionAPI) {
     activeTurnId = pending.turnId;
     suspended = false;
     lastAssistantBody = "";
-    deliveryBlocked = false;
     pendingAdmission = undefined;
     await exec(["mirror-delivered", pending.requestId], ctx);
   };
@@ -541,7 +552,6 @@ export default function (pi: ExtensionAPI) {
       for (const turn of settledTurns) {
         if (turn.request) preserved.add(turn.request);
       }
-      if (blockedTurn?.request) preserved.add(blockedTurn.request);
       const args = ["mirror-reconcile"];
       for (const requestId of preserved) args.push("--preserve-request", requestId);
       const result = await exec(args, ctx);
@@ -586,7 +596,7 @@ export default function (pi: ExtensionAPI) {
       const pending: PendingAdmission = {
         requestId,
         turnId: `telegram-${safeIdentity(requestId)}-${randomUUID()}`,
-        marker: randomBytes(32).toString("hex"),
+        marker: newOriginMarker(),
         accepted: false,
         queuedInput: false,
       };
@@ -629,7 +639,7 @@ export default function (pi: ExtensionAPI) {
         const recovered = await exec(["mirror-recover", heldAdmission.requestId], ctx);
         if (recovered.code === 0) heldAdmission = undefined;
       }
-      if (action === "on" && deliveryBlocked && !await retryBlockedDeliveries(ctx)) return;
+      if (action === "on" && deliveryBlocked) deliveryBlocked = false;
       if (action === "on" && !await flushSettledTurns(ctx)) return;
       if (action === "on") await settle(ctx);
       await updateFooter(ctx);
@@ -643,14 +653,17 @@ export default function (pi: ExtensionAPI) {
     if (reconcileTimer) clearInterval(reconcileTimer);
     scanTimer = undefined;
     reconcileTimer = undefined;
+    const staleReservations = [
+      activeTerminalDelivery,
+      ...settledTurns.map((turn) => turn.terminalDelivery),
+    ].filter((delivery): delivery is TerminalDelivery => !!delivery && !delivery.sent);
+    await Promise.all(staleReservations.map((delivery) => cancelReservation(delivery.deliveryId)));
     resetTurn();
     pendingAdmission = undefined;
     heldAdmission = undefined;
     inputCandidates.clear();
     committedMarkers.clear();
     settledTurns = [];
-    blockedTurn = undefined;
-    blockedTerminalDelivery = undefined;
     deliveryBlocked = false;
     transportOpen = false;
     mirrorMode = "off";
@@ -711,16 +724,14 @@ export default function (pi: ExtensionAPI) {
     if (pendingAdmission?.timer) clearTimeout(pendingAdmission.timer);
     pendingAdmission = undefined;
     heldAdmission = undefined;
-    const reservations = [...inputCandidates.values()]
-      .map((candidate) => candidate.segment)
-      .filter((segment): segment is Extract<InputSegment, { origin: "terminal" }> =>
-        segment.origin === "terminal");
-    await Promise.all(reservations.map((segment) => cancelReservation(segment.deliveryId)));
+    const reservations = [
+      activeTerminalDelivery,
+      ...settledTurns.map((turn) => turn.terminalDelivery),
+    ].filter((delivery): delivery is TerminalDelivery => !!delivery && !delivery.sent);
+    await Promise.all(reservations.map((delivery) => cancelReservation(delivery.deliveryId)));
     inputCandidates.clear();
     committedMarkers.clear();
     settledTurns = [];
-    blockedTurn = undefined;
-    blockedTerminalDelivery = undefined;
     deliveryBlocked = false;
     transportOpen = false;
     mirrorMode = "off";
@@ -730,7 +741,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerMarkdownTransformer((markdown, { messageType }) => {
     if (messageType !== "user") return markdown;
     const token = originMarkerToken(markdown);
-    return token && (inputCandidates.has(token) || committedMarkers.has(token))
+    return token && (validOriginMarker(token) || inputCandidates.has(token) || committedMarkers.has(token))
       ? stripOriginMarker(markdown)
       : markdown;
   });
@@ -750,23 +761,11 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Telegram delivery needs attention; use /telegram off before continuing.", "error");
         return { action: "handled" as const };
       }
-      if (inputCandidates.size >= maxInputCandidates) {
-        ctx.ui.notify("Telegram cannot reserve another mirrored terminal input yet.", "error");
+      if (settledTurns.length + (active ? 1 : 0) >= maxInputCandidates) {
+        ctx.ui.notify("Telegram cannot accept another mirrored terminal turn yet.", "error");
         return { action: "handled" as const };
       }
-      const turnId = `terminal-${randomUUID()}`;
-      const deliveryId = safeIdentity(`user-${turnId}`);
-      const body = `You · Terminal\n\n${event.text}`;
-      const reserved = await reserve(deliveryId, body, ctx);
-      if (reserved.code !== 0) {
-        ctx.ui.notify("Telegram could not reserve this mirrored terminal input; the Pi turn was not started.", "error");
-        return { action: "handled" as const };
-      }
-      const marker = randomBytes(32).toString("hex");
-      const candidate: InputCandidate = {
-        segment: { origin: "terminal", turnId, text: event.text, deliveryId },
-      };
-      inputCandidates.set(marker, candidate);
+      const marker = newOriginMarker();
       return { action: "transform" as const, text: markedInput(marker, "terminal", event.text) };
     }
     return { action: "continue" as const };
@@ -779,12 +778,25 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (message.role !== "user") return;
-    const token = originMarkerToken(textOf(message));
+    const markedText = inputTextOf(message);
+    const token = originMarkerToken(markedText);
     const candidate = token ? inputCandidates.get(token) : undefined;
     if (token && candidate) {
       inputCandidates.delete(token);
       committedMarkers.add(token);
       await transitionSegment(candidate.segment, ctx);
+      return;
+    }
+    const text = token && validOriginMarker(token) ? terminalText(markedText) : undefined;
+    if (token && text !== undefined) {
+      committedMarkers.add(token);
+      const turnId = `terminal-${token}`;
+      await transitionSegment({
+        origin: "terminal",
+        turnId,
+        text,
+        deliveryId: safeIdentity(`user-${turnId}`),
+      }, ctx);
       return;
     }
     await transitionSegment({ origin: "excluded" }, ctx);
@@ -811,7 +823,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", (event) => {
     const message = event.message as AssistantMessage;
     if (message.role === "user") {
-      const token = originMarkerToken(textOf(message));
+      const token = originMarkerToken(inputTextOf(message));
       if (token && committedMarkers.delete(token)) return { message: stripMessageOrigin(message) };
       return;
     }
