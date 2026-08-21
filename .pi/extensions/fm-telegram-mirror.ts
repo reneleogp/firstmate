@@ -417,6 +417,7 @@ export default function (pi: ExtensionAPI) {
   let holdAttempts = 0;
   let holdRetryAt = 0;
   let holdRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let fatalStorageError = false;
   let deliveryBlocked = false;
   let transportOpen = false;
   let mirrorMode: "on" | "off" = "off";
@@ -554,6 +555,10 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus(statusKey, "telegram: transport unavailable");
       return;
     }
+    if (fatalStorageError) {
+      ctx.ui.setStatus(statusKey, "telegram: state storage needs recovery");
+      return;
+    }
     if (deliveryBlocked) {
       ctx.ui.setStatus(statusKey, "telegram: delivery needs attention");
       return;
@@ -689,7 +694,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const holdInterrupted = async (ctx: ExtensionContext): Promise<void> => {
-    if (holdRunning || (holdTransitionPending && Date.now() < holdRetryAt)) return;
+    if (fatalStorageError || holdRunning || (holdTransitionPending && Date.now() < holdRetryAt)) return;
     const startedGeneration = generation;
     const requestId = activeRequest;
     const turnId = activeTurnId;
@@ -721,6 +726,17 @@ export default function (pi: ExtensionAPI) {
             }
             ctx.ui.notify("The interrupted Telegram turn was abandoned after bounded hold failures.", "error");
             resetTurn();
+          } else {
+            fatalStorageError = true;
+            holdTransitionPending = false;
+            holdRetryAt = 0;
+            if (holdRetryTimer) clearTimeout(holdRetryTimer);
+            holdRetryTimer = undefined;
+            ctx.ui.notify(
+              "Telegram mirror state storage is unavailable; restore it and restart Pi before continuing.",
+              "error",
+            );
+            await updateFooter(ctx);
           }
           return;
         }
@@ -948,7 +964,8 @@ export default function (pi: ExtensionAPI) {
   };
 
   const drain = async (ctx: ExtensionContext): Promise<void> => {
-    if (drainRunning || reconcileRunning || settleRunning || settledTurns.length > 0 || !transportOpen) return;
+    if (fatalStorageError || drainRunning || reconcileRunning || settleRunning ||
+        settledTurns.length > 0 || !transportOpen) return;
     const startedGeneration = generation;
     const primary = ownsHomeLock();
     if (!primary) return;
@@ -1061,6 +1078,7 @@ export default function (pi: ExtensionAPI) {
     committedExcludedSlashMarkers.clear();
     recoveryAbandons.clear();
     settledTurns = [];
+    fatalStorageError = false;
     deliveryBlocked = false;
     transportOpen = false;
     mirrorMode = "off";
@@ -1172,6 +1190,7 @@ export default function (pi: ExtensionAPI) {
     committedExcludedSlashMarkers.clear();
     recoveryAbandons.clear();
     settledTurns = [];
+    fatalStorageError = false;
     deliveryBlocked = false;
     transportOpen = false;
     mirrorMode = "off";
@@ -1198,6 +1217,9 @@ export default function (pi: ExtensionAPI) {
       }
       return { action: "continue" as const };
     }
+    if (event.source === "interactive" && fatalStorageError) {
+      return { action: "handled" as const };
+    }
     if (event.source === "interactive" && ctx.isIdle() && !ctx.hasPendingMessages()) {
       for (const [marker, candidate] of inputCandidates) {
         if (candidate.segment.origin === "terminal") inputCandidates.delete(marker);
@@ -1218,18 +1240,18 @@ export default function (pi: ExtensionAPI) {
       interactivePreflights += 1;
       try {
         const currentMode = await readMode(ctx);
-        const unsettledRequest = activeRequest;
+        const acceptedMirrorWork = active;
         if (!currentMode) {
           ctx.ui.notify("Telegram mirror preference could not be read; this input was not mirrored.", "error");
-          if (unsettledRequest) {
-            ctx.ui.notify("Wait for the accepted Telegram turn to settle before continuing locally.", "warning");
+          if (acceptedMirrorWork) {
+            ctx.ui.notify("Wait for the accepted mirrored turn to settle before continuing locally.", "warning");
             return { action: "handled" as const };
           }
           return { action: "continue" as const };
         }
         if (currentMode !== "on") {
-          if (unsettledRequest) {
-            ctx.ui.notify("Wait for the accepted Telegram turn to settle before continuing locally.", "warning");
+          if (acceptedMirrorWork) {
+            ctx.ui.notify("Wait for the accepted mirrored turn to settle before continuing locally.", "warning");
             return { action: "handled" as const };
           }
           return { action: "continue" as const };

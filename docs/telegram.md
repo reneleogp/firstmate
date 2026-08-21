@@ -56,6 +56,7 @@ A request moves to bounded handled state only after every Unicode-safe Telegram 
 Definite Telegram rejection is retried at most three times, while delivery-unknown state is not resent or marked complete automatically.
 Startup, reload, session replacement, and a bounded rescan reconcile missed notifications from extension-owned session admission entries.
 A provider failure moves that admission into one bounded interrupted hold, blocks later Telegram admissions, and retries only after the operator explicitly sends `/telegram on`.
+If both bounded hold and abandonment writes fail because local state storage is unavailable, the extension stops new admission and further retries, preserves the live claim, and requires storage repair plus a Pi restart.
 Telegram transport state alone never requires or routes through the Firstmate watcher.
 Terminal mirroring is live-only and never replays historical messages after startup, resume, clone, or retention expiry.
 

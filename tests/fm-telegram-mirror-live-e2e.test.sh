@@ -199,7 +199,9 @@ elif command == 'mirror-abandon':
     request_id, delivery_id = rest[:2]
     request = state.get('request')
     represented = state['represented_requests'].get(request_id)
-    if request and request.get('id') == request_id and request.get('status') == 'claimed':
+    if (home / 'reject-mirror-abandon').exists():
+        code = 1
+    elif request and request.get('id') == request_id and request.get('status') == 'claimed':
         state.setdefault('handled', []).append(request_id)
         state.setdefault('abandoned', []).append([request_id, delivery_id])
         state['request'] = None
@@ -867,6 +869,75 @@ assert.equal(faux.state.callCount, callsBeforeOffDuringTurn + 1,
   'mode-off during an accepted turn started a second model pass');
 await runtime.session.prompt('/telegram on', { source: 'interactive' });
 
+const terminalModeOffCalls = faux.state.callCount;
+globalThis.__telegramMirrorHoldTool = true;
+globalThis.__telegramMirrorTerminateTool = false;
+globalThis.__telegramMirrorToolStarted = false;
+faux.appendResponses([
+  fauxAssistantMessage([
+    fauxToolCall('mirror_test_tool', {}, { id: 'terminal-mode-off-tool-call' }),
+  ], { stopReason: 'toolUse' }),
+  fauxAssistantMessage('terminal tool loop answer after mode-off refusal'),
+]);
+const terminalModeOffRoot = runtime.session.prompt('terminal tool loop before mode-off refusal', {
+  source: 'interactive',
+});
+await waitFor(() => globalThis.__telegramMirrorToolStarted === true,
+  'terminal mode-off tool loop did not reach tool execution');
+await runtime.session.prompt('/telegram off', { source: 'interactive' });
+const usersBeforeTerminalModeOffRefusal = userTexts(initialManager).length;
+await runtime.session.prompt('local input while terminal mirror turn is active', {
+  source: 'interactive', streamingBehavior: 'steer',
+});
+assert.equal(userTexts(initialManager).length, usersBeforeTerminalModeOffRefusal,
+  'mode-off local input reset an accepted terminal mirror turn');
+assert.equal(notices.some(([message]) =>
+  message === 'Wait for the accepted mirrored turn to settle before continuing locally.'), true,
+  'terminal mode-off refusal was not visible');
+globalThis.__telegramMirrorHoldTool = false;
+await terminalModeOffRoot;
+await waitFor(() => Object.values(state().deliveries)
+  .some((body) => body === 'Firstmate · terminal tool loop answer after mode-off refusal'),
+'accepted terminal tool loop did not settle after mode-off refusal');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'You · Terminal\n\nterminal tool loop before mode-off refusal').length, 1);
+assert.equal(faux.state.callCount, terminalModeOffCalls + 2,
+  'mode-off terminal refusal added or lost a model pass');
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+
+const terminalModeReadCalls = faux.state.callCount;
+globalThis.__telegramMirrorHoldTool = true;
+globalThis.__telegramMirrorTerminateTool = false;
+globalThis.__telegramMirrorToolStarted = false;
+faux.appendResponses([
+  fauxAssistantMessage([
+    fauxToolCall('mirror_test_tool', {}, { id: 'terminal-mode-read-tool-call' }),
+  ], { stopReason: 'toolUse' }),
+  fauxAssistantMessage('terminal tool loop answer after mode-read refusal'),
+]);
+const terminalModeReadRoot = runtime.session.prompt('terminal tool loop before mode-read refusal', {
+  source: 'interactive',
+});
+await waitFor(() => globalThis.__telegramMirrorToolStarted === true,
+  'terminal mode-read tool loop did not reach tool execution');
+writeFileSync(`${home}/fail-mode-read`, '');
+const usersBeforeTerminalModeReadRefusal = userTexts(initialManager).length;
+await runtime.session.prompt('local input while mirror preference is unreadable', {
+  source: 'interactive', streamingBehavior: 'steer',
+});
+unlinkSync(`${home}/fail-mode-read`);
+assert.equal(userTexts(initialManager).length, usersBeforeTerminalModeReadRefusal,
+  'mode-read failure reset an accepted terminal mirror turn');
+globalThis.__telegramMirrorHoldTool = false;
+await terminalModeReadRoot;
+await waitFor(() => Object.values(state().deliveries)
+  .some((body) => body === 'Firstmate · terminal tool loop answer after mode-read refusal'),
+'accepted terminal tool loop did not settle after mode-read refusal');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'You · Terminal\n\nterminal tool loop before mode-read refusal').length, 1);
+assert.equal(faux.state.callCount, terminalModeReadCalls + 2,
+  'mode-read terminal refusal added or lost a model pass');
+
 current = state();
 writeFileSync(`${home}/config/telegram-mirror`, 'off\n');
 const beforeModeOff = Object.keys(current.deliveries).length;
@@ -1020,7 +1091,7 @@ await runtime.session.prompt('ordinary local steer while mirror is off', {
 assert.equal(userTexts(initialManager).length, usersBeforeModeOffSteer,
   'mode-off local continuation entered Pi before the accepted Telegram turn settled');
 assert.equal(notices.some(([message]) =>
-  message === 'Wait for the accepted Telegram turn to settle before continuing locally.'), true,
+  message === 'Wait for the accepted mirrored turn to settle before continuing locally.'), true,
   'mode-off local continuation refusal was not visible');
 globalThis.__telegramMirrorHoldTool = false;
 await waitFor(() => state().handled?.includes('tg-text-u31-m31'),
@@ -1357,13 +1428,12 @@ await runtime.session.prompt('handled preflight after provider failure', {
 });
 globalThis.__telegramMirrorHandleInteractiveInput = false;
 unlinkSync(`${home}/delay-mirror-validate`);
-await waitFor(() => state().request?.status === 'held',
-  'handled preflight stranded the finalized no-body Telegram request');
+await waitFor(() => state().request?.status === 'held' && initialManager.getEntries().some((entry) =>
+  entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
+    && entry.data.requestId === 'tg-text-u26-m26' && entry.data.state === 'interrupted'),
+'handled preflight stranded the finalized no-body Telegram request');
 assert.equal(userTexts(initialManager).length, usersBeforeDeferredHandled,
   'handled provider-failure preflight entered Pi');
-assert.equal(initialManager.getEntries().some((entry) =>
-  entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
-    && entry.data.requestId === 'tg-text-u26-m26' && entry.data.state === 'interrupted'), true);
 faux.appendResponses([fauxAssistantMessage('explicit deferred failure recovery')]);
 await runtime.session.prompt('/telegram on', { source: 'interactive' });
 await waitFor(() => state().handled?.includes('tg-text-u26-m26'),
@@ -1394,6 +1464,46 @@ assert.equal(faux.state.callCount, callsBeforeFailedHold + 1,
 await new Promise((resolve) => setTimeout(resolve, 500));
 assert.equal(state().log.filter((call) => call[0] === 'mirror-hold').length - holdsBeforeFailure, 3,
   'persistent hold failure kept retrying after its bounded outcome');
+
+const fatalHold = state();
+fatalHold.request = {
+  id: 'tg-text-u34-m34', text: 'provider failure with unavailable state storage', status: 'queued',
+};
+save(fatalHold);
+writeFileSync(`${home}/reject-mirror-hold`, '');
+writeFileSync(`${home}/reject-mirror-abandon`, '');
+const callsBeforeFatalHold = faux.state.callCount;
+const holdsBeforeFatal = state().log.filter((call) => call[0] === 'mirror-hold').length;
+const abandonsBeforeFatal = state().log.filter((call) => call[0] === 'mirror-abandon').length;
+faux.appendResponses([
+  fauxAssistantMessage([], { stopReason: 'error', errorMessage: 'provider and state storage failed' }),
+]);
+await waitFor(() =>
+  state().log.filter((call) => call[0] === 'mirror-hold').length - holdsBeforeFatal === 3 &&
+  state().log.filter((call) => call[0] === 'mirror-abandon').length - abandonsBeforeFatal === 1,
+'persistent state-storage failure did not exhaust its bounded transition budget');
+await new Promise((resolve) => setTimeout(resolve, 500));
+assert.equal(state().log.filter((call) => call[0] === 'mirror-hold').length - holdsBeforeFatal, 3,
+  'fatal state-storage failure kept retrying mirror-hold');
+assert.equal(state().log.filter((call) => call[0] === 'mirror-abandon').length - abandonsBeforeFatal, 1,
+  'fatal state-storage failure kept retrying mirror-abandon');
+assert.equal(state().request?.status, 'claimed',
+  'fatal state-storage failure released the accepted claim without a durable transition');
+assert.equal(statuses.at(-1)?.[1], 'telegram: state storage needs recovery');
+assert.equal(notices.filter(([message]) =>
+  message === 'Telegram mirror state storage is unavailable; restore it and restart Pi before continuing.'
+).length, 1, 'fatal state-storage failure did not notify exactly once');
+const usersBeforeFatalRefusal = userTexts(initialManager).length;
+await runtime.session.prompt('local input during fatal mirror storage error', { source: 'interactive' });
+assert.equal(userTexts(initialManager).length, usersBeforeFatalRefusal,
+  'fatal state-storage failure admitted new local mirror work');
+assert.equal(faux.state.callCount, callsBeforeFatalHold + 1,
+  'fatal state-storage failure ran another model turn');
+unlinkSync(`${home}/reject-mirror-hold`);
+unlinkSync(`${home}/reject-mirror-abandon`);
+await runtime.session.reload();
+await waitFor(() => state().handled?.includes('tg-text-u34-m34'),
+  'storage recovery did not resolve the preserved fatal claim');
 
 const failedTurn = state();
 failedTurn.request = { id: 'tg-text-u11-m11', text: 'provider failure request', status: 'queued' };
