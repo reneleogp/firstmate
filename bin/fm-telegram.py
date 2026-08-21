@@ -183,10 +183,11 @@ def validate_home_storage(home: Path) -> None:
     telegram = state / "telegram"
     for path in (
             state, config, telegram, telegram / "inbox", telegram / "handled",
-            telegram / "responses"):
+            telegram / "responses", telegram / "deliveries"):
         require_path_kind(path, "directory")
     for path in (
         config / CONFIG_NAME,
+        config / MIRROR_MODE_NAME,
         state / ".telegram-cleaned",
         state / ".telegram-lifecycle.lock",
         state / ".telegram-service-activation",

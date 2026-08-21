@@ -47,6 +47,7 @@ cat >"$owner_script" <<PY
 import json, os, subprocess, sys
 from pathlib import Path
 script = sys.argv[1]; home = sys.argv[2]; attacker = sys.argv[3]
+unsafe_root = Path(sys.argv[4])
 owner = os.getpid(); capability = b'a' * 64 + b'\\n'
 Path(home, 'state', '.lock').write_text(str(owner) + '\\n')
 mode_path = Path(home, 'config', 'telegram-mirror')
@@ -100,11 +101,35 @@ refused_reservation = run(
     'mirror-reserve', 'user-terminal-mode-off', '--text-file', str(reservation_body),
 )
 assert refused_reservation.returncode != 0 and 'mode is off' in refused_reservation.stderr
+external_deliveries = unsafe_root / 'external-deliveries'
+external_deliveries.mkdir(parents=True)
+delivery_root = Path(home, 'state', 'telegram', 'deliveries')
+delivery_root.rmdir()
+delivery_root.symlink_to(external_deliveries, target_is_directory=True)
+redirected_delivery = run(
+    'mirror-reserve', 'user-terminal-redirected', '--text-file', str(reservation_body),
+    '--accepted-input',
+)
+assert redirected_delivery.returncode != 0
+assert not list(external_deliveries.iterdir())
+delivery_root.unlink()
+delivery_root.mkdir(mode=0o700)
+external_mode = unsafe_root / 'external-telegram-mirror'
+external_mode.write_text('on\\n')
+mode_path.unlink()
+mode_path.symlink_to(external_mode)
+redirected_mode = run('mirror-mode', 'status')
+assert redirected_mode.returncode != 0
+assert external_mode.read_text() == 'on\\n'
+mode_path.unlink()
+mode_path.write_text('off\\n')
+mode_path.chmod(0o600)
 PY
 override_config="$TMP_ROOT/override-config"
 mkdir -p "$override_config"
 printf 'on\n' >"$override_config/telegram-mirror"
-FM_CONFIG_OVERRIDE="$override_config" $PYTHON "$owner_script" "$SCRIPT" "$home" "$TMP_ROOT/attacker.py" \
+FM_CONFIG_OVERRIDE="$override_config" $PYTHON "$owner_script" "$SCRIPT" "$home" \
+  "$TMP_ROOT/attacker.py" "$TMP_ROOT/unsafe" \
   || fail "private mirror capability claim/read interface failed"
 
 printf 'off\n' >"$home/config/telegram-mirror"
