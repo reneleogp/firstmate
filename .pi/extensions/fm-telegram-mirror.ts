@@ -45,6 +45,7 @@ type InputSegment =
 type InputCandidate = {
   segment: InputSegment;
   busyGeneration?: number;
+  unmarked?: boolean;
 };
 type TerminalDelivery = {
   deliveryId: string;
@@ -243,51 +244,56 @@ function admissionStates(entries: SessionEntry[]): Map<string, { state: string; 
   return states;
 }
 
-function unresolvedAdmission(entries: SessionEntry[]): {
+type RecoveredAdmission = {
   requestId: string;
   turnId: string;
   assistantBody: string;
   carried: boolean;
-} | undefined {
-  const unresolved = [...admissionStates(entries).entries()]
+};
+
+function unresolvedAdmissions(entries: SessionEntry[]): RecoveredAdmission[] {
+  const unresolved: RecoveredAdmission[] = [];
+  const states = [...admissionStates(entries).entries()]
     .filter(([, value]) => value.state === "admitted" || value.state === "carried")
-    .sort((left, right) => right[1].index - left[1].index)[0];
-  if (!unresolved) return undefined;
-  const [requestId, value] = unresolved;
-  let userSeen = false;
-  for (const entry of entries.slice(value.index + 1)) {
-    if (entry.type === "custom_message") break;
-    const message = entry.message;
-    if (entry.type !== "message" || !message?.role) continue;
-    if (message.role === "user") {
-      if (userSeen) break;
-      userSeen = true;
-      continue;
+    .sort((left, right) => right[1].index - left[1].index);
+  for (const [requestId, value] of states) {
+    let userSeen = false;
+    let assistantBody = "";
+    for (const entry of entries.slice(value.index + 1)) {
+      if (entry.type === "custom_message") break;
+      const message = entry.message;
+      if (entry.type !== "message" || !message?.role) continue;
+      if (message.role === "user") {
+        if (userSeen) break;
+        userSeen = true;
+        continue;
+      }
+      if (!userSeen) continue;
+      if (message.role === "custom") break;
+      if (message.role !== "assistant" || !["stop", "length"].includes(message.stopReason || "")) continue;
+      const body = textOf(message);
+      if (body) {
+        assistantBody = body;
+        break;
+      }
     }
-    if (!userSeen) continue;
-    if (message.role === "custom") break;
-    if (message.role !== "assistant" || !["stop", "length"].includes(message.stopReason || "")) continue;
-    const body = textOf(message);
-    if (body) {
-      return {
+    if (userSeen) {
+      unresolved.push({
         requestId,
         turnId: value.turnId,
-        assistantBody: body,
+        assistantBody,
         carried: value.state === "carried",
-      };
+      });
     }
   }
-  return userSeen
-    ? { requestId, turnId: value.turnId, assistantBody: "", carried: value.state === "carried" }
-    : undefined;
+  return unresolved;
 }
 
-function interruptedAdmission(entries: SessionEntry[]): HeldAdmission | undefined {
-  const interrupted = [...admissionStates(entries).entries()]
+function interruptedAdmissions(entries: SessionEntry[]): HeldAdmission[] {
+  return [...admissionStates(entries).entries()]
     .filter(([, value]) => value.state === "interrupted")
-    .sort((left, right) => right[1].index - left[1].index)[0];
-  if (!interrupted) return undefined;
-  return { requestId: interrupted[0], turnId: interrupted[1].turnId };
+    .sort((left, right) => right[1].index - left[1].index)
+    .map(([requestId, value]) => ({ requestId, turnId: value.turnId }));
 }
 
 export default function (pi: ExtensionAPI) {
@@ -316,6 +322,12 @@ export default function (pi: ExtensionAPI) {
   let generation = 0;
   let inputGeneration = 0;
   let interactivePreflights = 0;
+  let deferredSettlement: {
+    ctx: ExtensionContext;
+    inputGeneration: number;
+    sessionGeneration: number;
+  } | undefined;
+  let unmarkedUserMessages = new WeakSet<object>();
 
   const exec = async (args: string[], ctx?: ExtensionContext, body?: string): Promise<TransportResult> => {
     const signal = ctx?.signal;
@@ -361,10 +373,10 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
-  const readMode = async (ctx?: ExtensionContext): Promise<"on" | "off"> => {
+  const readMode = async (ctx?: ExtensionContext): Promise<"on" | "off" | undefined> => {
     const result = await exec(["mirror-mode", "status"], ctx);
     const output = result.stdout.trim();
-    if (result.code !== 0 || (output !== "on" && output !== "off")) return mirrorMode;
+    if (result.code !== 0 || (output !== "on" && output !== "off")) return undefined;
     mirrorMode = output;
     return mirrorMode;
   };
@@ -443,6 +455,10 @@ export default function (pi: ExtensionAPI) {
     }
     const current = snapshot?.currentMode ?? await readMode(ctx);
     if (startedGeneration !== generation) return;
+    if (!current) {
+      ctx.ui.setStatus(statusKey, "telegram: preference unavailable");
+      return;
+    }
     if (deliveryBlocked) {
       ctx.ui.setStatus(statusKey, "telegram: delivery needs attention");
       return;
@@ -856,9 +872,14 @@ export default function (pi: ExtensionAPI) {
         const recovered = await exec(["mirror-recover", heldAdmission.requestId], ctx);
         if (recovered.code === 0) heldAdmission = undefined;
       }
-      if (action === "on" && deliveryBlocked && !await reconcile(ctx)) {
-        ctx.ui.notify("Telegram delivery reconciliation is still in progress.", "warning");
-        return;
+      if (action === "on" && deliveryBlocked) {
+        while (settleRunning || drainRunning || reconcileRunning) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        if (!await reconcile(ctx)) {
+          ctx.ui.notify("Telegram delivery reconciliation is still in progress.", "warning");
+          return;
+        }
       }
       if (action === "on" && deliveryBlocked) deliveryBlocked = false;
       if (action === "on" && !await flushSettledTurns(ctx)) return;
@@ -890,6 +911,8 @@ export default function (pi: ExtensionAPI) {
     transportOpen = false;
     mirrorMode = "off";
     inputGeneration = 0;
+    deferredSettlement = undefined;
+    unmarkedUserMessages = new WeakSet<object>();
     if (!ownsHomeLock()) {
       ctx.ui.setStatus(statusKey, "telegram: not the primary session");
       return;
@@ -902,22 +925,39 @@ export default function (pi: ExtensionAPI) {
     transportOpen = true;
     const currentEntries = ctx.sessionManager.getBranch?.() as SessionEntry[] | undefined;
     const previousEntries = entriesFromFile(event.previousSessionFile);
-    const provenance = unresolvedAdmission(currentEntries || []) || unresolvedAdmission(previousEntries);
-    const interrupted = interruptedAdmission(currentEntries || []) || interruptedAdmission(previousEntries);
+    const provenanceByRequest = new Map<string, RecoveredAdmission>();
+    for (const candidate of unresolvedAdmissions(previousEntries)) {
+      provenanceByRequest.set(candidate.requestId, candidate);
+    }
+    for (const candidate of unresolvedAdmissions(currentEntries || [])) {
+      provenanceByRequest.set(candidate.requestId, candidate);
+    }
+    const interruptedByRequest = new Map<string, HeldAdmission>();
+    for (const candidate of interruptedAdmissions(previousEntries)) {
+      interruptedByRequest.set(candidate.requestId, candidate);
+    }
+    for (const candidate of interruptedAdmissions(currentEntries || [])) {
+      interruptedByRequest.set(candidate.requestId, candidate);
+    }
     const reconcileArgs = ["mirror-reconcile"];
-    if (provenance) reconcileArgs.push("--preserve-request", provenance.requestId);
+    for (const requestId of provenanceByRequest.keys()) {
+      reconcileArgs.push("--preserve-request", requestId);
+    }
     const reconciled = await exec(reconcileArgs);
     const reconciliation = reconciled.stdout.split("\n").map((line) => line.split("\t"));
     const transportHeld = reconciliation.find((fields) => fields[0] === "held" && fields.length === 3);
-    const provenanceOwned = provenance && reconciliation.some((fields) =>
-      fields[0] === "owned" && fields[1] === provenance.requestId);
-    if (interrupted && transportHeld?.[1] === interrupted.requestId &&
-        transportHeld[2] === interrupted.turnId) {
+    const ownedRequestIds = new Set(reconciliation
+      .filter((fields) => fields[0] === "owned" && fields.length >= 2)
+      .map((fields) => fields[1]));
+    const provenance = [...provenanceByRequest.values()]
+      .find((candidate) => ownedRequestIds.has(candidate.requestId));
+    const interrupted = transportHeld ? interruptedByRequest.get(transportHeld[1]) : undefined;
+    if (interrupted && transportHeld?.[2] === interrupted.turnId) {
       heldAdmission = interrupted;
     } else if (transportHeld) {
       heldAdmission = { requestId: transportHeld[1], turnId: transportHeld[2] };
     }
-    if (provenance && provenanceOwned) {
+    if (provenance) {
       active = true;
       activeOrigin = "telegram";
       activeRequest = provenance.requestId;
@@ -969,6 +1009,8 @@ export default function (pi: ExtensionAPI) {
     deliveryBlocked = false;
     transportOpen = false;
     mirrorMode = "off";
+    deferredSettlement = undefined;
+    unmarkedUserMessages = new WeakSet<object>();
     resetTurn();
   });
 
@@ -994,11 +1036,17 @@ export default function (pi: ExtensionAPI) {
         if (candidate.segment.origin === "terminal") inputCandidates.delete(marker);
       }
     }
-    if (event.source === "interactive" && event.text && !event.text.startsWith("/") &&
+    const telegramCommand = /^\/telegram(?:\s|$)/.test(event.text);
+    if (event.source === "interactive" && event.text && !telegramCommand &&
         transportOpen && ownsHomeLock()) {
       interactivePreflights += 1;
       try {
-        if (await readMode(ctx) !== "on") return { action: "continue" as const };
+        const currentMode = await readMode(ctx);
+        if (!currentMode) {
+          ctx.ui.notify("Telegram mirror preference could not be read; this input was not mirrored.", "error");
+          return { action: "continue" as const };
+        }
+        if (currentMode !== "on") return { action: "continue" as const };
         if (deliveryBlocked) {
           ctx.ui.notify("Telegram delivery needs attention; use /telegram off before continuing.", "error");
           return { action: "handled" as const };
@@ -1018,10 +1066,12 @@ export default function (pi: ExtensionAPI) {
         }
         const marker = newOriginMarker();
         const turnId = `terminal-${marker}`;
+        const slashInput = event.text.startsWith("/");
         inputCandidates.set(marker, {
           busyGeneration: ctx.isIdle() && event.streamingBehavior === undefined
             ? undefined
             : inputGeneration,
+          unmarked: slashInput,
           segment: {
             origin: "terminal",
             turnId,
@@ -1029,9 +1079,27 @@ export default function (pi: ExtensionAPI) {
             deliveryId: safeIdentity(`user-${turnId}`),
           },
         });
-        return { action: "transform" as const, text: markedInput(marker, "terminal", event.text) };
+        return slashInput
+          ? { action: "continue" as const }
+          : { action: "transform" as const, text: markedInput(marker, "terminal", event.text) };
       } finally {
         interactivePreflights -= 1;
+        if (interactivePreflights === 0 && deferredSettlement) {
+          const pending = deferredSettlement;
+          setTimeout(() => {
+            if (deferredSettlement !== pending || pending.sessionGeneration !== generation) return;
+            const pendingBusyInput = [...inputCandidates.values()].some((candidate) =>
+              candidate.segment.origin === "terminal" && candidate.busyGeneration !== undefined &&
+              candidate.busyGeneration <= pending.inputGeneration);
+            if (pendingBusyInput && pending.ctx.hasPendingMessages()) return;
+            deferredSettlement = undefined;
+            void finishAgentSettlement(
+              pending.ctx,
+              pending.inputGeneration,
+              pending.sessionGeneration,
+            );
+          }, 0);
+        }
       }
     }
     return { action: "continue" as const };
@@ -1069,6 +1137,14 @@ export default function (pi: ExtensionAPI) {
       }, ctx);
       return;
     }
+    const unmarked = [...inputCandidates.entries()]
+      .find(([, inputCandidate]) => inputCandidate.unmarked && inputCandidate.segment.origin === "terminal");
+    if (unmarked) {
+      inputCandidates.delete(unmarked[0]);
+      unmarkedUserMessages.add(message as object);
+      await transitionSegment(unmarked[1].segment, ctx);
+      return;
+    }
     await transitionSegment({ origin: "excluded" }, ctx);
   });
 
@@ -1086,15 +1162,24 @@ export default function (pi: ExtensionAPI) {
     return { messages };
   });
 
-  pi.on("user_bash", () => {
-    if (!active || activeOrigin !== "telegram") resetTurn();
-  });
+  pi.on("user_bash", () => {});
 
   pi.on("message_end", (event) => {
     const message = event.message as AssistantMessage;
     if (message.role === "user") {
       const token = originMarkerToken(inputTextOf(message));
       if (token && committedMarkers.delete(token)) return { message: stripMessageOrigin(message) };
+      if (unmarkedUserMessages.delete(message as object)) {
+        const content = Array.isArray(message.content)
+          ? message.content.map((part, index) => {
+            if (index !== 0 || !part || typeof part !== "object" ||
+                (part as { type?: string }).type !== "text" ||
+                typeof (part as { text?: unknown }).text !== "string") return part;
+            return { ...part, text: `You · Terminal\n\n${(part as { text: string }).text}` };
+          })
+          : `You · Terminal\n\n${message.content || ""}`;
+        return { message: { ...message, content } };
+      }
       return;
     }
     if (message.role !== "assistant" || !active || suspended ||
@@ -1103,34 +1188,47 @@ export default function (pi: ExtensionAPI) {
     if (body) lastAssistantBody = body;
   });
 
+  const finishAgentSettlement = async (
+    ctx: ExtensionContext,
+    settledInputGeneration: number,
+    settledSessionGeneration: number,
+  ): Promise<void> => {
+    if (settledSessionGeneration !== generation || settledInputGeneration !== inputGeneration) return;
+    for (const [marker, candidate] of inputCandidates) {
+      if (candidate.segment.origin === "terminal" && candidate.busyGeneration !== undefined &&
+          candidate.busyGeneration <= settledInputGeneration) {
+        inputCandidates.delete(marker);
+      }
+    }
+    if (active && activeOrigin) {
+      if (suspended) return;
+      if (!lastAssistantBody) {
+        await holdInterrupted(ctx);
+        await updateFooter(ctx);
+        return;
+      }
+      queueActiveTurn();
+    }
+    if (!await flushSettledTurns(ctx)) return;
+    void drain(ctx);
+  };
+
   pi.on("agent_settled", (_event, ctx) => {
     const settledInputGeneration = inputGeneration;
     const settledSessionGeneration = generation;
-    const finishSettlement = async (): Promise<void> => {
-      if (settledSessionGeneration !== generation || settledInputGeneration !== inputGeneration) return;
-      for (const [marker, candidate] of inputCandidates) {
-        if (candidate.segment.origin === "terminal" && candidate.busyGeneration !== undefined &&
-            candidate.busyGeneration <= settledInputGeneration) {
-          inputCandidates.delete(marker);
-        }
-      }
-      if (active && activeOrigin) {
-        if (suspended) return;
-        if (!lastAssistantBody) {
-          await holdInterrupted(ctx);
-          await updateFooter(ctx);
-          return;
-        }
-        queueActiveTurn();
-      }
-      if (!await flushSettledTurns(ctx)) return;
-      void drain(ctx);
-    };
     const pendingBusyInput = [...inputCandidates.values()].some((candidate) =>
       candidate.segment.origin === "terminal" && candidate.busyGeneration !== undefined &&
       candidate.busyGeneration <= settledInputGeneration);
     if (active && !lastAssistantBody &&
-        (interactivePreflights > 0 || (pendingBusyInput && ctx.hasPendingMessages()))) return;
-    return finishSettlement();
+        (interactivePreflights > 0 || (pendingBusyInput && ctx.hasPendingMessages()))) {
+      deferredSettlement = {
+        ctx,
+        inputGeneration: settledInputGeneration,
+        sessionGeneration: settledSessionGeneration,
+      };
+      return;
+    }
+    deferredSettlement = undefined;
+    return finishAgentSettlement(ctx, settledInputGeneration, settledSessionGeneration);
   });
 }
