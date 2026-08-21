@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Installed Pi runtime regression against the tracked extension and an executable fake transport.
 set -u
+
+if [ "${FM_TELEGRAM_MIRROR_LIVE_E2E:-0}" != 1 ]; then
+  echo "skip: set FM_TELEGRAM_MIRROR_LIVE_E2E=1 to run the installed Pi Telegram mirror regression"
+  exit 0
+fi
+
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
