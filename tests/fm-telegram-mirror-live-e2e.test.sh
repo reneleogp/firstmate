@@ -167,6 +167,8 @@ elif command == 'mirror-cancel':
 elif command == 'mirror-delivered':
     request = state.get('request')
     if not request or request.get('id') != rest[0] or request.get('status') != 'claimed': code = 1
+    elif (home / 'reject-delivered-receipt').exists():
+        state.setdefault('receipt_unknown', []).append(rest[0]); code = 1
     elif rest[0] not in state.setdefault('receipts', []): state['receipts'].append(rest[0])
 elif command == 'mirror-reply':
     delivery_id = rest[0]
@@ -958,6 +960,45 @@ assert.equal(initialManager.getEntries().some((entry) =>
   entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
     && entry.data.requestId === 'tg-text-u19-m19' && entry.data.state === 'carried'), true);
 
+const slashSteered = state();
+slashSteered.request = {
+  id: 'tg-text-u27-m27', text: 'Telegram tool loop before excluded slash', status: 'queued',
+};
+save(slashSteered);
+globalThis.__telegramMirrorHoldTool = true;
+globalThis.__telegramMirrorTerminateTool = true;
+globalThis.__telegramMirrorToolStarted = false;
+const callsBeforeSlashSteer = faux.state.callCount;
+const deliveriesBeforeSlashSteer = Object.keys(state().deliveries).length;
+faux.appendResponses([
+  fauxAssistantMessage([
+    fauxToolCall('mirror_test_tool', {}, { id: 'mirror-slash-steer-tool-call' }),
+  ], { stopReason: 'toolUse' }),
+  fauxAssistantMessage('answer after excluded slash steer'),
+]);
+await waitFor(() => globalThis.__telegramMirrorToolStarted === true,
+  'Telegram slash-steer tool loop did not reach tool execution');
+const slashSteer = runtime.session.prompt('/slash-mirror', {
+  source: 'interactive', streamingBehavior: 'steer',
+});
+await new Promise((resolve) => setTimeout(resolve, 50));
+globalThis.__telegramMirrorHoldTool = false;
+await slashSteer;
+globalThis.__telegramMirrorTerminateTool = false;
+await waitFor(() => state().handled?.includes('tg-text-u27-m27'),
+  'excluded slash steer did not settle the original Telegram request');
+assert.equal(userTexts(initialManager)
+  .filter((text) => text.includes('Telegram tool loop before excluded slash')).length, 1);
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · answer after excluded slash steer').length, 1);
+assert.equal(Object.keys(state().deliveries).length, deliveriesBeforeSlashSteer + 1,
+  'excluded slash lifecycle was mirrored');
+assert.equal(faux.state.callCount, callsBeforeSlashSteer + 2,
+  'excluded slash steer reinjected the original Telegram request');
+assert.equal(initialManager.getEntries().some((entry) =>
+  entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
+    && entry.data.requestId === 'tg-text-u27-m27' && entry.data.state === 'interrupted'), false);
+
 const expiringSteer = state();
 expiringSteer.request = {
   id: 'tg-text-u23-m23', text: 'Telegram request with expiring terminal steer', status: 'queued',
@@ -1228,6 +1269,38 @@ assert.equal(state().abandoned?.some(([id]) => id === 'tg-text-stale-current'), 
 assert.equal(userTexts(runtime.session.sessionManager)
   .some((text) => text.includes('stale current admission')), true,
   'current represented admission unexpectedly disappeared from persisted history');
+
+const receiptFailureManager = runtime.session.sessionManager;
+const receiptFailureRequestId = 'tg-text-u28-m28';
+const receiptFailureTurnId = 'telegram-tg-text-u28-m28-persisted';
+const receiptFailureState = state();
+receiptFailureState.request = {
+  id: receiptFailureRequestId, text: 'persisted request with failed admission receipt',
+  status: 'claimed', owner: process.pid,
+};
+save(receiptFailureState);
+receiptFailureManager.appendCustomEntry('firstmate-telegram-admission', {
+  requestId: receiptFailureRequestId, turnId: receiptFailureTurnId,
+  sessionId: receiptFailureManager.getSessionId(), state: 'admitted',
+});
+receiptFailureManager.appendMessage({
+  role: 'user', content: [{ type: 'text', text: 'You · Telegram\n\npersisted request with failed admission receipt' }],
+  timestamp: Date.now(),
+});
+receiptFailureManager.appendMessage(fauxAssistantMessage('persisted answer despite failed admission receipt'));
+writeFileSync(`${home}/reject-delivered-receipt`, '');
+const callsBeforeReceiptFailureRestart = faux.state.callCount;
+await runtime.newSession({ parentSession: receiptFailureManager.getSessionFile() });
+await waitFor(() => state().handled?.includes(receiptFailureRequestId),
+  'failed admission receipt released durable Telegram provenance');
+unlinkSync(`${home}/reject-delivered-receipt`);
+assert.equal(userTexts(runtime.session.sessionManager).length, 0,
+  'failed admission receipt reinjected the persisted Telegram request');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · persisted answer despite failed admission receipt').length, 1);
+assert.equal(state().receipt_unknown?.filter((id) => id === receiptFailureRequestId).length, 1);
+assert.equal(faux.state.callCount, callsBeforeReceiptFailureRestart,
+  'failed admission receipt started a second model pass');
 
 const carriedManager = runtime.session.sessionManager;
 const carriedRequestId = 'tg-text-u24-m24';

@@ -41,7 +41,7 @@ type PendingAdmission = {
 type InputSegment =
   | { origin: "telegram"; pending: PendingAdmission }
   | { origin: "terminal"; turnId: string; text: string; deliveryId: string }
-  | { origin: "excluded" };
+  | { origin: "excluded"; preserveRequest?: boolean };
 type InputCandidate = {
   segment: InputSegment;
   busyGeneration?: number;
@@ -621,6 +621,8 @@ export default function (pi: ExtensionAPI) {
     let carriedRequest: string | undefined;
     let carriedRequestTurnId: string | undefined;
     if (active) {
+      if (segment.origin === "excluded" && segment.preserveRequest && activeRequest &&
+          !suspended && !lastAssistantBody) return;
       if (!queueActiveTurn()) {
         if (segment.origin === "terminal" && !suspended) {
           carriedRequest = activeRequest;
@@ -980,19 +982,18 @@ export default function (pi: ExtensionAPI) {
       lastAssistantBody = provenance.assistantBody;
       suspended = !lastAssistantBody;
       const delivered = await exec(["mirror-delivered", provenance.requestId]);
-      if (delivered.code === 0) {
-        if (lastAssistantBody) {
-          void settle(ctx);
-        } else if (await abandonRequest(
-          provenance.requestId,
-          provenance.turnId,
-          `assistant-${provenance.turnId}`,
-          ctx,
-        )) {
-          ctx.ui.notify("An interrupted persisted Telegram turn was abandoned without reinjection.", "warning");
-          resetTurn();
-        }
-      } else {
+      if (delivered.code !== 0) {
+        ctx.ui.notify("The Telegram admission receipt was not confirmed; the persisted turn remains owned.", "warning");
+      }
+      if (lastAssistantBody) {
+        void settle(ctx);
+      } else if (await abandonRequest(
+        provenance.requestId,
+        provenance.turnId,
+        `assistant-${provenance.turnId}`,
+        ctx,
+      )) {
+        ctx.ui.notify("An interrupted persisted Telegram turn was abandoned without reinjection.", "warning");
         resetTurn();
       }
     }
@@ -1145,7 +1146,7 @@ export default function (pi: ExtensionAPI) {
       }, ctx);
       return;
     }
-    await transitionSegment({ origin: "excluded" }, ctx);
+    await transitionSegment({ origin: "excluded", preserveRequest: true }, ctx);
   });
 
   pi.on("context", (event) => {
