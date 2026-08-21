@@ -58,6 +58,15 @@ PERMANENT_CONFIG_EXIT = 78
 FINAL_CONTINUATION_PENDING_EXIT = 2
 DELIVERY_UNKNOWN_EXIT = 3
 FIRSTMATE_REPLY_LABEL = "Firstmate · "
+QUEUED_RECEIPT = "Bot · Queued for Firstmate."
+PI_DELIVERED_RECEIPT = "Pi · Delivered to Firstmate."
+VOICE_PROGRESS_NOTICE = "Bot · Transcribing…"
+MIRROR_OFF_REFUSAL = (
+    "Bot · Telegram mirror mode is off, so this message was not processed. "
+    "Send /telegram on to mirror this chat into the Firstmate terminal."
+)
+MIRROR_COMMANDS = {"/telegram on": "on", "/telegram off": "off", "/telegram status": "status"}
+MIRROR_MODE_NAME = "telegram-mirror"
 MESSAGE_ENVELOPE_FIELDS = frozenset({
     "author_signature", "business_connection_id", "chat", "date", "direct_messages_topic",
     "edit_date", "effect_id", "external_reply", "forward_origin", "from",
@@ -191,11 +200,12 @@ def validate_home_storage(home: Path) -> None:
         require_path_kind(path, "regular file")
     if telegram.is_dir():
         for child in telegram.iterdir():
-            if child.name in {"inbox", "handled", "responses"}:
+            if child.name in {"inbox", "handled", "responses", "deliveries"}:
                 continue
             require_path_kind(child, "regular file")
         for directory in (
-                telegram / "inbox", telegram / "handled", telegram / "responses"):
+                telegram / "inbox", telegram / "handled", telegram / "responses",
+                telegram / "deliveries"):
             if directory.is_dir():
                 for child in directory.iterdir():
                     require_path_kind(child, "regular file")
@@ -1465,10 +1475,37 @@ def reconcile_requests(home: Path) -> None:
             continue
 
 
-def transport_reply(home: Path) -> str:
-    if primary_running(home):
-        return "Bot · Message received."
-    return "Bot · Message received and queued. It will be processed when Firstmate starts."
+def mirror_mode_path(home: Path) -> Path:
+    return home / "config" / MIRROR_MODE_NAME
+
+
+def mirror_mode_enabled(home: Path) -> bool:
+    try:
+        return mirror_mode_path(home).read_text(encoding="ascii").strip() == "on"
+    except (OSError, UnicodeError):
+        return False
+
+
+def set_mirror_mode(home: Path, enabled: bool) -> None:
+    atomic_bytes(mirror_mode_path(home), b"on\n" if enabled else b"off\n")
+
+
+def mirror_command(text: Any) -> Optional[str]:
+    return MIRROR_COMMANDS.get(text) if isinstance(text, str) else None
+
+
+def mirror_mode_reply(home: Path, action: str) -> str:
+    if action == "on":
+        set_mirror_mode(home, True)
+        return "Pi · Telegram mirror mode is on."
+    if action == "off":
+        set_mirror_mode(home, False)
+        return "Pi · Telegram mirror mode is off."
+    return f"Pi · Telegram mirror mode is {'on' if mirror_mode_enabled(home) else 'off'}."
+
+
+def transport_reply(_home: Path) -> str:
+    return QUEUED_RECEIPT
 
 
 def send_text(home: Path, chat_id: int, text: str, markup: Optional[Dict[str, Any]] = None) -> Any:
@@ -1476,6 +1513,222 @@ def send_text(home: Path, chat_id: int, text: str, markup: Optional[Dict[str, An
     if markup is not None:
         params["reply_markup"] = markup
     return api_call(home, "sendMessage", params)
+
+
+def mirror_owner_is_child(owner_pid: int) -> bool:
+    return owner_pid == os.getppid()
+
+
+def mirror_queue_paths_locked(home: Path) -> List[Path]:
+    inbox, _handled = request_dirs(home)
+    return sorted(inbox.glob("*.json"), key=request_order_key)
+
+
+def mirror_reconcile(home: Path) -> int:
+    marker = state_dir(home) / ".mirror-migration-v1"
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        if not marker.is_file():
+            for legacy in (active_path(home), closing_path(home)):
+                durable_unlink(legacy)
+            legacy_responses = state_dir(home) / "responses"
+            if legacy_responses.is_dir() and not legacy_responses.is_symlink():
+                durable_rmtree(legacy_responses)
+            for path in mirror_queue_paths_locked(home):
+                record = read_json(path)
+                if not isinstance(record, dict):
+                    continue
+                for field in ("continuation_of", "continuation_routing", "work_id",
+                              "work_published", "initial_routing_consumed", "wake_recorded"):
+                    record.pop(field, None)
+                if record.get("status") != "claimed":
+                    record["status"] = "queued"
+                    record.pop("claim_owner_pid", None)
+                    record.pop("claimed_at", None)
+                atomic_json(path, record)
+            atomic_bytes(marker, b"v1\n")
+        for path in mirror_queue_paths_locked(home):
+            record = read_json(path)
+            if not isinstance(record, dict):
+                continue
+            owner = record.get("claim_owner_pid")
+            if record.get("status") == "claimed" and strict_int(owner):
+                try:
+                    alive = os.kill(owner, 0) is None
+                except OSError:
+                    alive = False
+                if not alive:
+                    record["status"] = "queued"
+                    record.pop("claim_owner_pid", None)
+                    record.pop("claimed_at", None)
+                    atomic_json(path, record)
+    return 0
+
+
+def mirror_list(home: Path) -> int:
+    mirror_reconcile(home)
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        paths = mirror_queue_paths_locked(home)
+        for path in paths:
+            record = read_json(path)
+            if isinstance(record, dict) and record.get("status", "queued") == "queued":
+                print(path.stem)
+                return 0
+    return 1
+
+
+def mirror_claim(home: Path, request_id: str, owner_pid: int) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        path = request_path(home, request_id)
+        if path is None or path.parent.name != "inbox":
+            return die("Telegram request is not queued")
+        record = read_json(path)
+        if not isinstance(record, dict) or record.get("origin") != "telegram":
+            return die("Telegram request is malformed")
+        current_owner = record.get("claim_owner_pid")
+        if record.get("status") == "claimed":
+            if current_owner == owner_pid:
+                return 0
+            if strict_int(current_owner):
+                try:
+                    os.kill(current_owner, 0)
+                    return die("Telegram request is already being processed")
+                except OSError:
+                    pass
+        record["status"] = "claimed"
+        record["claim_owner_pid"] = owner_pid
+        record["claimed_at"] = now()
+        atomic_json(path, record)
+    return 0
+
+
+def mirror_read(home: Path, request_id: str, owner_pid: int) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        path = request_path(home, request_id)
+        record = read_json(path) if path is not None else None
+        if (path is None or path.parent.name != "inbox" or not isinstance(record, dict)
+                or record.get("status") != "claimed" or record.get("claim_owner_pid") != owner_pid):
+            return die("Telegram request is not owned by this extension")
+        text = record.get("text")
+        if not isinstance(text, str):
+            return die("Telegram request is malformed")
+    sys.stdout.buffer.write(text.encode("utf-8"))
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def mirror_release(home: Path, request_id: str, owner_pid: int) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        path = request_path(home, request_id)
+        record = read_json(path) if path is not None else None
+        if path is None or path.parent.name != "inbox" or not isinstance(record, dict):
+            return 1
+        if record.get("claim_owner_pid") != owner_pid:
+            return 1
+        record["status"] = "queued"
+        record.pop("claim_owner_pid", None)
+        record.pop("claimed_at", None)
+        atomic_json(path, record)
+    return 0
+
+
+def mirror_delivered(home: Path, request_id: str, owner_pid: int) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        path = request_path(home, request_id)
+        record = read_json(path) if path is not None else None
+        if (path is None or path.parent.name != "inbox" or not isinstance(record, dict)
+                or record.get("status") != "claimed" or record.get("claim_owner_pid") != owner_pid):
+            return die("Telegram request is not owned by this extension")
+        if record.get("delivery_status") == "sent":
+            return 0
+        record["delivery_status"] = "sending"
+        atomic_json(path, record)
+        chat_id = record.get("chat_id")
+    try:
+        send_text(home, int(chat_id), PI_DELIVERED_RECEIPT)
+    except TelegramError:
+        with FileLock(state_lock(home)):
+            current = read_json(path)
+            if isinstance(current, dict) and current.get("claim_owner_pid") == owner_pid:
+                current["delivery_status"] = "delivery_unknown"
+                atomic_json(path, current)
+        return 1
+    with FileLock(state_lock(home)):
+        current = read_json(path)
+        if isinstance(current, dict) and current.get("claim_owner_pid") == owner_pid:
+            current["delivery_status"] = "sent"
+            atomic_json(path, current)
+    return 0
+
+
+def mirror_delivery_dir(home: Path) -> Path:
+    path = state_dir(home) / "deliveries"
+    private_dir(path)
+    return path
+
+
+def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    if not safe_id(delivery_id) or len(delivery_id) > 160:
+        return die("Telegram delivery identity is invalid")
+    try:
+        body = text_from_file(text_file).encode("utf-8")
+    except (OSError, UnicodeError):
+        return die("Telegram delivery body is not valid UTF-8")
+    if len(body) > MAX_RESPONSE_BYTES:
+        return die("Telegram delivery exceeds the response limit")
+    body_path = mirror_delivery_dir(home) / f"{delivery_id}.txt"
+    metadata_path = mirror_delivery_dir(home) / f"{delivery_id}.json"
+    digest = hashlib.sha256(body).hexdigest()
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        existing = read_json(metadata_path)
+        if isinstance(existing, dict):
+            if existing.get("sha256") != digest:
+                return die("Telegram delivery identity is already bound to different content")
+            if existing.get("status") == "sent":
+                return 0
+            if existing.get("status") == "delivery_unknown":
+                return DELIVERY_UNKNOWN_EXIT
+        else:
+            atomic_bytes(body_path, body)
+            atomic_json(metadata_path, {"delivery_id": delivery_id, "sha256": digest,
+                                        "status": "pending", "created_at": now()})
+        record = read_json(metadata_path)
+        record["status"] = "sending"
+        record["attempted_at"] = now()
+        atomic_json(metadata_path, record)
+        config = load_config(home)
+        chat_id = int(config["chat_id"])
+    try:
+        send_text(home, chat_id, body.decode("utf-8"))
+    except TelegramError:
+        with FileLock(state_lock(home)):
+            record = read_json(metadata_path)
+            if isinstance(record, dict):
+                record["status"] = "delivery_unknown"
+                atomic_json(metadata_path, record)
+        return DELIVERY_UNKNOWN_EXIT
+    with FileLock(state_lock(home)):
+        record = read_json(metadata_path)
+        if isinstance(record, dict):
+            record["status"] = "sent"
+            atomic_json(metadata_path, record)
+    return 0
 
 
 def answer_callback(home: Path, callback_id: str) -> None:
@@ -1901,6 +2154,8 @@ def complete_send(home: Path, pending: Dict[str, Any]) -> bool:
 
 
 def reconcile_pending(home: Path, config: Dict[str, Any]) -> None:
+    if not mirror_mode_enabled(home):
+        return
     pending = read_json(pending_path(home))
     if not isinstance(pending, dict):
         return
@@ -1954,6 +2209,19 @@ def handle_text(home: Path, config: Dict[str, Any], message: Dict[str, Any], upd
     if (not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT
             or unicode_text_units(text) is None):
         return False
+    action = mirror_command(text)
+    if action is not None:
+        try:
+            send_text(home, int(config["chat_id"]), mirror_mode_reply(home, action))
+        except TelegramError:
+            return False
+        return True
+    if not mirror_mode_enabled(home):
+        try:
+            send_text(home, int(config["chat_id"]), MIRROR_OFF_REFUSAL)
+        except TelegramError:
+            return False
+        return True
     pending = read_json(pending_path(home))
     if isinstance(pending, dict):
         edit_replay = (pending.get("edit_update_id") == update_id
@@ -1985,7 +2253,7 @@ def handle_text(home: Path, config: Dict[str, Any], message: Dict[str, Any], upd
             return True
     request_id = queue_request(home, text, int(config["chat_id"]),
                                int(message_id), update_id,
-                               attach_to_active=True)
+                               attach_to_active=False)
     reconcile_request(home, request_id)
     record = read_json(request_path(home, request_id))
     return isinstance(record, dict) and record.get("wake_recorded") is True
@@ -2007,6 +2275,12 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any],
     if duration < 0 or duration > MAX_VOICE_SECONDS or size < 0 or size > MAX_VOICE_BYTES:
         return False
     message_id = int(message["message_id"])
+    if not mirror_mode_enabled(home):
+        try:
+            send_text(home, int(config["chat_id"]), MIRROR_OFF_REFUSAL)
+        except TelegramError:
+            return False
+        return True
     pending_id = f"voice-u{update_id}-m{message_id}"
     with FileLock(state_lock(home)):
         pending = read_json(pending_path(home))
@@ -2071,8 +2345,42 @@ def advance_pending_voice(home: Path, config: Dict[str, Any]) -> None:
             }
             save_pending(home, pending)
             save_pending_voice_queue_locked(home, records[1:])
+        try:
+            send_voice_progress(home, pending)
+        except TelegramError:
+            pass
         if complete_initial_transcription(home, config, pending):
             return
+
+
+def send_voice_progress(home: Path, pending: Dict[str, Any]) -> None:
+    pending_id = pending.get("pending_id")
+    if not isinstance(pending_id, str):
+        return
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                or current.get("mode") != "transcribing"):
+            return
+        if current.get("progress_status") == "sent":
+            return
+        current["progress_status"] = "sending"
+        atomic_json(pending_path(home), current)
+        chat_id = int(current["chat_id"])
+    try:
+        send_text(home, chat_id, VOICE_PROGRESS_NOTICE)
+    except TelegramError:
+        with FileLock(state_lock(home)):
+            current = read_json(pending_path(home))
+            if isinstance(current, dict) and current.get("pending_id") == pending_id:
+                current["progress_status"] = "delivery_unknown"
+                atomic_json(pending_path(home), current)
+        raise
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if isinstance(current, dict) and current.get("pending_id") == pending_id:
+            current["progress_status"] = "sent"
+            atomic_json(pending_path(home), current)
 
 
 def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], update_id: int) -> bool:
@@ -3137,11 +3445,9 @@ def set_telegram_enabled(home: Path, enabled: bool) -> None:
 
 
 def prepare_transport_activation(home: Path) -> None:
+    # The transport is allowed to queue while no primary exists. The project-local
+    # Pi extension, not a watcher or a second route, owns live delivery.
     set_telegram_enabled(home, True)
-    if primary_running(home) and not watcher_running(home):
-        raise WatcherPreconditionError(
-            "a running primary must establish its harness-owned watcher before Telegram starts; retry after supervision is healthy"
-        )
 
 
 def unit_path() -> Path:
@@ -3406,6 +3712,7 @@ def _cleanup_locked(home: Path) -> int:
             config = config_path(home)
             if config.is_symlink() or config.is_file():
                 durable_unlink(config)
+            durable_unlink(mirror_mode_path(home))
     print("Telegram service and private Telegram state cleaned up.")
     return 0
 
@@ -3419,8 +3726,8 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, request-read, request-handled, request-bind, request-routed, active-request, continuation-handled, response-reserve, response-stage, response-status, response-render, response-rendered, send, reply, install, start, stop, status, disable, cleanup.\n"
-                "Retention limits: 256 queued requests for 7 days, 4096 handled requests, and 256 responses of up to 256 KiB or 64 Telegram chunks each.\n"
+        epilog=("Commands: pair, serve, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-reply, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
+                "Retention limits: 256 queued requests for 7 days, 4096 handled requests, and 256 responses of up to 256 KiB.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
                 "Voice limits: 10 MiB, 120 seconds, a 4096-unit transcript, and 64 waiting notes. Temporary audio is restricted to /dev/shm.\n"
                 "Pairing accepts --parakeet-command and --whisper-command as absolute executable paths; configured paths must be regular executable files.\n"
@@ -3452,88 +3759,35 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--once", action="store_true")
     serve_parser.add_argument("--poll-timeout", type=int, default=POLL_TIMEOUT)
     serve_parser.add_argument("--systemd-service", action="store_true", help=argparse.SUPPRESS)
-    read_parser = sub.add_parser("request-read", help="print one queued Telegram request")
-    add_home(read_parser)
-    read_parser.add_argument("request_id")
-    handled_parser = sub.add_parser("request-handled", help="claim and mark one Telegram request handled")
-    add_home(handled_parser)
-    handled_parser.add_argument("request_id")
-    bind_parser = sub.add_parser("request-bind", help="bind the active request to one lifecycle work id")
-    add_home(bind_parser)
-    bind_parser.add_argument("request_id")
-    bind_parser.add_argument("work_id")
-    bind_locked_parser = sub.add_parser("request-bind-locked", help=argparse.SUPPRESS)
-    add_home(bind_locked_parser)
-    bind_locked_parser.add_argument("request_id")
-    bind_locked_parser.add_argument("work_id")
-    authorize_parser = sub.add_parser("publication-authorize", help=argparse.SUPPRESS)
-    add_home(authorize_parser)
-    authorize_parser.add_argument("request_id")
-    authorize_parser.add_argument("work_id")
-    reserved_parser = sub.add_parser("publication-reserved", help=argparse.SUPPRESS)
-    add_home(reserved_parser)
-    reserved_parser.add_argument("work_id")
-    published_parser = sub.add_parser("request-published", help=argparse.SUPPRESS)
-    add_home(published_parser)
-    published_parser.add_argument("request_id")
-    published_parser.add_argument("work_id")
-    routed_parser = sub.add_parser(
-        "request-routed", help="acknowledge a directly handled initial route"
-    )
-    add_home(routed_parser)
-    routed_parser.add_argument("request_id")
-    active_parser = sub.add_parser(
-        "active-request", help="print the active request route and any claimed work id"
-    )
-    add_home(active_parser)
-    active_group = active_parser.add_mutually_exclusive_group()
-    active_group.add_argument("--work-id", help="require an exact lifecycle work binding")
-    active_group.add_argument("--claimed-request", help="require a recoverably pending handled request route")
-    continuation_parser = sub.add_parser(
-        "continuation-handled", help="acknowledge a handled continuation after its route is consumed"
-    )
-    add_home(continuation_parser)
-    continuation_parser.add_argument("request_id")
-    reserve_parser = sub.add_parser(
-        "response-reserve", help="reserve one private response output file for a claimed route"
-    )
-    add_home(reserve_parser)
-    reserve_parser.add_argument("claimed_request_id")
-    reserve_parser.add_argument("response_id")
-    reserve_parser.add_argument("--final", action="store_true")
-    stage_parser = sub.add_parser(
-        "response-stage", help="durably stage the labeled bytes in a reserved response file"
-    )
-    add_home(stage_parser)
-    stage_parser.add_argument("claimed_request_id")
-    stage_parser.add_argument("response_id")
-    stage_parser.add_argument("--final", action="store_true")
-    stage_parser.add_argument("--text-file", required=True, help="reserved UTF-8 labeled response file")
-    status_parser = sub.add_parser(
-        "response-status", help="print a reserved response path and its content, render, and delivery states"
-    )
-    add_home(status_parser)
-    status_parser.add_argument("claimed_request_id")
-    status_parser.add_argument("response_id")
-    render_parser = sub.add_parser(
-        "response-render", help="attempt to render staged response bytes"
-    )
-    add_home(render_parser)
-    render_parser.add_argument("claimed_request_id")
-    render_parser.add_argument("response_id")
-    rendered_parser = sub.add_parser(
-        "response-rendered", help="acknowledge a successful terminal render"
-    )
-    add_home(rendered_parser)
-    rendered_parser.add_argument("claimed_request_id")
-    rendered_parser.add_argument("response_id")
-    send_parser = sub.add_parser("send", help="send to the paired private chat")
-    add_home(send_parser)
-    send_parser.add_argument("--text-file", required=True, help="UTF-8 text file, or - for stdin")
-    reply_parser = sub.add_parser("reply", help="deliver one staged Telegram response")
-    add_home(reply_parser)
-    reply_parser.add_argument("request_id")
-    reply_parser.add_argument("--response-id", required=True)
+    mode_parser = sub.add_parser("mirror-mode", help="read or set the private Telegram mirror preference")
+    add_home(mode_parser)
+    mode_parser.add_argument("action", choices=("on", "off", "status"))
+    mode_parser.add_argument("--owner-pid", type=int, required=True)
+    next_parser = sub.add_parser("mirror-next", help="print the next queued mirror request id")
+    add_home(next_parser)
+    claim_parser = sub.add_parser("mirror-claim", help="claim one queued request for this Pi process")
+    add_home(claim_parser)
+    claim_parser.add_argument("request_id")
+    claim_parser.add_argument("--owner-pid", type=int, required=True)
+    mirror_read_parser = sub.add_parser("mirror-read", help="print one request owned by this Pi process")
+    add_home(mirror_read_parser)
+    mirror_read_parser.add_argument("request_id")
+    mirror_read_parser.add_argument("--owner-pid", type=int, required=True)
+    delivered_parser = sub.add_parser("mirror-delivered", help="send the zero-token Pi delivery receipt")
+    add_home(delivered_parser)
+    delivered_parser.add_argument("request_id")
+    delivered_parser.add_argument("--owner-pid", type=int, required=True)
+    release_parser = sub.add_parser("mirror-release", help="return a failed live claim to the queue")
+    add_home(release_parser)
+    release_parser.add_argument("request_id")
+    release_parser.add_argument("--owner-pid", type=int, required=True)
+    mirror_reply_parser = sub.add_parser("mirror-reply", help="deliver one stable finalized assistant body")
+    add_home(mirror_reply_parser)
+    mirror_reply_parser.add_argument("delivery_id")
+    mirror_reply_parser.add_argument("--owner-pid", type=int, required=True)
+    mirror_reply_parser.add_argument("--text-file", required=True)
+    reconcile_parser = sub.add_parser("mirror-reconcile", help="requeue claims whose Pi process ended")
+    add_home(reconcile_parser)
     for name, help_text in (("install", "install and start the user service"), ("start", "start the user service"),
                             ("stop", "stop the user service"), ("status", "show user service status"),
                             ("disable", "disable the user service"), ("cleanup", "remove this service and private state")):
@@ -3560,45 +3814,28 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return serve(
                 home, args.once, max(0, min(args.poll_timeout, 50)), args.systemd_service
             )
-        if args.command == "request-read":
-            return request_read(home, args.request_id)
-        if args.command == "request-handled":
-            return request_handled(home, args.request_id)
-        if args.command == "request-bind":
-            return request_bind(home, args.request_id, args.work_id)
-        if args.command == "request-bind-locked":
-            return request_bind_locked(home, args.request_id, args.work_id)
-        if args.command == "publication-authorize":
-            return publication_authorize(home, args.request_id, args.work_id)
-        if args.command == "publication-reserved":
-            return publication_reserved(home, args.work_id)
-        if args.command == "request-published":
-            return request_published(home, args.request_id, args.work_id)
-        if args.command == "request-routed":
-            return request_routed(home, args.request_id)
-        if args.command == "active-request":
-            return request_active(home, args.work_id, args.claimed_request)
-        if args.command == "continuation-handled":
-            return continuation_handled(home, args.request_id)
-        if args.command == "response-reserve":
-            return response_reserve(
-                home, args.claimed_request_id, args.response_id, args.final,
-            )
-        if args.command == "response-stage":
-            return response_stage(
-                home, args.claimed_request_id, args.response_id,
-                args.text_file, args.final,
-            )
-        if args.command == "response-status":
-            return response_status(home, args.claimed_request_id, args.response_id)
-        if args.command == "response-render":
-            return response_render(home, args.claimed_request_id, args.response_id)
-        if args.command == "response-rendered":
-            return response_rendered(home, args.claimed_request_id, args.response_id)
-        if args.command == "send":
-            return send_command(home, text_from_file(args.text_file))
-        if args.command == "reply":
-            return reply_command(home, args.request_id, args.response_id)
+        if args.command == "mirror-mode":
+            if not mirror_owner_is_child(args.owner_pid):
+                return die("Telegram mirror owner is not the invoking extension")
+            if args.action == "status":
+                print("on" if mirror_mode_enabled(home) else "off")
+                return 0
+            print(mirror_mode_reply(home, args.action))
+            return 0
+        if args.command == "mirror-next":
+            return mirror_list(home)
+        if args.command == "mirror-claim":
+            return mirror_claim(home, args.request_id, args.owner_pid)
+        if args.command == "mirror-read":
+            return mirror_read(home, args.request_id, args.owner_pid)
+        if args.command == "mirror-delivered":
+            return mirror_delivered(home, args.request_id, args.owner_pid)
+        if args.command == "mirror-release":
+            return mirror_release(home, args.request_id, args.owner_pid)
+        if args.command == "mirror-reply":
+            return mirror_reply(home, args.delivery_id, args.owner_pid, args.text_file)
+        if args.command == "mirror-reconcile":
+            return mirror_reconcile(home)
         if args.command == "install":
             return install(home)
         if args.command == "start":
