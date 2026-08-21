@@ -695,6 +695,11 @@ fi
         fsync_directory(home / "state")
 
 
+def migrate_wakes(home: Path) -> int:
+    consume_safe_wakes(home)
+    return 0
+
+
 def active_path(home: Path) -> Path:
     return state_dir(home) / "active.json"
 
@@ -3389,7 +3394,7 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-hold, mirror-recover, mirror-validate, mirror-reserve, mirror-cancel, mirror-reply, mirror-abandon, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
+        epilog=("Commands: pair, serve, migrate-wakes, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-hold, mirror-recover, mirror-validate, mirror-reserve, mirror-cancel, mirror-reply, mirror-abandon, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
                 "Private mirror commands require the lock-owning extension capability on an inherited file descriptor.\n"
                 "Retention limits: 256 queued or interrupted requests for 7 days, 4096 handled requests, and 256 mirror deliveries of up to 256 KiB.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
@@ -3427,6 +3432,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--once", action="store_true")
     serve_parser.add_argument("--poll-timeout", type=int, default=POLL_TIMEOUT)
     serve_parser.add_argument("--systemd-service", action="store_true", help=argparse.SUPPRESS)
+    migrate_parser = sub.add_parser(
+        "migrate-wakes", help="retire obsolete Telegram wake rows without reading request content"
+    )
+    add_home(migrate_parser)
     open_parser = sub.add_parser("mirror-open", help="open the lock owner's private extension capability")
     add_private(open_parser)
     mode_parser = sub.add_parser("mirror-mode", help="read or set the private Telegram mirror preference")
@@ -3507,6 +3516,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return serve(
                 home, args.once, max(0, min(args.poll_timeout, 50)), args.systemd_service
             )
+        if args.command == "migrate-wakes":
+            return migrate_wakes(home)
         if args.command == "mirror-open":
             return mirror_open(home, args.owner_pid, args.capability_fd)
         if args.command.startswith("mirror-"):

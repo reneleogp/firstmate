@@ -179,6 +179,8 @@ elif command == 'mirror-delivered':
     elif (home / 'reject-delivered-receipt').exists():
         state.setdefault('receipt_unknown', []).append(rest[0]); code = 1
     elif rest[0] not in state.setdefault('receipts', []): state['receipts'].append(rest[0])
+    if code == 0 and (home / 'exercise-delivered-timeout').exists():
+        time.sleep(0.05)
 elif command == 'mirror-reply':
     delivery_id = rest[0]
     body = sys.stdin.read() if option('--text-file') == '-' else Path(option('--text-file')).read_text()
@@ -356,10 +358,13 @@ process.env.FM_TELEGRAM_MAX_INPUT_CANDIDATES = '256';
 process.env.FM_TELEGRAM_HOLD_RETRY_BACKOFF_MS = '25';
 const nativeSetTimeout = globalThis.setTimeout;
 const completeMirrorReplyTimeout = (1 + 64 * 3) * 45_000 + 30_000;
+const completeMirrorDeliveredTimeout = 2 * 45_000 + 30_000;
 globalThis.setTimeout = (callback, delay, ...args) => {
   let effectiveDelay = delay;
   if (existsSync(`${home}/exercise-reply-timeout`) && typeof delay === 'number' && delay > 30_000) {
     effectiveDelay = delay >= completeMirrorReplyTimeout ? 200 : 5;
+  } else if (existsSync(`${home}/exercise-delivered-timeout`) && typeof delay === 'number' && delay > 30_000) {
+    effectiveDelay = delay >= completeMirrorDeliveredTimeout ? 200 : 5;
   } else if (delay === 30_000 && existsSync(`${home}/delay-assistant-reply`)) {
     effectiveDelay = 200;
   }
@@ -419,6 +424,7 @@ faux.setResponses([
 ]);
 const statuses = [];
 const notices = [];
+const parityFallback = 'Firstmate · Response could not be mirrored; view it in the terminal.';
 const uiContext = {
   setStatus(key, value) { statuses.push([key, value]); },
   notify(message, level) { notices.push([message, level]); },
@@ -472,6 +478,20 @@ await waitFor(() => state().handled?.includes('tg-text-u32-m32'),
 unlinkSync(`${home}/exercise-reply-timeout`);
 assert.equal(Object.values(state().deliveries)
   .filter((body) => body === 'Firstmate · reply completed within the derived timeout').length, 1);
+
+writeFileSync(`${home}/exercise-delivered-timeout`, '');
+const deliveredTimeoutState = state();
+deliveredTimeoutState.request = {
+  id: 'tg-text-u35-m35', text: 'exercise delivered receipt timeout', status: 'queued',
+};
+save(deliveredTimeoutState);
+faux.appendResponses([fauxAssistantMessage('receipt completed within the derived timeout')]);
+await waitFor(() => state().handled?.includes('tg-text-u35-m35'),
+  'receipt authentication and delivery timeout killed a valid mirror receipt');
+unlinkSync(`${home}/exercise-delivered-timeout`);
+assert.equal(state().receipts.filter((id) => id === 'tg-text-u35-m35').length, 1);
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · receipt completed within the derived timeout').length, 1);
 
 const usersBeforeReload = userTexts(initialManager).length;
 await runtime.session.reload();
@@ -537,8 +557,11 @@ assert.equal(faux.state.callCount, callsAfterAcceptedUserBlock,
 writeFileSync(`${home}/reject-user-reply`, '');
 globalThis.__telegramMirrorDelayInteractiveInput = true;
 const callsBeforeQueuedUserBlock = faux.state.callCount;
+globalThis.__telegramMirrorTerminateTool = true;
 faux.appendResponses([
-  fauxAssistantMessage('queued user block A answer'),
+  fauxAssistantMessage([
+    fauxToolCall('mirror_test_tool', {}, { id: 'queued-user-block-a-tool-call' }),
+  ], { stopReason: 'toolUse' }),
   fauxAssistantMessage('queued user block B answer'),
 ]);
 const queuedUserBlockA = runtime.session.prompt('queued user block A', {
@@ -549,6 +572,7 @@ const queuedUserBlockB = runtime.session.prompt('queued user block B', {
 });
 await Promise.all([queuedUserBlockA, queuedUserBlockB]);
 globalThis.__telegramMirrorDelayInteractiveInput = false;
+globalThis.__telegramMirrorTerminateTool = false;
 await waitFor(() => statuses.at(-1)?.[1] === 'telegram: delivery needs attention',
   'queued terminal user delivery failure did not pause ordered settlement');
 unlinkSync(`${home}/reject-user-reply`);
@@ -558,7 +582,8 @@ await waitFor(() => Object.values(state().deliveries)
 'queued terminal B did not settle after A user delivery recovered');
 const queuedBodies = Object.values(state().deliveries);
 assert.equal(queuedBodies.filter((body) => body === 'You · Terminal\n\nqueued user block A').length, 1);
-assert.equal(queuedBodies.filter((body) => body === 'Firstmate · queued user block A answer').length, 1);
+assert.equal(queuedBodies.filter((body) => body === parityFallback).length >= 1, true,
+  'accepted terminal A without a final body was dropped instead of settled');
 assert.equal(queuedBodies.filter((body) => body === 'You · Terminal\n\nqueued user block B').length, 1);
 assert.equal(queuedBodies.filter((body) => body === 'Firstmate · queued user block B answer').length, 1);
 assert.equal(faux.state.callCount, callsBeforeQueuedUserBlock + 2,
@@ -577,8 +602,9 @@ current = state();
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'You · Terminal\n\nterminal request').length, 1);
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · terminal\nanswer').length, 1);
 
-const parityFallback = 'Firstmate · Response could not be mirrored; view it in the terminal.';
 const callsBeforeOversizedTerminalResponse = faux.state.callCount;
+const fallbacksBeforeOversizedTerminalResponse = Object.values(state().deliveries)
+  .filter((body) => body === parityFallback).length;
 writeFileSync(`${home}/reject-fallback-reply`, '');
 faux.appendResponses([fauxAssistantMessage('x'.repeat(256 * 1024))]);
 await runtime.session.prompt('terminal with oversized assistant response', { source: 'interactive' });
@@ -591,8 +617,9 @@ assert.equal(Object.values(state().deliveries)
 const callsAfterBlockedFallback = faux.state.callCount;
 unlinkSync(`${home}/reject-fallback-reply`);
 await runtime.session.prompt('/telegram on', { source: 'interactive' });
-await waitFor(() => Object.values(state().deliveries).filter((body) => body === parityFallback).length === 1,
-  'oversized terminal response did not receive its paired fallback');
+await waitFor(() => Object.values(state().deliveries)
+  .filter((body) => body === parityFallback).length === fallbacksBeforeOversizedTerminalResponse + 1,
+'oversized terminal response did not receive its paired fallback');
 assert.equal(faux.state.callCount, callsAfterBlockedFallback,
   'blocked oversized-response fallback retry invoked the model');
 assert.equal(state().log.some((call) => call[0] === 'mirror-reply' &&
@@ -609,8 +636,9 @@ assert.equal(faux.state.callCount, callsBeforeRejectedTerminalResponse + 1,
   'rejected terminal response invoked another model pass');
 assert.equal(Object.values(state().deliveries)
   .filter((body) => body === 'You · Terminal\n\nterminal with rejected assistant response').length, 1);
-assert.equal(Object.values(state().deliveries).filter((body) => body === parityFallback).length, 2,
-  'definitely rejected terminal response did not receive its paired fallback');
+assert.equal(Object.values(state().deliveries).filter((body) => body === parityFallback).length,
+  fallbacksBeforeOversizedTerminalResponse + 2,
+'definitely rejected terminal response did not receive its paired fallback');
 assert.equal(Object.values(state().deliveries)
   .some((body) => body === 'Firstmate · definitely rejected terminal response'), false,
 'definitely rejected terminal response was recorded as delivered');

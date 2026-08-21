@@ -95,6 +95,7 @@ const mirrorReplyProcessOverheadMs = 30_000;
 const mirrorReplyTimeoutMs =
   (1 + mirrorReplyMaxChunks * mirrorReplyMaxAttempts) * telegramApiCallTimeoutMs +
   mirrorReplyProcessOverheadMs;
+const mirrorDeliveredTimeoutMs = 2 * telegramApiCallTimeoutMs + mirrorReplyProcessOverheadMs;
 const assistantFallbackBody = "Firstmate · Response could not be mirrored; view it in the terminal.";
 const configuredHoldRetryBackoff = Number(process.env.FM_TELEGRAM_HOLD_RETRY_BACKOFF_MS || "1000");
 const holdRetryBackoffMs = Number.isFinite(configuredHoldRetryBackoff)
@@ -468,10 +469,15 @@ export default function (pi: ExtensionAPI) {
         killed = true;
         child.kill("SIGTERM");
       };
+      const timeoutMs = args[0] === "mirror-reply"
+        ? mirrorReplyTimeoutMs
+        : args[0] === "mirror-delivered"
+          ? mirrorDeliveredTimeoutMs
+          : 30_000;
       const timeout = setTimeout(() => {
         killed = true;
         child.kill("SIGKILL");
-      }, args[0] === "mirror-reply" ? mirrorReplyTimeoutMs : 30_000);
+      }, timeoutMs);
       signal?.addEventListener("abort", abort, { once: true });
       child.stdout?.setEncoding("utf8");
       child.stderr?.setEncoding("utf8");
@@ -698,6 +704,7 @@ export default function (pi: ExtensionAPI) {
 
   const deliverSettledTurn = async (turn: SettledTurn, ctx: ExtensionContext): Promise<boolean> => {
     const startedGeneration = generation;
+    if (!turn.body && turn.origin === "terminal") turn.assistantFallback = true;
     if (turn.terminalDelivery && !turn.terminalDelivery.sent) {
       turn.terminalDelivery.attempted = true;
       const terminalResult = await deliver(
@@ -911,6 +918,15 @@ export default function (pi: ExtensionAPI) {
         if (segment.origin === "terminal" && !suspended) {
           carriedRequest = activeRequest;
           carriedRequestTurnId = activeRequestTurnId || activeTurnId;
+          if (activeOrigin === "terminal" && activeTurnId && activeTerminalDelivery) {
+            settledTurns.push({
+              origin: "terminal",
+              turnId: activeTurnId,
+              body: "",
+              terminalDelivery: activeTerminalDelivery,
+              assistantFallback: true,
+            });
+          }
           resetTurn();
         } else {
           await holdInterrupted(ctx);
