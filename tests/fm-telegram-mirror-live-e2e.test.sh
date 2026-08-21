@@ -557,6 +557,8 @@ assert.equal(faux.state.callCount, callsAfterAcceptedUserBlock,
 writeFileSync(`${home}/reject-user-reply`, '');
 globalThis.__telegramMirrorDelayInteractiveInput = true;
 const callsBeforeQueuedUserBlock = faux.state.callCount;
+const fallbacksBeforeQueuedUserBlock = Object.values(state().deliveries)
+  .filter((body) => body === parityFallback).length;
 globalThis.__telegramMirrorTerminateTool = true;
 faux.appendResponses([
   fauxAssistantMessage([
@@ -581,9 +583,11 @@ await waitFor(() => Object.values(state().deliveries)
   .some((body) => body === 'Firstmate · queued user block B answer'),
 'queued terminal B did not settle after A user delivery recovered');
 const queuedBodies = Object.values(state().deliveries);
-assert.equal(queuedBodies.filter((body) => body === 'You · Terminal\n\nqueued user block A').length, 1);
-assert.equal(queuedBodies.filter((body) => body === parityFallback).length >= 1, true,
-  'accepted terminal A without a final body was dropped instead of settled');
+assert.equal(queuedBodies.filter((body) => body === 'You · Terminal\n\nqueued user block A').length, 0,
+  'interrupted terminal A replayed its previously blocked user side');
+assert.equal(queuedBodies.filter((body) => body === parityFallback).length,
+  fallbacksBeforeQueuedUserBlock,
+  'unfinished terminal A fabricated a transport-failure fallback');
 assert.equal(queuedBodies.filter((body) => body === 'You · Terminal\n\nqueued user block B').length, 1);
 assert.equal(queuedBodies.filter((body) => body === 'Firstmate · queued user block B answer').length, 1);
 assert.equal(faux.state.callCount, callsBeforeQueuedUserBlock + 2,

@@ -67,6 +67,7 @@ type SettledTurn = {
   terminalDelivery?: TerminalDelivery;
   assistantAttempted?: boolean;
   assistantFallback?: boolean;
+  interrupted?: boolean;
 };
 
 const extensionRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -704,7 +705,14 @@ export default function (pi: ExtensionAPI) {
 
   const deliverSettledTurn = async (turn: SettledTurn, ctx: ExtensionContext): Promise<boolean> => {
     const startedGeneration = generation;
-    if (!turn.body && turn.origin === "terminal") turn.assistantFallback = true;
+    if (!turn.body) {
+      if (!turn.interrupted) return false;
+      if (turn.terminalDelivery && !turn.terminalDelivery.sent && !turn.terminalDelivery.attempted) {
+        await cancelReservation(turn.terminalDelivery.deliveryId, ctx);
+      }
+      ctx.ui.notify("An unfinished terminal mirror turn was abandoned after interruption.", "warning");
+      return true;
+    }
     if (turn.terminalDelivery && !turn.terminalDelivery.sent) {
       turn.terminalDelivery.attempted = true;
       const terminalResult = await deliver(
@@ -924,7 +932,7 @@ export default function (pi: ExtensionAPI) {
               turnId: activeTurnId,
               body: "",
               terminalDelivery: activeTerminalDelivery,
-              assistantFallback: true,
+              interrupted: true,
             });
           }
           resetTurn();

@@ -643,7 +643,13 @@ def seen_path(home: Path) -> Path:
     return state_dir(home) / "seen.json"
 
 
-def consume_safe_wakes(home: Path, request_ids: Optional[List[str]] = None) -> None:
+def effective_wake_state(home: Path) -> Path:
+    override = os.environ.get("FM_STATE_OVERRIDE")
+    return Path(override).expanduser().resolve() if override else home / "state"
+
+
+def consume_safe_wakes(home: Path, wake_state: Path,
+                       request_ids: Optional[List[str]] = None) -> None:
     for request_id in request_ids or [""]:
         if request_id and not safe_id(request_id):
             continue
@@ -682,21 +688,21 @@ fi
 '''
         environment = os.environ.copy()
         environment["FM_HOME"] = str(home)
-        environment["FM_STATE_OVERRIDE"] = str(home / "state")
+        environment["FM_STATE_OVERRIDE"] = str(wake_state)
         result = subprocess.run(
             ["/bin/bash", "-c", script, "fm-telegram", str(library), request_id],
             env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         if result.returncode != 0:
             raise TelegramError("safe Telegram wakes could not be cleaned")
-        queue = home / "state" / ".wake-queue"
+        queue = wake_state / ".wake-queue"
         if queue.is_file() and not queue.is_symlink():
             fsync_file(queue)
-        fsync_directory(home / "state")
+        fsync_directory(wake_state)
 
 
 def migrate_wakes(home: Path) -> int:
-    consume_safe_wakes(home)
+    consume_safe_wakes(home, effective_wake_state(home))
     return 0
 
 
@@ -889,7 +895,7 @@ def cleanup_failed_completion_request_locked(home: Path, record: Dict[str, Any])
         )
         if candidate.get("status") == "sent" or delivery_live:
             return
-    consume_safe_wakes(home, [request_id])
+    consume_safe_wakes(home, effective_wake_state(home), [request_id])
     durable_unlink(path)
 
 
@@ -1002,7 +1008,7 @@ def _bounded_cleanup_locked(home: Path, preserve_requests: Iterable[str] = ()) -
         queued_index += 1
         if should_remove:
             try:
-                consume_safe_wakes(home, [path.stem])
+                consume_safe_wakes(home, effective_wake_state(home), [path.stem])
                 durable_unlink(path)
             except (OSError, TelegramError):
                 pass
@@ -1086,7 +1092,7 @@ def _queue_request_locked(home: Path, text: str, chat_id: int, message_id: int,
             queued_files.append(candidate)
     while len(queued_files) >= MAX_INBOX:
         oldest = queued_files.pop(0)
-        consume_safe_wakes(home, [oldest.stem])
+        consume_safe_wakes(home, effective_wake_state(home), [oldest.stem])
         durable_unlink(oldest)
     atomic_json(path, record)
     return request_id
@@ -1456,7 +1462,7 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
                 atomic_json(path, record)
             atomic_bytes(marker, b"v2\n")
         _bounded_cleanup_locked(home, preserved)
-        consume_safe_wakes(home)
+        consume_safe_wakes(home, effective_wake_state(home))
         for path in mirror_queue_paths_locked(home):
             record = read_json(path)
             if not isinstance(record, dict):
@@ -3372,7 +3378,7 @@ def _cleanup_locked(home: Path) -> int:
                 pending = read_json(telegram_state / "pending.json")
                 if isinstance(pending, dict):
                     remove_audio(pending)
-            consume_safe_wakes(home)
+            consume_safe_wakes(home, effective_wake_state(home))
             if telegram_state.is_symlink() or telegram_state.is_file():
                 durable_unlink(telegram_state)
             elif telegram_state.is_dir():
