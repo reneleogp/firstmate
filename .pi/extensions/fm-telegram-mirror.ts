@@ -66,6 +66,7 @@ type SettledTurn = {
   body: string;
   terminalDelivery?: TerminalDelivery;
   assistantAttempted?: boolean;
+  assistantFallback?: boolean;
 };
 
 const extensionRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -94,6 +95,7 @@ const mirrorReplyProcessOverheadMs = 30_000;
 const mirrorReplyTimeoutMs =
   (1 + mirrorReplyMaxChunks * mirrorReplyMaxAttempts) * telegramApiCallTimeoutMs +
   mirrorReplyProcessOverheadMs;
+const assistantFallbackBody = "Firstmate · Response could not be mirrored; view it in the terminal.";
 const configuredHoldRetryBackoff = Number(process.env.FM_TELEGRAM_HOLD_RETRY_BACKOFF_MS || "1000");
 const holdRetryBackoffMs = Number.isFinite(configuredHoldRetryBackoff)
   ? Math.max(25, Math.min(configuredHoldRetryBackoff, 5_000))
@@ -696,7 +698,6 @@ export default function (pi: ExtensionAPI) {
 
   const deliverSettledTurn = async (turn: SettledTurn, ctx: ExtensionContext): Promise<boolean> => {
     const startedGeneration = generation;
-    const deliveryId = safeIdentity(`assistant-${turn.turnId}`);
     if (turn.terminalDelivery && !turn.terminalDelivery.sent) {
       turn.terminalDelivery.attempted = true;
       const terminalResult = await deliver(
@@ -713,51 +714,76 @@ export default function (pi: ExtensionAPI) {
       }
       turn.terminalDelivery.sent = true;
     }
-    const assistantBody = `Firstmate · ${turn.body}`;
-    const validated = await validateDelivery(assistantBody, ctx);
-    if (startedGeneration !== generation) return false;
-    if (validated.code !== 0) {
-      if (turn.request && !await abandonRequest(
-        turn.request,
-        turn.requestTurnId || turn.turnId,
-        deliveryId,
-        ctx,
-      )) return false;
-      ctx.ui.notify("An undeliverable mirror response was abandoned without another model turn.", "error");
-      return true;
-    }
-    turn.assistantAttempted = true;
-    const result = await deliver(deliveryId, assistantBody, ctx, turn.request);
-    if (startedGeneration !== generation) return false;
-    if (result.code !== 0 && result.stdout.trim() === "delivery-rejected") {
-      if (turn.request && !await abandonRequest(
-        turn.request,
-        turn.requestTurnId || turn.turnId,
-        deliveryId,
-        ctx,
-      )) return false;
-      ctx.ui.notify("A rejected mirror response was abandoned without another model turn.", "error");
-      return true;
-    }
-    if (result.code === 0 && turn.request) {
-      const completed = await exec(["mirror-complete", turn.request, deliveryId], ctx);
+    while (true) {
+      const deliveryId = safeIdentity(
+        `${turn.assistantFallback ? "assistant-fallback" : "assistant"}-${turn.turnId}`,
+      );
+      const assistantBody = turn.assistantFallback
+        ? assistantFallbackBody
+        : `Firstmate · ${turn.body}`;
+      if (!turn.assistantFallback) {
+        const validated = await validateDelivery(assistantBody, ctx);
+        if (startedGeneration !== generation) return false;
+        if (validated.code !== 0) {
+          if (turn.origin === "terminal") {
+            turn.assistantFallback = true;
+            continue;
+          }
+          if (turn.request && !await abandonRequest(
+            turn.request,
+            turn.requestTurnId || turn.turnId,
+            deliveryId,
+            ctx,
+          )) return false;
+          ctx.ui.notify("An undeliverable mirror response was abandoned without another model turn.", "error");
+          return true;
+        }
+      }
+      turn.assistantAttempted = true;
+      const result = await deliver(deliveryId, assistantBody, ctx, turn.request);
       if (startedGeneration !== generation) return false;
-      if (completed.code === 0) {
-        appendAdmission(
-          turn.request,
-          turn.requestTurnId || turn.turnId,
-          ctx.sessionManager.getSessionId?.() || "session",
-          "completed",
-        );
+      if (result.code !== 0 && result.stdout.trim() === "delivery-rejected") {
+        if (turn.origin === "terminal" && !turn.assistantFallback) {
+          turn.assistantFallback = true;
+          continue;
+        }
+        if (!turn.assistantFallback) {
+          if (turn.request && !await abandonRequest(
+            turn.request,
+            turn.requestTurnId || turn.turnId,
+            deliveryId,
+            ctx,
+          )) return false;
+          ctx.ui.notify("A rejected mirror response was abandoned without another model turn.", "error");
+          return true;
+        }
+      }
+      if (result.code === 0 && turn.request) {
+        const completed = await exec(["mirror-complete", turn.request, deliveryId], ctx);
+        if (startedGeneration !== generation) return false;
+        if (completed.code === 0) {
+          appendAdmission(
+            turn.request,
+            turn.requestTurnId || turn.turnId,
+            ctx.sessionManager.getSessionId?.() || "session",
+            "completed",
+          );
+          if (turn.assistantFallback) {
+            ctx.ui.notify("Telegram received a fallback for a response available only in the terminal.", "warning");
+          }
+          return true;
+        }
+      } else if (result.code === 0) {
+        if (turn.assistantFallback) {
+          ctx.ui.notify("Telegram received a fallback for a response available only in the terminal.", "warning");
+        }
         return true;
       }
-    } else if (result.code === 0) {
-      return true;
+      deliveryBlocked = true;
+      ctx.ui.notify("Telegram delivery needs attention; mirrored terminal input is paused.", "error");
+      await updateFooter(ctx);
+      return false;
     }
-    deliveryBlocked = true;
-    ctx.ui.notify("Telegram delivery needs attention; mirrored terminal input is paused.", "error");
-    await updateFooter(ctx);
-    return false;
   };
 
   const queueActiveTurn = (): boolean => {
@@ -1053,7 +1079,11 @@ export default function (pi: ExtensionAPI) {
       }
       for (const turn of settledTurns) {
         if (turn.terminalDelivery?.attempted) reportedDeliveries.add(turn.terminalDelivery.deliveryId);
-        if (turn.assistantAttempted) reportedDeliveries.add(safeIdentity(`assistant-${turn.turnId}`));
+        if (turn.assistantAttempted) {
+          reportedDeliveries.add(safeIdentity(
+            `${turn.assistantFallback ? "assistant-fallback" : "assistant"}-${turn.turnId}`,
+          ));
+        }
       }
       const args = ["mirror-reconcile"];
       for (const requestId of preserved) args.push("--preserve-request", requestId);
@@ -1111,7 +1141,9 @@ export default function (pi: ExtensionAPI) {
         for (const turn of settledTurns) {
           const terminalExpired = !!turn.terminalDelivery &&
             missing.has(turn.terminalDelivery.deliveryId);
-          const assistantId = safeIdentity(`assistant-${turn.turnId}`);
+          const assistantId = safeIdentity(
+            `${turn.assistantFallback ? "assistant-fallback" : "assistant"}-${turn.turnId}`,
+          );
           const assistantExpired = !!turn.assistantAttempted && missing.has(assistantId);
           if (!terminalExpired && !assistantExpired) {
             retained.push(turn);

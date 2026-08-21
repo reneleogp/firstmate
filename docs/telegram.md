@@ -54,6 +54,7 @@ These statuses are zero-token transport messages and do not enter the conversati
 Stable request and message identities prevent ordinary duplicate injection and delivery within one live process.
 A request moves to bounded handled state only after every Unicode-safe Telegram chunk of its assistant response is definitively sent.
 Definite Telegram rejection is retried at most three times, while delivery-unknown state is not resent or marked complete automatically.
+If a terminal-origin finalized response exceeds the transport limit or is definitely content-rejected, Telegram receives one stable non-model fallback directing the user to the terminal; a retryable or unknown fallback remains in the same bounded blocked turn.
 Startup, reload, session replacement, and a bounded rescan reconcile missed notifications from extension-owned session admission entries.
 A provider failure moves that admission into one bounded interrupted hold, blocks later Telegram admissions, and retries only after the operator explicitly sends `/telegram on`.
 If both bounded hold and abandonment writes fail because local state storage is unavailable, the extension stops new admission and further retries, preserves the live claim, and requires storage repair plus a Pi restart.

@@ -187,6 +187,13 @@ elif command == 'mirror-reply':
     if (home / 'reject-mirror-reply').exists(): code = 1
     if (home / 'reject-user-reply').exists() and body.startswith('You · Terminal'): code = 1
     if (home / 'reject-assistant-reply').exists() and body.startswith('Firstmate ·'): code = 1
+    if ((home / 'definite-reject-assistant-reply').exists()
+            and body.startswith('Firstmate ·')
+            and body != 'Firstmate · Response could not be mirrored; view it in the terminal.'):
+        print('delivery-rejected'); code = 1
+    if ((home / 'reject-fallback-reply').exists()
+            and body == 'Firstmate · Response could not be mirrored; view it in the terminal.'):
+        code = 1
     existing = state['deliveries'].get(delivery_id)
     if code == 0 and existing is not None and existing != body: code = 1
     state['delivery_records'][delivery_id] = 'rejected' if code != 0 else 'sent'
@@ -569,6 +576,47 @@ await runtime.session.prompt('terminal request', { source: 'interactive' });
 current = state();
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'You · Terminal\n\nterminal request').length, 1);
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · terminal\nanswer').length, 1);
+
+const parityFallback = 'Firstmate · Response could not be mirrored; view it in the terminal.';
+const callsBeforeOversizedTerminalResponse = faux.state.callCount;
+writeFileSync(`${home}/reject-fallback-reply`, '');
+faux.appendResponses([fauxAssistantMessage('x'.repeat(256 * 1024))]);
+await runtime.session.prompt('terminal with oversized assistant response', { source: 'interactive' });
+await waitFor(() => statuses.at(-1)?.[1] === 'telegram: delivery needs attention',
+  'failed oversized-response fallback did not retain its bounded turn');
+assert.equal(faux.state.callCount, callsBeforeOversizedTerminalResponse + 1,
+  'oversized terminal response invoked another model pass');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'You · Terminal\n\nterminal with oversized assistant response').length, 1);
+const callsAfterBlockedFallback = faux.state.callCount;
+unlinkSync(`${home}/reject-fallback-reply`);
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await waitFor(() => Object.values(state().deliveries).filter((body) => body === parityFallback).length === 1,
+  'oversized terminal response did not receive its paired fallback');
+assert.equal(faux.state.callCount, callsAfterBlockedFallback,
+  'blocked oversized-response fallback retry invoked the model');
+assert.equal(state().log.some((call) => call[0] === 'mirror-reply' &&
+  call[1].startsWith('assistant-terminal-') &&
+  state().deliveries[call[1]]?.length > 256 * 1024), false,
+'oversized terminal response body reached Telegram delivery');
+
+writeFileSync(`${home}/definite-reject-assistant-reply`, '');
+const callsBeforeRejectedTerminalResponse = faux.state.callCount;
+faux.appendResponses([fauxAssistantMessage('definitely rejected terminal response')]);
+await runtime.session.prompt('terminal with rejected assistant response', { source: 'interactive' });
+unlinkSync(`${home}/definite-reject-assistant-reply`);
+assert.equal(faux.state.callCount, callsBeforeRejectedTerminalResponse + 1,
+  'rejected terminal response invoked another model pass');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'You · Terminal\n\nterminal with rejected assistant response').length, 1);
+assert.equal(Object.values(state().deliveries).filter((body) => body === parityFallback).length, 2,
+  'definitely rejected terminal response did not receive its paired fallback');
+assert.equal(Object.values(state().deliveries)
+  .some((body) => body === 'Firstmate · definitely rejected terminal response'), false,
+'definitely rejected terminal response was recorded as delivered');
+assert.equal(state().log.some((call) => call[0] === 'mirror-reply' &&
+  call[1].startsWith('assistant-fallback-terminal-')), true,
+'paired fallback did not use its stable fallback identity');
 
 const deliveriesBeforeSlash = Object.keys(state().deliveries).length;
 globalThis.__telegramMirrorInjectNestedSlash = true;
