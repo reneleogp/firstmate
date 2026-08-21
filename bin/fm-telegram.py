@@ -97,10 +97,12 @@ _TEST_API_BASES: Dict[Path, str] = {}
 
 class TelegramError(RuntimeError):
     def __init__(self, message: str, delivery_unknown: bool = False,
-                 http_status: Optional[int] = None):
+                 http_status: Optional[int] = None,
+                 description: Optional[str] = None):
         super().__init__(message)
         self.delivery_unknown = delivery_unknown
         self.http_status = http_status
+        self.description = description
 
 
 class PermanentConfigurationError(TelegramError):
@@ -409,8 +411,24 @@ def raw_api_call(home: Path, token: str, method: str,
         with urllib.request.urlopen(request, timeout=45) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
-        raise TelegramError(f"Telegram request failed for {method}",
-                            http_status=exc.code) from exc
+        error_code: Optional[int] = exc.code
+        description: Optional[str] = None
+        try:
+            envelope = json.loads(exc.read().decode("utf-8"))
+            if isinstance(envelope, dict):
+                candidate_code = envelope.get("error_code")
+                if strict_int(candidate_code):
+                    error_code = candidate_code
+                candidate_description = envelope.get("description")
+                if isinstance(candidate_description, str):
+                    description = candidate_description
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        raise TelegramError(
+            f"Telegram request failed for {method}",
+            http_status=error_code,
+            description=description,
+        ) from exc
     except (OSError, urllib.error.URLError) as exc:
         raise TelegramError(f"Telegram request failed for {method}", delivery_unknown=True) from exc
     try:
@@ -419,9 +437,11 @@ def raw_api_call(home: Path, token: str, method: str,
         raise TelegramError(f"Telegram returned invalid data for {method}", delivery_unknown=True) from exc
     if not isinstance(envelope, dict) or envelope.get("ok") is not True:
         error_code = envelope.get("error_code") if isinstance(envelope, dict) else None
+        description = envelope.get("description")
         raise TelegramError(
             f"Telegram rejected {method}",
             http_status=error_code if strict_int(error_code) else None,
+            description=description if isinstance(description, str) else None,
         )
     return envelope.get("result")
 
@@ -1437,6 +1457,18 @@ def outbound_message_id(result: Any) -> Optional[int]:
     return _reply_message_id(result.get("message_id")) if isinstance(result, dict) else None
 
 
+def reply_target_unavailable(error: TelegramError) -> bool:
+    if error.http_status != 400 or not isinstance(error.description, str):
+        return False
+    description = error.description.casefold()
+    return any(phrase in description for phrase in (
+        "reply message not found",
+        "message to be replied not found",
+        "replied message not found",
+        "reply_to_message not found",
+    ))
+
+
 def send_text(home: Path, chat_id: int, text: str,
               markup: Optional[Dict[str, Any]] = None,
               reply_to: Optional[int] = None,
@@ -1476,7 +1508,9 @@ def send_text(home: Path, chat_id: int, text: str,
                 _reply_journal_update(home, key, status="delivery_unknown")
                 raise
             _reply_journal_update(home, key, status="rejected")
-            continue
+            if target is not None and reply_target_unavailable(exc):
+                continue
+            raise
         message_id = outbound_message_id(result)
         _reply_journal_update(
             home, key, status="sent", chat_id=chat_id,
@@ -1956,6 +1990,8 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str,
     delivery_identity = process_identity(delivery_pid)
     if delivery_identity is None:
         return die("Telegram delivery process identity is unavailable")
+    config: Optional[Dict[str, Any]] = None
+    chat_id: Optional[int] = None
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
         if request_id is not None:
@@ -1972,8 +2008,6 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str,
                 atomic_json(metadata_path, existing)
             if existing.get("status") == "sent":
                 return 0
-            if existing.get("status") == "delivery_unknown":
-                return DELIVERY_UNKNOWN_EXIT
             record = existing
             if record.get("status") == "reserved":
                 reservation_identity = claim_owner_identity(owner_pid)
@@ -1995,14 +2029,46 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str,
             )
             if previous_owner_live:
                 return die("Telegram delivery is already in flight")
-            if any(chunk.get("telegram_status") == "sending" for chunk in record["chunks"]):
-                for chunk in record["chunks"]:
-                    if chunk.get("telegram_status") == "sending":
+            interrupted = any(
+                chunk.get("telegram_status") in {"sending", "delivery_unknown"}
+                for chunk in record["chunks"]
+            )
+            if interrupted:
+                config = load_config(home)
+                chat_id = int(config["chat_id"])
+                journal = read_json(reply_journal_path(home), {})
+                journal = journal if isinstance(journal, dict) else {}
+                for index, chunk in enumerate(record["chunks"]):
+                    if chunk.get("telegram_status") not in {"sending", "delivery_unknown"}:
+                        continue
+                    acknowledgement = journal.get(f"delivery:{delivery_id}:chunk:{index}")
+                    acknowledgement = (
+                        acknowledgement if isinstance(acknowledgement, dict) else {}
+                    )
+                    target = acknowledgement.get("target_message_id")
+                    outbound_id = _reply_message_id(acknowledgement.get("outbound_message_id"))
+                    target_valid = target is None or _reply_message_id(target) is not None
+                    if (acknowledgement.get("status") == "sent"
+                            and acknowledgement.get("chat_id") == chat_id
+                            and target_valid and outbound_id is not None):
+                        chunk["telegram_status"] = "sent"
+                        chunk["telegram_sent_at"] = acknowledgement.get("updated_at", now())
+                        chunk["reply_to_message_id"] = target
+                        chunk["outbound_message_id"] = outbound_id
+                    elif (chunk.get("telegram_status") == "sending"
+                          and acknowledgement.get("status") == "rejected"):
+                        chunk["telegram_status"] = "rejected"
+                    else:
                         chunk["telegram_status"] = "delivery_unknown"
-                record["status"] = "delivery_unknown"
+                record["status"] = aggregate_response_delivery(record["chunks"])
                 record.pop("delivery_owner_pid", None)
                 record.pop("delivery_owner_identity", None)
                 atomic_json(metadata_path, record)
+                if record["status"] == "sent":
+                    return 0
+                if record["status"] == "delivery_unknown":
+                    return DELIVERY_UNKNOWN_EXIT
+            if record.get("status") == "delivery_unknown":
                 return DELIVERY_UNKNOWN_EXIT
         else:
             if not cleanup_mirror_deliveries_locked(home, reserve_slots=1):
@@ -2010,13 +2076,14 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str,
             atomic_bytes(body_path, body)
             record = {"delivery_id": delivery_id, "sha256": digest, "status": "pending",
                       "created_at": now(), "chunks": chunks}
+        if config is None or chat_id is None:
+            config = load_config(home)
+            chat_id = int(config["chat_id"])
         if request_id is not None:
             record["completion_request_id"] = request_id
         record["delivery_owner_pid"] = delivery_pid
         record["delivery_owner_identity"] = delivery_identity
         atomic_json(metadata_path, record)
-        config = load_config(home)
-        chat_id = int(config["chat_id"])
         source_message_id: Optional[int] = None
         if request_id is not None:
             request_path_value = request_path(home, request_id)
@@ -2777,6 +2844,89 @@ def complete_retry(home: Path, config: Dict[str, Any], pending: Dict[str, Any]) 
     return True
 
 
+def cancel_transition_unknown(home: Path, pending_id: str, revision: int) -> bool:
+    journal = read_json(reply_journal_path(home), {})
+    if not isinstance(journal, dict):
+        return False
+    prefix = f"voice:{pending_id}:{revision}:cancelled"
+    return any(
+        isinstance(journal.get(key), dict)
+        and journal[key].get("status") in {"sending", "delivery_unknown"}
+        for key in (prefix, f"{prefix}-fallback")
+    )
+
+
+def finalize_cancel(home: Path, pending_id: str, cancel_token: str,
+                    revision: int) -> bool:
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                or current.get("mode") != "canceling" or current.get("cancel_token") != cancel_token
+                or current.get("revision") != revision):
+            return completed_callback_locked(home, pending_id, cancel_token)
+        remember_callback_locked(home, pending_id, cancel_token)
+        remove_pending(home, current)
+    return True
+
+
+def settle_unknown_cancel(home: Path, pending_id: str, cancel_token: str,
+                          revision: int) -> bool:
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                or current.get("mode") != "canceling" or current.get("cancel_token") != cancel_token
+                or current.get("revision") != revision):
+            return completed_callback_locked(home, pending_id, cancel_token)
+        unknown_attempts = current.get("cancel_unknown_attempts", 0)
+        if not strict_int(unknown_attempts) or unknown_attempts < 0:
+            unknown_attempts = 0
+        unknown_attempts += 1
+        current["cancel_unknown_attempts"] = unknown_attempts
+        current["cancel_unknown_attempted_at"] = now()
+        save_pending(home, current)
+        snapshot = dict(current)
+    message_id = snapshot.get("transcript_message_id")
+    if strict_int(message_id) and message_id > 0:
+        try:
+            edit_reply_markup(
+                home, int(snapshot["chat_id"]), message_id, EMPTY_INLINE_MARKUP,
+                journal_key=f"voice:{pending_id}:{revision}:cancel-controls",
+            )
+        except (TelegramError, KeyError, TypeError, ValueError):
+            pass
+    if unknown_attempts < CALLBACK_DELIVERY_ATTEMPTS:
+        return False
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                or current.get("mode") != "canceling" or current.get("cancel_token") != cancel_token
+                or current.get("revision") != revision):
+            return completed_callback_locked(home, pending_id, cancel_token)
+        fallback_attempts = current.get("cancel_fallback_attempts", 0)
+        if not strict_int(fallback_attempts) or fallback_attempts < 0:
+            fallback_attempts = 0
+        terminal = fallback_attempts >= CALLBACK_DELIVERY_ATTEMPTS
+        if not terminal:
+            fallback_attempts += 1
+            current["cancel_fallback_attempts"] = fallback_attempts
+            current["cancel_fallback_attempted_at"] = now()
+            save_pending(home, current)
+            source_message_id = int(current["message_id"])
+            chat_id = int(current["chat_id"])
+    if terminal:
+        return finalize_cancel(home, pending_id, cancel_token, revision)
+    try:
+        send_text(
+            home, chat_id, "Cancelled",
+            reply_to=source_message_id, fallback_to=source_message_id,
+            journal_key=f"voice:{pending_id}:{revision}:cancelled-uncertain",
+        )
+    except TelegramError as exc:
+        if not exc.delivery_unknown and fallback_attempts < CALLBACK_DELIVERY_ATTEMPTS:
+            return False
+    return finalize_cancel(home, pending_id, cancel_token, revision)
+
+
 def complete_cancel(home: Path, pending: Dict[str, Any]) -> bool:
     pending_id = pending.get("pending_id")
     cancel_token = pending.get("cancel_token")
@@ -2793,17 +2943,15 @@ def complete_cancel(home: Path, pending: Dict[str, Any]) -> bool:
                 or current.get("revision") != revision):
             return False
         snapshot = dict(current)
-    if not pending_confirmation_update(home, snapshot, "Cancelled", EMPTY_INLINE_MARKUP, "cancelled"):
-        return False
-    with FileLock(state_lock(home)):
-        current = read_json(pending_path(home))
-        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
-                or current.get("mode") != "canceling" or current.get("cancel_token") != cancel_token
-                or current.get("revision") != revision):
-            return completed_callback_locked(home, pending_id, cancel_token)
-        remember_callback_locked(home, pending_id, cancel_token)
-        remove_pending(home, current)
-    return True
+    unknown = cancel_transition_unknown(home, pending_id, revision)
+    if (not unknown
+            and pending_confirmation_update(
+                home, snapshot, "Cancelled", EMPTY_INLINE_MARKUP, "cancelled"
+            )):
+        return finalize_cancel(home, pending_id, cancel_token, revision)
+    if cancel_transition_unknown(home, pending_id, revision):
+        return settle_unknown_cancel(home, pending_id, cancel_token, revision)
+    return False
 
 
 def complete_send(home: Path, pending: Dict[str, Any]) -> bool:
@@ -3264,12 +3412,13 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
             if not sending and not canceling and not already_completed:
                 if pending.get("revision") != revision:
                     already_completed = True
-                mode = pending.get("mode")
-                if action == "cancel":
-                    if mode not in {"confirm", "edit"}:
+                if not already_completed:
+                    mode = pending.get("mode")
+                    if action == "cancel":
+                        if mode not in {"confirm", "edit"}:
+                            return False
+                    elif mode != "confirm":
                         return False
-                elif mode != "confirm":
-                    return False
             try:
                 expired = now() - int(pending.get("created_at", 0)) >= PENDING_TTL
             except (TypeError, ValueError):
@@ -3341,9 +3490,8 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
         answer_callback(home, callback_id)
         return True
     if operation == "cancel" and pending_snapshot is not None:
-        if not complete_cancel(home, pending_snapshot):
-            return False
         answer_callback(home, callback_id)
+        complete_cancel(home, pending_snapshot)
         return True
     if operation == "edit":
         answer_callback(home, callback_id)

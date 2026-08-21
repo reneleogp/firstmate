@@ -46,10 +46,17 @@ class Handler(BaseHTTPRequestHandler):
     def reply(self, value):
         body = json.dumps({'ok': True, 'result': value}).encode()
         self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
-    def reject(self):
-        body = json.dumps({'ok': False, 'error_code': 400}).encode()
-        self.send_response(400); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
-    def should_reject(self, method, params):
+    def reject(self, rule=None):
+        rule = rule or {}
+        if rule.get('invalid_json'):
+            body = b'not-json'; status = int(rule.get('http_status', 200))
+        else:
+            code = int(rule.get('error_code', 400)); status = int(rule.get('http_status', code))
+            envelope = {'ok': False, 'error_code': code}
+            if isinstance(rule.get('description'), str): envelope['description'] = rule['description']
+            body = json.dumps(envelope).encode()
+        self.send_response(status); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+    def failure_rule(self, method, params):
         path = home / 'failures.json'
         rules = json.loads(path.read_text()) if path.exists() else []
         for rule in rules:
@@ -61,20 +68,22 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             rule['remaining'] -= 1
             path.write_text(json.dumps(rules))
-            return True
-        return False
+            return rule
+        return None
     def do_POST(self):
         size = int(self.headers.get('Content-Length', '0')); params = json.loads(self.rfile.read(size) or b'{}')
         with (home / 'calls.jsonl').open('a') as stream: stream.write(json.dumps({'path': self.path, 'params': params}) + '\n')
         method = self.path.rsplit('/', 1)[-1]
-        if self.should_reject(method, params): return self.reject()
+        failure = self.failure_rule(method, params)
+        if failure is not None: return self.reject(failure)
         if method == 'getMe': return self.reply({'id': 9901, 'is_bot': True})
         if method == 'getFile': return self.reply({'file_path': 'voice/test.oga'})
         if method == 'getUpdates':
             updates = json.loads((home / 'updates.json').read_text()); (home / 'updates.json').write_text('[]'); return self.reply(updates)
         if method == 'sendMessage':
             target = params.get('reply_parameters', {}).get('message_id')
-            if target in {998, 999}: return self.reject()
+            if target in {998, 999}:
+                return self.reject({'description': 'Bad Request: message to be replied not found'})
             path = home / 'next-id'; value = int(path.read_text()) if path.exists() else 1000; path.write_text(str(value + 1))
             with (home / 'sent.jsonl').open('a') as stream:
                 stream.write(json.dumps({'params': params, 'message_id': value}) + '\n')
@@ -174,10 +183,19 @@ pending = json.load(open(sys.argv[1])); assert pending['revision'] == 2 and pend
 calls = [json.loads(x) for x in open(sys.argv[2])]
 assert any(x['path'].endswith('/editMessageText') and x['params'].get('message_id') == int(sys.argv[3]) and x['params']['text'] == 'corrected transcript' for x in calls)
 PY
-# An old revision is acknowledged but cannot enqueue the corrected transcript twice.
-set_updates "[{\"update_id\":7,\"callback_query\":{\"id\":\"stale-30\",\"from\":{\"id\":77},\"message\":{\"message_id\":$transcript_id,\"date\":1,\"chat\":{\"id\":77,\"type\":\"private\"},\"text\":\"corrected transcript\"},\"data\":\"send:voice-u4-m30:1\"}}]"
+# Old Send, Edit, and Retry revisions are acknowledged but cannot change the corrected transcript.
+set_updates "[{\"update_id\":7,\"callback_query\":{\"id\":\"stale-send-30\",\"from\":{\"id\":77},\"message\":{\"message_id\":$transcript_id,\"date\":1,\"chat\":{\"id\":77,\"type\":\"private\"},\"text\":\"corrected transcript\"},\"data\":\"send:voice-u4-m30:1\"}}]"
+run_tg serve --once >/dev/null
+set_updates "[{\"update_id\":71,\"callback_query\":{\"id\":\"stale-edit-30\",\"from\":{\"id\":77},\"message\":{\"message_id\":$transcript_id,\"date\":1,\"chat\":{\"id\":77,\"type\":\"private\"},\"text\":\"corrected transcript\"},\"data\":\"edit:voice-u4-m30:1\"}},{\"update_id\":72,\"callback_query\":{\"id\":\"stale-retry-30\",\"from\":{\"id\":77},\"message\":{\"message_id\":$transcript_id,\"date\":1,\"chat\":{\"id\":77,\"type\":\"private\"},\"text\":\"corrected transcript\"},\"data\":\"retry:voice-u4-m30:1\"}}]"
 run_tg serve --once >/dev/null
 [ ! -e "$home/state/telegram/inbox/tg-voice-u4-m30.json" ] || fail "stale voice revision was admitted"
+python3 - "$home/state/telegram/pending.json" "$home/calls.jsonl" <<'PY'
+import json, sys
+pending = json.load(open(sys.argv[1])); assert pending['mode'] == 'confirm' and pending['revision'] == 2
+calls = [json.loads(x) for x in open(sys.argv[2])]
+answered = {x['params'].get('callback_query_id') for x in calls if x['path'].endswith('/answerCallbackQuery')}
+assert {'stale-send-30', 'stale-edit-30', 'stale-retry-30'} <= answered
+PY
 
 set_updates "[{\"update_id\":8,\"callback_query\":{\"id\":\"retry-ok-30\",\"from\":{\"id\":77},\"message\":{\"message_id\":$transcript_id,\"date\":1,\"chat\":{\"id\":77,\"type\":\"private\"},\"text\":\"corrected transcript\"},\"data\":\"retry:voice-u4-m30:2\"}}]"
 run_tg serve --once >/dev/null
@@ -201,25 +219,29 @@ buttons = failed['params']['reply_markup']['inline_keyboard']
 assert any(button['text'] == 'Retry with Whisper' for row in buttons for button in row)
 PY
 
-set_failures '[{"method":"editMessageText","text":"Cancelled","remaining":1},{"method":"sendMessage","text":"Cancelled","remaining":2}]'
+set_failures '[{"method":"editMessageText","text":"Cancelled","remaining":1,"invalid_json":true}]'
 set_updates "[{\"update_id\":10,\"callback_query\":{\"id\":\"cancel-crash-30\",\"from\":{\"id\":77},\"message\":{\"message_id\":$transcript_id,\"date\":1,\"chat\":{\"id\":77,\"type\":\"private\"},\"text\":\"whisper transcript\"},\"data\":\"cancel:voice-u4-m30:4\"}}]"
-run_tg serve --once >/dev/null || true
-python3 - "$home/state/telegram/pending.json" <<'PY'
+run_tg serve --once >/dev/null
+python3 - "$home/state/telegram/pending.json" "$home/calls.jsonl" <<'PY'
 import json, sys
 assert json.load(open(sys.argv[1]))['mode'] == 'canceling'
+calls = [json.loads(x) for x in open(sys.argv[2])]
+assert any(x['path'].endswith('/editMessageReplyMarkup') and x['params']['reply_markup'] == {'inline_keyboard': []} for x in calls)
+assert any(x['path'].endswith('/answerCallbackQuery') and x['params'].get('callback_query_id') == 'cancel-crash-30' for x in calls)
 PY
 printf 'off\n' >"$home/config/telegram-mirror"
 set_failures '[]'
 set_updates '[]'
 run_tg serve --once >/dev/null
-[ ! -e "$home/state/telegram/pending.json" ] || fail "mode-off cancellation reconciliation stalled"
-set_updates "[{\"update_id\":10,\"callback_query\":{\"id\":\"cancel-crash-30\",\"from\":{\"id\":77},\"message\":{\"message_id\":$transcript_id,\"date\":1,\"chat\":{\"id\":77,\"type\":\"private\"},\"text\":\"whisper transcript\"},\"data\":\"cancel:voice-u4-m30:4\"}}]"
+[ -e "$home/state/telegram/pending.json" ] || fail "delivery-unknown cancellation settled before its bounded window"
 run_tg serve --once >/dev/null
-python3 - "$home/calls.jsonl" <<'PY'
+[ ! -e "$home/state/telegram/pending.json" ] || fail "mode-off delivery-unknown cancellation reconciliation stalled"
+python3 - "$home/sent.jsonl" "$home/calls.jsonl" <<'PY'
 import json, sys
-calls = [json.loads(x) for x in open(sys.argv[1])]
-successful_cancel_edits = [x for x in calls if x['path'].endswith('/editMessageText') and x['params'].get('text') == 'Cancelled']
-assert len(successful_cancel_edits) == 2
+sent = [json.loads(x) for x in open(sys.argv[1])]
+fallback = [x for x in sent if x['params'].get('text') == 'Cancelled'][-1]
+assert fallback['params']['reply_parameters'] == {'message_id': 30}
+calls = [json.loads(x) for x in open(sys.argv[2])]
 answers = [x for x in calls if x['path'].endswith('/answerCallbackQuery') and x['params'].get('callback_query_id') == 'cancel-crash-30']
 assert len(answers) == 1
 PY
@@ -350,4 +372,37 @@ journal = json.load(open(sys.argv[1].replace('calls.jsonl', 'state/telegram/repl
 assert journal['fallback-test']['status'] == 'sent' and journal['fallback-test']['target_message_id'] is None
 assert isinstance(journal['fallback-test']['outbound_message_id'], int)
 PY
+
+for case in rate-limit auth markup content; do
+  case "$case" in
+    rate-limit) rule='{"method":"sendMessage","text":"rate-limit","remaining":1,"error_code":429,"description":"Too Many Requests"}' ;;
+    auth) rule='{"method":"sendMessage","text":"auth","remaining":1,"error_code":401,"description":"Unauthorized"}' ;;
+    markup) rule='{"method":"sendMessage","text":"markup","remaining":1,"error_code":400,"description":"Bad Request: inline keyboard expected"}' ;;
+    content) rule='{"method":"sendMessage","text":"content","remaining":1,"error_code":400,"description":"Bad Request: message text is empty"}' ;;
+  esac
+  set_failures "[$rule]"
+  "$PYTHON" - "$home" "$(cat "$home/port")" "$case" <<'PY'
+import importlib.util, sys
+from pathlib import Path
+script = Path('bin/fm-telegram.py').resolve()
+spec = importlib.util.spec_from_file_location('fm_telegram_errors', script)
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+home = Path(sys.argv[1]); module.configure_test_api_base(home, 'http://127.0.0.1:' + sys.argv[2])
+try:
+    module.send_text(home, 77, sys.argv[3], reply_to=997, fallback_to=996, journal_key='error-' + sys.argv[3])
+except module.TelegramError:
+    pass
+else:
+    raise AssertionError('Telegram rejection unexpectedly succeeded')
+PY
+done
+python3 - "$home/calls.jsonl" <<'PY'
+import json, sys
+calls = [json.loads(x) for x in open(sys.argv[1])]
+for text in ('rate-limit', 'auth', 'markup', 'content'):
+    attempts = [x for x in calls if x['path'].endswith('/sendMessage') and x['params'].get('text') == text]
+    assert len(attempts) == 1, (text, attempts)
+    assert attempts[0]['params']['reply_parameters'] == {'message_id': 997}
+PY
+
 pass "Telegram reply fallbacks, voice transitions, replay, ordering, and progress settlement"

@@ -45,7 +45,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(updates)
         if method == 'sendMessage' and (home / 'reject-send').exists():
             (home / 'reject-send').unlink()
-            body = json.dumps({'ok': False, 'error_code': 400}).encode()
+            body = json.dumps({
+                'ok': False, 'error_code': 400,
+                'description': 'Bad Request: message to be replied not found',
+            }).encode()
             self.send_response(200); self.send_header('Content-Length', str(len(body)))
             self.end_headers(); self.wfile.write(body); return
         if method == 'sendMessage':
@@ -301,6 +304,34 @@ first = run('mirror-reply', 'delivery-long', '--request-id', request, '--text-fi
 assert first.returncode == 0, first.stderr
 second = run('mirror-reply', 'delivery-long', '--request-id', request, '--text-file', body_path)
 assert second.returncode == 0, second.stderr
+crash_delivery = 'delivery-crash-ack'
+crash_text = 'Firstmate · acknowledged before local chunk settlement'
+crash_path = Path(home, 'crash-ack.txt'); crash_path.write_text(crash_text)
+Path(delivery_root, crash_delivery + '.txt').write_text(crash_text)
+Path(delivery_root, crash_delivery + '.json').write_text(json.dumps({
+    'delivery_id': crash_delivery,
+    'sha256': __import__('hashlib').sha256(crash_text.encode()).hexdigest(),
+    'status': 'sending', 'created_at': int(time.time()),
+    'chunks': [{'start': 0, 'end': len(crash_text.encode()),
+                'telegram_status': 'sending', 'telegram_attempts': 1}],
+}))
+journal_path = Path(home, 'state', 'telegram', 'reply-journal.json')
+journal = json.loads(journal_path.read_text())
+journal[f'delivery:{crash_delivery}:chunk:0'] = {
+    'status': 'sent', 'chat_id': 77, 'target_message_id': 3,
+    'outbound_message_id': 4321, 'updated_at': int(time.time()),
+}
+journal_path.write_text(json.dumps(journal))
+before_crash_reconcile = send_count()
+crash_reconciled = run('mirror-reply', crash_delivery, '--text-file', str(crash_path))
+assert crash_reconciled.returncode == 0, crash_reconciled.stderr
+assert send_count() == before_crash_reconcile
+crash_record = json.loads(Path(delivery_root, crash_delivery + '.json').read_text())
+assert crash_record['status'] == 'sent'
+assert crash_record['chunks'][0]['reply_to_message_id'] == 3
+assert crash_record['chunks'][0]['outbound_message_id'] == 4321
+Path(delivery_root, crash_delivery + '.json').unlink()
+Path(delivery_root, crash_delivery + '.txt').unlink()
 try:
     owner_fields = Path(f'/proc/{owner}/stat').read_text().rsplit(')', 1)[1].split()
     owner_identity = f'proc:{owner}:{owner_fields[19]}'

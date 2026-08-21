@@ -82,6 +82,7 @@ The Bot API delivery-unknown window can also repeat a transport message after Te
 
 Voice confirmation controls are revision-bound and are removed or replaced as soon as an action starts.
 Send shows `Sent to Firstmate` only after the transcript is durably admitted, while Cancel shows `Cancelled` and removes temporary audio and pending state.
+If a Cancel edit has delivery-unknown status, the transport disables its controls when possible and waits through three bounded reconciliation attempts before using one journaled `Cancelled` reply to the original voice and completing cleanup.
 Edit shows `Editing transcript…`, offers Telegram's `copy_text` button when supported, and sends a `ForceReply` prompt with the placeholder `Paste and edit the transcript`.
 The bot cannot prefill the ordinary Telegram composer, so it does not add a Web App or inline-mode subsystem.
 If a client does not support `copy_text`, the transcript remains available as copyable fallback text alongside the ForceReply prompt.
