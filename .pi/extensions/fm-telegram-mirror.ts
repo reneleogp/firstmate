@@ -28,6 +28,7 @@ type SessionEntry = {
 type PendingAdmission = {
   requestId: string;
   turnId: string;
+  marker: string;
   accepted: boolean;
   queuedInput: boolean;
   timer?: ReturnType<typeof setTimeout>;
@@ -36,6 +37,11 @@ type InputSegment =
   | { origin: "telegram"; pending: PendingAdmission }
   | { origin: "terminal"; turnId: string; text: string }
   | { origin: "excluded" };
+type InputCandidate = {
+  segment: InputSegment;
+  timer?: ReturnType<typeof setTimeout>;
+};
+type HeldAdmission = { requestId: string; turnId: string };
 type SettledTurn = {
   origin: Origin;
   request?: string;
@@ -101,6 +107,39 @@ function safeIdentity(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 160);
 }
 
+const originMarkerPattern = /^\u2063firstmate-origin:([a-f0-9]{64})\u2063\n/;
+
+function originMarkerToken(text: string): string | undefined {
+  return originMarkerPattern.exec(text)?.[1];
+}
+
+function markedInput(marker: string, label: Origin, text: string): string {
+  const title = label === "telegram" ? "Telegram" : "Terminal";
+  return `\u2063firstmate-origin:${marker}\u2063\nYou · ${title}\n\n${text}`;
+}
+
+function stripOriginMarker(text: string): string {
+  return text.replace(originMarkerPattern, "");
+}
+
+function stripMessageOrigin(message: AssistantMessage): AssistantMessage {
+  if (typeof message.content === "string") {
+    return { ...message, content: stripOriginMarker(message.content) };
+  }
+  if (!Array.isArray(message.content)) return message;
+  let stripped = false;
+  return {
+    ...message,
+    content: message.content.map((part) => {
+      if (stripped || !part || typeof part !== "object" ||
+          (part as { type?: string }).type !== "text" ||
+          typeof (part as { text?: unknown }).text !== "string") return part;
+      stripped = true;
+      return { ...part, text: stripOriginMarker((part as { text: string }).text) };
+    }),
+  };
+}
+
 function activeBranch(entries: SessionEntry[]): SessionEntry[] {
   const byId = new Map(entries
     .filter((entry): entry is SessionEntry & { id: string } => typeof entry.id === "string")
@@ -130,11 +169,7 @@ function entriesFromFile(path: string | undefined): SessionEntry[] {
   }
 }
 
-function unresolvedAdmission(entries: SessionEntry[]): {
-  requestId: string;
-  turnId: string;
-  assistantBody: string;
-} | undefined {
+function admissionStates(entries: SessionEntry[]): Map<string, { state: string; turnId: string; index: number }> {
   const states = new Map<string, { state: string; turnId: string; index: number }>();
   entries.forEach((entry, index) => {
     if (entry.type !== "custom" || entry.customType !== admissionType) return;
@@ -145,14 +180,22 @@ function unresolvedAdmission(entries: SessionEntry[]): {
       states.set(requestId, { state, turnId, index });
     }
   });
-  const unresolved = [...states.entries()]
+  return states;
+}
+
+function unresolvedAdmission(entries: SessionEntry[]): {
+  requestId: string;
+  turnId: string;
+  assistantBody: string;
+} | undefined {
+  const unresolved = [...admissionStates(entries).entries()]
     .filter(([, value]) => value.state === "admitted")
     .sort((left, right) => right[1].index - left[1].index)[0];
   if (!unresolved) return undefined;
   const [requestId, value] = unresolved;
   let userSeen = false;
-  let assistantBody = "";
   for (const entry of entries.slice(value.index + 1)) {
+    if (entry.type === "custom_message") break;
     const message = entry.message;
     if (entry.type !== "message" || !message?.role) continue;
     if (message.role === "user") {
@@ -160,12 +203,21 @@ function unresolvedAdmission(entries: SessionEntry[]): {
       userSeen = true;
       continue;
     }
-    if (!userSeen || message.role !== "assistant" ||
-        !["stop", "length"].includes(message.stopReason || "")) continue;
+    if (!userSeen) continue;
+    if (message.role === "custom") break;
+    if (message.role !== "assistant" || !["stop", "length"].includes(message.stopReason || "")) continue;
     const body = textOf(message);
-    if (body) assistantBody = body;
+    if (body) return { requestId, turnId: value.turnId, assistantBody: body };
   }
-  return userSeen ? { requestId, turnId: value.turnId, assistantBody } : undefined;
+  return userSeen ? { requestId, turnId: value.turnId, assistantBody: "" } : undefined;
+}
+
+function interruptedAdmission(entries: SessionEntry[]): HeldAdmission | undefined {
+  const interrupted = [...admissionStates(entries).entries()]
+    .filter(([, value]) => value.state === "interrupted")
+    .sort((left, right) => right[1].index - left[1].index)[0];
+  if (!interrupted) return undefined;
+  return { requestId: interrupted[0], turnId: interrupted[1].turnId };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -175,8 +227,9 @@ export default function (pi: ExtensionAPI) {
   let activeTurnId: string | undefined;
   let suspended = false;
   let pendingAdmission: PendingAdmission | undefined;
-  let awaitingInjectedInput = false;
-  let inputSegments: InputSegment[] = [];
+  let heldAdmission: HeldAdmission | undefined;
+  const inputCandidates = new Map<string, InputCandidate>();
+  const committedMarkers = new Set<string>();
   let settledTurns: SettledTurn[] = [];
   let lastAssistantBody = "";
   let scanTimer: ReturnType<typeof setInterval> | undefined;
@@ -334,11 +387,15 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const holdInterrupted = (ctx: ExtensionContext): void => {
-    if (activeRequest && activeTurnId && !suspended) {
+  const holdInterrupted = async (ctx: ExtensionContext): Promise<void> => {
+    const requestId = activeRequest;
+    const turnId = activeTurnId;
+    if (requestId && turnId) {
+      heldAdmission = { requestId, turnId };
+      await exec(["mirror-hold", requestId, turnId], ctx);
       appendAdmission(
-        activeRequest,
-        activeTurnId,
+        requestId,
+        turnId,
         ctx.sessionManager.getSessionId?.() || "session",
         "interrupted",
       );
@@ -354,16 +411,14 @@ export default function (pi: ExtensionAPI) {
     }
     const startedGeneration = generation;
     pendingAdmission = undefined;
-    awaitingInjectedInput = false;
-    inputSegments = inputSegments.filter((segment) =>
-      segment.origin !== "telegram" || segment.pending !== pending);
+    inputCandidates.delete(pending.marker);
     await exec(["mirror-release", pending.requestId], ctx);
     if (startedGeneration === generation) void updateFooter(ctx);
   };
 
   const transitionSegment = async (segment: InputSegment, ctx: ExtensionContext): Promise<void> => {
     if (active) {
-      if (suspended || deliveryBlocked) return;
+      if (deliveryBlocked) return;
       if (lastAssistantBody && activeOrigin && activeTurnId) {
         settledTurns.push({
           origin: activeOrigin,
@@ -373,8 +428,7 @@ export default function (pi: ExtensionAPI) {
         });
         resetTurn();
       } else {
-        holdInterrupted(ctx);
-        if (active) return;
+        await holdInterrupted(ctx);
       }
     }
     if (segment.origin === "excluded") return;
@@ -407,12 +461,12 @@ export default function (pi: ExtensionAPI) {
     lastAssistantBody = "";
     deliveryBlocked = false;
     pendingAdmission = undefined;
-    awaitingInjectedInput = false;
     await exec(["mirror-delivered", pending.requestId], ctx);
   };
 
   const drain = async (ctx: ExtensionContext): Promise<void> => {
-    if (drainRunning || !transportOpen || !ownsHomeLock() || mode() !== "on" || pendingAdmission) return;
+    if (drainRunning || !transportOpen || !ownsHomeLock() || mode() !== "on" ||
+        pendingAdmission || heldAdmission) return;
     const startedGeneration = generation;
     if (active) return;
     drainRunning = true;
@@ -433,13 +487,14 @@ export default function (pi: ExtensionAPI) {
       const pending: PendingAdmission = {
         requestId,
         turnId: `telegram-${safeIdentity(requestId)}-${randomUUID()}`,
+        marker: randomBytes(32).toString("hex"),
         accepted: false,
         queuedInput: false,
       };
       pendingAdmission = pending;
-      awaitingInjectedInput = true;
+      inputCandidates.set(pending.marker, { segment: { origin: "telegram", pending } });
       pending.timer = setTimeout(() => void releasePending(ctx, pending), admissionTimeoutMs);
-      pi.sendUserMessage(body.stdout, { deliverAs: "followUp" });
+      pi.sendUserMessage(markedInput(pending.marker, "telegram", body.stdout), { deliverAs: "followUp" });
     } finally {
       drainRunning = false;
       if (startedGeneration === generation) await updateFooter(ctx);
@@ -468,6 +523,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       ctx.ui.notify(action === "status" ? `Telegram mirror is ${result.stdout.trim()}.` : result.stdout.trim(), "info");
+      if (action === "on" && heldAdmission) {
+        const recovered = await exec(["mirror-recover", heldAdmission.requestId], ctx);
+        if (recovered.code === 0) heldAdmission = undefined;
+      }
       await updateFooter(ctx);
       if (action === "on") void drain(ctx);
     },
@@ -477,8 +536,12 @@ export default function (pi: ExtensionAPI) {
     generation += 1;
     resetTurn();
     pendingAdmission = undefined;
-    awaitingInjectedInput = false;
-    inputSegments = [];
+    heldAdmission = undefined;
+    for (const candidate of inputCandidates.values()) {
+      if (candidate.timer) clearTimeout(candidate.timer);
+    }
+    inputCandidates.clear();
+    committedMarkers.clear();
     settledTurns = [];
     transportOpen = false;
     if (!ownsHomeLock()) {
@@ -494,9 +557,20 @@ export default function (pi: ExtensionAPI) {
     const currentEntries = ctx.sessionManager.getBranch?.() as SessionEntry[] | undefined;
     const previousEntries = entriesFromFile(event.previousSessionFile);
     const provenance = unresolvedAdmission(currentEntries || []) || unresolvedAdmission(previousEntries);
+    const interrupted = interruptedAdmission(currentEntries || []) || interruptedAdmission(previousEntries);
     const reconcileArgs = ["mirror-reconcile"];
     if (provenance) reconcileArgs.push("--preserve-request", provenance.requestId);
-    await exec(reconcileArgs);
+    else if (interrupted) reconcileArgs.push("--preserve-request", interrupted.requestId);
+    const reconciled = await exec(reconcileArgs);
+    const transportHeld = reconciled.stdout.split("\n")
+      .map((line) => line.split("\t"))
+      .find((fields) => fields[0] === "held" && fields.length === 3);
+    if (interrupted) {
+      heldAdmission = interrupted;
+      await exec(["mirror-hold", interrupted.requestId, interrupted.turnId]);
+    } else if (transportHeld) {
+      heldAdmission = { requestId: transportHeld[1], turnId: transportHeld[2] };
+    }
     if (provenance) {
       active = true;
       activeOrigin = "telegram";
@@ -506,7 +580,7 @@ export default function (pi: ExtensionAPI) {
       suspended = !lastAssistantBody;
       await exec(["mirror-delivered", provenance.requestId]);
       if (lastAssistantBody) void settle(ctx);
-      else holdInterrupted(ctx);
+      else await holdInterrupted(ctx);
     }
     await updateFooter(ctx);
     scanTimer = setInterval(() => void drain(ctx), 750);
@@ -519,38 +593,65 @@ export default function (pi: ExtensionAPI) {
     scanTimer = undefined;
     if (pendingAdmission?.timer) clearTimeout(pendingAdmission.timer);
     pendingAdmission = undefined;
-    awaitingInjectedInput = false;
-    inputSegments = [];
+    heldAdmission = undefined;
+    for (const candidate of inputCandidates.values()) {
+      if (candidate.timer) clearTimeout(candidate.timer);
+    }
+    inputCandidates.clear();
+    committedMarkers.clear();
     settledTurns = [];
     transportOpen = false;
     resetTurn();
   });
 
+  pi.registerMarkdownTransformer((markdown, { messageType }) => {
+    if (messageType !== "user") return markdown;
+    const token = originMarkerToken(markdown);
+    return token && (inputCandidates.has(token) || committedMarkers.has(token))
+      ? stripOriginMarker(markdown)
+      : markdown;
+  });
+
   pi.on("input", (event) => {
-    if (event.source === "interactive" && event.text && !event.text.startsWith("/")) {
-      if (!transportOpen || !ownsHomeLock() || mode() !== "on") {
-        return { action: "continue" as const };
+    const token = originMarkerToken(event.text);
+    if (event.source === "extension" && token) {
+      const candidate = inputCandidates.get(token);
+      if (candidate?.segment.origin === "telegram") {
+        candidate.segment.pending.queuedInput = event.streamingBehavior === "followUp";
       }
+      return { action: "continue" as const };
+    }
+    if (event.source === "interactive" && event.text && !event.text.startsWith("/") &&
+        transportOpen && ownsHomeLock() && mode() === "on" && !deliveryBlocked) {
       const turnId = `terminal-${randomUUID()}`;
-      inputSegments.push({ origin: "terminal", turnId, text: event.text });
-      return { action: "transform" as const, text: `You · Terminal\n\n${event.text}` };
+      const marker = randomBytes(32).toString("hex");
+      const candidate: InputCandidate = {
+        segment: { origin: "terminal", turnId, text: event.text },
+      };
+      candidate.timer = setTimeout(() => inputCandidates.delete(marker), admissionTimeoutMs);
+      inputCandidates.set(marker, candidate);
+      return { action: "transform" as const, text: markedInput(marker, "terminal", event.text) };
     }
-    if (event.source === "extension" && awaitingInjectedInput && pendingAdmission) {
-      const pending = pendingAdmission;
-      awaitingInjectedInput = false;
-      pending.queuedInput = event.streamingBehavior === "followUp";
-      inputSegments.push({ origin: "telegram", pending });
-      return { action: "transform" as const, text: `You · Telegram\n\n${event.text}` };
-    }
-    inputSegments.push({ origin: "excluded" });
     return { action: "continue" as const };
   });
 
   pi.on("message_start", async (event, ctx) => {
     const message = event.message as AssistantMessage;
+    if (message.role === "custom") {
+      await transitionSegment({ origin: "excluded" }, ctx);
+      return;
+    }
     if (message.role !== "user") return;
-    const segment = inputSegments.shift() || { origin: "excluded" as const };
-    await transitionSegment(segment, ctx);
+    const token = originMarkerToken(textOf(message));
+    const candidate = token ? inputCandidates.get(token) : undefined;
+    if (token && candidate) {
+      inputCandidates.delete(token);
+      if (candidate.timer) clearTimeout(candidate.timer);
+      committedMarkers.add(token);
+      await transitionSegment(candidate.segment, ctx);
+      return;
+    }
+    await transitionSegment({ origin: "excluded" }, ctx);
   });
 
   pi.on("context", (event) => {
@@ -573,6 +674,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("message_end", (event) => {
     const message = event.message as AssistantMessage;
+    if (message.role === "user") {
+      const token = originMarkerToken(textOf(message));
+      if (token && committedMarkers.delete(token)) return { message: stripMessageOrigin(message) };
+      return;
+    }
     if (message.role !== "assistant" || !active || suspended ||
         !["stop", "length"].includes(message.stopReason || "")) return;
     const body = textOf(message);
@@ -587,7 +693,7 @@ export default function (pi: ExtensionAPI) {
     }
     if (suspended) return;
     if (!lastAssistantBody) {
-      holdInterrupted(ctx);
+      await holdInterrupted(ctx);
       await updateFooter(ctx);
       return;
     }

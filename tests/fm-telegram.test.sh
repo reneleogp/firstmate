@@ -196,8 +196,27 @@ Path(home, 'state', '.wake-queue').write_text(
     '2\t2\tcheck\ttelegram:late-legacy\ttelegram late-legacy\n')
 assert run('mirror-reconcile').returncode == 0
 assert 'telegram:' not in Path(home, 'state', '.wake-queue').read_text()
-assert run('mirror-claim', request).returncode == 0
 inbox = Path(home, 'state', 'telegram', 'inbox')
+stale_owner = subprocess.Popen(['sleep', '30'])
+stale_id = 'tg-text-u900-m900'
+stale_path = Path(inbox, stale_id + '.json')
+stale_path.write_text(json.dumps({
+    'request_id': stale_id, 'origin': 'telegram', 'text': 'stale pid claim',
+    'chat_id': 77, 'message_id': 900, 'update_id': 900,
+    'created_at': int(time.time()), 'admission_sequence': 900,
+    'status': 'claimed', 'claim_owner_pid': stale_owner.pid,
+    'claim_owner_identity': f'proc:{stale_owner.pid}:reused',
+    'receipt_text': 'queued', 'receipt_status': 'pending',
+}))
+try:
+    assert run('mirror-reconcile').returncode == 0
+    stale_record = json.loads(stale_path.read_text())
+    assert stale_record['status'] == 'queued'
+    assert 'claim_owner_pid' not in stale_record and 'claim_owner_identity' not in stale_record
+finally:
+    stale_owner.terminate(); stale_owner.wait()
+stale_path.unlink()
+assert run('mirror-claim', request).returncode == 0
 for index in range(260):
     queued_id = f'tg-text-u{1000 + index}-m{1000 + index}'
     Path(inbox, queued_id + '.json').write_text(json.dumps({
@@ -213,6 +232,7 @@ cleaned = subprocess.run(
 assert cleaned.returncode == 0, cleaned.stderr
 claimed_record = json.loads(Path(inbox, request + '.json').read_text())
 assert claimed_record['status'] == 'claimed' and claimed_record['claim_owner_pid'] == int(owner)
+assert isinstance(claimed_record['claim_owner_identity'], str)
 body = 'Firstmate · ' + ('😀' * 3000)
 body_path = os.path.join(home, 'long-reply.txt')
 open(body_path, 'w').write(body)

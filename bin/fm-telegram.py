@@ -915,7 +915,11 @@ def bounded_cleanup(home: Path) -> None:
         for path in inbox_files:
             record = read_json(path, {})
             if isinstance(record, dict) and record.get("status") == "claimed":
-                continue
+                owner_pid = record.get("claim_owner_pid")
+                owner_identity = record.get("claim_owner_identity")
+                if (strict_int(owner_pid) and isinstance(owner_identity, str)
+                        and process_identity(owner_pid) == owner_identity):
+                    continue
             created = record.get("created_at", 0) if isinstance(record, dict) else 0
             should_remove = (queued_index >= MAX_INBOX or not strict_int(created)
                              or created < cutoff)
@@ -1294,16 +1298,45 @@ def mirror_owner_is_child(owner_pid: int) -> bool:
     return owner_pid == os.getppid()
 
 
+def claim_owner_identity(owner_pid: int) -> Optional[str]:
+    return process_identity(owner_pid) if mirror_owner_is_child(owner_pid) else None
+
+
+def claim_owned_by(record: Dict[str, Any], owner_pid: int) -> bool:
+    identity = claim_owner_identity(owner_pid)
+    return bool(
+        identity is not None
+        and record.get("claim_owner_pid") == owner_pid
+        and record.get("claim_owner_identity") == identity
+    )
+
+
+def bind_claim_owner(record: Dict[str, Any], owner_pid: int, identity: str) -> None:
+    record["claim_owner_pid"] = owner_pid
+    record["claim_owner_identity"] = identity
+    record["claimed_at"] = now()
+
+
+def clear_claim_owner(record: Dict[str, Any]) -> None:
+    record.pop("claim_owner_pid", None)
+    record.pop("claim_owner_identity", None)
+    record.pop("claimed_at", None)
+
+
 def mirror_queue_paths_locked(home: Path) -> List[Path]:
     inbox, _handled = request_dirs(home)
     return sorted(inbox.glob("*.json"), key=request_order_key)
 
 
 def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
-                     preserve_requests: Iterable[str] = ()) -> int:
+                     preserve_requests: Iterable[str] = (), report_held: bool = False) -> int:
     marker = state_dir(home) / ".mirror-migration-v2"
-    if replacing_owner_pid is not None and not mirror_owner_is_child(replacing_owner_pid):
-        return die("Telegram mirror owner is not the invoking extension")
+    replacement_identity = None
+    if replacing_owner_pid is not None:
+        replacement_identity = claim_owner_identity(replacing_owner_pid)
+        if replacement_identity is None:
+            return die("Telegram mirror owner is not the invoking extension")
+    held_records: List[Tuple[str, str]] = []
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
         if not marker.is_file():
@@ -1329,8 +1362,7 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
                               "work_published", "initial_routing_consumed", "wake_recorded"):
                     record.pop(field, None)
                 record["status"] = "queued"
-                record.pop("claim_owner_pid", None)
-                record.pop("claimed_at", None)
+                clear_claim_owner(record)
                 atomic_json(path, record)
             atomic_bytes(marker, b"v2\n")
         consume_safe_wakes(home)
@@ -1339,24 +1371,33 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
             record = read_json(path)
             if not isinstance(record, dict):
                 continue
+            status = record.get("status")
+            if status == "held":
+                turn_id = record.get("held_turn_id")
+                if isinstance(turn_id, str) and safe_id(turn_id):
+                    held_records.append((path.stem, turn_id))
+                continue
             owner = record.get("claim_owner_pid")
+            owner_identity = record.get("claim_owner_identity")
+            owner_alive = bool(
+                strict_int(owner)
+                and isinstance(owner_identity, str)
+                and process_identity(owner) == owner_identity
+            )
             if (path.stem in preserved and replacing_owner_pid is not None
-                    and record.get("status") == "queued"):
+                    and replacement_identity is not None and status in {"queued", "claimed"}):
                 record["status"] = "claimed"
-                record["claim_owner_pid"] = replacing_owner_pid
-                record["claimed_at"] = now()
+                bind_claim_owner(record, replacing_owner_pid, replacement_identity)
                 atomic_json(path, record)
-            elif record.get("status") == "claimed" and strict_int(owner):
-                alive = process_identity(owner) is not None
-                if path.stem in preserved and replacing_owner_pid is not None:
-                    record["claim_owner_pid"] = replacing_owner_pid
-                    record["claimed_at"] = now()
-                    atomic_json(path, record)
-                elif not alive or owner == replacing_owner_pid:
-                    record["status"] = "queued"
-                    record.pop("claim_owner_pid", None)
-                    record.pop("claimed_at", None)
-                    atomic_json(path, record)
+            elif status == "claimed" and (
+                    not owner_alive
+                    or (owner == replacing_owner_pid and owner_identity == replacement_identity)):
+                record["status"] = "queued"
+                clear_claim_owner(record)
+                atomic_json(path, record)
+    if report_held:
+        for request_id, turn_id in held_records[:1]:
+            print(f"held\t{request_id}\t{turn_id}")
     return 0
 
 
@@ -1374,7 +1415,8 @@ def mirror_list(home: Path) -> int:
 
 
 def mirror_claim(home: Path, request_id: str, owner_pid: int) -> int:
-    if not mirror_owner_is_child(owner_pid):
+    identity = claim_owner_identity(owner_pid)
+    if identity is None:
         return die("Telegram mirror owner is not the invoking extension")
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
@@ -1386,19 +1428,19 @@ def mirror_claim(home: Path, request_id: str, owner_pid: int) -> int:
         record = read_json(path)
         if not isinstance(record, dict) or record.get("origin") != "telegram":
             return die("Telegram request is malformed")
-        current_owner = record.get("claim_owner_pid")
-        if record.get("status") == "claimed":
-            if current_owner == owner_pid:
+        status = record.get("status", "queued")
+        if status == "claimed":
+            if claim_owned_by(record, owner_pid):
                 return 0
-            if strict_int(current_owner):
-                try:
-                    os.kill(current_owner, 0)
-                    return die("Telegram request is already being processed")
-                except OSError:
-                    pass
+            current_owner = record.get("claim_owner_pid")
+            current_identity = record.get("claim_owner_identity")
+            if (strict_int(current_owner) and isinstance(current_identity, str)
+                    and process_identity(current_owner) == current_identity):
+                return die("Telegram request is already being processed")
+        elif status != "queued":
+            return die("Telegram request is not queued")
         record["status"] = "claimed"
-        record["claim_owner_pid"] = owner_pid
-        record["claimed_at"] = now()
+        bind_claim_owner(record, owner_pid, identity)
         atomic_json(path, record)
     return 0
 
@@ -1411,7 +1453,7 @@ def mirror_read(home: Path, request_id: str, owner_pid: int) -> int:
         path = request_path(home, request_id)
         record = read_json(path) if path is not None else None
         if (path is None or path.parent.name != "inbox" or not isinstance(record, dict)
-                or record.get("status") != "claimed" or record.get("claim_owner_pid") != owner_pid):
+                or record.get("status") != "claimed" or not claim_owned_by(record, owner_pid)):
             return die("Telegram request is not owned by this extension")
         text = record.get("text")
         if not isinstance(text, str):
@@ -1428,13 +1470,51 @@ def mirror_release(home: Path, request_id: str, owner_pid: int) -> int:
         require_state_available_locked(home)
         path = request_path(home, request_id)
         record = read_json(path) if path is not None else None
-        if path is None or path.parent.name != "inbox" or not isinstance(record, dict):
-            return 1
-        if record.get("claim_owner_pid") != owner_pid:
+        if (path is None or path.parent.name != "inbox" or not isinstance(record, dict)
+                or not claim_owned_by(record, owner_pid)):
             return 1
         record["status"] = "queued"
-        record.pop("claim_owner_pid", None)
-        record.pop("claimed_at", None)
+        clear_claim_owner(record)
+        atomic_json(path, record)
+    return 0
+
+
+def mirror_hold(home: Path, request_id: str, turn_id: str, owner_pid: int) -> int:
+    if not safe_id(turn_id) or not mirror_owner_is_child(owner_pid):
+        return die("Telegram interrupted admission identity is invalid")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        path = request_path(home, request_id)
+        record = read_json(path) if path is not None else None
+        if path is None or path.parent.name != "inbox" or not isinstance(record, dict):
+            return die("Telegram interrupted admission was not found")
+        if record.get("status") == "held":
+            return 0 if record.get("held_turn_id") == turn_id else 1
+        if record.get("status") != "claimed" or not claim_owned_by(record, owner_pid):
+            return die("Telegram interrupted admission is not owned by this extension")
+        record["status"] = "held"
+        record["held_at"] = now()
+        record["held_turn_id"] = turn_id
+        clear_claim_owner(record)
+        atomic_json(path, record)
+    return 0
+
+
+def mirror_recover(home: Path, request_id: str, owner_pid: int) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        path = request_path(home, request_id)
+        record = read_json(path) if path is not None else None
+        if path is None:
+            return 0
+        if (path.parent.name != "inbox" or not isinstance(record, dict)
+                or record.get("status") != "held"):
+            return die("Telegram interrupted admission is not held")
+        record["status"] = "queued"
+        record.pop("held_at", None)
+        record.pop("held_turn_id", None)
         atomic_json(path, record)
     return 0
 
@@ -1447,7 +1527,7 @@ def mirror_delivered(home: Path, request_id: str, owner_pid: int) -> int:
         path = request_path(home, request_id)
         record = read_json(path) if path is not None else None
         if (path is None or path.parent.name != "inbox" or not isinstance(record, dict)
-                or record.get("status") != "claimed" or record.get("claim_owner_pid") != owner_pid):
+                or record.get("status") != "claimed" or not claim_owned_by(record, owner_pid)):
             return die("Telegram request is not owned by this extension")
         if record.get("delivery_status") == "sent":
             return 0
@@ -1459,13 +1539,13 @@ def mirror_delivered(home: Path, request_id: str, owner_pid: int) -> int:
     except TelegramError:
         with FileLock(state_lock(home)):
             current = read_json(path)
-            if isinstance(current, dict) and current.get("claim_owner_pid") == owner_pid:
+            if isinstance(current, dict) and claim_owned_by(current, owner_pid):
                 current["delivery_status"] = "delivery_unknown"
                 atomic_json(path, current)
         return 1
     with FileLock(state_lock(home)):
         current = read_json(path)
-        if isinstance(current, dict) and current.get("claim_owner_pid") == owner_pid:
+        if isinstance(current, dict) and claim_owned_by(current, owner_pid):
             current["delivery_status"] = "sent"
             atomic_json(path, current)
     return 0
@@ -1629,7 +1709,7 @@ def mirror_complete(home: Path, request_id: str, delivery_id: str, owner_pid: in
         record = read_json(source)
         delivery = read_json(mirror_delivery_dir(home) / f"{delivery_id}.json")
         if (not isinstance(record, dict) or record.get("request_id") != request_id
-                or record.get("status") != "claimed" or record.get("claim_owner_pid") != owner_pid):
+                or record.get("status") != "claimed" or not claim_owned_by(record, owner_pid)):
             return die("Telegram request is not owned by this extension")
         if (not isinstance(delivery, dict) or delivery.get("delivery_id") != delivery_id
                 or delivery.get("status") != "sent"):
@@ -1637,8 +1717,7 @@ def mirror_complete(home: Path, request_id: str, delivery_id: str, owner_pid: in
         record["status"] = "handled"
         record["delivery_id"] = delivery_id
         record["completed_at"] = now()
-        record.pop("claim_owner_pid", None)
-        record.pop("claimed_at", None)
+        clear_claim_owner(record)
         atomic_json(source, record)
         durable_replace(source, target)
         private_file(target)
@@ -3034,9 +3113,9 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-reply, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
+        epilog=("Commands: pair, serve, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-hold, mirror-recover, mirror-reply, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
                 "Private mirror commands require the lock-owning extension capability on an inherited file descriptor.\n"
-                "Retention limits: 256 queued requests for 7 days, 4096 handled requests, and 256 mirror deliveries of up to 256 KiB.\n"
+                "Retention limits: 256 queued or interrupted requests for 7 days, 4096 handled requests, and 256 mirror deliveries of up to 256 KiB.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
                 "Voice limits: 10 MiB, 120 seconds, a 4096-unit transcript, and 64 waiting notes. Temporary audio is restricted to /dev/shm.\n"
                 "Pairing accepts --parakeet-command and --whisper-command as absolute executable paths; configured paths must be regular executable files.\n"
@@ -3091,6 +3170,13 @@ def build_parser() -> argparse.ArgumentParser:
     release_parser = sub.add_parser("mirror-release", help="return a failed live claim to the queue")
     add_private(release_parser)
     release_parser.add_argument("request_id")
+    hold_parser = sub.add_parser("mirror-hold", help="hold one interrupted admission without retrying it")
+    add_private(hold_parser)
+    hold_parser.add_argument("request_id")
+    hold_parser.add_argument("turn_id")
+    recover_parser = sub.add_parser("mirror-recover", help="explicitly requeue one held interrupted admission")
+    add_private(recover_parser)
+    recover_parser.add_argument("request_id")
     mirror_reply_parser = sub.add_parser("mirror-reply", help="deliver one stable finalized assistant body")
     add_private(mirror_reply_parser)
     mirror_reply_parser.add_argument("delivery_id")
@@ -3149,12 +3235,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return mirror_delivered(home, args.request_id, args.owner_pid)
         if args.command == "mirror-release":
             return mirror_release(home, args.request_id, args.owner_pid)
+        if args.command == "mirror-hold":
+            return mirror_hold(home, args.request_id, args.turn_id, args.owner_pid)
+        if args.command == "mirror-recover":
+            return mirror_recover(home, args.request_id, args.owner_pid)
         if args.command == "mirror-reply":
             return mirror_reply(home, args.delivery_id, args.owner_pid, args.text_file)
         if args.command == "mirror-complete":
             return mirror_complete(home, args.request_id, args.delivery_id, args.owner_pid)
         if args.command == "mirror-reconcile":
-            return mirror_reconcile(home, args.owner_pid, args.preserve_request)
+            return mirror_reconcile(home, args.owner_pid, args.preserve_request, report_held=True)
         if args.command == "install":
             return install(home)
         if args.command == "start":

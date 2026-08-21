@@ -48,9 +48,12 @@ elif command == 'mirror-reconcile':
             request['status'] = 'claimed'; request['owner'] = int(option('--owner-pid'))
         else:
             request['status'] = 'queued'; request.pop('owner', None)
+    if request and request.get('status') == 'held':
+        print(f"held\t{request['id']}\t{request['turn_id']}")
 elif command == 'mirror-next':
     request = state.get('request')
     if request and request.get('status') == 'queued': print(request['id'])
+    elif state.get('next_request'): print(state['next_request']['id'])
     else: code = 1
 elif command == 'mirror-claim':
     request = state.get('request')
@@ -72,6 +75,16 @@ elif command == 'mirror-release':
     request = state.get('request')
     if not request or request.get('id') != rest[0]: code = 1
     else: request['status'] = 'queued'; request.pop('owner', None)
+elif command == 'mirror-hold':
+    request = state.get('request')
+    if not request or request.get('id') != rest[0] or request.get('status') not in ('claimed', 'held'): code = 1
+    else:
+        request['status'] = 'held'; request['turn_id'] = rest[1]; request.pop('owner', None)
+elif command == 'mirror-recover':
+    request = state.get('request')
+    if not request or request.get('id') != rest[0] or request.get('status') != 'held': code = 1
+    else:
+        request['status'] = 'queued'; request.pop('turn_id', None)
 elif command == 'mirror-delivered':
     request = state.get('request')
     if not request or request.get('id') != rest[0] or request.get('status') != 'claimed': code = 1
@@ -110,6 +123,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI): void {
   let injected = false;
+  let nested = false;
   pi.registerTool({
     name: "mirror_test_tool",
     label: "Mirror test tool",
@@ -119,17 +133,36 @@ export default function (pi: ExtensionAPI): void {
       return { content: [{ type: "text" as const, text: "tool diagnostic payload" }], details: {} };
     },
   });
-  pi.on("input", (event) => {
-    const state = globalThis as typeof globalThis & { __telegramMirrorHandleExtensionInput?: boolean };
-    if (state.__telegramMirrorHandleExtensionInput && event.source === "extension") {
-      return { action: "handled" as const };
+  pi.on("input", async (event) => {
+    const state = globalThis as typeof globalThis & { __telegramMirrorInjectNested?: boolean };
+    if (state.__telegramMirrorInjectNested && event.source === "extension" && !nested) {
+      nested = true;
+      pi.sendUserMessage("nested extension input");
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
   });
   pi.on("agent_end", () => {
     const state = globalThis as typeof globalThis & { __telegramMirrorInjectOperational?: boolean };
     if (!state.__telegramMirrorInjectOperational || injected) return;
     injected = true;
-    pi.sendUserMessage("operational follow-up", { deliverAs: "followUp" });
+    pi.sendMessage({
+      customType: "mirror-test-operational",
+      content: "operational follow-up",
+      display: false,
+    }, { triggerTurn: true, deliverAs: "followUp" });
+  });
+}
+TS
+
+cat >"$TMP_ROOT/handling-extension.ts" <<'TS'
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+export default function (pi: ExtensionAPI): void {
+  pi.on("input", (event) => {
+    const state = globalThis as typeof globalThis & { __telegramMirrorHandleExtensionInput?: boolean };
+    if (state.__telegramMirrorHandleExtensionInput && event.source === "extension") {
+      return { action: "handled" as const };
+    }
   });
 }
 TS
@@ -139,7 +172,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
-const [sdkPath, aiPath, projectRoot, extensionPath, competingPath, home, agentDir, sessionDir, transport, lockLib] = process.argv.slice(2);
+const [sdkPath, aiPath, projectRoot, extensionPath, competingPath, handlingPath, home, agentDir, sessionDir, transport, lockLib] = process.argv.slice(2);
 process.env.FM_HOME = home;
 process.env.FM_TELEGRAM_TRANSPORT = transport;
 process.env.FM_TELEGRAM_SESSION_LOCK_LIB = lockLib;
@@ -166,22 +199,33 @@ const settingsManager = SettingsManager.inMemory({
 const createRuntime = async ({ cwd, sessionManager, sessionStartEvent }) => {
   const services = await createAgentSessionServices({
     cwd, agentDir, modelRuntime, settingsManager,
-    resourceLoaderOptions: { additionalExtensionPaths: [extensionPath, competingPath] },
+    resourceLoaderOptions: { additionalExtensionPaths: [competingPath, extensionPath, handlingPath] },
   });
   const result = await createAgentSessionFromServices({
     services, sessionManager, sessionStartEvent, model, thinkingLevel: 'off', noTools: 'builtin',
   });
   return { ...result, services, diagnostics: services.diagnostics };
 };
+globalThis.__telegramMirrorInjectNested = true;
 const initialManager = SessionManager.create(home, sessionDir);
 const runtime = await createAgentSessionRuntime(createRuntime, {
   cwd: home, agentDir, sessionManager: initialManager,
 });
 faux.setResponses([
+  async (context) => {
+    assert.doesNotMatch(context.systemPrompt, /authenticated Telegram mirror/);
+    const user = context.messages.findLast((message) => message.role === 'user');
+    assert.equal(user.content.map((part) => part.text || '').join(''), 'nested extension input');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return fauxAssistantMessage('nested extension answer');
+  },
   (context) => {
     assert.match(context.systemPrompt + JSON.stringify(context.messages), /authenticated Telegram mirror/);
     const user = context.messages.findLast((message) => message.role === 'user');
-    assert.match(user.content.map((part) => part.text || '').join(''), /^You · Telegram/);
+    const text = user.content.map((part) => part.text || '').join('');
+    assert.match(text, /^You · Telegram\n\nhello from Telegram/);
+    assert.match(text, /authenticated Telegram mirror/);
+    assert.doesNotMatch(text, /firstmate-origin/);
     return fauxAssistantMessage('settled answer');
   },
 ]);
@@ -200,7 +244,7 @@ async function waitFor(predicate, message) {
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  assert.fail(message);
+  assert.fail(`${message}: ${JSON.stringify({ state: state(), entries: initialManager.getEntries(), calls: faux.state.callCount })}`);
 }
 function userTexts(manager) {
   return manager.getEntries()
@@ -213,9 +257,12 @@ await waitFor(() => state().handled?.includes('tg-text-u1-m1')
     entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
       && entry.data.state === 'completed'), 'real runtime did not complete Telegram admission');
 let current = state();
+globalThis.__telegramMirrorInjectNested = false;
 assert.equal(current.receipts.filter((id) => id === 'tg-text-u1-m1').length, 1);
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · settled answer').length, 1);
+assert.equal(Object.values(current.deliveries).some((body) => body.includes('nested extension answer')), false);
 assert.equal(userTexts(initialManager).filter((text) => text.startsWith('You · Telegram')).length, 1);
+assert.equal(userTexts(initialManager).filter((text) => text === 'nested extension input').length, 1);
 assert.equal(initialManager.getEntries().some((entry) =>
   entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission' && entry.data.state === 'completed'), true);
 assert.equal(runtime.session.agent.state.tools.some((tool) => /telegram/i.test(tool.name)), false);
@@ -326,18 +373,21 @@ faux.appendResponses([
     return fauxAssistantMessage('paired answer');
   },
   (context) => {
-    const user = context.messages.findLast((message) => message.role === 'user');
-    assert.equal(user.content.map((part) => part.text || '').join(''), 'operational follow-up');
+    const operational = context.messages.findLast((message) => message.role === 'custom');
+    assert.equal(operational.content, 'operational follow-up');
     return fauxAssistantMessage('operational answer');
   },
 ]);
 await waitFor(() => state().handled?.includes('tg-text-u9-m9'), 'competing extension turn prevented Telegram settlement');
-await waitFor(() => userTexts(initialManager).includes('operational follow-up'), 'competing extension input did not execute');
+await waitFor(() => initialManager.getEntries().some((entry) =>
+  entry.type === 'custom_message' && entry.content === 'operational follow-up'),
+'competing custom operational continuation did not execute');
 current = state();
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · paired answer').length, 1);
 assert.equal(Object.values(current.deliveries).some((body) => body.includes('operational answer')), false);
 assert.equal(Object.values(current.deliveries).some((body) => body.includes('private Telegram reasoning')), false);
 assert.equal(Object.values(current.deliveries).some((body) => body.includes('tool diagnostic payload')), false);
+globalThis.__telegramMirrorInjectOperational = false;
 
 const voice = state();
 voice.request = { id: 'tg-voice-u10-m10', text: 'confirmed voice text', status: 'queued' };
@@ -362,19 +412,27 @@ await waitFor(() => initialManager.getEntries().some((entry) =>
 'provider failure did not persist an interrupted admission');
 await new Promise((resolve) => setTimeout(resolve, 300));
 current = state();
-assert.equal(current.request?.status, 'claimed', 'provider failure released its admitted request');
+assert.equal(current.request?.status, 'held', 'provider failure did not bound its interrupted request');
 assert.equal(faux.state.callCount, callsBeforeFailure + 1, 'provider failure hot-looped another model turn');
 assert.equal(userTexts(initialManager).filter((text) => text.includes('provider failure request')).length, 1);
+current.next_request = { id: 'tg-text-u13-m13', text: 'must remain queued' };
+save(current);
+await new Promise((resolve) => setTimeout(resolve, 300));
+assert.equal(state().log.some((call) => call[0] === 'mirror-claim' && call[1] === 'tg-text-u13-m13'), false,
+  'held provider failure admitted another Telegram request');
 faux.appendResponses([fauxAssistantMessage('terminal after interrupted answer')]);
 await runtime.session.prompt('terminal after interrupted Telegram', { source: 'interactive' });
 current = state();
-assert.equal(current.request?.status, 'claimed', 'terminal recovery released the interrupted Telegram claim');
+assert.equal(current.request?.status, 'held', 'terminal turn released the interrupted Telegram hold');
 assert.equal(Object.values(current.deliveries).filter((body) =>
   body === 'You · Terminal\n\nterminal after interrupted Telegram').length, 1);
 assert.equal(Object.values(current.deliveries).filter((body) =>
   body === 'Firstmate · terminal after interrupted answer').length, 1);
-current.request = null;
+current.next_request = null;
 save(current);
+faux.appendResponses([fauxAssistantMessage('explicit provider recovery answer')]);
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await waitFor(() => state().handled?.includes('tg-text-u11-m11'), 'explicit mode-on recovery did not settle the held request');
 
 const replacement = state();
 replacement.request = { id: 'tg-text-u2-m2', text: 'replacement request', status: 'claimed', owner: process.pid };
@@ -464,5 +522,5 @@ sdk_path="$pi_root/dist/index.js"
 ai_path="$pi_root/node_modules/@earendil-works/pi-ai/dist/index.js"
 node "$TMP_ROOT/runtime.mjs" \
   "$sdk_path" "$ai_path" "$ROOT" "$ROOT/.pi/extensions/fm-telegram-mirror.ts" \
-  "$TMP_ROOT/competing-extension.ts" "$home" "$agent_dir" "$session_dir" \
-  "$TMP_ROOT/fake-transport.py" "$TMP_ROOT/lock-lib.sh"
+  "$TMP_ROOT/competing-extension.ts" "$TMP_ROOT/handling-extension.ts" \
+  "$home" "$agent_dir" "$session_dir" "$TMP_ROOT/fake-transport.py" "$TMP_ROOT/lock-lib.sh"
