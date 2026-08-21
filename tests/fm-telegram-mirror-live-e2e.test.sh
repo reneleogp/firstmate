@@ -51,6 +51,7 @@ lock = (home / 'fake-state.lock').open('a+')
 fcntl.flock(lock, fcntl.LOCK_EX)
 path = home / 'fake-state.json'
 state = json.loads(path.read_text()) if path.exists() else {'request': None, 'deliveries': {}, 'log': []}
+state.setdefault('reservations', {})
 state.setdefault('log', []).append([command, *rest])
 def save():
     temporary = path.with_name(f'.{path.name}.{os.getpid()}')
@@ -114,6 +115,15 @@ elif command == 'mirror-recover':
     if not request or request.get('id') != rest[0] or request.get('status') != 'held': code = 1
     else:
         request['status'] = 'queued'; request.pop('turn_id', None)
+elif command == 'mirror-reserve':
+    delivery_id = rest[0]
+    body = sys.stdin.read() if option('--text-file') == '-' else Path(option('--text-file')).read_text()
+    if mode_path().read_text().strip() != 'on' or (home / 'reject-user-reserve').exists(): code = 1
+    elif delivery_id in state['reservations'] and state['reservations'][delivery_id] != body: code = 1
+    elif delivery_id in state['deliveries'] and state['deliveries'][delivery_id] != body: code = 1
+    else: state['reservations'][delivery_id] = body
+elif command == 'mirror-cancel':
+    state['reservations'].pop(rest[0], None)
 elif command == 'mirror-delivered':
     request = state.get('request')
     if not request or request.get('id') != rest[0] or request.get('status') != 'claimed': code = 1
@@ -121,12 +131,16 @@ elif command == 'mirror-delivered':
 elif command == 'mirror-reply':
     delivery_id = rest[0]
     body = sys.stdin.read() if option('--text-file') == '-' else Path(option('--text-file')).read_text()
+    reservation = state['reservations'].get(delivery_id)
+    if reservation is not None and reservation != body: code = 1
     if (home / 'reject-mirror-reply').exists(): code = 1
     if (home / 'reject-user-reply').exists() and body.startswith('You · Terminal'): code = 1
     if (home / 'reject-assistant-reply').exists() and body.startswith('Firstmate ·'): code = 1
     existing = state['deliveries'].get(delivery_id)
     if code == 0 and existing is not None and existing != body: code = 1
-    elif code == 0: state['deliveries'][delivery_id] = body
+    elif code == 0:
+        state['deliveries'][delivery_id] = body
+        state['reservations'].pop(delivery_id, None)
 elif command == 'mirror-complete':
     request_id, delivery_id = rest[:2]
     request = state.get('request')
@@ -190,9 +204,19 @@ cat >"$TMP_ROOT/handling-extension.ts" <<'TS'
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI): void {
-  pi.on("input", (event) => {
-    const state = globalThis as typeof globalThis & { __telegramMirrorHandleExtensionInput?: boolean };
+  pi.on("input", async (event) => {
+    const state = globalThis as typeof globalThis & {
+      __telegramMirrorHandleExtensionInput?: boolean;
+      __telegramMirrorHandleInteractiveInput?: boolean;
+      __telegramMirrorDelayInteractiveInput?: boolean;
+    };
+    if (state.__telegramMirrorDelayInteractiveInput && event.source === "interactive") {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
     if (state.__telegramMirrorHandleExtensionInput && event.source === "extension") {
+      return { action: "handled" as const };
+    }
+    if (state.__telegramMirrorHandleInteractiveInput && event.source === "interactive") {
       return { action: "handled" as const };
     }
   });
@@ -335,16 +359,33 @@ assert.equal(existsSync(`${home}/drain-overlapped-reconcile`), false,
 assert.equal(userTexts(initialManager).filter((text) => text.includes('reconcile race request')).length, 1);
 assert.equal(Object.values(state().deliveries).filter((body) => body === 'Firstmate · reconcile race answer').length, 1);
 
-writeFileSync(`${home}/reject-user-reply`, '');
+writeFileSync(`${home}/reject-user-reserve`, '');
 const usersBeforeRejectedTerminal = userTexts(initialManager).length;
 const callsBeforeRejectedTerminal = faux.state.callCount;
-await runtime.session.prompt('terminal transport rejection', { source: 'interactive' });
+await runtime.session.prompt('terminal reservation rejection', { source: 'interactive' });
 assert.equal(userTexts(initialManager).length, usersBeforeRejectedTerminal,
-  'terminal input entered Pi after its Telegram delivery was rejected');
+  'terminal input entered Pi after its Telegram reservation was rejected');
 assert.equal(faux.state.callCount, callsBeforeRejectedTerminal,
-  'terminal delivery rejection started a model turn');
+  'terminal reservation rejection started a model turn');
 assert.equal(notices.some(([message]) => message.includes('Pi turn was not started')), true);
+unlinkSync(`${home}/reject-user-reserve`);
+
+writeFileSync(`${home}/reject-user-reply`, '');
+faux.appendResponses([fauxAssistantMessage('answer after accepted user delivery block')]);
+await runtime.session.prompt('accepted terminal delivery block', { source: 'interactive' });
+await waitFor(() => statuses.at(-1)?.[1] === 'telegram: delivery needs attention',
+  'accepted terminal user delivery failure was not retained');
+const callsAfterAcceptedUserBlock = faux.state.callCount;
 unlinkSync(`${home}/reject-user-reply`);
+await runtime.session.prompt('/telegram off', { source: 'interactive' });
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await waitFor(() => Object.values(state().deliveries)
+  .some((body) => body === 'Firstmate · answer after accepted user delivery block'),
+'accepted terminal pair did not settle after user delivery retry');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'You · Terminal\n\naccepted terminal delivery block').length, 1);
+assert.equal(faux.state.callCount, callsAfterAcceptedUserBlock,
+  'accepted terminal delivery retry invoked the model');
 
 faux.appendResponses([
   (context) => {
@@ -358,6 +399,44 @@ await runtime.session.prompt('terminal request', { source: 'interactive' });
 current = state();
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'You · Terminal\n\nterminal request').length, 1);
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · terminal\nanswer').length, 1);
+
+const usersBeforeHandledTerminal = userTexts(initialManager).length;
+const callsBeforeHandledTerminal = faux.state.callCount;
+globalThis.__telegramMirrorHandleInteractiveInput = true;
+await runtime.session.prompt('handled terminal reservation', { source: 'interactive' });
+globalThis.__telegramMirrorHandleInteractiveInput = false;
+assert.equal(userTexts(initialManager).length, usersBeforeHandledTerminal,
+  'later handler did not consume the reserved terminal input');
+assert.equal(faux.state.callCount, callsBeforeHandledTerminal,
+  'later-handler-consumed terminal input started a model turn');
+assert.equal(Object.values(state().deliveries)
+  .some((body) => body === 'You · Terminal\n\nhandled terminal reservation'), false);
+assert.equal(Object.values(state().reservations)
+  .filter((body) => body === 'You · Terminal\n\nhandled terminal reservation').length, 1);
+await runtime.session.reload();
+await waitFor(() => Object.values(state().reservations)
+  .every((body) => body !== 'You · Terminal\n\nhandled terminal reservation'),
+'handled terminal reservation was not cancelled on lifecycle cleanup');
+
+faux.appendResponses([fauxAssistantMessage('long preflight answer')]);
+globalThis.__telegramMirrorDelayInteractiveInput = true;
+const callsBeforeLongPreflight = faux.state.callCount;
+const longPreflight = runtime.session.prompt('long preflight terminal', { source: 'interactive' });
+await new Promise((resolve) => setTimeout(resolve, 250));
+assert.equal(Object.values(state().reservations)
+  .filter((body) => body === 'You · Terminal\n\nlong preflight terminal').length, 1,
+  'long input preflight lost its bounded reservation');
+assert.equal(Object.values(state().deliveries)
+  .some((body) => body === 'You · Terminal\n\nlong preflight terminal'), false,
+  'terminal input was delivered before Pi accepted it');
+assert.equal(faux.state.callCount, callsBeforeLongPreflight,
+  'long input preflight started the model before acceptance');
+await longPreflight;
+globalThis.__telegramMirrorDelayInteractiveInput = false;
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'You · Terminal\n\nlong preflight terminal').length, 1);
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · long preflight answer').length, 1);
 
 writeFileSync(`${home}/reject-assistant-reply`, '');
 faux.appendResponses([fauxAssistantMessage('blocked terminal answer')]);
@@ -375,6 +454,57 @@ assert.equal(faux.state.callCount, callsAfterTerminalBlock,
   'blocked terminal assistant retry invoked the model');
 assert.equal(userTexts(initialManager)
   .filter((text) => text.includes('terminal with blocked assistant')).length, 1);
+
+writeFileSync(`${home}/reject-assistant-reply`, '');
+const callsBeforeOrderedBlock = faux.state.callCount;
+faux.appendResponses([
+  async () => {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return fauxAssistantMessage('ordered blocked A answer');
+  },
+  fauxAssistantMessage('ordered finalized B answer'),
+]);
+const orderedA = runtime.session.prompt('ordered blocked A', { source: 'interactive' });
+await waitFor(() => userTexts(initialManager).some((text) => text.includes('ordered blocked A')),
+  'ordered blocked A did not start');
+await runtime.session.prompt('ordered finalized B', {
+  source: 'interactive', streamingBehavior: 'followUp',
+});
+await orderedA;
+await waitFor(() => statuses.at(-1)?.[1] === 'telegram: delivery needs attention',
+  'ordered blocked A did not stop settlement before finalized B');
+unlinkSync(`${home}/reject-assistant-reply`);
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await waitFor(() => Object.values(state().deliveries)
+  .some((body) => body === 'Firstmate · ordered finalized B answer'),
+'finalized B did not settle immediately after blocked A recovered');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · ordered blocked A answer').length, 1);
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · ordered finalized B answer').length, 1);
+assert.equal(faux.state.callCount, callsBeforeOrderedBlock + 2,
+  'ordered blocked delivery recovery invoked an extra model pass');
+
+faux.appendResponses([
+  async () => {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    return fauxAssistantMessage('off during accepted turn answer');
+  },
+]);
+const callsBeforeOffDuringTurn = faux.state.callCount;
+const offDuringTurn = runtime.session.prompt('off during accepted terminal turn', { source: 'interactive' });
+await waitFor(() => userTexts(initialManager)
+  .some((text) => text.includes('off during accepted terminal turn')),
+'accepted terminal turn did not start before mode-off command');
+await runtime.session.prompt('/telegram off', { source: 'interactive' });
+await offDuringTurn;
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'You · Terminal\n\noff during accepted terminal turn').length, 1);
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · off during accepted turn answer').length, 1);
+assert.equal(faux.state.callCount, callsBeforeOffDuringTurn + 1,
+  'mode-off during an accepted turn started a second model pass');
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
 
 current = state();
 writeFileSync(`${home}/config/telegram-mirror`, 'off\n');

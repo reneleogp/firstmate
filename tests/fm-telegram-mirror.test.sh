@@ -44,7 +44,7 @@ raise SystemExit(result.returncode)
 PY
 owner_script="$TMP_ROOT/owner.py"
 cat >"$owner_script" <<PY
-import os, subprocess, sys
+import json, os, subprocess, sys
 from pathlib import Path
 script = sys.argv[1]; home = sys.argv[2]; attacker = sys.argv[3]
 owner = os.getpid(); capability = b'a' * 64 + b'\\n'
@@ -71,11 +71,23 @@ claimed = run('mirror-claim', 'tg-text-u1-m1')
 assert claimed.returncode == 0, claimed.stderr
 body = run('mirror-read', 'tg-text-u1-m1')
 assert body.returncode == 0 and body.stdout == 'same text'
+reservation_body = Path(home, 'terminal-reservation.txt')
+reservation_body.write_text('You · Terminal\\n\\nreserved only')
+reserved = run('mirror-reserve', 'user-terminal-reserved', '--text-file', str(reservation_body))
+assert reserved.returncode == 0, reserved.stderr
+reservation = Path(home, 'state', 'telegram', 'deliveries', 'user-terminal-reserved.json')
+assert json.loads(reservation.read_text())['status'] == 'reserved'
+assert run('mirror-cancel', 'user-terminal-reserved').returncode == 0
+assert not reservation.exists()
 second = Path(home, 'state', 'telegram', 'inbox', 'tg-text-u2-m2.json')
 second.write_text('{"request_id":"tg-text-u2-m2","origin":"telegram","text":"off","status":"queued"}')
 mode_path.write_text('off\\n')
 refused = run('mirror-claim', 'tg-text-u2-m2')
 assert refused.returncode != 0 and 'mode is off' in refused.stderr
+refused_reservation = run(
+    'mirror-reserve', 'user-terminal-mode-off', '--text-file', str(reservation_body),
+)
+assert refused_reservation.returncode != 0 and 'mode is off' in refused_reservation.stderr
 PY
 override_config="$TMP_ROOT/override-config"
 mkdir -p "$override_config"

@@ -27,6 +27,8 @@ The Pi footer shows `telegram: on`, `telegram: off`, or a non-primary warning.
 
 When mode is on, authenticated text and confirmed voice transcripts enter Pi through `pi.sendUserMessage()` as one visible `You · Telegram` user turn.
 Interactive terminal input remains `You · Terminal` and is mirrored to Telegram as one user message.
+The transport reserves that bounded live delivery while Pi input handlers run and sends it only after the exact user-message lifecycle confirms Pi accepted the turn.
+Turning mirror mode off blocks future admissions without discarding an already accepted turn or its pending response delivery.
 After `agent_settled`, one finalized user-facing assistant body is delivered as `Firstmate ·`.
 Normal live operation is one Telegram message, one Pi turn, and one response.
 No Telegram model tool, second model pass, summary, regeneration, or transport implementation in TypeScript is used.

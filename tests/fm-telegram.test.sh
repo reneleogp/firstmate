@@ -256,6 +256,20 @@ assert cleaned.returncode == 0, cleaned.stderr
 claimed_record = json.loads(Path(inbox, request + '.json').read_text())
 assert claimed_record['status'] == 'claimed' and claimed_record['claim_owner_pid'] == int(owner)
 assert isinstance(claimed_record['claim_owner_identity'], str)
+terminal_body = 'You · Terminal\n\nreserved until Pi acceptance'
+terminal_path = os.path.join(home, 'terminal-reserved.txt')
+open(terminal_path, 'w').write(terminal_body)
+calls_path = Path(home, 'calls.jsonl')
+def send_count():
+    return sum(1 for line in calls_path.read_text().splitlines()
+               if json.loads(line)['path'].endswith('/sendMessage'))
+before_reservation = send_count()
+reserved = run('mirror-reserve', 'user-terminal-accepted', '--text-file', terminal_path)
+assert reserved.returncode == 0, reserved.stderr
+assert send_count() == before_reservation
+sent_reservation = run('mirror-reply', 'user-terminal-accepted', '--text-file', terminal_path)
+assert sent_reservation.returncode == 0, sent_reservation.stderr
+assert send_count() == before_reservation + 1
 body = 'Firstmate · ' + ('😀' * 3000)
 body_path = os.path.join(home, 'long-reply.txt')
 open(body_path, 'w').write(body)

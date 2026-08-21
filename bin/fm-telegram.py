@@ -876,11 +876,24 @@ def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> bool
         bodies.add(body_path.name)
         delivery_pid = record.get("delivery_owner_pid")
         delivery_identity = record.get("delivery_owner_identity")
-        protected = bool(
+        reservation_pid = record.get("reservation_owner_pid")
+        reservation_identity = record.get("reservation_owner_identity")
+        delivery_live = bool(
             strict_int(delivery_pid)
             and isinstance(delivery_identity, str)
             and process_identity(delivery_pid) == delivery_identity
         )
+        reservation_live = bool(
+            strict_int(reservation_pid)
+            and isinstance(reservation_identity, str)
+            and process_identity(reservation_pid) == reservation_identity
+        )
+        protected = delivery_live or reservation_live
+        if record.get("status") == "reserved" and not reservation_live:
+            durable_unlink(metadata_path)
+            durable_unlink(body_path)
+            bodies.discard(body_path.name)
+            continue
         if created < cutoff and not protected:
             durable_unlink(metadata_path)
             durable_unlink(body_path)
@@ -1566,20 +1579,91 @@ def mirror_delivery_dir(home: Path) -> Path:
     return path
 
 
+def mirror_delivery_body(text_file: str) -> Tuple[bytes, List[Dict[str, Any]]]:
+    try:
+        body = text_from_file(text_file).encode("utf-8")
+        chunks = split_telegram_response(body)
+    except (OSError, UnicodeError) as exc:
+        raise TelegramError("Telegram delivery body is not valid UTF-8") from exc
+    if len(body) > MAX_MIRROR_DELIVERY_BYTES:
+        raise TelegramError("Telegram delivery exceeds the response limit")
+    if not chunks or len(chunks) > MAX_MIRROR_DELIVERY_CHUNKS:
+        raise TelegramError("Telegram delivery exceeds the chunk limit")
+    return body, chunks
+
+
+def mirror_reserve(home: Path, delivery_id: str, owner_pid: int, text_file: str) -> int:
+    identity = claim_owner_identity(owner_pid)
+    if identity is None:
+        return die("Telegram mirror owner is not the invoking extension")
+    if not safe_id(delivery_id) or len(delivery_id) > 160:
+        return die("Telegram delivery identity is invalid")
+    try:
+        body, chunks = mirror_delivery_body(text_file)
+    except TelegramError as exc:
+        return die(str(exc))
+    root = mirror_delivery_dir(home)
+    body_path = root / f"{delivery_id}.txt"
+    metadata_path = root / f"{delivery_id}.json"
+    digest = hashlib.sha256(body).hexdigest()
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        if not mirror_mode_enabled(home):
+            return die("Telegram mirror mode is off")
+        existing = read_json(metadata_path)
+        if isinstance(existing, dict):
+            if existing.get("sha256") != digest:
+                return die("Telegram delivery identity is already bound to different content")
+            if (existing.get("status") == "reserved"
+                    and existing.get("reservation_owner_pid") == owner_pid
+                    and existing.get("reservation_owner_identity") == identity):
+                return 0
+            return die("Telegram delivery identity is already in use")
+        if not cleanup_mirror_deliveries_locked(home, reserve_slots=1):
+            return die("Telegram delivery journal has no bounded free slot")
+        atomic_bytes(body_path, body)
+        atomic_json(metadata_path, {
+            "delivery_id": delivery_id,
+            "sha256": digest,
+            "status": "reserved",
+            "created_at": now(),
+            "chunks": chunks,
+            "reservation_owner_pid": owner_pid,
+            "reservation_owner_identity": identity,
+        })
+    return 0
+
+
+def mirror_cancel(home: Path, delivery_id: str, owner_pid: int) -> int:
+    identity = claim_owner_identity(owner_pid)
+    if identity is None or not safe_id(delivery_id) or len(delivery_id) > 160:
+        return die("Telegram delivery reservation identity is invalid")
+    root = mirror_delivery_dir(home)
+    body_path = root / f"{delivery_id}.txt"
+    metadata_path = root / f"{delivery_id}.json"
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        record = read_json(metadata_path)
+        if record is None:
+            return 0
+        if (not isinstance(record, dict) or record.get("status") != "reserved"
+                or record.get("reservation_owner_pid") != owner_pid
+                or record.get("reservation_owner_identity") != identity):
+            return die("Telegram delivery reservation is not owned by this extension")
+        durable_unlink(metadata_path)
+        durable_unlink(body_path)
+    return 0
+
+
 def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -> int:
     if not mirror_owner_is_child(owner_pid):
         return die("Telegram mirror owner is not the invoking extension")
     if not safe_id(delivery_id) or len(delivery_id) > 160:
         return die("Telegram delivery identity is invalid")
     try:
-        body = text_from_file(text_file).encode("utf-8")
-        chunks = split_telegram_response(body)
-    except (OSError, UnicodeError):
-        return die("Telegram delivery body is not valid UTF-8")
-    if len(body) > MAX_MIRROR_DELIVERY_BYTES:
-        return die("Telegram delivery exceeds the response limit")
-    if not chunks or len(chunks) > MAX_MIRROR_DELIVERY_CHUNKS:
-        return die("Telegram delivery exceeds the chunk limit")
+        body, chunks = mirror_delivery_body(text_file)
+    except TelegramError as exc:
+        return die(str(exc))
     root = mirror_delivery_dir(home)
     body_path = root / f"{delivery_id}.txt"
     metadata_path = root / f"{delivery_id}.json"
@@ -1599,6 +1683,15 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -
             if existing.get("status") == "delivery_unknown":
                 return DELIVERY_UNKNOWN_EXIT
             record = existing
+            if record.get("status") == "reserved":
+                reservation_identity = claim_owner_identity(owner_pid)
+                if (reservation_identity is None
+                        or record.get("reservation_owner_pid") != owner_pid
+                        or record.get("reservation_owner_identity") != reservation_identity):
+                    return die("Telegram delivery reservation is not owned by this extension")
+                record.pop("reservation_owner_pid", None)
+                record.pop("reservation_owner_identity", None)
+                record["status"] = "pending"
             if not isinstance(record.get("chunks"), list):
                 record["chunks"] = chunks
             previous_pid = record.get("delivery_owner_pid")
@@ -3138,7 +3231,7 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-hold, mirror-recover, mirror-reply, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
+        epilog=("Commands: pair, serve, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-hold, mirror-recover, mirror-reserve, mirror-cancel, mirror-reply, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
                 "Private mirror commands require the lock-owning extension capability on an inherited file descriptor.\n"
                 "Retention limits: 256 queued or interrupted requests for 7 days, 4096 handled requests, and 256 mirror deliveries of up to 256 KiB.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
@@ -3202,6 +3295,13 @@ def build_parser() -> argparse.ArgumentParser:
     recover_parser = sub.add_parser("mirror-recover", help="explicitly requeue one held interrupted admission")
     add_private(recover_parser)
     recover_parser.add_argument("request_id")
+    reserve_parser = sub.add_parser("mirror-reserve", help="reserve one bounded live terminal delivery")
+    add_private(reserve_parser)
+    reserve_parser.add_argument("delivery_id")
+    reserve_parser.add_argument("--text-file", required=True)
+    cancel_parser = sub.add_parser("mirror-cancel", help="cancel one unaccepted terminal delivery reservation")
+    add_private(cancel_parser)
+    cancel_parser.add_argument("delivery_id")
     mirror_reply_parser = sub.add_parser("mirror-reply", help="deliver one stable finalized assistant body")
     add_private(mirror_reply_parser)
     mirror_reply_parser.add_argument("delivery_id")
@@ -3264,6 +3364,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return mirror_hold(home, args.request_id, args.turn_id, args.owner_pid)
         if args.command == "mirror-recover":
             return mirror_recover(home, args.request_id, args.owner_pid)
+        if args.command == "mirror-reserve":
+            return mirror_reserve(home, args.delivery_id, args.owner_pid, args.text_file)
+        if args.command == "mirror-cancel":
+            return mirror_cancel(home, args.delivery_id, args.owner_pid)
         if args.command == "mirror-reply":
             return mirror_reply(home, args.delivery_id, args.owner_pid, args.text_file)
         if args.command == "mirror-complete":
