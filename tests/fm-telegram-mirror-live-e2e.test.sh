@@ -70,7 +70,15 @@ def mode_path():
     return home / 'config' / 'telegram-mirror'
 code = 0
 skip_final_save = False
-if command == 'mirror-open':
+force_reconcile_failure = False
+if command == 'mirror-reconcile' and (home / 'fail-next-reconcile').exists():
+    (home / 'fail-next-reconcile').unlink()
+    force_reconcile_failure = True
+if command == 'mirror-reconcile' and (home / 'reject-mirror-reconcile').exists():
+    force_reconcile_failure = True
+if force_reconcile_failure:
+    code = 1
+elif command == 'mirror-open':
     pass
 elif command == 'mirror-reconcile':
     state['legacy_wake'] = False
@@ -1690,6 +1698,92 @@ unlinkSync(`${home}/reject-mirror-abandon`);
 await runtime.session.reload();
 await waitFor(() => state().abandoned?.some(([id]) => id === primaryRecoveryRequestId),
   'storage recovery did not abandon the primary represented admission');
+
+const transientReconcileRequestId = 'tg-text-transient-reconcile';
+const transientReconcileTurnId = 'telegram-transient-reconcile';
+const transientReconcileState = state();
+transientReconcileState.request = {
+  id: transientReconcileRequestId, text: 'persisted request across transient reconciliation failure',
+  status: 'claimed', owner: process.pid,
+};
+save(transientReconcileState);
+writeFileSync(`${home}/fail-next-reconcile`, '');
+const transientReconcileCallsBefore = state().log.filter((call) =>
+  call[0] === 'mirror-reconcile' && call.includes(transientReconcileRequestId)).length;
+const modelCallsBeforeTransientReconcile = faux.state.callCount;
+await runtime.newSession({
+  setup: async (manager) => {
+    manager.appendCustomEntry('firstmate-telegram-admission', {
+      requestId: transientReconcileRequestId, turnId: transientReconcileTurnId,
+      sessionId: manager.getSessionId(), state: 'admitted',
+    });
+    manager.appendMessage({
+      role: 'user', content: [{ type: 'text', text: 'You · Telegram\n\npersisted request across transient reconciliation failure' }],
+      timestamp: Date.now(),
+    });
+    manager.appendMessage(fauxAssistantMessage('persisted answer after transient reconciliation failure'));
+  },
+});
+await waitFor(() => state().handled?.includes(transientReconcileRequestId),
+  'transient startup reconciliation failure did not recover durable admission ownership');
+assert.ok(state().log.filter((call) =>
+  call[0] === 'mirror-reconcile' && call.includes(transientReconcileRequestId)).length -
+  transientReconcileCallsBefore >= 2,
+  'transient startup reconciliation failure did not retry with preserved provenance');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · persisted answer after transient reconciliation failure').length, 1);
+assert.equal(faux.state.callCount, modelCallsBeforeTransientReconcile,
+  'transient startup reconciliation failure reinjected durable Telegram input');
+
+const permanentReconcileRequestId = 'tg-text-permanent-reconcile';
+const permanentReconcileTurnId = 'telegram-permanent-reconcile';
+const permanentReconcileState = state();
+permanentReconcileState.request = {
+  id: permanentReconcileRequestId, text: 'persisted request during unavailable state storage',
+  status: 'claimed', owner: process.pid,
+};
+save(permanentReconcileState);
+writeFileSync(`${home}/reject-mirror-reconcile`, '');
+const permanentReconcilesBefore = state().log.filter((call) =>
+  call[0] === 'mirror-reconcile' && call.includes(permanentReconcileRequestId)).length;
+const modelCallsBeforePermanentReconcile = faux.state.callCount;
+const fatalNoticesBeforePermanentReconcile = notices.filter(([message]) =>
+  message === 'Telegram mirror state storage is unavailable; restore it and restart Pi before continuing.').length;
+await runtime.newSession({
+  setup: async (manager) => {
+    manager.appendCustomEntry('firstmate-telegram-admission', {
+      requestId: permanentReconcileRequestId, turnId: permanentReconcileTurnId,
+      sessionId: manager.getSessionId(), state: 'admitted',
+    });
+    manager.appendMessage({
+      role: 'user', content: [{ type: 'text', text: 'You · Telegram\n\npersisted request during unavailable state storage' }],
+      timestamp: Date.now(),
+    });
+  },
+});
+await waitFor(() => state().log.filter((call) =>
+  call[0] === 'mirror-reconcile' && call.includes(permanentReconcileRequestId)).length -
+  permanentReconcilesBefore === 3,
+'persistent startup reconciliation failure did not exhaust its bounded retry budget');
+assert.equal(statuses.at(-1)?.[1], 'telegram: state storage needs recovery',
+  'persistent startup reconciliation failure did not reach fatal storage recovery');
+await new Promise((resolve) => setTimeout(resolve, 700));
+assert.equal(state().log.filter((call) =>
+  call[0] === 'mirror-reconcile' && call.includes(permanentReconcileRequestId)).length -
+  permanentReconcilesBefore, 3,
+  'persistent startup reconciliation failure kept polling after its bounded budget');
+assert.equal(state().request?.id, permanentReconcileRequestId,
+  'persistent startup reconciliation failure discarded durable admission evidence');
+assert.equal(faux.state.callCount, modelCallsBeforePermanentReconcile,
+  'persistent startup reconciliation failure ran another model turn');
+assert.equal(notices.filter(([message]) =>
+  message === 'Telegram mirror state storage is unavailable; restore it and restart Pi before continuing.').length,
+  fatalNoticesBeforePermanentReconcile + 1,
+  'persistent startup reconciliation failure did not notify exactly once');
+unlinkSync(`${home}/reject-mirror-reconcile`);
+await runtime.session.reload();
+await waitFor(() => state().abandoned?.some(([id]) => id === permanentReconcileRequestId),
+  'storage recovery did not abandon the preserved reconciliation-failure admission');
 
 const receiptFailureManager = runtime.session.sessionManager;
 const receiptFailureRequestId = 'tg-text-u28-m28';

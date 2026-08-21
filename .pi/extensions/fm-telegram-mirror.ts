@@ -411,6 +411,9 @@ export default function (pi: ExtensionAPI) {
   const committedMarkers = new Set<string>();
   const committedExcludedSlashMarkers = new Set<string>();
   const recoveryAbandons = new Map<string, RecoveryAbandon>();
+  const recoveryAttemptsRunning = new Set<string>();
+  const startupProvenance = new Map<string, RecoveredAdmission>();
+  const startupInterrupted = new Map<string, HeldAdmission>();
   let settledTurns: SettledTurn[] = [];
   let lastAssistantBody = "";
   let scanTimer: ReturnType<typeof setInterval> | undefined;
@@ -423,6 +426,10 @@ export default function (pi: ExtensionAPI) {
   let holdAttempts = 0;
   let holdRetryAt = 0;
   let holdRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let recoveryRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let reconcileRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let reconcileFailureAttempts = 0;
+  let reconcileRetryAt = 0;
   let fatalStorageError = false;
   let deliveryBlocked = false;
   let transportOpen = false;
@@ -565,6 +572,10 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus(statusKey, "telegram: state storage needs recovery");
       return;
     }
+    if (reconcileFailureAttempts > 0 || startupProvenance.size > 0 || recoveryAbandons.size > 0) {
+      ctx.ui.setStatus(statusKey, "telegram: state recovery pending");
+      return;
+    }
     if (deliveryBlocked) {
       ctx.ui.setStatus(statusKey, "telegram: delivery needs attention");
       return;
@@ -594,8 +605,17 @@ export default function (pi: ExtensionAPI) {
     fatalStorageError = true;
     holdTransitionPending = false;
     holdRetryAt = 0;
+    reconcileRetryAt = 0;
+    if (scanTimer) clearInterval(scanTimer);
+    if (reconcileTimer) clearInterval(reconcileTimer);
     if (holdRetryTimer) clearTimeout(holdRetryTimer);
+    if (recoveryRetryTimer) clearTimeout(recoveryRetryTimer);
+    if (reconcileRetryTimer) clearTimeout(reconcileRetryTimer);
+    scanTimer = undefined;
+    reconcileTimer = undefined;
     holdRetryTimer = undefined;
+    recoveryRetryTimer = undefined;
+    reconcileRetryTimer = undefined;
     ctx.ui.notify(
       "Telegram mirror state storage is unavailable; restore it and restart Pi before continuing.",
       "error",
@@ -614,20 +634,46 @@ export default function (pi: ExtensionAPI) {
     return recovery;
   };
 
+  const scheduleRecoveryRetries = (ctx: ExtensionContext): void => {
+    if (fatalStorageError || recoveryRetryTimer || recoveryAbandons.size === 0) return;
+    const pendingRecoveries = [...recoveryAbandons]
+      .filter(([requestId]) => !recoveryAttemptsRunning.has(requestId));
+    if (pendingRecoveries.length === 0) return;
+    const sessionGeneration = generation;
+    const nextRetryAt = Math.min(...pendingRecoveries.map(([, recovery]) => recovery.retryAt));
+    recoveryRetryTimer = setTimeout(async () => {
+      recoveryRetryTimer = undefined;
+      if (fatalStorageError || sessionGeneration !== generation) return;
+      for (const [requestId, recovery] of [...recoveryAbandons]) {
+        if (Date.now() < recovery.retryAt) continue;
+        await attemptRecoveryAbandon(requestId, recovery, ctx);
+        if (fatalStorageError) return;
+      }
+      scheduleRecoveryRetries(ctx);
+    }, Math.max(0, nextRetryAt - Date.now()));
+  };
+
   const attemptRecoveryAbandon = async (
     requestId: string,
     recovery: RecoveryAbandon,
     ctx: ExtensionContext,
   ): Promise<boolean> => {
-    if (fatalStorageError || Date.now() < recovery.retryAt) return false;
+    if (fatalStorageError || recoveryAttemptsRunning.has(requestId)) return false;
+    if (Date.now() < recovery.retryAt) {
+      scheduleRecoveryRetries(ctx);
+      return false;
+    }
     recovery.attempts += 1;
     const candidate = recovery.admission;
-    if (await abandonRequest(
+    recoveryAttemptsRunning.add(requestId);
+    const abandoned = await abandonRequest(
       requestId,
       candidate.turnId,
       `assistant-${candidate.turnId}`,
       ctx,
-    )) {
+    );
+    recoveryAttemptsRunning.delete(requestId);
+    if (abandoned) {
       recoveryAbandons.delete(requestId);
       if (activeRequest === requestId) resetTurn();
       ctx.ui.notify(
@@ -636,6 +682,7 @@ export default function (pi: ExtensionAPI) {
           : "An extra persisted Telegram admission was abandoned without reinjection.",
         "warning",
       );
+      scheduleRecoveryRetries(ctx);
       return true;
     }
     if (recovery.attempts >= maxHoldAttempts) {
@@ -643,6 +690,7 @@ export default function (pi: ExtensionAPI) {
       return false;
     }
     recovery.retryAt = Date.now() + holdRetryBackoffMs * 2 ** (recovery.attempts - 1);
+    scheduleRecoveryRetries(ctx);
     return false;
   };
 
@@ -904,6 +952,85 @@ export default function (pi: ExtensionAPI) {
     await exec(["mirror-delivered", pending.requestId], ctx);
   };
 
+  const processStartupReconciliation = async (
+    lines: string[],
+    ctx: ExtensionContext,
+  ): Promise<void> => {
+    if (startupProvenance.size === 0 && startupInterrupted.size === 0) return;
+    const ownedRequestIds = new Set(lines
+      .filter((line) => line.startsWith("owned\t"))
+      .map((line) => line.split("\t")[1])
+      .filter((requestId): requestId is string => !!requestId));
+    const transportHeld = lines
+      .map((line) => line.split("\t"))
+      .find((fields) => fields[0] === "held" && fields.length === 3);
+    const ownedProvenance = [...startupProvenance.values()]
+      .filter((candidate) => ownedRequestIds.has(candidate.requestId));
+    const provenance = ownedProvenance[0];
+    for (const candidate of ownedProvenance.slice(1)) {
+      queueRecoveryAbandon(candidate, "extra");
+    }
+    if (transportHeld) {
+      const interrupted = startupInterrupted.get(transportHeld[1]);
+      heldAdmission = interrupted && interrupted.turnId === transportHeld[2]
+        ? interrupted
+        : { requestId: transportHeld[1], turnId: transportHeld[2] };
+    }
+    startupProvenance.clear();
+    startupInterrupted.clear();
+    if (!provenance) return;
+    active = true;
+    activeOrigin = "telegram";
+    activeRequest = provenance.requestId;
+    activeRequestTurnId = provenance.turnId;
+    activeTurnId = provenance.turnId;
+    lastAssistantBody = provenance.assistantBody;
+    suspended = !lastAssistantBody;
+    const delivered = await exec(["mirror-delivered", provenance.requestId], ctx);
+    if (delivered.code !== 0) {
+      ctx.ui.notify("The Telegram admission receipt was not confirmed; the persisted turn remains owned.", "warning");
+    }
+    if (lastAssistantBody) {
+      void settle(ctx);
+    } else {
+      queueRecoveryAbandon(provenance, "primary");
+    }
+  };
+
+  const clearReconcileFailure = (): void => {
+    reconcileFailureAttempts = 0;
+    reconcileRetryAt = 0;
+    if (reconcileRetryTimer) clearTimeout(reconcileRetryTimer);
+    reconcileRetryTimer = undefined;
+  };
+
+  const scheduleReconcileRetry = (ctx: ExtensionContext): void => {
+    if (fatalStorageError || reconcileRetryTimer || reconcileFailureAttempts === 0) return;
+    const sessionGeneration = generation;
+    reconcileRetryTimer = setTimeout(async () => {
+      reconcileRetryTimer = undefined;
+      if (fatalStorageError || sessionGeneration !== generation) return;
+      const completed = await reconcile(ctx);
+      if (!completed && !fatalStorageError && reconcileFailureAttempts > 0 && !reconcileRetryTimer) {
+        reconcileRetryAt = Math.max(reconcileRetryAt, Date.now() + 100);
+        scheduleReconcileRetry(ctx);
+      }
+    }, Math.max(0, reconcileRetryAt - Date.now()));
+  };
+
+  const recordReconcileFailure = async (ctx: ExtensionContext): Promise<void> => {
+    reconcileFailureAttempts += 1;
+    if (reconcileFailureAttempts === 1) {
+      ctx.ui.notify("Telegram state reconciliation failed; mirror admission is paused.", "warning");
+    }
+    if (reconcileFailureAttempts >= maxHoldAttempts) {
+      await enterFatalStorageError(ctx);
+      return;
+    }
+    reconcileRetryAt = Date.now() + holdRetryBackoffMs * 2 ** (reconcileFailureAttempts - 1);
+    scheduleReconcileRetry(ctx);
+  };
+
   const reconcile = async (ctx: ExtensionContext): Promise<boolean> => {
     if (fatalStorageError || reconcileRunning || drainRunning || settleRunning ||
         !transportOpen || !ownsHomeLock()) return false;
@@ -914,6 +1041,8 @@ export default function (pi: ExtensionAPI) {
       const preserved = new Set<string>();
       if (pendingAdmission) preserved.add(pendingAdmission.requestId);
       if (activeRequest) preserved.add(activeRequest);
+      for (const requestId of startupProvenance.keys()) preserved.add(requestId);
+      for (const requestId of startupInterrupted.keys()) preserved.add(requestId);
       for (const turn of settledTurns) {
         if (turn.request) preserved.add(turn.request);
       }
@@ -930,90 +1059,95 @@ export default function (pi: ExtensionAPI) {
       for (const requestId of preserved) args.push("--preserve-request", requestId);
       for (const deliveryId of reportedDeliveries) args.push("--report-delivery", deliveryId);
       const result = await exec(args, ctx);
-      if (startedGeneration !== generation) return;
-      if (result.code === 0) {
-        const lines = result.stdout.split("\n");
-        if (reportedHeldAdmission && heldAdmission === reportedHeldAdmission) {
-          const held = lines.some((line) =>
-            line === `held\t${reportedHeldAdmission.requestId}\t${reportedHeldAdmission.turnId}`);
-          if (!held) heldAdmission = undefined;
+      if (startedGeneration !== generation) return false;
+      if (result.code !== 0) {
+        await recordReconcileFailure(ctx);
+        return false;
+      }
+      clearReconcileFailure();
+      const lines = result.stdout.split("\n");
+      await processStartupReconciliation(lines, ctx);
+      if (reportedHeldAdmission && heldAdmission === reportedHeldAdmission) {
+        const held = lines.some((line) =>
+          line === `held\t${reportedHeldAdmission.requestId}\t${reportedHeldAdmission.turnId}`);
+        if (!held) heldAdmission = undefined;
+      }
+      const missing = new Set(lines
+        .filter((line) => line.startsWith("delivery-missing\t"))
+        .map((line) => line.slice("delivery-missing\t".length))
+        .filter((deliveryId) => reportedDeliveries.has(deliveryId)));
+      const ownedRequestIds = new Set(lines
+        .filter((line) => line.startsWith("owned\t"))
+        .map((line) => line.split("\t")[1])
+        .filter((requestId): requestId is string => !!requestId));
+      for (const [requestId, recovery] of recoveryAbandons) {
+        if (!ownedRequestIds.has(requestId)) {
+          recoveryAbandons.delete(requestId);
+          if (activeRequest === requestId) resetTurn();
+          continue;
         }
-        const missing = new Set(lines
-          .filter((line) => line.startsWith("delivery-missing\t"))
-          .map((line) => line.slice("delivery-missing\t".length))
-          .filter((deliveryId) => reportedDeliveries.has(deliveryId)));
-        const ownedRequestIds = new Set(lines
-          .filter((line) => line.startsWith("owned\t"))
-          .map((line) => line.split("\t")[1])
-          .filter((requestId): requestId is string => !!requestId));
-        for (const [requestId, recovery] of recoveryAbandons) {
-          if (!ownedRequestIds.has(requestId)) {
-            recoveryAbandons.delete(requestId);
-            if (activeRequest === requestId) resetTurn();
-            continue;
-          }
-          await attemptRecoveryAbandon(requestId, recovery, ctx);
-          if (fatalStorageError) break;
-        }
-        if (missing.size > 0) {
-          let abandoned = false;
-          const activeExpired = activeOrigin === "terminal" &&
-            !!activeTerminalDelivery && missing.has(activeTerminalDelivery.deliveryId);
-          if (activeExpired && activeTerminalDelivery) {
-            const requestId = activeRequest;
-            const requestTurnId = activeRequestTurnId || activeTurnId;
-            const requestAbandoned = !requestId || !requestTurnId || await abandonRequest(
-              requestId,
-              requestTurnId,
-              activeTerminalDelivery.deliveryId,
-              ctx,
-            );
-            if (requestAbandoned) {
-              resetTurn();
-              abandoned = true;
-            }
-          }
-          const retained: SettledTurn[] = [];
-          for (const turn of settledTurns) {
-            const terminalExpired = !!turn.terminalDelivery &&
-              missing.has(turn.terminalDelivery.deliveryId);
-            const assistantId = safeIdentity(`assistant-${turn.turnId}`);
-            const assistantExpired = !!turn.assistantAttempted && missing.has(assistantId);
-            if (!terminalExpired && !assistantExpired) {
-              retained.push(turn);
-              continue;
-            }
-            const failedDeliveryId = terminalExpired && turn.terminalDelivery
-              ? turn.terminalDelivery.deliveryId
-              : assistantId;
-            if (turn.request && !await abandonRequest(
-              turn.request,
-              turn.requestTurnId || turn.turnId,
-              failedDeliveryId,
-              ctx,
-            )) {
-              retained.push(turn);
-              continue;
-            }
+        await attemptRecoveryAbandon(requestId, recovery, ctx);
+        if (fatalStorageError) break;
+      }
+      if (missing.size > 0) {
+        let abandoned = false;
+        const activeExpired = activeOrigin === "terminal" &&
+          !!activeTerminalDelivery && missing.has(activeTerminalDelivery.deliveryId);
+        if (activeExpired && activeTerminalDelivery) {
+          const requestId = activeRequest;
+          const requestTurnId = activeRequestTurnId || activeTurnId;
+          const requestAbandoned = !requestId || !requestTurnId || await abandonRequest(
+            requestId,
+            requestTurnId,
+            activeTerminalDelivery.deliveryId,
+            ctx,
+          );
+          if (requestAbandoned) {
+            resetTurn();
             abandoned = true;
           }
-          if (abandoned) {
-            settledTurns = retained;
-            deliveryBlocked = false;
-            ctx.ui.notify("An expired blocked mirror turn was abandoned without replay.", "warning");
-            void flushSettledTurns(ctx);
-          }
         }
-        await readMode(ctx);
+        const retained: SettledTurn[] = [];
+        for (const turn of settledTurns) {
+          const terminalExpired = !!turn.terminalDelivery &&
+            missing.has(turn.terminalDelivery.deliveryId);
+          const assistantId = safeIdentity(`assistant-${turn.turnId}`);
+          const assistantExpired = !!turn.assistantAttempted && missing.has(assistantId);
+          if (!terminalExpired && !assistantExpired) {
+            retained.push(turn);
+            continue;
+          }
+          const failedDeliveryId = terminalExpired && turn.terminalDelivery
+            ? turn.terminalDelivery.deliveryId
+            : assistantId;
+          if (turn.request && !await abandonRequest(
+            turn.request,
+            turn.requestTurnId || turn.turnId,
+            failedDeliveryId,
+            ctx,
+          )) {
+            retained.push(turn);
+            continue;
+          }
+          abandoned = true;
+        }
+        if (abandoned) {
+          settledTurns = retained;
+          deliveryBlocked = false;
+          ctx.ui.notify("An expired blocked mirror turn was abandoned without replay.", "warning");
+          void flushSettledTurns(ctx);
+        }
       }
+      await readMode(ctx);
+      return true;
     } finally {
       reconcileRunning = false;
     }
-    return true;
   };
 
   const drain = async (ctx: ExtensionContext): Promise<void> => {
-    if (fatalStorageError || drainRunning || reconcileRunning || settleRunning ||
+    if (fatalStorageError || reconcileFailureAttempts > 0 || startupProvenance.size > 0 ||
+        recoveryAbandons.size > 0 || drainRunning || reconcileRunning || settleRunning ||
         settledTurns.length > 0 || !transportOpen) return;
     const startedGeneration = generation;
     const primary = ownsHomeLock();
@@ -1112,8 +1246,14 @@ export default function (pi: ExtensionAPI) {
     generation += 1;
     if (scanTimer) clearInterval(scanTimer);
     if (reconcileTimer) clearInterval(reconcileTimer);
+    if (recoveryRetryTimer) clearTimeout(recoveryRetryTimer);
+    if (reconcileRetryTimer) clearTimeout(reconcileRetryTimer);
     scanTimer = undefined;
     reconcileTimer = undefined;
+    recoveryRetryTimer = undefined;
+    reconcileRetryTimer = undefined;
+    reconcileFailureAttempts = 0;
+    reconcileRetryAt = 0;
     const staleReservations = [
       activeTerminalDelivery,
       ...settledTurns.map((turn) => turn.terminalDelivery),
@@ -1126,6 +1266,9 @@ export default function (pi: ExtensionAPI) {
     committedMarkers.clear();
     committedExcludedSlashMarkers.clear();
     recoveryAbandons.clear();
+    recoveryAttemptsRunning.clear();
+    startupProvenance.clear();
+    startupInterrupted.clear();
     settledTurns = [];
     fatalStorageError = false;
     deliveryBlocked = false;
@@ -1145,75 +1288,39 @@ export default function (pi: ExtensionAPI) {
     transportOpen = true;
     const currentEntries = ctx.sessionManager.getBranch?.() as SessionEntry[] | undefined;
     const previousEntries = entriesFromFile(event.previousSessionFile);
-    const provenanceByRequest = new Map<string, RecoveredAdmission>();
     for (const candidate of unresolvedAdmissions(previousEntries)) {
-      provenanceByRequest.set(candidate.requestId, candidate);
+      startupProvenance.set(candidate.requestId, candidate);
     }
     for (const candidate of unresolvedAdmissions(currentEntries || [])) {
-      provenanceByRequest.set(candidate.requestId, candidate);
+      startupProvenance.set(candidate.requestId, candidate);
     }
-    const interruptedByRequest = new Map<string, HeldAdmission>();
     for (const candidate of interruptedAdmissions(previousEntries)) {
-      interruptedByRequest.set(candidate.requestId, candidate);
+      startupInterrupted.set(candidate.requestId, candidate);
     }
     for (const candidate of interruptedAdmissions(currentEntries || [])) {
-      interruptedByRequest.set(candidate.requestId, candidate);
+      startupInterrupted.set(candidate.requestId, candidate);
     }
-    const reconcileArgs = ["mirror-reconcile"];
-    for (const requestId of provenanceByRequest.keys()) {
-      reconcileArgs.push("--preserve-request", requestId);
-    }
-    const reconciled = await exec(reconcileArgs);
-    const reconciliation = reconciled.stdout.split("\n").map((line) => line.split("\t"));
-    const transportHeld = reconciliation.find((fields) => fields[0] === "held" && fields.length === 3);
-    const ownedRequestIds = new Set(reconciliation
-      .filter((fields) => fields[0] === "owned" && fields.length >= 2)
-      .map((fields) => fields[1]));
-    const ownedProvenance = [...provenanceByRequest.values()]
-      .filter((candidate) => ownedRequestIds.has(candidate.requestId));
-    const provenance = ownedProvenance[0];
-    for (const candidate of ownedProvenance.slice(1)) {
-      const recovery = queueRecoveryAbandon(candidate, "extra");
-      await attemptRecoveryAbandon(candidate.requestId, recovery, ctx);
-      if (fatalStorageError) break;
-    }
-    const interrupted = transportHeld ? interruptedByRequest.get(transportHeld[1]) : undefined;
-    if (interrupted && transportHeld?.[2] === interrupted.turnId) {
-      heldAdmission = interrupted;
-    } else if (transportHeld) {
-      heldAdmission = { requestId: transportHeld[1], turnId: transportHeld[2] };
-    }
-    if (provenance) {
-      active = true;
-      activeOrigin = "telegram";
-      activeRequest = provenance.requestId;
-      activeRequestTurnId = provenance.turnId;
-      activeTurnId = provenance.turnId;
-      lastAssistantBody = provenance.assistantBody;
-      suspended = !lastAssistantBody;
-      const delivered = await exec(["mirror-delivered", provenance.requestId]);
-      if (delivered.code !== 0) {
-        ctx.ui.notify("The Telegram admission receipt was not confirmed; the persisted turn remains owned.", "warning");
-      }
-      if (lastAssistantBody) {
-        void settle(ctx);
-      } else {
-        const recovery = queueRecoveryAbandon(provenance, "primary");
-        await attemptRecoveryAbandon(provenance.requestId, recovery, ctx);
-      }
-    }
+    await reconcile(ctx);
     await updateFooter(ctx);
-    scanTimer = setInterval(() => void drain(ctx), 750);
-    reconcileTimer = setInterval(() => void reconcile(ctx), reconcileIntervalMs);
-    void drain(ctx);
+    if (!fatalStorageError) {
+      scanTimer = setInterval(() => void drain(ctx), 750);
+      reconcileTimer = setInterval(() => void reconcile(ctx), reconcileIntervalMs);
+      void drain(ctx);
+    }
   });
 
   pi.on("session_shutdown", async () => {
     generation += 1;
     if (scanTimer) clearInterval(scanTimer);
     if (reconcileTimer) clearInterval(reconcileTimer);
+    if (recoveryRetryTimer) clearTimeout(recoveryRetryTimer);
+    if (reconcileRetryTimer) clearTimeout(reconcileRetryTimer);
     scanTimer = undefined;
     reconcileTimer = undefined;
+    recoveryRetryTimer = undefined;
+    reconcileRetryTimer = undefined;
+    reconcileFailureAttempts = 0;
+    reconcileRetryAt = 0;
     if (pendingAdmission?.timer) clearTimeout(pendingAdmission.timer);
     pendingAdmission = undefined;
     heldAdmission = undefined;
@@ -1226,6 +1333,9 @@ export default function (pi: ExtensionAPI) {
     committedMarkers.clear();
     committedExcludedSlashMarkers.clear();
     recoveryAbandons.clear();
+    recoveryAttemptsRunning.clear();
+    startupProvenance.clear();
+    startupInterrupted.clear();
     settledTurns = [];
     fatalStorageError = false;
     deliveryBlocked = false;
@@ -1255,6 +1365,11 @@ export default function (pi: ExtensionAPI) {
       return { action: "continue" as const };
     }
     if (event.source === "interactive" && fatalStorageError) {
+      return { action: "handled" as const };
+    }
+    if (event.source === "interactive" &&
+        (reconcileFailureAttempts > 0 || startupProvenance.size > 0 || recoveryAbandons.size > 0)) {
+      ctx.ui.notify("Telegram state recovery is still in progress; try again shortly.", "warning");
       return { action: "handled" as const };
     }
     if (event.source === "interactive" && ctx.isIdle() && !ctx.hasPendingMessages()) {
