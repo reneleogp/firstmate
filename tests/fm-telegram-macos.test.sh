@@ -305,7 +305,18 @@ printf '%s\n' '<not-a-plist>' >"$plist"
 printf '%s\n' '{"loaded":false,"active":false}' >"$LAUNCHD_STATE"
 if run_tg "$foreign" install >/dev/null 2>&1; then fail "foreign plist was replaced"; fi
 [ "$(cat "$plist")" = '<not-a-plist>' ] || fail "malformed foreign plist changed"
-printf '%s\n' '{"loaded":true,"active":true,"path":"/other/foreign.plist"}' >"$LAUNCHD_STATE"
+rm -f "$plist"
+run_tg "$foreign" install >/dev/null || fail "foreign-home fixture install failed"
+run_tg "$foreign" disable >/dev/null || fail "foreign-home fixture disable failed"
+printf '%s\n' '{"loaded":true,"active":true,"disabled":true,"path":"/other/foreign.plist"}' >"$LAUNCHD_STATE"
+if run_tg "$foreign" start >/dev/null 2>&1; then fail "foreign loaded label was started"; fi
+"$PYTHON" - "$LAUNCHD_STATE" <<'PY' || fail "foreign loaded label was mutated"
+import json, sys
+state = json.load(open(sys.argv[1]))
+assert state['loaded'] is True and state['disabled'] is True
+assert state['path'] == '/other/foreign.plist'
+PY
+[ ! -e "$foreign/state/.telegram-service-activation" ] || fail "foreign start left an activation reservation"
 rm -f "$plist"
 if run_tg "$foreign" cleanup >/dev/null 2>&1; then fail "foreign loaded label was cleaned"; fi
 

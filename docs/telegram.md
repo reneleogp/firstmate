@@ -3,13 +3,12 @@
 This optional transport connects one pinned private Telegram bot DM to one Firstmate home.
 It uses one Python user service and one project-local Pi extension.
 Linux and WSL use one systemd user service, while macOS uses one owned user LaunchAgent.
-The transport never starts Firstmate, a second Pi, an RPC or SDK session, a Telegram-only agent, or a shadow orchestrator.
 The service uses Python's standard library and outbound Telegram Bot API long polling, with no webhook, public ingress, tunnel, hosted service, or third-party Telegram package.
 Python owns pairing, authentication, deduplication, voice confirmation, offline queueing, retention, service lifecycle, and Telegram delivery.
 The extension acts only in the current Pi process that owns the exact home session lock.
 Its private transport commands require a per-process capability passed on an inherited file descriptor, so model tools and accidental shell calls cannot claim or deliver mirror traffic.
 A deliberately hostile same-UID process is outside this boundary.
-Telegram never starts or hosts a second Pi, RPC or SDK agent, Telegram agent, shadow orchestrator, secondmate route, or fallback model.
+Telegram never starts Firstmate, a second Pi, an RPC or SDK agent, a Telegram agent, a shadow orchestrator, a secondmate route, or a fallback model.
 
 ## Setup
 
@@ -18,7 +17,7 @@ Do not copy the token into a unit file, LaunchAgent plist, tracked file, command
 Pair one private user and chat with `bin/fm-telegram.py --home "$FM_HOME" pair --user-id <private-user-id> --chat-id <private-dm-id>`.
 Pairing verifies the bot identity and private chat, then stores the pinned user, chat, and bot identifiers in private `config/telegram.json`.
 Use `--parakeet-command <absolute-path> --whisper-command <absolute-path>` together when local transcribers are outside the service PATH.
-Use optional `--ffmpeg-command <absolute-path>` for local Ogg/Opus conversion when the transcriber needs PCM input.
+On macOS, use optional `--ffmpeg-command <absolute-path>` for local Ogg/Opus conversion when the transcriber needs PCM input.
 The executable `bin/fm-telegram.py --help` owns the exact flags, limits, and command configuration rules.
 Stop the installed service before replacing its pairing, and run `cleanup` first when changing an identity that still has private Telegram state.
 
@@ -33,7 +32,10 @@ Use `bin/fm-telegram.py --home "$FM_HOME" start`, `stop`, `status`, `disable`, a
 Install and start exactly one user LaunchAgent with `bin/fm-telegram.py --home "$FM_HOME" install`.
 The owned plist is `~/Library/LaunchAgents/com.reneleogp.firstmate.telegram.plist` and uses `launchctl bootstrap`, `kickstart`, `print`, `kill`, `disable`, and `bootout` without sudo or a system daemon.
 Use `bin/fm-telegram.py --home "$FM_HOME" start`, `stop`, `status`, `disable`, and `cleanup` for its lifecycle.
-The plist is validated with `plutil` before publication and contains no bot token, pinned identifiers, transcript, audio, model path secret, or message content.
+The plist contains only its label, stable absolute Python, program, and home paths, fixed service flags, `RunAtLoad`, and the non-secret `FM_HOME` environment.
+It is safely XML-encoded, validated with `plutil`, and atomically published with owner-only permissions.
+Lifecycle commands verify the exact plist contents and loaded path before mutation, refuse foreign or malformed same-label agents, and verify active or inactive convergence through launchd races.
+The LaunchAgent configures no service log files, and neither its plist nor transport diagnostics includes the bot token, pinned identifiers, transcripts, audio, model secrets, or message content.
 Apple Silicon Parakeet and Whisper wrappers must be configured as absolute executable paths, and no Homebrew location is assumed.
 
 Stopping or disabling abandons pending voice confirmations and waiting voice notes and removes temporary audio.
@@ -98,7 +100,8 @@ The Bot API delivery-unknown window can also repeat a transport message after Te
 Only authenticated private text and voice notes are accepted.
 Voice notes are downloaded only after pin verification, transcribed locally, and require explicit confirmation before admission.
 Queued and interrupted requests, handled identities, voice confirmations, and paired delivery metadata and body records are bounded by the executable's private retention limits.
-Temporary audio is deleted after sending, cancellation, expiry, failed initial transcription, service stop, disable, or cleanup.
+On macOS, source audio and converted PCM remain inside an owner-only per-user temporary root; converted PCM is removed after every transcription attempt and stale crash artifacts are removed during routine reconciliation.
+Active source audio is deleted after sending, cancellation, expiry, failed initial transcription, service stop, disable, or cleanup.
 Raw request bodies do not enter wake rows, unit files, command arguments, diagnostics, or tracked files.
 Telegram can retain unconsumed bot updates for only about 24 hours, so a longer laptop or service outage can lose requests before this service queues them.
 The executable's `--help` output owns supported command flags, operator-visible size, count, and retention limits, and transcriber overrides.
@@ -110,5 +113,4 @@ Every primary session start and bounded extension reconciliation also retires ob
 If session-start wake migration fails, the effective wake queue remains undrained so an obsolete Telegram wake cannot be presented as model work.
 There is no permanent fallback route or AI-facing Telegram response choreography.
 Native reply and status UX is reserved for issue 6.
-macOS support is reserved for issue 4.
 One-primary auto-start is reserved for issue 7.

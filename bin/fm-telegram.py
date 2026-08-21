@@ -3630,6 +3630,8 @@ def start_macos(home: Path) -> int:
         with FileLock(lifecycle_lock(home)):
             if not launchd_owned_by(home):
                 raise TelegramError("Telegram LaunchAgent is not installed for this home")
+            if launchd_runtime_reserved(home):
+                raise TelegramError("Telegram LaunchAgent belongs to another home or installation")
             config = load_config(home)
             verified_token_for(home, config)
             loaded = launchd_unit_loaded(home)
