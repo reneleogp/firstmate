@@ -51,6 +51,8 @@ class Handler(BaseHTTPRequestHandler):
         if method == 'sendMessage':
             next_id = int((home / 'next-message-id').read_text()) if (home / 'next-message-id').exists() else 1000
             (home / 'next-message-id').write_text(str(next_id + 1))
+            with (home / 'sent.jsonl').open('a') as stream:
+                stream.write(json.dumps({'params': params, 'message_id': next_id}) + '\n')
             return self.reply({'message_id': next_id, 'chat': {'id': params.get('chat_id')}})
         if method in {'editMessageText', 'editMessageReplyMarkup'}:
             return self.reply({'message_id': params.get('message_id'), 'chat': {'id': params.get('chat_id')}})
@@ -248,6 +250,7 @@ finally:
     stale_owner.terminate(); stale_owner.wait()
 stale_path.unlink()
 assert run('mirror-claim', request).returncode == 0
+assert run('mirror-delivered', request).returncode == 0
 owned = run('mirror-reconcile', '--preserve-request', request)
 assert owned.returncode == 0 and f'owned\t{request}' in owned.stdout
 for index in range(260):
@@ -470,17 +473,25 @@ base="http://127.0.0.1:$(cat "$home/port")"
 "$PYTHON" "$owner_script" "$SCRIPT" "$home" "$base" || fail "mirror delivery settlement interface failed"
 [ ! -e "$home/state/telegram/inbox/tg-text-u3-m3.json" ] || fail "completed request remained queued"
 [ -e "$home/state/telegram/handled/tg-text-u3-m3.json" ] || fail "completed request identity was not retained"
-python3 - "$home/calls.jsonl" "$home/long-reply.txt" <<'PY'
+python3 - "$home/calls.jsonl" "$home/sent.jsonl" "$home/long-reply.txt" <<'PY' || fail "Telegram response reply chain was malformed"
 import json, sys
 calls = [json.loads(line) for line in open(sys.argv[1])]
-body = open(sys.argv[2]).read()
+sent = [json.loads(line) for line in open(sys.argv[2])]
+body = open(sys.argv[3]).read()
 fallback = 'Firstmate · Response could not be mirrored; view it in the terminal.'
 chunks = [call['params']['text'] for call in calls if call['path'].endswith('/sendMessage') and call['params']['text'] != fallback and call['params']['text'].startswith(('Firstmate · ', '😀'))]
 assert len(chunks) == 3
 assert ''.join(chunks[1:]) == body
 assert all(len(chunk.encode('utf-16-le')) // 2 <= 4096 for chunk in chunks)
-chunk_calls = [call for call in calls if call['path'].endswith('/sendMessage') and call['params'].get('text') != fallback and call['params'].get('text', '').startswith(('Firstmate · ', '😀'))]
-assert any(call['params'].get('reply_parameters') == {'message_id': 3} for call in chunk_calls), chunk_calls
+pi = [item for item in sent if item['params'].get('text') == 'Pi · Delivered to Firstmate.'][-1]
+assert pi['params']['reply_parameters'] == {'message_id': 3}
+chain = [item for item in sent if item['params'].get('text') != fallback and item['params'].get('text', '').startswith(('Firstmate · ', '😀'))]
+assert ''.join(item['params']['text'] for item in chain) == body
+first_attempt = [call for call in calls if call['path'].endswith('/sendMessage') and call['params'].get('text') == chain[0]['params']['text']][0]
+assert first_attempt['params']['reply_parameters'] == {'message_id': 3}
+assert 'reply_parameters' not in chain[0]['params']
+for previous, current in zip(chain, chain[1:]):
+    assert current['params']['reply_parameters'] == {'message_id': previous['message_id']}
 PY
 
 # Every bounded reconciliation consumes legacy Telegram wakes, including rows published after migration.

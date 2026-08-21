@@ -2209,9 +2209,16 @@ def pending_voice_queue_path(home: Path) -> Path:
 
 
 def valid_pending_voice_record(value: Any) -> bool:
-    if not isinstance(value, dict) or set(value) != {
-            "pending_id", "file_id", "duration", "size", "chat_id",
-            "message_id", "update_id", "queued_at"}:
+    required = {
+        "pending_id", "file_id", "duration", "size", "chat_id",
+        "message_id", "update_id", "queued_at",
+    }
+    optional = {
+        "queued_notice_status", "queued_notice_attempts", "queued_notice_attempted_at",
+        "queued_notice_message_id",
+    }
+    if (not isinstance(value, dict) or not required.issubset(value)
+            or not set(value).issubset(required | optional)):
         return False
     pending_id = value.get("pending_id")
     file_id = value.get("file_id")
@@ -2231,6 +2238,21 @@ def valid_pending_voice_record(value: Any) -> bool:
             or not telegram_numeric_id(update_id)
             or not strict_int(queued_at) or queued_at <= 0):
         return False
+    status = value.get("queued_notice_status", "pending")
+    attempts = value.get("queued_notice_attempts", 0)
+    if status not in {
+            "not_required", "pending", "sending", "delivery_unknown", "rejected",
+            "sent", "delivery_unknown_terminal", "rejected_terminal",
+    }:
+        return False
+    if not strict_int(attempts) or attempts < 0 or attempts > CALLBACK_DELIVERY_ATTEMPTS:
+        return False
+    attempted_at = value.get("queued_notice_attempted_at")
+    if attempted_at is not None and (not strict_int(attempted_at) or attempted_at <= 0):
+        return False
+    outbound_id = value.get("queued_notice_message_id")
+    if outbound_id is not None and _reply_message_id(outbound_id) is None:
+        return False
     return pending_id == f"voice-u{update_id}-m{message_id}"
 
 
@@ -2246,7 +2268,10 @@ def load_pending_voice_queue_locked(home: Path) -> Tuple[List[Dict[str, Any]], b
                 or value["pending_id"] in identifiers):
             continue
         identifiers.add(value["pending_id"])
-        records.append(dict(value))
+        record = dict(value)
+        record.setdefault("queued_notice_status", "pending")
+        record.setdefault("queued_notice_attempts", 0)
+        records.append(record)
         if len(records) >= MAX_PENDING_VOICES:
             break
     return records, raw != records
@@ -2263,6 +2288,107 @@ def remove_pending_voice_locked(home: Path, pending_id: str) -> None:
     records, _ = load_pending_voice_queue_locked(home)
     retained = [record for record in records if record.get("pending_id") != pending_id]
     save_pending_voice_queue_locked(home, retained)
+
+
+def queued_voice_notice_settled(record: Dict[str, Any]) -> bool:
+    return record.get("queued_notice_status") in {
+        "not_required", "sent", "delivery_unknown_terminal", "rejected_terminal",
+    }
+
+
+def reconcile_queued_voice_notice(home: Path, pending_id: str) -> bool:
+    with FileLock(state_lock(home)):
+        records, changed = load_pending_voice_queue_locked(home)
+        index = next(
+            (position for position, record in enumerate(records)
+             if record.get("pending_id") == pending_id),
+            None,
+        )
+        if index is None:
+            if changed:
+                save_pending_voice_queue_locked(home, records)
+            return True
+        record = records[index]
+        if queued_voice_notice_settled(record):
+            seen_update(home, int(record["update_id"]), int(record["message_id"]))
+            if changed:
+                save_pending_voice_queue_locked(home, records)
+            return True
+        attempts = int(record.get("queued_notice_attempts", 0))
+        if attempts >= CALLBACK_DELIVERY_ATTEMPTS:
+            record["queued_notice_status"] = (
+                "delivery_unknown_terminal"
+                if record.get("queued_notice_status") in {"sending", "delivery_unknown"}
+                else "rejected_terminal"
+            )
+            records[index] = record
+            save_pending_voice_queue_locked(home, records)
+            seen_update(home, int(record["update_id"]), int(record["message_id"]))
+            return True
+        attempts += 1
+        record["queued_notice_attempts"] = attempts
+        record["queued_notice_status"] = "sending"
+        record["queued_notice_attempted_at"] = now()
+        records[index] = record
+        save_pending_voice_queue_locked(home, records)
+        chat_id = int(record["chat_id"])
+        message_id = int(record["message_id"])
+    try:
+        result = send_text(
+            home, chat_id, VOICE_QUEUED_NOTICE,
+            reply_to=message_id, fallback_to=message_id,
+            journal_key=f"voice:{pending_id}:queued",
+        )
+    except TelegramError as exc:
+        with FileLock(state_lock(home)):
+            records, _ = load_pending_voice_queue_locked(home)
+            for index, current in enumerate(records):
+                if (current.get("pending_id") == pending_id
+                        and current.get("queued_notice_attempts") == attempts):
+                    terminal = attempts >= CALLBACK_DELIVERY_ATTEMPTS
+                    if exc.delivery_unknown:
+                        current["queued_notice_status"] = (
+                            "delivery_unknown_terminal" if terminal else "delivery_unknown"
+                        )
+                    else:
+                        current["queued_notice_status"] = (
+                            "rejected_terminal" if terminal else "rejected"
+                        )
+                    records[index] = current
+                    save_pending_voice_queue_locked(home, records)
+                    if terminal:
+                        seen_update(
+                            home, int(current["update_id"]), int(current["message_id"])
+                        )
+                    return terminal
+        return False
+    with FileLock(state_lock(home)):
+        records, _ = load_pending_voice_queue_locked(home)
+        for index, current in enumerate(records):
+            if (current.get("pending_id") == pending_id
+                    and current.get("queued_notice_attempts") == attempts):
+                current["queued_notice_status"] = "sent"
+                outbound_id = outbound_message_id(result)
+                if outbound_id is not None:
+                    current["queued_notice_message_id"] = outbound_id
+                records[index] = current
+                save_pending_voice_queue_locked(home, records)
+                seen_update(home, int(current["update_id"]), int(current["message_id"]))
+                return True
+    return False
+
+
+def reconcile_queued_voice_notices(home: Path) -> None:
+    with FileLock(state_lock(home)):
+        records, changed = load_pending_voice_queue_locked(home)
+        if changed:
+            save_pending_voice_queue_locked(home, records)
+        pending_ids = [record["pending_id"] for record in records]
+    for pending_id in pending_ids:
+        try:
+            reconcile_queued_voice_notice(home, pending_id)
+        except (TelegramError, KeyError, TypeError, ValueError):
+            continue
 
 
 def callback_history_path(home: Path) -> Path:
@@ -2531,6 +2657,17 @@ def complete_initial_transcription(home: Path, config: Dict[str, Any],
                 if isinstance(pending_id, str):
                     remove_pending_voice_locked(home, pending_id)
         return False
+    if not send_voice_progress(home, pending):
+        return False
+    with FileLock(state_lock(home)):
+        current = read_json(pending_path(home))
+        if (not isinstance(current, dict) or current.get("pending_id") != pending_id
+                or current.get("mode") != "transcribing"
+                or current.get("progress_status") not in {
+                    "sent", "delivery_unknown_terminal", "rejected_terminal",
+                }):
+            return False
+        pending = dict(current)
     audio = Path(audio_value)
     try:
         remove_audio(pending)
@@ -2709,10 +2846,11 @@ def complete_send(home: Path, pending: Dict[str, Any]) -> bool:
 
 
 def reconcile_pending(home: Path, config: Dict[str, Any]) -> None:
-    if not mirror_mode_enabled(home):
-        return
     pending = read_json(pending_path(home))
     if not isinstance(pending, dict):
+        return
+    if (not mirror_mode_enabled(home)
+            and pending.get("mode") not in {"canceling", "sending"}):
         return
     try:
         if pending.get("mode") == "transcribing":
@@ -2738,18 +2876,12 @@ def reconcile_pending(home: Path, config: Dict[str, Any]) -> None:
                 {"text": "Cancel edit", "callback_data": f"cancel:{pending_id}:{revision}"},
             ]]}
             snapshot = dict(pending)
-            updated = pending_confirmation_update(
+            pending_confirmation_update(
                 home, snapshot, "Editing transcript…", copy_markup, "editing",
             )
-            if not updated:
-                fallback_markup = {"inline_keyboard": [[
-                    {"text": "Cancel edit", "callback_data": f"cancel:{pending_id}:{revision}"},
-                ]]}
-                pending_confirmation_update(
-                    home, snapshot,
-                    "Editing transcript…\n\nCopy this transcript:\n" + text,
-                    fallback_markup, "editing-fallback",
-                )
+            deliver_pending_message(
+                home, pending_id, revision, "edit", "edit_copy", text,
+            )
             prompt_markup = {"force_reply": True,
                              "input_field_placeholder": "Paste and edit the transcript"}
             deliver_pending_message(
@@ -2891,24 +3023,31 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any],
             if isinstance(pending, dict) and pending.get("pending_id") == pending_id:
                 return True
             records, changed = load_pending_voice_queue_locked(home)
-            queued_notice = bool(records or isinstance(pending, dict))
-            if any(record.get("pending_id") == pending_id for record in records):
+            existing = next(
+                (record for record in records if record.get("pending_id") == pending_id),
+                None,
+            )
+            if existing is not None:
+                queued_notice = existing.get("queued_notice_status") != "not_required"
                 if changed:
                     save_pending_voice_queue_locked(home, records)
-                return True
-            if len(records) >= MAX_PENDING_VOICES:
-                return None
-            records.append({
-                "pending_id": pending_id,
-                "file_id": file_id,
-                "duration": duration,
-                "size": size,
-                "chat_id": int(config["chat_id"]),
-                "message_id": message_id,
-                "update_id": update_id,
-                "queued_at": now(),
-            })
-            save_pending_voice_queue_locked(home, records)
+            else:
+                if len(records) >= MAX_PENDING_VOICES:
+                    return None
+                queued_notice = bool(records or isinstance(pending, dict))
+                records.append({
+                    "pending_id": pending_id,
+                    "file_id": file_id,
+                    "duration": duration,
+                    "size": size,
+                    "chat_id": int(config["chat_id"]),
+                    "message_id": message_id,
+                    "update_id": update_id,
+                    "queued_at": now(),
+                    "queued_notice_status": "pending" if queued_notice else "not_required",
+                    "queued_notice_attempts": 0,
+                })
+                save_pending_voice_queue_locked(home, records)
     if refuse:
         try:
             send_text(
@@ -2919,14 +3058,7 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any],
         except TelegramError:
             return False
     elif queued_notice:
-        try:
-            send_text(
-                home, int(config["chat_id"]), VOICE_QUEUED_NOTICE,
-                reply_to=message_id, fallback_to=message_id,
-                journal_key=f"voice:{pending_id}:queued",
-            )
-        except TelegramError:
-            pass
+        return True if reconcile_queued_voice_notice(home, pending_id) else None
     return True
 
 
@@ -2951,6 +3083,10 @@ def advance_pending_voice(home: Path, config: Dict[str, Any]) -> None:
                     save_pending_voice_queue_locked(home, records)
                 return
             record = records[0]
+            if not queued_voice_notice_settled(record):
+                if changed:
+                    save_pending_voice_queue_locked(home, records)
+                return
             pending = {
                 "pending_id": record["pending_id"],
                 "mode": "transcribing",
@@ -2968,66 +3104,91 @@ def advance_pending_voice(home: Path, config: Dict[str, Any]) -> None:
             }
             save_pending(home, pending)
             save_pending_voice_queue_locked(home, records[1:])
-        try:
-            send_voice_progress(home, pending)
-        except TelegramError:
-            pass
         if complete_initial_transcription(home, config, pending):
             return
+        return
 
 
-def send_voice_progress(home: Path, pending: Dict[str, Any]) -> None:
+def send_voice_progress(home: Path, pending: Dict[str, Any]) -> bool:
     pending_id = pending.get("pending_id")
     if not isinstance(pending_id, str):
-        return
+        return False
     with FileLock(state_lock(home)):
         current = read_json(pending_path(home))
         if (not isinstance(current, dict) or current.get("pending_id") != pending_id
                 or current.get("mode") != "transcribing"):
-            return
-        if current.get("progress_status") == "sent":
-            return
+            return False
+        if current.get("progress_status") in {
+                "sent", "delivery_unknown_terminal", "rejected_terminal"}:
+            return True
+        attempts = current.get("progress_attempts", 0)
+        if not strict_int(attempts) or attempts < 0:
+            attempts = 0
+        if attempts >= CALLBACK_DELIVERY_ATTEMPTS:
+            current["progress_status"] = (
+                "delivery_unknown_terminal"
+                if current.get("progress_status") in {"sending", "delivery_unknown"}
+                else "rejected_terminal"
+            )
+            save_pending(home, current)
+            return True
+        attempts += 1
+        current["progress_attempts"] = attempts
         current["progress_status"] = "sending"
-        atomic_json(pending_path(home), current)
+        current["progress_attempted_at"] = now()
+        save_pending(home, current)
         chat_id = int(current["chat_id"])
     try:
-        queued_record = _reply_journal_existing(home, f"voice:{pending_id}:queued")
-        queued_message_id = (queued_record.get("outbound_message_id")
-                             if isinstance(queued_record, dict) else None)
-        if strict_int(queued_message_id) and queued_message_id > 0:
-            try:
-                edit_message(
-                    home, chat_id, queued_message_id, VOICE_PROGRESS_NOTICE, EMPTY_INLINE_MARKUP,
-                    journal_key=f"voice:{pending_id}:transcribing-edit",
-                )
-                result = {"message_id": queued_message_id}
-            except TelegramError as exc:
-                if exc.delivery_unknown:
-                    raise
-                result = send_text(
-                    home, chat_id, VOICE_PROGRESS_NOTICE,
-                    reply_to=int(current["message_id"]), fallback_to=int(current["message_id"]),
-                    journal_key=f"voice:{pending_id}:transcribing",
-                )
-        else:
-            result = send_text(
-                home, chat_id, VOICE_PROGRESS_NOTICE,
-                reply_to=int(current["message_id"]), fallback_to=int(current["message_id"]),
-                journal_key=f"voice:{pending_id}:transcribing",
-            )
-    except TelegramError:
+        result = send_text(
+            home, chat_id, VOICE_PROGRESS_NOTICE,
+            reply_to=int(current["message_id"]), fallback_to=int(current["message_id"]),
+            journal_key=f"voice:{pending_id}:transcribing",
+        )
+    except TelegramError as exc:
         with FileLock(state_lock(home)):
             current = read_json(pending_path(home))
-            if isinstance(current, dict) and current.get("pending_id") == pending_id:
-                current["progress_status"] = "delivery_unknown"
-                atomic_json(pending_path(home), current)
-        raise
+            if (isinstance(current, dict) and current.get("pending_id") == pending_id
+                    and current.get("progress_attempts") == attempts):
+                terminal = attempts >= CALLBACK_DELIVERY_ATTEMPTS
+                if exc.delivery_unknown:
+                    current["progress_status"] = (
+                        "delivery_unknown_terminal" if terminal else "delivery_unknown"
+                    )
+                else:
+                    current["progress_status"] = (
+                        "rejected_terminal" if terminal else "rejected"
+                    )
+                save_pending(home, current)
+                return terminal
+        return False
     with FileLock(state_lock(home)):
         current = read_json(pending_path(home))
-        if isinstance(current, dict) and current.get("pending_id") == pending_id:
+        if (isinstance(current, dict) and current.get("pending_id") == pending_id
+                and current.get("progress_attempts") == attempts):
             current["progress_status"] = "sent"
             current["progress_message_id"] = outbound_message_id(result)
-            atomic_json(pending_path(home), current)
+            save_pending(home, current)
+            return True
+    return False
+
+
+def refuse_callback(home: Path, config: Dict[str, Any], callback_id: str,
+                    pending_id: str, action: str, revision: int,
+                    callback_message_id: int,
+                    pending: Optional[Dict[str, Any]] = None) -> None:
+    answer_callback(home, callback_id)
+    source_message_id: Any = callback_message_id
+    current = pending if isinstance(pending, dict) else read_json(pending_path(home))
+    if isinstance(current, dict) and current.get("pending_id") == pending_id:
+        source_message_id = current.get("message_id", source_message_id)
+    try:
+        send_text(
+            home, int(config["chat_id"]), MIRROR_OFF_REFUSAL,
+            reply_to=int(source_message_id), fallback_to=int(source_message_id),
+            journal_key=f"callback:{pending_id}:{action}:{revision}:off",
+        )
+    except (TelegramError, TypeError, ValueError):
+        pass
 
 
 def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], update_id: int) -> bool:
@@ -3074,20 +3235,10 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
         return False
     token = f"{action}:{revision}"
     if action != "cancel" and not mirror_mode_enabled(home):
-        answer_callback(home, callback_id)
-        source_message_id = message.get("message_id")
-        pending_for_source = read_json(pending_path(home))
-        if (isinstance(pending_for_source, dict)
-                and pending_for_source.get("pending_id") == pending_id):
-            source_message_id = pending_for_source.get("message_id", source_message_id)
-        try:
-            send_text(
-                home, int(config["chat_id"]), MIRROR_OFF_REFUSAL,
-                reply_to=int(source_message_id), fallback_to=int(source_message_id),
-                journal_key=f"callback:{pending_id}:{action}:{revision}:off",
-            )
-        except (TelegramError, TypeError, ValueError):
-            pass
+        refuse_callback(
+            home, config, callback_id, pending_id, action, revision,
+            int(message["message_id"]),
+        )
         return True
     operation = ""
     pending_snapshot: Optional[Dict[str, Any]] = None
@@ -3137,6 +3288,7 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
             else:
                 if action != "cancel" and not mirror_mode_enabled(home):
                     operation = "refuse"
+                    pending_snapshot = dict(pending)
                 elif action == "cancel":
                     pending["mode"] = "canceling"
                     pending["cancel_token"] = token
@@ -3149,6 +3301,9 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
                     ][-31:] + [token]
                     if action == "edit":
                         pending["mode"] = "edit"
+                        pending["edit_copy_sent"] = False
+                        pending["edit_copy_delivery"] = "pending"
+                        pending["edit_copy_attempts"] = 0
                         pending["edit_prompt_sent"] = False
                         pending["edit_prompt_delivery"] = "pending"
                         pending["edit_prompt_attempts"] = 0
@@ -3177,11 +3332,10 @@ def handle_callback(home: Path, config: Dict[str, Any], query: Dict[str, Any], u
                         operation = "send"
                         pending_snapshot = dict(pending)
     if operation == "refuse":
-        answer_callback(home, callback_id)
-        try:
-            send_text(home, int(config["chat_id"]), MIRROR_OFF_REFUSAL)
-        except TelegramError:
-            pass
+        refuse_callback(
+            home, config, callback_id, pending_id, action, revision,
+            int(message["message_id"]), pending_snapshot,
+        )
         return True
     if operation == "acknowledge":
         answer_callback(home, callback_id)
@@ -3375,6 +3529,7 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
                 bounded_cleanup(home)
                 reconcile_requests(home)
                 reconcile_pending(home, config)
+                reconcile_queued_voice_notices(home)
                 advance_pending_voice(home, config)
                 try:
                     updates = api_call(home, "getUpdates", {"offset": offset, "timeout": poll_timeout,
@@ -3386,6 +3541,7 @@ def serve(home: Path, once: bool = False, poll_timeout: int = POLL_TIMEOUT,
                             break
                         if isinstance(update, dict) and telegram_numeric_id(update.get("update_id")):
                             offset = max(offset, int(update["update_id"]) + 1)
+                        reconcile_queued_voice_notices(home)
                         advance_pending_voice(home, config)
                     reconcile_requests(home)
                 except TelegramError as exc:
