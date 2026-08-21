@@ -11,6 +11,11 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 type Origin = "terminal" | "telegram";
 type AssistantMessage = { role?: string; content?: unknown; stopReason?: string };
 type TransportResult = { code: number; stdout: string; stderr: string; killed: boolean };
+type FooterSnapshot = {
+  primary: boolean;
+  currentMode: "on" | "off";
+  next: TransportResult;
+};
 type AdmissionData = {
   requestId?: unknown;
   turnId?: unknown;
@@ -305,9 +310,10 @@ export default function (pi: ExtensionAPI) {
   const deliver = async (deliveryId: string, body: string, ctx: ExtensionContext) =>
     exec(["mirror-reply", safeIdentity(deliveryId), "--text-file", "-"], ctx, body);
 
-  const updateFooter = async (ctx: ExtensionContext): Promise<void> => {
+  const updateFooter = async (ctx: ExtensionContext, snapshot?: FooterSnapshot): Promise<void> => {
     const startedGeneration = generation;
-    if (!ownsHomeLock()) {
+    const primary = snapshot?.primary ?? ownsHomeLock();
+    if (!primary) {
       ctx.ui.setStatus(statusKey, "telegram: not the primary session");
       return;
     }
@@ -319,8 +325,8 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus(statusKey, "telegram: delivery needs attention");
       return;
     }
-    const current = mode();
-    const result = await exec(["mirror-next"]);
+    const current = snapshot?.currentMode ?? mode();
+    const result = snapshot?.next ?? await exec(["mirror-next"]);
     if (startedGeneration !== generation) return;
     const waiting = result.code === 0;
     ctx.ui.setStatus(statusKey, current === "on" && waiting ? "telegram: on · queued" : `telegram: ${current}`);
@@ -465,17 +471,24 @@ export default function (pi: ExtensionAPI) {
   };
 
   const drain = async (ctx: ExtensionContext): Promise<void> => {
-    if (drainRunning || !transportOpen || !ownsHomeLock() || mode() !== "on" ||
-        pendingAdmission || heldAdmission) return;
+    if (drainRunning || !transportOpen) return;
+    const primary = ownsHomeLock();
+    const currentMode = mode();
+    if (!primary || currentMode !== "on" || pendingAdmission || heldAdmission) return;
     const startedGeneration = generation;
     if (active) return;
+    let refreshFooter = false;
     drainRunning = true;
     try {
       if (!ctx.isIdle()) return;
       const next = await exec(["mirror-next"]);
       if (startedGeneration !== generation) return;
       const requestId = next.code === 0 ? next.stdout.trim().split("\n")[0] : "";
-      if (!requestId) return;
+      if (!requestId) {
+        await updateFooter(ctx, { primary, currentMode, next });
+        return;
+      }
+      refreshFooter = true;
       const claimed = await exec(["mirror-claim", requestId]);
       if (startedGeneration !== generation || claimed.code !== 0) return;
       const body = await exec(["mirror-read", requestId]);
@@ -497,7 +510,7 @@ export default function (pi: ExtensionAPI) {
       pi.sendUserMessage(markedInput(pending.marker, "telegram", body.stdout), { deliverAs: "followUp" });
     } finally {
       drainRunning = false;
-      if (startedGeneration === generation) await updateFooter(ctx);
+      if (startedGeneration === generation && refreshFooter) await updateFooter(ctx);
     }
   };
 

@@ -271,6 +271,11 @@ const usersBeforeReload = userTexts(initialManager).length;
 await runtime.session.reload();
 await new Promise((resolve) => setTimeout(resolve, 150));
 assert.equal(userTexts(initialManager).length, usersBeforeReload, 'fresh extension reload duplicated a completed request');
+await new Promise((resolve) => setTimeout(resolve, 800));
+const idleScansBefore = state().log.filter((call) => call[0] === 'mirror-next').length;
+await new Promise((resolve) => setTimeout(resolve, 1600));
+const idleScans = state().log.filter((call) => call[0] === 'mirror-next').length - idleScansBefore;
+assert.ok(idleScans >= 2 && idleScans <= 3, `idle scan duplicated queue probes: ${idleScans}`);
 
 faux.appendResponses([
   (context) => {
