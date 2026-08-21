@@ -1,0 +1,9 @@
+$ bash tests/fm-telegram-mirror.test.sh
+ok - bounded mirror queue, mode preference, and single-primary claim interface
+
+$ FM_TELEGRAM_MIRROR_LIVE_E2E=1 bash tests/fm-telegram-mirror-live-e2e.test.sh
+pass: installed Pi runtime mirror admission, persistence, reload, replacement, preflight, fan-out, exclusions, lock, and crash contract
+pass: confirmed voice Send traversed real Python transport and tracked Pi extension
+
+$ bash tests/fm-telegram.test.sh
+ok - Telegram mode, queue, voice, chunked delivery, completion, uncertainty, migration, and admission races
