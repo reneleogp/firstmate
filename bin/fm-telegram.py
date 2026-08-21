@@ -15,6 +15,9 @@ overridden by FM_TELEGRAM_DIR):
                  chat_id            paired private chat id (integer)
                  transcribe_command local Parakeet command (string; the audio
                                     path replaces {audio} or is appended)
+                 confirmations      send "Pi · Sent to Firstmate." or not
+                                    (boolean, default true, persisted by the
+                                    Telegram control button)
   bot.sock     Unix socket the Pi extension connects to
   audio/       temporary voice downloads, deleted after send, cancel, failure,
                and at start and stop
@@ -28,6 +31,15 @@ Wire protocol (newline-delimited JSON, both directions):
                     {"t":"accepted","id":"..."}     Pi accepted that message
   bot -> extension  {"t":"deliver","id":"...","text":...}
                     {"t":"command_result","id":N,"text":...}
+
+These commands work from both Telegram and the Pi terminal and never reach
+Firstmate as conversation text:
+
+  /telegram on | off | status        both surfaces
+  /telegram_on | /telegram_off | /telegram_status
+                                     Telegram menu aliases, published to the
+                                     paired chat with setMyCommands because
+                                     Telegram's menu rejects a space
 
 Mirror mode starts off on every start and lives in memory only. The inbound
 queue is an in-memory FIFO with no durable queue, expiry, replay journal, or
@@ -90,12 +102,30 @@ TRANSCRIBE_FAILED_REPLY = "Transcription failed. Nothing was sent to Firstmate."
 UNSUPPORTED_REPLY = "Only text and voice notes are mirrored."
 HELP_REPLY = (
     "Firstmate terminal mirror.\n"
-    "/telegram on - start mirroring\n"
-    "/telegram off - stop mirroring\n"
-    "/telegram status - show mirror and Firstmate state"
+    "/telegram_on or /telegram on - start mirroring\n"
+    "/telegram_off or /telegram off - stop mirroring\n"
+    "/telegram_status or /telegram status - show mirror and Firstmate state"
 )
 
 MIRROR_COMMANDS = ("on", "off", "status")
+# Telegram's command menu accepts only lowercase letters, digits, and
+# underscores, so "/telegram on" cannot appear in it. These single-token
+# aliases are the menu entries; both forms do the same thing.
+MIRROR_ALIASES = {
+    "/telegram_on": "on",
+    "/telegram_off": "off",
+    "/telegram_status": "status",
+}
+MENU_COMMANDS = [
+    {"command": "telegram_on", "description": "Start mirroring the Firstmate terminal"},
+    {"command": "telegram_off", "description": "Stop mirroring"},
+    {"command": "telegram_status", "description": "Show mirror and Firstmate state"},
+]
+# The delivery-confirmation setting is a Telegram-side preference, so its only
+# control is this button on the command replies. Pi gets no command for it.
+CONFIRMATIONS_CALLBACK = "c:confirmations"
+DISABLE_CONFIRMATIONS_LABEL = "Disable confirmations"
+ENABLE_CONFIRMATIONS_LABEL = "Enable confirmations"
 TELEGRAM_TEXT_LIMIT = 3900
 COPY_TEXT_LIMIT = 256
 TRANSCRIBE_TIMEOUT = 180
@@ -184,6 +214,7 @@ class Config:
     chat_id: int
     transcribe_command: str
     api_base: str
+    confirmations: bool = True
 
 
 def load_config(home: Path) -> Config:
@@ -201,6 +232,7 @@ def load_config(home: Path) -> Config:
         )
     command = data.get("transcribe_command") or DEFAULT_TRANSCRIBE_COMMAND
     api_base = os.environ.get("FM_TELEGRAM_API_BASE") or data.get("api_base") or DEFAULT_API_BASE
+    confirmations = data.get("confirmations")
     return Config(
         home=home,
         token=token,
@@ -208,6 +240,7 @@ def load_config(home: Path) -> Config:
         chat_id=chat_id,
         transcribe_command=str(command),
         api_base=str(api_base).rstrip("/"),
+        confirmations=confirmations if isinstance(confirmations, bool) else True,
     )
 
 
@@ -376,7 +409,8 @@ class MirrorBot:
         if isinstance(text, str):
             command = mirror_command(text)
             if command:
-                await self.send(self.apply_command(command), reply_to=message_id)
+                await self.send(self.apply_command(command), reply_to=message_id,
+                                markup=self.control_markup())
                 return
             head = text.strip().split(" ", 1)[0].split("@", 1)[0]
             if head in ("/start", "/help", "/telegram"):
@@ -411,13 +445,31 @@ class MirrorBot:
             self.mirror_on = True
         elif command == "off":
             self.mirror_on = False
+        return self.status_text()
+
+    def status_text(self) -> str:
         mirror = "on" if self.mirror_on else "off"
         firstmate = "connected" if self.connected else "not running"
+        confirmations = "on" if self.config.confirmations else "off"
+        status = f"Mirror is {mirror}. Firstmate is {firstmate}. Confirmations are {confirmations}."
         queued = len(self.queue) + len(self.pending)
-        status = f"Mirror is {mirror}. Firstmate is {firstmate}."
         if queued:
             status += f" {queued} message(s) waiting."
         return status
+
+    def control_markup(self) -> dict[str, Any]:
+        label = DISABLE_CONFIRMATIONS_LABEL if self.config.confirmations else ENABLE_CONFIRMATIONS_LABEL
+        return {"inline_keyboard": [[{"text": label, "callback_data": CONFIRMATIONS_CALLBACK}]]}
+
+    def set_confirmations(self, enabled: bool) -> None:
+        self.config.confirmations = enabled
+        data = read_config(self.config.home)
+        data["confirmations"] = enabled
+        try:
+            write_config(self.config.home, data)
+        except OSError as exc:
+            # The choice still applies to this run; only its persistence failed.
+            log(f"could not persist the confirmations setting: {exc}")
 
     async def accept_text(self, text: str, reply_to: int) -> None:
         item = Queued(id=self.next_id(), text=text, reply_to=reply_to)
@@ -437,6 +489,10 @@ class MirrorBot:
     async def on_accepted(self, message_id: str) -> None:
         item = self.pending.pop(message_id, None)
         if item is None:
+            return
+        # Pending state clears either way: the message reached Pi, so it must
+        # never be re-delivered. Only the visible receipt is optional.
+        if not self.config.confirmations:
             return
         await self.send(ACCEPTED_REPLY, reply_to=item.reply_to)
 
@@ -467,7 +523,16 @@ class MirrorBot:
 
     async def handle_callback(self, callback: dict[str, Any]) -> None:
         callback_id = str(callback.get("id"))
-        parsed = parse_callback(str(callback.get("data") or ""))
+        data = str(callback.get("data") or "")
+        if data == CONFIRMATIONS_CALLBACK:
+            await self.answer_callback(callback_id)
+            self.set_confirmations(not self.config.confirmations)
+            card = callback.get("message") or {}
+            message_id = card.get("message_id")
+            if isinstance(message_id, int):
+                await self.edit_card(message_id, self.status_text(), self.control_markup())
+            return
+        parsed = parse_callback(data)
         if parsed is None:
             await self.answer_callback(callback_id, "Unsupported button.")
             return
@@ -608,6 +673,20 @@ class MirrorBot:
 
     # --- run loop ---
 
+    async def register_menu(self) -> None:
+        """Publish the menu aliases, scoped to the paired chat.
+
+        A failure here costs the menu, never the mirror, so it is logged and the
+        bot keeps running: both command forms still work by typing them.
+        """
+        try:
+            await self.api.call("setMyCommands", {
+                "commands": MENU_COMMANDS,
+                "scope": {"type": "chat", "chat_id": self.config.chat_id},
+            })
+        except TelegramError as exc:
+            log(f"could not publish the command menu: {exc}")
+
     async def poll(self) -> None:
         offset: Optional[int] = None
         while not self._stopping:
@@ -647,6 +726,9 @@ class MirrorBot:
                 loop.add_signal_handler(name, stopping.set)
         poller = asyncio.create_task(self.poll())
         waiter = asyncio.create_task(stopping.wait())
+        menu = asyncio.create_task(self.register_menu())
+        self.background.add(menu)
+        menu.add_done_callback(self.background.discard)
         try:
             async with server:
                 await asyncio.wait({poller, waiter}, return_when=asyncio.FIRST_COMPLETED)
@@ -671,10 +753,12 @@ def chunk_text(text: str) -> list[str]:
 
 def mirror_command(text: str) -> Optional[str]:
     parts = text.strip().split()
-    if len(parts) != 2:
+    if not parts:
         return None
     head = parts[0].split("@", 1)[0]
-    if head != "/telegram" or parts[1] not in MIRROR_COMMANDS:
+    if head in MIRROR_ALIASES:
+        return MIRROR_ALIASES[head]
+    if len(parts) != 2 or head != "/telegram" or parts[1] not in MIRROR_COMMANDS:
         return None
     return parts[1]
 

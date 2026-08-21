@@ -54,6 +54,19 @@ These work from Telegram and from the Pi terminal, and are handled by the bot ra
 - `/telegram off` - stop new mirroring.
 - `/telegram status` - report whether mirroring is on and whether Firstmate is connected.
 
+Telegram's own command menu cannot contain a space, so the same three commands are published to the paired chat as `/telegram_on`, `/telegram_off`, and `/telegram_status`.
+Both spellings do the same thing; the menu aliases exist so the commands are visible and tappable in Telegram.
+
+## Delivery confirmations
+
+`Pi · Sent to Firstmate.` is on by default and can be turned off.
+Every reply to `/telegram on`, `/telegram off`, or `/telegram status` carries one button that reads `Disable confirmations` while they are on and `Enable confirmations` while they are off; tapping it switches the setting and updates that same message.
+The current state is part of the status line, and the choice is stored in `~/.firstmate-telegram/config.json` as `confirmations`, so it survives a bot or WSL restart.
+
+This setting is deliberately Telegram-only: it changes what Telegram shows you, so it has no Pi terminal command.
+Turning it off hides only the receipt.
+Messages still reach Firstmate exactly as before, and an accepted message still leaves the queue, so nothing is delivered twice.
+
 While mirror mode is off, an ordinary Telegram message is answered with `Telegram mirror is off. Send /telegram on to enable it.` and never reaches Pi.
 
 While mirror mode is on:
@@ -72,6 +85,7 @@ A message typed in Telegram is already visible there, so it is not echoed back a
 Telegram text enters an in-memory FIFO in arrival order and is submitted through Pi's normal user input.
 Messages sent back-to-back while Pi is working steer the run exactly like typing them in the terminal, so Pi keeps its own batching and continuation behavior.
 When Pi accepts a message, `Pi · Sent to Firstmate.` replies to that exact message; that means Pi accepted the input, not that Firstmate finished answering.
+That receipt can be switched off (see Delivery confirmations).
 
 If Firstmate is not running, the reply is `Firstmate is not running. Your message is queued until it starts.` and the text waits in memory until the one Pi session connects.
 

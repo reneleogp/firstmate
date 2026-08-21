@@ -39,6 +39,7 @@ class FakeTelegram:
         self.sent: list[dict[str, Any]] = []
         self.edits: list[dict[str, Any]] = []
         self.callback_answers: list[dict[str, Any]] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
         self.next_message_id = 1000
         self.next_update_id = 1
         harness = self
@@ -89,6 +90,9 @@ class FakeTelegram:
         self.server.server_close()
 
     def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method != "getUpdates":
+            with self.lock:
+                self.calls.append((method, params))
         if method == "getUpdates":
             deadline = time.time() + 0.2
             while time.time() < deadline:
@@ -176,6 +180,16 @@ class FakeTelegram:
                         return edit
             time.sleep(0.02)
         raise AssertionError(f"no edit matched; saw {[e.get('text') for e in self.edits]}")
+
+    def wait_call(self, method: str, timeout: float = DEADLINE) -> dict[str, Any]:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                for name, params in self.calls:
+                    if name == method:
+                        return params
+            time.sleep(0.02)
+        raise AssertionError(f"the bot never called {method}; saw {[c[0] for c in self.calls]}")
 
     def sent_texts(self) -> list[str]:
         with self.lock:
@@ -319,9 +333,124 @@ class MirrorTestCase(unittest.TestCase):
         pi.send({"t": "command", "id": 7, "command": "status"})
         frame = pi.read()
         self.assertEqual(frame, {"t": "command_result", "id": 7,
-                                 "text": "Mirror is on. Firstmate is connected."})
+                                 "text": "Mirror is on. Firstmate is connected. Confirmations are on."})
         pi.send({"t": "command", "id": 8, "command": "off"})
         self.assertIn("Mirror is off", pi.read()["text"])
+
+    def test_menu_aliases_are_published_and_switch_the_mirror(self) -> None:
+        pi = self.connect_pi()
+        published = self.telegram.wait_call("setMyCommands")
+        self.assertEqual(
+            [entry["command"] for entry in published["commands"]],
+            ["telegram_on", "telegram_off", "telegram_status"],
+        )
+        self.assertTrue(all(entry.get("description") for entry in published["commands"]))
+        self.assertEqual(published["scope"], {"type": "chat", "chat_id": CHAT_ID})
+
+        self.telegram.push_text("/telegram_on", 71)
+        started = self.telegram.wait_sent(lambda m: str(m.get("text", "")).startswith("Mirror is on"))
+        self.assertEqual(started["reply_parameters"]["message_id"], 71)
+
+        # An alias is transport, so it is never forwarded to Firstmate.
+        pi.expect_nothing()
+
+        self.telegram.push_text("/telegram_status@FirstmateMirrorBot", 72)
+        status = self.telegram.wait_sent(
+            lambda m: str(m.get("text", "")).startswith("Mirror is on")
+            and m.get("reply_parameters", {}).get("message_id") == 72
+        )
+        self.assertIn("Firstmate is connected", status["text"])
+
+        self.telegram.push_text("/telegram_off", 73)
+        self.telegram.wait_sent(
+            lambda m: str(m.get("text", "")).startswith("Mirror is off")
+            and m.get("reply_parameters", {}).get("message_id") == 73
+        )
+
+        # Both spellings stay live: the spaced form still switches it back on.
+        self.telegram.push_text("/telegram on", 74)
+        self.telegram.wait_sent(
+            lambda m: str(m.get("text", "")).startswith("Mirror is on")
+            and m.get("reply_parameters", {}).get("message_id") == 74
+        )
+        self.telegram.push_text("an ordinary message", 75)
+        self.assertEqual(pi.read()["text"], "an ordinary message")
+
+    def test_confirmations_default_on_toggle_persists_and_gates_only_the_receipt(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.telegram.push_text("/telegram_status", 201)
+        card = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 201
+        )
+        self.assertIn("Confirmations are on.", card["text"])
+        self.assertEqual(
+            card["reply_markup"]["inline_keyboard"][0][0]["text"], "Disable confirmations"
+        )
+        card_id = int(card["message_id"])
+
+        # A delivered message is still confirmed while the setting is on.
+        self.telegram.push_text("before the toggle", 202)
+        frame = pi.read()
+        pi.send({"t": "accepted", "id": frame["id"]})
+        receipt = self.telegram.wait_sent(lambda m: m.get("text") == "Pi · Sent to Firstmate.")
+        self.assertEqual(receipt["reply_parameters"]["message_id"], 202)
+
+        self.telegram.push_callback("c:confirmations", card_id, "cb-confirm")
+        toggled = self.telegram.wait_edit(lambda e: "Confirmations are off." in str(e.get("text")))
+        self.assertEqual(
+            toggled["reply_markup"]["inline_keyboard"][0][0]["text"], "Enable confirmations"
+        )
+        self.assertIs(json.loads((self.home / "config.json").read_text())["confirmations"], False)
+
+        # With the setting off the receipt is gone, but the message must still
+        # leave the pending queue: reconnecting may not deliver it a second time.
+        receipts_before = len([m for m in self.telegram.sent if m.get("text") == "Pi · Sent to Firstmate."])
+        self.telegram.push_text("after the toggle", 203)
+        second = pi.read()
+        self.assertEqual(second["text"], "after the toggle")
+        pi.send({"t": "accepted", "id": second["id"]})
+        time.sleep(0.6)
+        receipts_after = len([m for m in self.telegram.sent if m.get("text") == "Pi · Sent to Firstmate."])
+        self.assertEqual(receipts_after, receipts_before)
+        pi.close()
+        time.sleep(0.3)
+        later = self.connect_pi()
+        later.expect_nothing(1.0)
+
+        # The choice survives a restart, and the mirror still starts off.
+        self.stop_bot()
+        deadline = time.time() + DEADLINE
+        while self.socket_path.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        self.start_bot()
+        restarted = self.connect_pi()
+        restarted.send({"t": "command", "id": 3, "command": "status"})
+        self.assertEqual(
+            restarted.read()["text"],
+            "Mirror is off. Firstmate is connected. Confirmations are off.",
+        )
+
+    def test_voice_send_without_confirmations_still_reaches_pi(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.telegram.push_text("/telegram_status", 211)
+        card = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 211
+        )
+        self.telegram.push_callback("c:confirmations", int(card["message_id"]), "cb-off")
+        self.telegram.wait_edit(lambda e: "Confirmations are off." in str(e.get("text")))
+
+        self.telegram.push_voice(212)
+        transcript_id = self.card_id_for("please rebase the branch")
+        self.telegram.push_callback("v:212:1:send", transcript_id, "cb-voice-send")
+        self.telegram.wait_edit(lambda e: str(e.get("text", "")).endswith("Sent to Firstmate"))
+        frame = pi.read()
+        self.assertEqual(frame["text"], "please rebase the branch")
+        pi.send({"t": "accepted", "id": frame["id"]})
+        time.sleep(0.6)
+        self.assertNotIn("Pi · Sent to Firstmate.", self.telegram.sent_texts())
+        self.assertFalse((self.home / "audio" / "212.ogg").exists())
 
     def test_telegram_text_reaches_pi_unchanged_and_is_confirmed(self) -> None:
         pi = self.connect_pi()
@@ -533,7 +662,8 @@ class MirrorTestCase(unittest.TestCase):
         later = self.connect_pi()
         later.expect_nothing(1.0)
         later.send({"t": "command", "id": 1, "command": "status"})
-        self.assertEqual(later.read()["text"], "Mirror is off. Firstmate is connected.")
+        self.assertEqual(later.read()["text"],
+                         "Mirror is off. Firstmate is connected. Confirmations are on.")
 
 
 class ServiceUnitTestCase(unittest.TestCase):
