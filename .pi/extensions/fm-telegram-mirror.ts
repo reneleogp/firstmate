@@ -27,7 +27,18 @@ type PendingAdmission = {
   requestId: string;
   turnId: string;
   inputSeen: boolean;
+  accepted: boolean;
   timer?: ReturnType<typeof setTimeout>;
+};
+type InputSegment =
+  | { origin: "telegram"; pending: PendingAdmission }
+  | { origin: "terminal"; turnId: string; mirrored: boolean }
+  | { origin: "excluded" };
+type SettledTurn = {
+  origin: Origin;
+  request?: string;
+  turnId: string;
+  body: string;
 };
 
 const extensionRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -139,6 +150,8 @@ export default function (pi: ExtensionAPI) {
   let suspended = false;
   let pendingAdmission: PendingAdmission | undefined;
   let awaitingInjectedInput = false;
+  let inputSegments: InputSegment[] = [];
+  let settledTurns: SettledTurn[] = [];
   let lastAssistantBody = "";
   let scanTimer: ReturnType<typeof setInterval> | undefined;
   let drainRunning = false;
@@ -234,32 +247,45 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus(statusKey, current === "on" && waiting ? "telegram: on · queued" : `telegram: ${current}`);
   };
 
+  const deliverSettledTurn = async (turn: SettledTurn, ctx: ExtensionContext): Promise<boolean> => {
+    const startedGeneration = generation;
+    const deliveryId = safeIdentity(`assistant-${turn.turnId}`);
+    const result = await deliver(deliveryId, `Firstmate · ${turn.body}`, ctx);
+    if (startedGeneration !== generation) return false;
+    if (result.code !== 0) {
+      deliveryBlocked = true;
+      await updateFooter(ctx);
+      return false;
+    }
+    if (turn.request) {
+      const completed = await exec(["mirror-complete", turn.request, deliveryId], ctx);
+      if (startedGeneration !== generation) return false;
+      if (completed.code !== 0) {
+        await updateFooter(ctx);
+        return false;
+      }
+      appendAdmission(
+        turn.request,
+        turn.turnId,
+        ctx.sessionManager.getSessionId?.() || "session",
+        "completed",
+      );
+    }
+    return true;
+  };
+
   const settle = async (ctx: ExtensionContext): Promise<void> => {
     if (settleRunning || deliveryBlocked || !active || suspended || !activeOrigin ||
         !activeTurnId || !lastAssistantBody || !ownsHomeLock()) return;
-    const startedGeneration = generation;
     settleRunning = true;
     try {
-      const origin = activeOrigin;
-      const request = activeRequest;
-      const turnId = activeTurnId;
-      const deliveryId = safeIdentity(`assistant-${turnId}`);
-      const result = await deliver(deliveryId, `Firstmate · ${lastAssistantBody}`, ctx);
-      if (startedGeneration !== generation) return;
-      if (result.code !== 0) {
-        deliveryBlocked = true;
-        await updateFooter(ctx);
-        return;
-      }
-      if (request) {
-        const completed = await exec(["mirror-complete", request, deliveryId], ctx);
-        if (startedGeneration !== generation) return;
-        if (completed.code !== 0) {
-          await updateFooter(ctx);
-          return;
-        }
-        appendAdmission(request, turnId, ctx.sessionManager.getSessionId?.() || "session", "completed");
-      }
+      const turn = {
+        origin: activeOrigin,
+        request: activeRequest,
+        turnId: activeTurnId,
+        body: lastAssistantBody,
+      };
+      if (!await deliverSettledTurn(turn, ctx)) return;
       resetTurn();
       await updateFooter(ctx);
     } finally {
@@ -267,22 +293,101 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  const flushSettledTurns = async (ctx: ExtensionContext): Promise<boolean> => {
+    if (settleRunning || deliveryBlocked || !ownsHomeLock()) return false;
+    settleRunning = true;
+    try {
+      while (settledTurns.length > 0) {
+        if (!await deliverSettledTurn(settledTurns[0], ctx)) return false;
+        settledTurns.shift();
+      }
+      await updateFooter(ctx);
+      return true;
+    } finally {
+      settleRunning = false;
+    }
+  };
+
+  const holdInterrupted = (ctx: ExtensionContext): void => {
+    if (activeRequest && activeTurnId) {
+      if (!suspended) {
+        appendAdmission(
+          activeRequest,
+          activeTurnId,
+          ctx.sessionManager.getSessionId?.() || "session",
+          "interrupted",
+        );
+      }
+      suspended = true;
+      lastAssistantBody = "";
+      return;
+    }
+    resetTurn();
+  };
+
   const releasePending = async (ctx: ExtensionContext, pending: PendingAdmission): Promise<void> => {
-    if (pendingAdmission !== pending) return;
+    if (pendingAdmission !== pending || pending.accepted) return;
     const startedGeneration = generation;
     pendingAdmission = undefined;
     awaitingInjectedInput = false;
+    inputSegments = inputSegments.filter((segment) =>
+      segment.origin !== "telegram" || segment.pending !== pending);
     await exec(["mirror-release", pending.requestId], ctx);
     if (startedGeneration === generation) void updateFooter(ctx);
+  };
+
+  const transitionSegment = async (segment: InputSegment, ctx: ExtensionContext): Promise<void> => {
+    if (active) {
+      if (suspended || deliveryBlocked) return;
+      if (lastAssistantBody && activeOrigin && activeTurnId) {
+        settledTurns.push({
+          origin: activeOrigin,
+          request: activeRequest,
+          turnId: activeTurnId,
+          body: lastAssistantBody,
+        });
+        resetTurn();
+      } else {
+        holdInterrupted(ctx);
+        if (active) return;
+      }
+    }
+    if (segment.origin === "excluded") return;
+    if (segment.origin === "terminal") {
+      if (!segment.mirrored) return;
+      active = true;
+      activeOrigin = "terminal";
+      activeTurnId = segment.turnId;
+      suspended = false;
+      lastAssistantBody = "";
+      deliveryBlocked = false;
+      return;
+    }
+    const pending = segment.pending;
+    if (!pending.accepted || pendingAdmission !== pending) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    appendAdmission(
+      pending.requestId,
+      pending.turnId,
+      ctx.sessionManager.getSessionId?.() || "session",
+      "admitted",
+    );
+    active = true;
+    activeOrigin = "telegram";
+    activeRequest = pending.requestId;
+    activeTurnId = pending.turnId;
+    suspended = false;
+    lastAssistantBody = "";
+    deliveryBlocked = false;
+    pendingAdmission = undefined;
+    awaitingInjectedInput = false;
+    await exec(["mirror-delivered", pending.requestId], ctx);
   };
 
   const drain = async (ctx: ExtensionContext): Promise<void> => {
     if (drainRunning || !transportOpen || !ownsHomeLock() || mode() !== "on" || pendingAdmission) return;
     const startedGeneration = generation;
-    if (active) {
-      if (lastAssistantBody) void settle(ctx);
-      return;
-    }
+    if (active) return;
     drainRunning = true;
     try {
       if (!ctx.isIdle()) return;
@@ -302,6 +407,7 @@ export default function (pi: ExtensionAPI) {
         requestId,
         turnId: `telegram-${safeIdentity(requestId)}-${randomUUID()}`,
         inputSeen: false,
+        accepted: false,
       };
       pendingAdmission = pending;
       awaitingInjectedInput = true;
@@ -345,6 +451,8 @@ export default function (pi: ExtensionAPI) {
     resetTurn();
     pendingAdmission = undefined;
     awaitingInjectedInput = false;
+    inputSegments = [];
+    settledTurns = [];
     transportOpen = false;
     if (!ownsHomeLock()) {
       ctx.ui.setStatus(statusKey, "telegram: not the primary session");
@@ -384,27 +492,14 @@ export default function (pi: ExtensionAPI) {
     if (pendingAdmission?.timer) clearTimeout(pendingAdmission.timer);
     pendingAdmission = undefined;
     awaitingInjectedInput = false;
+    inputSegments = [];
+    settledTurns = [];
     transportOpen = false;
     resetTurn();
   });
 
   pi.on("input", async (event, ctx) => {
     if (event.source === "interactive" && event.text && !event.text.startsWith("/")) {
-      if (suspended && activeRequest && activeTurnId) {
-        const interruptedRequest = activeRequest;
-        const interruptedTurn = activeTurnId;
-        const released = await exec(["mirror-release", interruptedRequest], ctx);
-        if (released.code === 0) {
-          appendAdmission(
-            interruptedRequest,
-            interruptedTurn,
-            ctx.sessionManager.getSessionId?.() || "session",
-            "interrupted",
-          );
-          resetTurn();
-        }
-      }
-      const alreadyActive = active;
       const turnId = `terminal-${randomUUID()}`;
       const mirrored = transportOpen && ownsHomeLock() && mode() === "on";
       let delivered = false;
@@ -412,47 +507,50 @@ export default function (pi: ExtensionAPI) {
         const result = await deliver(`user-${turnId}`, `You · Terminal\n\n${event.text}`, ctx);
         delivered = result.code === 0;
       }
-      if (!alreadyActive && !active) {
-        activeOrigin = delivered ? "terminal" : undefined;
-        activeRequest = undefined;
-        activeTurnId = delivered ? turnId : undefined;
-        active = delivered;
-        suspended = false;
-        lastAssistantBody = "";
-        deliveryBlocked = false;
-      }
+      inputSegments.push({ origin: "terminal", turnId, mirrored: delivered });
       return { action: "transform" as const, text: `You · Terminal\n\n${event.text}` };
     }
     if (event.source === "extension" && awaitingInjectedInput && pendingAdmission) {
+      const pending = pendingAdmission;
       awaitingInjectedInput = false;
-      pendingAdmission.inputSeen = true;
+      pending.inputSeen = true;
+      if (event.streamingBehavior) {
+        pending.accepted = true;
+        if (pending.timer) clearTimeout(pending.timer);
+      }
+      inputSegments.push({ origin: "telegram", pending });
       return { action: "transform" as const, text: `You · Telegram\n\n${event.text}` };
     }
+    inputSegments.push({ origin: "excluded" });
     return { action: "continue" as const };
   });
 
-  pi.on("before_agent_start", async (event, ctx) => {
+  pi.on("before_agent_start", () => {
     const pending = pendingAdmission;
-    if (pending?.inputSeen) {
-      if (pending.timer) clearTimeout(pending.timer);
-      appendAdmission(
-        pending.requestId,
-        pending.turnId,
-        ctx.sessionManager.getSessionId?.() || "session",
-        "admitted",
-      );
-      active = true;
-      activeOrigin = "telegram";
-      activeRequest = pending.requestId;
-      activeTurnId = pending.turnId;
-      suspended = false;
-      lastAssistantBody = "";
-      deliveryBlocked = false;
-      pendingAdmission = undefined;
-      await exec(["mirror-delivered", pending.requestId], ctx);
-    }
+    if (!pending?.inputSeen) return;
+    pending.accepted = true;
+    if (pending.timer) clearTimeout(pending.timer);
+  });
+
+  pi.on("message_start", async (event, ctx) => {
+    const message = event.message as AssistantMessage;
+    if (message.role !== "user") return;
+    const segment = inputSegments.shift() || { origin: "excluded" as const };
+    await transitionSegment(segment, ctx);
+  });
+
+  pi.on("context", (event) => {
     if (activeOrigin !== "telegram" || suspended) return;
-    return { systemPrompt: `${event.systemPrompt}\n\n${telegramAuthority}` };
+    const messages = [...event.messages];
+    const index = messages.findLastIndex((message) => message.role === "user");
+    if (index < 0) return;
+    const user = messages[index];
+    if (user.role !== "user") return;
+    messages[index] = {
+      ...user,
+      content: [...user.content, { type: "text", text: `\n\n${telegramAuthority}` }],
+    };
+    return { messages };
   });
 
   pi.on("user_bash", () => {
@@ -468,15 +566,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
-    if (!active || !activeOrigin || suspended) {
+    if (!await flushSettledTurns(ctx)) return;
+    if (!active || !activeOrigin) {
       void drain(ctx);
       return;
     }
+    if (suspended) return;
     if (!lastAssistantBody) {
-      const request = activeRequest;
-      resetTurn();
-      if (request) await exec(["mirror-release", request], ctx);
-      void drain(ctx);
+      holdInterrupted(ctx);
+      await updateFooter(ctx);
       return;
     }
     await settle(ctx);

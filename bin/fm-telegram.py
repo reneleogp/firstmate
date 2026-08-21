@@ -858,7 +858,7 @@ def cleanup_atomic_temps_locked(home: Path) -> None:
             pass
 
 
-def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> None:
+def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> bool:
     root = state_dir(home) / "deliveries"
     private_dir(root)
     records = []
@@ -874,21 +874,35 @@ def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> None
             durable_unlink(body_path)
             continue
         bodies.add(body_path.name)
-        if record.get("status") in {"sent", "delivery_unknown", "rejected"}:
-            records.append((created, metadata_path, body_path))
-        elif created < cutoff:
+        delivery_pid = record.get("delivery_owner_pid")
+        delivery_identity = record.get("delivery_owner_identity")
+        protected = bool(
+            record.get("status") == "sending"
+            and strict_int(delivery_pid)
+            and isinstance(delivery_identity, str)
+            and process_identity(delivery_pid) == delivery_identity
+        )
+        if created < cutoff and not protected:
             durable_unlink(metadata_path)
             durable_unlink(body_path)
             bodies.discard(body_path.name)
+            continue
+        records.append((created, metadata_path, body_path, protected))
     for body_path in root.glob("*.txt"):
         if body_path.name not in bodies:
             durable_unlink(body_path)
     records.sort(key=lambda item: item[0], reverse=True)
     keep = max(0, MAX_MIRROR_DELIVERIES - reserve_slots)
-    for index, (created, metadata_path, body_path) in enumerate(records):
-        if index >= keep or created < cutoff:
-            durable_unlink(metadata_path)
-            durable_unlink(body_path)
+    retained = len(records)
+    for _created, metadata_path, body_path, protected in reversed(records):
+        if retained <= keep:
+            break
+        if protected:
+            continue
+        durable_unlink(metadata_path)
+        durable_unlink(body_path)
+        retained -= 1
+    return retained <= keep
 
 
 def bounded_cleanup(home: Path) -> None:
@@ -1308,7 +1322,6 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
             legacy_responses = state_dir(home) / "responses"
             if legacy_responses.is_dir() and not legacy_responses.is_symlink():
                 durable_rmtree(legacy_responses)
-            consume_safe_wakes(home)
             for path in mirror_queue_paths_locked(home):
                 record = read_json(path)
                 if not isinstance(record, dict):
@@ -1321,6 +1334,7 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
                 record.pop("claimed_at", None)
                 atomic_json(path, record)
             atomic_bytes(marker, b"v2\n")
+        consume_safe_wakes(home)
         preserved = {request_id for request_id in preserve_requests if safe_id(request_id)}
         for path in mirror_queue_paths_locked(home):
             record = read_json(path)
@@ -1496,7 +1510,8 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -
             if not isinstance(record.get("chunks"), list):
                 record["chunks"] = chunks
         else:
-            cleanup_mirror_deliveries_locked(home, reserve_slots=1)
+            if not cleanup_mirror_deliveries_locked(home, reserve_slots=1):
+                return die("Telegram delivery journal has no bounded free slot")
             atomic_bytes(body_path, body)
             record = {"delivery_id": delivery_id, "sha256": digest, "status": "pending",
                       "created_at": now(), "chunks": chunks}
@@ -1512,10 +1527,17 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -
             if not isinstance(current_chunks, list):
                 return die("Telegram delivery record is malformed")
             if any(chunk.get("telegram_status") == "sending" for chunk in current_chunks):
+                delivery_pid = record.get("delivery_owner_pid")
+                delivery_identity = record.get("delivery_owner_identity")
+                if (strict_int(delivery_pid) and isinstance(delivery_identity, str)
+                        and process_identity(delivery_pid) == delivery_identity):
+                    return die("Telegram delivery is already in flight")
                 for chunk in current_chunks:
                     if chunk.get("telegram_status") == "sending":
                         chunk["telegram_status"] = "delivery_unknown"
                 record["status"] = "delivery_unknown"
+                record.pop("delivery_owner_pid", None)
+                record.pop("delivery_owner_identity", None)
                 atomic_json(metadata_path, record)
                 return DELIVERY_UNKNOWN_EXIT
             index = next((position for position, chunk in enumerate(current_chunks)
@@ -1536,6 +1558,8 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -
             chunk["telegram_status"] = "sending"
             chunk["telegram_attempted_at"] = now()
             record["status"] = "sending"
+            record["delivery_owner_pid"] = os.getpid()
+            record["delivery_owner_identity"] = process_identity(os.getpid())
             atomic_json(metadata_path, record)
             start = chunk.get("start")
             end = chunk.get("end")
@@ -1551,6 +1575,8 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -
                     chunk = record["chunks"][index]
                     chunk["telegram_status"] = "delivery_unknown" if exc.delivery_unknown else "rejected"
                     record["status"] = aggregate_response_delivery(record["chunks"])
+                    record.pop("delivery_owner_pid", None)
+                    record.pop("delivery_owner_identity", None)
                     atomic_json(metadata_path, record)
             if exc.delivery_unknown:
                 return DELIVERY_UNKNOWN_EXIT
@@ -1564,6 +1590,8 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str) -
             record["chunks"][index]["telegram_status"] = "sent"
             record["chunks"][index]["telegram_sent_at"] = now()
             record["status"] = aggregate_response_delivery(record["chunks"])
+            record.pop("delivery_owner_pid", None)
+            record.pop("delivery_owner_identity", None)
             atomic_json(metadata_path, record)
 
 

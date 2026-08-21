@@ -137,17 +137,33 @@ sent = [x['params']['text'] for x in calls if x['path'].endswith('/sendMessage')
 assert 'Bot · Transcribing…' in sent
 PY
 
+# Confirmed voice Send while mode is on becomes one normal queued Telegram-origin request.
+set_updates '[{"update_id":5,"callback_query":{"id":"callback-send-on","from":{"id":77},"message":{"message_id":40,"date":1,"chat":{"id":77,"type":"private"},"text":"confirmed voice text"},"data":"send:voice-u4-m4:1"}}]' "$home"
+run_tg "$home" serve --once >/dev/null
+voice_request="$home/state/telegram/inbox/tg-voice-u4-m4.json"
+[ -f "$voice_request" ] || fail "mode-on confirmed voice was not queued"
+python3 - "$voice_request" <<'PY'
+import json, sys
+record = json.load(open(sys.argv[1]))
+assert record['origin'] == 'telegram' and record['source'] == 'voice'
+assert record['confirmed'] is True and record['text'] == 'confirmed voice text'
+PY
+
+# A second pending voice supplies a stale cleanup control for the mode-off path.
+set_updates '[{"update_id":6,"message":{"message_id":6,"date":1,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-6","duration":2,"file_size":10}}}]' "$home"
+run_tg "$home" serve --once >/dev/null
+
 # Exact off command is deterministic and leaves ordinary queued content untouched.
-set_updates '[{"update_id":5,"message":{"message_id":5,"date":1,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"/telegram off"}}]' "$home"
+set_updates '[{"update_id":7,"message":{"message_id":7,"date":1,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"/telegram off"}}]' "$home"
 run_tg "$home" serve --once >/dev/null
 [ "$(cat "$home/config/telegram-mirror")" = off ] || fail "bot /telegram off did not persist mode"
 
 # A stale voice Send button cannot admit content after mode is turned off, while Cancel still cleans it up.
-set_updates '[{"update_id":6,"callback_query":{"id":"callback-send","from":{"id":77},"message":{"message_id":40,"date":1,"chat":{"id":77,"type":"private"},"text":"confirmed voice text"},"data":"send:voice-u4-m4:1"}}]' "$home"
+set_updates '[{"update_id":8,"callback_query":{"id":"callback-send-off","from":{"id":77},"message":{"message_id":60,"date":1,"chat":{"id":77,"type":"private"},"text":"confirmed voice text"},"data":"send:voice-u6-m6:1"}}]' "$home"
 run_tg "$home" serve --once >/dev/null
-[ ! -e "$home/state/telegram/inbox/tg-voice-u4-m4.json" ] || fail "mode-off voice callback admitted content"
+[ ! -e "$home/state/telegram/inbox/tg-voice-u6-m6.json" ] || fail "mode-off voice callback admitted content"
 [ -e "$home/state/telegram/pending.json" ] || fail "mode-off refusal removed the pending voice cleanup control"
-set_updates '[{"update_id":7,"callback_query":{"id":"callback-cancel","from":{"id":77},"message":{"message_id":40,"date":1,"chat":{"id":77,"type":"private"},"text":"confirmed voice text"},"data":"cancel:voice-u4-m4:1"}}]' "$home"
+set_updates '[{"update_id":9,"callback_query":{"id":"callback-cancel","from":{"id":77},"message":{"message_id":60,"date":1,"chat":{"id":77,"type":"private"},"text":"confirmed voice text"},"data":"cancel:voice-u6-m6:1"}}]' "$home"
 run_tg "$home" serve --once >/dev/null
 [ ! -e "$home/state/telegram/pending.json" ] || fail "mode-off Cancel did not clean up pending voice state"
 
@@ -176,6 +192,10 @@ def run(*args, api=base):
 request = 'tg-text-u3-m3'
 assert run('mirror-open').returncode == 0
 assert run('mirror-reconcile').returncode == 0
+Path(home, 'state', '.wake-queue').write_text(
+    '2\t2\tcheck\ttelegram:late-legacy\ttelegram late-legacy\n')
+assert run('mirror-reconcile').returncode == 0
+assert 'telegram:' not in Path(home, 'state', '.wake-queue').read_text()
 assert run('mirror-claim', request).returncode == 0
 inbox = Path(home, 'state', 'telegram', 'inbox')
 for index in range(260):
@@ -209,7 +229,8 @@ for index in range(260):
     text = f'retained {index}'
     open(os.path.join(delivery_root, delivery_id + '.txt'), 'w').write(text)
     json.dump({'delivery_id': delivery_id, 'sha256': __import__('hashlib').sha256(text.encode()).hexdigest(),
-               'status': 'sent', 'created_at': int(time.time()), 'chunks': []},
+               'status': ('pending' if index % 2 else 'sent'),
+               'created_at': int(time.time()), 'chunks': []},
               open(os.path.join(delivery_root, delivery_id + '.json'), 'w'))
 unknown_path = os.path.join(home, 'unknown-reply.txt')
 open(unknown_path, 'w').write('You · Terminal\n\nuncertain')
@@ -234,9 +255,9 @@ assert ''.join(chunks[1:]) == body
 assert all(len(chunk.encode('utf-16-le')) // 2 <= 4096 for chunk in chunks)
 PY
 
-# One-time migration consumes legacy Telegram wakes without publishing replacements.
+# Every bounded reconciliation consumes legacy Telegram wakes, including rows published after migration.
 if grep -q $'\ttelegram:' "$home/state/.wake-queue"; then
-  fail "legacy Telegram wake survived mirror migration"
+  fail "legacy Telegram wake survived bounded reconciliation"
 fi
 
 pass "Telegram mode, queue, voice, chunked delivery, completion, uncertainty, and migration behavior"

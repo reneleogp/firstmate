@@ -18,7 +18,7 @@ SH
 
 cat >"$TMP_ROOT/fake-transport.py" <<'PY'
 #!/usr/bin/env python3
-import fcntl, json, os, sys
+import fcntl, json, os, sys, time
 from pathlib import Path
 args = sys.argv[1:]
 assert args[0] == '--home'
@@ -37,6 +37,7 @@ def option(name):
 def options(name):
     return [rest[index + 1] for index, value in enumerate(rest[:-1]) if value == name]
 code = 0
+skip_final_save = False
 if command == 'mirror-open':
     pass
 elif command == 'mirror-reconcile':
@@ -55,7 +56,14 @@ elif command == 'mirror-claim':
     request = state.get('request')
     if not request or request.get('id') != rest[0] or request.get('status') != 'queued': code = 1
     elif (home / 'config' / 'telegram-mirror').read_text().strip() != 'on': code = 1
-    else: request['status'] = 'claimed'; request['owner'] = int(option('--owner-pid'))
+    else:
+        request['status'] = 'claimed'; request['owner'] = int(option('--owner-pid'))
+        save()
+        delay = request.get('claim_delay_ms', 0)
+        if delay:
+            skip_final_save = True
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            time.sleep(delay / 1000)
 elif command == 'mirror-read':
     request = state.get('request')
     if not request or request.get('id') != rest[0] or request.get('status') != 'claimed': code = 1
@@ -90,18 +98,42 @@ elif command == 'mirror-mode':
         mode_path.write_text(action + '\n'); print('Pi · Telegram mirror mode is ' + action + '.')
 else:
     code = 1
-save()
+if not skip_final_save: save()
 raise SystemExit(code)
 PY
 chmod +x "$TMP_ROOT/fake-transport.py"
 printf '%s\n' '{"request":{"id":"tg-text-u1-m1","text":"hello from Telegram","status":"queued"},"deliveries":{},"log":[]}' >"$home/fake-state.json"
+
+cat >"$TMP_ROOT/competing-extension.ts" <<'TS'
+import { Type } from "typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+export default function (pi: ExtensionAPI): void {
+  let injected = false;
+  pi.registerTool({
+    name: "mirror_test_tool",
+    label: "Mirror test tool",
+    description: "Return a diagnostic payload for structural mirror exclusion coverage",
+    parameters: Type.Object({}),
+    async execute() {
+      return { content: [{ type: "text" as const, text: "tool diagnostic payload" }], details: {} };
+    },
+  });
+  pi.on("agent_end", () => {
+    const state = globalThis as typeof globalThis & { __telegramMirrorInjectOperational?: boolean };
+    if (!state.__telegramMirrorInjectOperational || injected) return;
+    injected = true;
+    pi.sendUserMessage("operational follow-up", { deliverAs: "followUp" });
+  });
+}
+TS
 
 cat >"$TMP_ROOT/runtime.mjs" <<'JS'
 import assert from 'node:assert/strict';
 import { readFileSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
-const [sdkPath, aiPath, projectRoot, extensionPath, home, agentDir, sessionDir, transport, lockLib] = process.argv.slice(2);
+const [sdkPath, aiPath, projectRoot, extensionPath, competingPath, home, agentDir, sessionDir, transport, lockLib] = process.argv.slice(2);
 process.env.FM_HOME = home;
 process.env.FM_TELEGRAM_TRANSPORT = transport;
 process.env.FM_TELEGRAM_SESSION_LOCK_LIB = lockLib;
@@ -114,7 +146,7 @@ const {
   createAgentSessionRuntime,
   createAgentSessionServices,
 } = await import(pathToFileURL(sdkPath).href);
-const { fauxAssistantMessage, fauxProvider } = await import(pathToFileURL(aiPath).href);
+const { fauxAssistantMessage, fauxProvider, fauxThinking, fauxText, fauxToolCall } = await import(pathToFileURL(aiPath).href);
 const faux = fauxProvider({ tokensPerSecond: 100000 });
 const modelRuntime = await ModelRuntime.create({
   authPath: `${agentDir}/auth.json`, modelsPath: null, modelsStorePath: `${agentDir}/models-store.json`,
@@ -128,10 +160,10 @@ const settingsManager = SettingsManager.inMemory({
 const createRuntime = async ({ cwd, sessionManager, sessionStartEvent }) => {
   const services = await createAgentSessionServices({
     cwd, agentDir, modelRuntime, settingsManager,
-    resourceLoaderOptions: { additionalExtensionPaths: [extensionPath] },
+    resourceLoaderOptions: { additionalExtensionPaths: [extensionPath, competingPath] },
   });
   const result = await createAgentSessionFromServices({
-    services, sessionManager, sessionStartEvent, model, thinkingLevel: 'off', noTools: 'all',
+    services, sessionManager, sessionStartEvent, model, thinkingLevel: 'off', noTools: 'builtin',
   });
   return { ...result, services, diagnostics: services.diagnostics };
 };
@@ -141,7 +173,7 @@ const runtime = await createAgentSessionRuntime(createRuntime, {
 });
 faux.setResponses([
   (context) => {
-    assert.match(context.systemPrompt, /authenticated Telegram mirror/);
+    assert.match(context.systemPrompt + JSON.stringify(context.messages), /authenticated Telegram mirror/);
     const user = context.messages.findLast((message) => message.role === 'user');
     assert.match(user.content.map((part) => part.text || '').join(''), /^You · Telegram/);
     return fauxAssistantMessage('settled answer');
@@ -204,6 +236,94 @@ const beforeRpc = Object.keys(current.deliveries).length;
 faux.appendResponses([fauxAssistantMessage('rpc diagnostic answer')]);
 await runtime.session.prompt('rpc diagnostic', { source: 'rpc' });
 assert.equal(Object.keys(state().deliveries).length, beforeRpc, 'RPC input was mirrored');
+
+const busy = state();
+busy.request = {
+  id: 'tg-text-u8-m8', text: 'busy Telegram request', status: 'queued', claim_delay_ms: 250,
+};
+save(busy);
+faux.appendResponses([
+  async (context) => {
+    const user = context.messages.findLast((message) => message.role === 'user');
+    assert.match(user.content.map((part) => part.text || '').join(''), /^You · Terminal/);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return fauxAssistantMessage('busy terminal answer');
+  },
+  (context) => {
+    assert.match(context.systemPrompt + JSON.stringify(context.messages), /authenticated Telegram mirror/);
+    const user = context.messages.findLast((message) => message.role === 'user');
+    assert.match(user.content.map((part) => part.text || '').join(''), /^You · Telegram/);
+    return fauxAssistantMessage('busy Telegram answer');
+  },
+]);
+await waitFor(() => state().request?.status === 'claimed', 'delayed claim did not begin while idle');
+const busyPrompt = runtime.session.prompt('terminal raced with claim', { source: 'interactive' });
+await busyPrompt;
+await waitFor(() => state().handled?.includes('tg-text-u8-m8'), 'busy follow-up Telegram turn did not settle');
+current = state();
+assert.equal(userTexts(initialManager).filter((text) => text.includes('busy Telegram request')).length, 1);
+assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · busy terminal answer').length, 1);
+assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · busy Telegram answer').length, 1);
+assert.equal(current.receipts.filter((id) => id === 'tg-text-u8-m8').length, 1);
+
+const competing = state();
+competing.request = { id: 'tg-text-u9-m9', text: 'paired Telegram request', status: 'queued' };
+save(competing);
+globalThis.__telegramMirrorInjectOperational = true;
+faux.appendResponses([
+  (context) => {
+    assert.match(context.systemPrompt + JSON.stringify(context.messages), /authenticated Telegram mirror/);
+    return fauxAssistantMessage([
+      fauxThinking('private Telegram reasoning'),
+      fauxToolCall('mirror_test_tool', {}, { id: 'mirror-test-tool-call' }),
+    ], { stopReason: 'toolUse' });
+  },
+  (context) => {
+    assert.match(JSON.stringify(context.messages), /tool diagnostic payload/);
+    return fauxAssistantMessage('paired answer');
+  },
+  (context) => {
+    const user = context.messages.findLast((message) => message.role === 'user');
+    assert.equal(user.content.map((part) => part.text || '').join(''), 'operational follow-up');
+    return fauxAssistantMessage('operational answer');
+  },
+]);
+await waitFor(() => state().handled?.includes('tg-text-u9-m9'), 'competing extension turn prevented Telegram settlement');
+await waitFor(() => userTexts(initialManager).includes('operational follow-up'), 'competing extension input did not execute');
+current = state();
+assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · paired answer').length, 1);
+assert.equal(Object.values(current.deliveries).some((body) => body.includes('operational answer')), false);
+assert.equal(Object.values(current.deliveries).some((body) => body.includes('private Telegram reasoning')), false);
+assert.equal(Object.values(current.deliveries).some((body) => body.includes('tool diagnostic payload')), false);
+
+const voice = state();
+voice.request = { id: 'tg-voice-u10-m10', text: 'confirmed voice text', status: 'queued' };
+save(voice);
+faux.appendResponses([fauxAssistantMessage('confirmed voice answer')]);
+await waitFor(() => state().handled?.includes('tg-voice-u10-m10'), 'confirmed voice queue did not become a Pi turn');
+current = state();
+assert.equal(userTexts(initialManager).filter((text) => text === 'You · Telegram\n\nconfirmed voice text').length, 1);
+assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · confirmed voice answer').length, 1);
+assert.equal(current.receipts.filter((id) => id === 'tg-voice-u10-m10').length, 1);
+
+const failedTurn = state();
+failedTurn.request = { id: 'tg-text-u11-m11', text: 'provider failure request', status: 'queued' };
+save(failedTurn);
+const callsBeforeFailure = faux.state.callCount;
+faux.appendResponses([
+  fauxAssistantMessage([], { stopReason: 'error', errorMessage: 'provider failed' }),
+]);
+await waitFor(() => initialManager.getEntries().some((entry) =>
+  entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
+    && entry.data.requestId === 'tg-text-u11-m11' && entry.data.state === 'interrupted'),
+'provider failure did not persist an interrupted admission');
+await new Promise((resolve) => setTimeout(resolve, 300));
+current = state();
+assert.equal(current.request?.status, 'claimed', 'provider failure released its admitted request');
+assert.equal(faux.state.callCount, callsBeforeFailure + 1, 'provider failure hot-looped another model turn');
+assert.equal(userTexts(initialManager).filter((text) => text.includes('provider failure request')).length, 1);
+current.request = null;
+save(current);
 
 const replacement = state();
 replacement.request = { id: 'tg-text-u2-m2', text: 'replacement request', status: 'claimed', owner: process.pid };
@@ -278,4 +398,5 @@ sdk_path="$pi_root/dist/index.js"
 ai_path="$pi_root/node_modules/@earendil-works/pi-ai/dist/index.js"
 node "$TMP_ROOT/runtime.mjs" \
   "$sdk_path" "$ai_path" "$ROOT" "$ROOT/.pi/extensions/fm-telegram-mirror.ts" \
-  "$home" "$agent_dir" "$session_dir" "$TMP_ROOT/fake-transport.py" "$TMP_ROOT/lock-lib.sh"
+  "$TMP_ROOT/competing-extension.ts" "$home" "$agent_dir" "$session_dir" \
+  "$TMP_ROOT/fake-transport.py" "$TMP_ROOT/lock-lib.sh"
