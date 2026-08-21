@@ -1886,12 +1886,16 @@ def mirror_abandon(home: Path, request_id: str, delivery_id: str, owner_pid: int
         record = read_json(source)
         if record is None:
             return 0
+        status = record.get("status") if isinstance(record, dict) else None
+        owned_claim = status == "claimed" and claim_owned_by(record, owner_pid)
         if (not isinstance(record, dict) or record.get("request_id") != request_id
-                or record.get("status") != "claimed" or not claim_owned_by(record, owner_pid)):
+                or not (owned_claim or status == "held")):
             return die("Telegram request is not owned by this extension")
         record["status"] = "abandoned"
         record["failure_delivery_id"] = delivery_id
         record["abandoned_at"] = now()
+        record.pop("held_at", None)
+        record.pop("held_turn_id", None)
         clear_claim_owner(record)
         atomic_json(source, record)
         durable_replace(source, target)

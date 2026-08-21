@@ -187,6 +187,8 @@ elif command == 'mirror-reply':
     if code == 0:
         state['deliveries'][delivery_id] = body
         state['reservations'].pop(delivery_id, None)
+        if (home / 'exercise-reply-timeout').exists():
+            time.sleep(0.05)
         if body == 'Firstmate · slow settlement A answer' and (home / 'delay-assistant-reply').exists():
             save(); skip_final_save = True
             fcntl.flock(lock, fcntl.LOCK_UN)
@@ -334,12 +336,18 @@ process.env.FM_TELEGRAM_SESSION_LOCK_LIB = lockLib;
 process.env.FM_TELEGRAM_ADMISSION_TIMEOUT_MS = '150';
 process.env.FM_TELEGRAM_RECONCILE_INTERVAL_MS = '500';
 process.env.FM_TELEGRAM_MAX_INPUT_CANDIDATES = '256';
+process.env.FM_TELEGRAM_HOLD_RETRY_BACKOFF_MS = '25';
 const nativeSetTimeout = globalThis.setTimeout;
-globalThis.setTimeout = (callback, delay, ...args) => nativeSetTimeout(
-  callback,
-  delay === 30_000 && existsSync(`${home}/delay-assistant-reply`) ? 200 : delay,
-  ...args,
-);
+const completeMirrorReplyTimeout = (1 + 64 * 3) * 45_000 + 30_000;
+globalThis.setTimeout = (callback, delay, ...args) => {
+  let effectiveDelay = delay;
+  if (existsSync(`${home}/exercise-reply-timeout`) && typeof delay === 'number' && delay > 30_000) {
+    effectiveDelay = delay >= completeMirrorReplyTimeout ? 200 : 5;
+  } else if (delay === 30_000 && existsSync(`${home}/delay-assistant-reply`)) {
+    effectiveDelay = 200;
+  }
+  return nativeSetTimeout(callback, effectiveDelay, ...args);
+};
 const {
   ModelRuntime,
   SessionManager,
@@ -434,6 +442,19 @@ assert.equal(userTexts(initialManager).filter((text) => text === 'nested extensi
 assert.equal(initialManager.getEntries().some((entry) =>
   entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission' && entry.data.state === 'completed'), true);
 assert.equal(runtime.session.agent.state.tools.some((tool) => /telegram/i.test(tool.name)), false);
+
+writeFileSync(`${home}/exercise-reply-timeout`, '');
+const timeoutBoundaryState = state();
+timeoutBoundaryState.request = {
+  id: 'tg-text-u32-m32', text: 'exercise complete reply timeout', status: 'queued',
+};
+save(timeoutBoundaryState);
+faux.appendResponses([fauxAssistantMessage('reply completed within the derived timeout')]);
+await waitFor(() => state().handled?.includes('tg-text-u32-m32'),
+  'complete chunk/authentication timeout budget killed a valid mirror reply');
+unlinkSync(`${home}/exercise-reply-timeout`);
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · reply completed within the derived timeout').length, 1);
 
 const usersBeforeReload = userTexts(initialManager).length;
 await runtime.session.reload();
@@ -979,7 +1000,7 @@ modeOffSteered.request = {
 };
 save(modeOffSteered);
 globalThis.__telegramMirrorHoldTool = true;
-globalThis.__telegramMirrorTerminateTool = true;
+globalThis.__telegramMirrorTerminateTool = false;
 globalThis.__telegramMirrorToolStarted = false;
 const callsBeforeModeOffSteer = faux.state.callCount;
 const deliveriesBeforeModeOffSteer = Object.keys(state().deliveries).length;
@@ -987,25 +1008,31 @@ faux.appendResponses([
   fauxAssistantMessage([
     fauxToolCall('mirror_test_tool', {}, { id: 'mirror-mode-off-steer-tool-call' }),
   ], { stopReason: 'toolUse' }),
-  fauxAssistantMessage('unmirrored mode-off local answer'),
+  fauxAssistantMessage('accepted Telegram answer after mode-off refusal'),
 ]);
 await waitFor(() => globalThis.__telegramMirrorToolStarted === true,
   'mode-off steer Telegram tool loop did not reach tool execution');
+const usersBeforeModeOffSteer = userTexts(initialManager).length;
 await runtime.session.prompt('/telegram off', { source: 'interactive' });
-const modeOffLocalSteer = runtime.session.prompt('ordinary local steer while mirror is off', {
+await runtime.session.prompt('ordinary local steer while mirror is off', {
   source: 'interactive', streamingBehavior: 'steer',
 });
-await new Promise((resolve) => setTimeout(resolve, 50));
+assert.equal(userTexts(initialManager).length, usersBeforeModeOffSteer,
+  'mode-off local continuation entered Pi before the accepted Telegram turn settled');
+assert.equal(notices.some(([message]) =>
+  message === 'Wait for the accepted Telegram turn to settle before continuing locally.'), true,
+  'mode-off local continuation refusal was not visible');
 globalThis.__telegramMirrorHoldTool = false;
-await modeOffLocalSteer;
-globalThis.__telegramMirrorTerminateTool = false;
 await waitFor(() => state().handled?.includes('tg-text-u31-m31'),
-  'mode-off local steer did not end the accepted request without requeue');
+  'mode-off refusal prevented the accepted Telegram response from settling');
 assert.equal(userTexts(initialManager)
   .filter((text) => text.includes('Telegram tool loop before mode-off local steer')).length, 1);
-assert.equal(userTexts(initialManager).at(-1), 'ordinary local steer while mirror is off');
-assert.equal(Object.keys(state().deliveries).length, deliveriesBeforeModeOffSteer,
-  'mode-off local steer or its assistant was mirrored');
+assert.equal(userTexts(initialManager)
+  .some((text) => text === 'ordinary local steer while mirror is off'), false);
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · accepted Telegram answer after mode-off refusal').length, 1);
+assert.equal(Object.keys(state().deliveries).length, deliveriesBeforeModeOffSteer + 1,
+  'accepted Telegram response did not fan out after mode-off continuation refusal');
 assert.equal(faux.state.callCount, callsBeforeModeOffSteer + 2,
   'mode-off local steer added an unexpected model pass');
 await runtime.session.prompt('/telegram on', { source: 'interactive' });
@@ -1015,6 +1042,57 @@ assert.equal(userTexts(initialManager)
   'mode-on reinjected the accepted Telegram request after a local mode-off steer');
 assert.equal(faux.state.callCount, callsBeforeModeOffSteer + 2,
   'mode-on reran the model after a local mode-off steer');
+
+const carriedModeOffState = state();
+carriedModeOffState.request = {
+  id: 'tg-text-u33-m33', text: 'Telegram tool loop carried by terminal steer', status: 'queued',
+};
+save(carriedModeOffState);
+globalThis.__telegramMirrorHoldTool = true;
+globalThis.__telegramMirrorHoldProvider = true;
+globalThis.__telegramMirrorTerminateTool = true;
+globalThis.__telegramMirrorToolStarted = false;
+const callsBeforeCarriedModeOff = faux.state.callCount;
+faux.appendResponses([
+  fauxAssistantMessage([
+    fauxToolCall('mirror_test_tool', {}, { id: 'mirror-carried-mode-off-root-tool' }),
+  ], { stopReason: 'toolUse' }),
+  async () => {
+    while (globalThis.__telegramMirrorHoldProvider) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return fauxAssistantMessage('accepted carried answer after mode-off refusal');
+  },
+]);
+await waitFor(() => globalThis.__telegramMirrorToolStarted === true,
+  'carried mode-off root did not reach tool execution');
+const carriedSteer = runtime.session.prompt('terminal steer carrying Telegram request', {
+  source: 'interactive', streamingBehavior: 'steer',
+});
+globalThis.__telegramMirrorHoldTool = false;
+await waitFor(() => userTexts(initialManager)
+  .some((text) => text.includes('terminal steer carrying Telegram request')),
+  'carrying terminal steer did not enter Pi');
+globalThis.__telegramMirrorTerminateTool = false;
+await runtime.session.prompt('/telegram off', { source: 'interactive' });
+const usersBeforeCarriedRefusal = userTexts(initialManager).length;
+await runtime.session.prompt('local mode-off steer after carried request', {
+  source: 'interactive', streamingBehavior: 'steer',
+});
+assert.equal(userTexts(initialManager).length, usersBeforeCarriedRefusal,
+  'mode-off local continuation entered Pi while a carried request was active');
+globalThis.__telegramMirrorHoldProvider = false;
+await carriedSteer;
+await waitFor(() => state().handled?.includes('tg-text-u33-m33'),
+  'carried Telegram request did not settle after mode-off refusal');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · accepted carried answer after mode-off refusal').length, 1);
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await new Promise((resolve) => setTimeout(resolve, 300));
+assert.equal(userTexts(initialManager)
+  .filter((text) => text.includes('Telegram tool loop carried by terminal steer')).length, 1);
+assert.equal(faux.state.callCount, callsBeforeCarriedModeOff + 2,
+  'carried request was reinjected after mode-off refusal');
 
 const slashSteered = state();
 slashSteered.request = {
@@ -1292,38 +1370,30 @@ await waitFor(() => state().handled?.includes('tg-text-u26-m26'),
   'explicit recovery did not settle the deferred provider failure');
 
 const failedHold = state();
-failedHold.request = { id: 'tg-text-u30-m30', text: 'provider failure with delayed hold', status: 'queued' };
+failedHold.request = { id: 'tg-text-u30-m30', text: 'provider failure with bounded hold', status: 'queued' };
 save(failedHold);
 writeFileSync(`${home}/reject-mirror-hold`, '');
 const callsBeforeFailedHold = faux.state.callCount;
+const holdsBeforeFailure = state().log.filter((call) => call[0] === 'mirror-hold').length;
 faux.appendResponses([
   fauxAssistantMessage([], { stopReason: 'error', errorMessage: 'provider failed before hold transition' }),
 ]);
-await waitFor(() => state().log.some((call) =>
-  call[0] === 'mirror-hold' && call[1] === 'tg-text-u30-m30'),
-'provider failure did not attempt its bounded hold transition');
-await new Promise((resolve) => setTimeout(resolve, 900));
-assert.equal(state().request?.status, 'claimed',
-  'failed hold transition released the accepted Telegram claim');
+await waitFor(() => state().abandoned?.some(([id]) => id === 'tg-text-u30-m30'),
+  'persistent hold failure did not reach a bounded non-requeue outcome');
+unlinkSync(`${home}/reject-mirror-hold`);
+const boundedHoldAttempts = state().log.filter((call) => call[0] === 'mirror-hold').length - holdsBeforeFailure;
+assert.equal(boundedHoldAttempts, 3, 'persistent hold failure did not use the bounded retry budget');
 assert.equal(initialManager.getEntries().some((entry) =>
   entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
-    && entry.data.requestId === 'tg-text-u30-m30' && entry.data.state === 'interrupted'), false,
-'failed hold transition persisted an unconfirmed interrupted state');
+    && entry.data.requestId === 'tg-text-u30-m30' && entry.data.state === 'abandoned'), true,
+'persistent hold failure did not persist its non-requeue outcome');
 assert.equal(userTexts(initialManager)
-  .filter((text) => text.includes('provider failure with delayed hold')).length, 1);
+  .filter((text) => text.includes('provider failure with bounded hold')).length, 1);
 assert.equal(faux.state.callCount, callsBeforeFailedHold + 1,
-  'failed hold transition reinjected the accepted Telegram request');
-unlinkSync(`${home}/reject-mirror-hold`);
-await waitFor(() => state().request?.status === 'held' && initialManager.getEntries().some((entry) =>
-  entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
-    && entry.data.requestId === 'tg-text-u30-m30' && entry.data.state === 'interrupted'),
-'accepted Telegram claim did not retry only its hold transition');
-assert.equal(faux.state.callCount, callsBeforeFailedHold + 1,
-  'successful hold retry invoked another model turn');
-faux.appendResponses([fauxAssistantMessage('explicit delayed hold recovery')]);
-await runtime.session.prompt('/telegram on', { source: 'interactive' });
-await waitFor(() => state().handled?.includes('tg-text-u30-m30'),
-  'explicit delayed-hold recovery did not settle');
+  'persistent hold failure reinjected the accepted Telegram request');
+await new Promise((resolve) => setTimeout(resolve, 500));
+assert.equal(state().log.filter((call) => call[0] === 'mirror-hold').length - holdsBeforeFailure, 3,
+  'persistent hold failure kept retrying after its bounded outcome');
 
 const failedTurn = state();
 failedTurn.request = { id: 'tg-text-u11-m11', text: 'provider failure request', status: 'queued' };
