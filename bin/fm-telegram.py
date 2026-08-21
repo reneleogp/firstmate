@@ -2216,42 +2216,54 @@ def handle_text(home: Path, config: Dict[str, Any], message: Dict[str, Any], upd
         except TelegramError:
             return False
         return True
-    if not mirror_mode_enabled(home):
+    operation = ""
+    request_id = ""
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        if not mirror_mode_enabled(home):
+            operation = "refuse"
+        else:
+            pending = read_json(pending_path(home))
+            if isinstance(pending, dict):
+                edit_replay = (pending.get("edit_update_id") == update_id
+                               and pending.get("edit_message_id") == message_id)
+                if edit_replay:
+                    operation = "reconcile"
+                elif pending.get("mode") == "edit":
+                    text_units = unicode_text_units(text)
+                    if text_units is None or text_units > MAX_TRANSCRIPT_UNITS:
+                        return False
+                    revision = pending.get("revision")
+                    if not strict_int(revision) or revision <= 0:
+                        return False
+                    pending["text"] = text
+                    pending["mode"] = "confirm"
+                    pending["revision"] = revision + 1
+                    pending["edit_update_id"] = update_id
+                    pending["edit_message_id"] = message_id
+                    pending["heading_sent"] = False
+                    pending["transcript_sent"] = False
+                    for field in ("heading_delivery", "heading_attempts", "heading_attempted_at",
+                                  "transcript_delivery", "transcript_attempts", "transcript_attempted_at",
+                                  "edit_prompt_delivery", "edit_prompt_attempts", "edit_prompt_attempted_at"):
+                        pending.pop(field, None)
+                    pending.pop("edit_prompt_sent", None)
+                    save_pending(home, pending)
+                    operation = "reconcile"
+            if not operation:
+                request_id = _queue_request_locked(
+                    home, text, int(config["chat_id"]), int(message_id), update_id,
+                    "text", False,
+                )
+    if operation == "refuse":
         try:
             send_text(home, int(config["chat_id"]), MIRROR_OFF_REFUSAL)
         except TelegramError:
             return False
         return True
-    pending = read_json(pending_path(home))
-    if isinstance(pending, dict):
-        edit_replay = (pending.get("edit_update_id") == update_id
-                       and pending.get("edit_message_id") == message_id)
-        if edit_replay:
-            reconcile_pending(home, config)
-            return True
-        if pending.get("mode") == "edit":
-            text_units = unicode_text_units(text)
-            if text_units is None or text_units > MAX_TRANSCRIPT_UNITS:
-                return False
-            revision = pending.get("revision")
-            if not strict_int(revision) or revision <= 0:
-                return False
-            pending["text"] = text
-            pending["mode"] = "confirm"
-            pending["revision"] = revision + 1
-            pending["edit_update_id"] = update_id
-            pending["edit_message_id"] = message_id
-            pending["heading_sent"] = False
-            pending["transcript_sent"] = False
-            for field in ("heading_delivery", "heading_attempts", "heading_attempted_at",
-                          "transcript_delivery", "transcript_attempts", "transcript_attempted_at",
-                          "edit_prompt_delivery", "edit_prompt_attempts", "edit_prompt_attempted_at"):
-                pending.pop(field, None)
-            pending.pop("edit_prompt_sent", None)
-            save_pending(home, pending)
-            reconcile_pending(home, config)
-            return True
-    request_id = queue_request(home, text, int(config["chat_id"]), int(message_id), update_id)
+    if operation == "reconcile":
+        reconcile_pending(home, config)
+        return True
     reconcile_request(home, request_id)
     record = read_json(request_path(home, request_id))
     return isinstance(record, dict) and record.get("status") in {"queued", "claimed"}
@@ -2273,35 +2285,39 @@ def handle_voice(home: Path, config: Dict[str, Any], message: Dict[str, Any],
     if duration < 0 or duration > MAX_VOICE_SECONDS or size < 0 or size > MAX_VOICE_BYTES:
         return False
     message_id = int(message["message_id"])
-    if not mirror_mode_enabled(home):
+    pending_id = f"voice-u{update_id}-m{message_id}"
+    refuse = False
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        if not mirror_mode_enabled(home):
+            refuse = True
+        else:
+            pending = read_json(pending_path(home))
+            if isinstance(pending, dict) and pending.get("pending_id") == pending_id:
+                return True
+            records, changed = load_pending_voice_queue_locked(home)
+            if any(record.get("pending_id") == pending_id for record in records):
+                if changed:
+                    save_pending_voice_queue_locked(home, records)
+                return True
+            if len(records) >= MAX_PENDING_VOICES:
+                return None
+            records.append({
+                "pending_id": pending_id,
+                "file_id": file_id,
+                "duration": duration,
+                "size": size,
+                "chat_id": int(config["chat_id"]),
+                "message_id": message_id,
+                "update_id": update_id,
+                "queued_at": now(),
+            })
+            save_pending_voice_queue_locked(home, records)
+    if refuse:
         try:
             send_text(home, int(config["chat_id"]), MIRROR_OFF_REFUSAL)
         except TelegramError:
             return False
-        return True
-    pending_id = f"voice-u{update_id}-m{message_id}"
-    with FileLock(state_lock(home)):
-        pending = read_json(pending_path(home))
-        if isinstance(pending, dict) and pending.get("pending_id") == pending_id:
-            return True
-        records, changed = load_pending_voice_queue_locked(home)
-        if any(record.get("pending_id") == pending_id for record in records):
-            if changed:
-                save_pending_voice_queue_locked(home, records)
-            return True
-        if len(records) >= MAX_PENDING_VOICES:
-            return None
-        records.append({
-            "pending_id": pending_id,
-            "file_id": file_id,
-            "duration": duration,
-            "size": size,
-            "chat_id": int(config["chat_id"]),
-            "message_id": message_id,
-            "update_id": update_id,
-            "queued_at": now(),
-        })
-        save_pending_voice_queue_locked(home, records)
     return True
 
 

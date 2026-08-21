@@ -312,4 +312,70 @@ if grep -q $'\ttelegram:' "$home/state/.wake-queue"; then
   fail "legacy Telegram wake survived bounded reconciliation"
 fi
 
-pass "Telegram mode, queue, voice, chunked delivery, completion, uncertainty, and migration behavior"
+race_harness="$TMP_ROOT/mode-admission-race.py"
+cat >"$race_harness" <<'PY'
+import fcntl, importlib.util, os, subprocess, sys, time
+from pathlib import Path
+
+script, home_arg, base, role, kind = sys.argv[1:]
+home = Path(home_arg)
+ready = home / f'{kind}-race-ready'
+result = home / f'{kind}-race-result'
+if role == 'child':
+    spec = importlib.util.spec_from_file_location('fm_telegram_race', script)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    module.configure_test_api_base(home, base)
+    config = module.load_config(home)
+    ready.write_text('ready\n')
+    if kind == 'text':
+        handled = module.handle_text(
+            home, config, {'text': 'mode race text', 'message_id': 901}, 901,
+        )
+    else:
+        handled = module.handle_voice(home, config, {
+            'message_id': 902,
+            'voice': {'file_id': 'mode-race-voice', 'duration': 2, 'file_size': 10},
+        }, 902)
+    result.write_text(repr(handled) + '\n')
+    raise SystemExit(0)
+
+mode_path = home / 'config' / 'telegram-mirror'
+lock_path = home / 'state' / '.telegram-state.lock'
+for target in (ready, result):
+    target.unlink(missing_ok=True)
+mode_path.write_text('on\n')
+with lock_path.open('a+') as lock:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    child = subprocess.Popen([sys.executable, __file__, script, str(home), base, 'child', kind])
+    for _ in range(100):
+        if ready.exists():
+            break
+        time.sleep(0.01)
+    else:
+        child.kill()
+        raise AssertionError(f'{kind} admission child did not start')
+    time.sleep(0.2)
+    temporary = mode_path.with_name(f'.{mode_path.name}.{os.getpid()}')
+    temporary.write_text('off\n')
+    os.replace(temporary, mode_path)
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+assert child.wait(timeout=10) == 0
+assert result.read_text().strip() == 'True'
+if kind == 'text':
+    assert not (home / 'state' / 'telegram' / 'inbox' / 'tg-text-u901-m901.json').exists()
+else:
+    queue = home / 'state' / 'telegram' / 'pending-voice-queue.json'
+    if queue.exists():
+        import json
+        records = json.loads(queue.read_text())
+        assert all(item.get('pending_id') != 'voice-u902-m902' for item in records)
+PY
+base="http://127.0.0.1:$(cat "$home/port")"
+"$PYTHON" "$race_harness" "$SCRIPT" "$home" "$base" parent text \
+  || fail "mode-off text admission race was not refused atomically"
+"$PYTHON" "$race_harness" "$SCRIPT" "$home" "$base" parent voice \
+  || fail "mode-off voice admission race was not refused atomically"
+
+pass "Telegram mode, queue, voice, chunked delivery, completion, uncertainty, migration, and admission races"

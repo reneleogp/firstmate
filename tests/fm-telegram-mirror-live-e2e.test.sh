@@ -23,11 +23,20 @@ from pathlib import Path
 args = sys.argv[1:]
 assert args[0] == '--home'
 home = Path(args[1]); args = args[2:]
+command, rest = args[0], args[1:]
+reconcile_active = home / 'reconcile-active'
+if command in ('mirror-next', 'mirror-claim') and reconcile_active.exists():
+    (home / 'drain-overlapped-reconcile').touch()
+reconcile_trigger = home / 'delay-next-reconcile'
+if command == 'mirror-reconcile' and reconcile_trigger.exists():
+    reconcile_trigger.unlink()
+    reconcile_active.touch()
+    time.sleep(1.2)
+    reconcile_active.unlink(missing_ok=True)
 lock = (home / 'fake-state.lock').open('a+')
 fcntl.flock(lock, fcntl.LOCK_EX)
 path = home / 'fake-state.json'
 state = json.loads(path.read_text()) if path.exists() else {'request': None, 'deliveries': {}, 'log': []}
-command, rest = args[0], args[1:]
 state.setdefault('log', []).append([command, *rest])
 def save():
     temporary = path.with_name(f'.{path.name}.{os.getpid()}')
@@ -170,7 +179,7 @@ TS
 
 cat >"$TMP_ROOT/runtime.mjs" <<'JS'
 import assert from 'node:assert/strict';
-import { readFileSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 const [sdkPath, aiPath, projectRoot, extensionPath, competingPath, handlingPath, home, agentDir, sessionDir, transport, lockLib] = process.argv.slice(2);
@@ -282,6 +291,22 @@ const lateLegacyWake = state();
 lateLegacyWake.legacy_wake = true;
 save(lateLegacyWake);
 await waitFor(() => state().legacy_wake === false, 'slow reconciliation did not retire a late legacy wake');
+
+writeFileSync(`${home}/delay-next-reconcile`, '');
+await waitFor(() => existsSync(`${home}/reconcile-active`), 'delayed reconciliation did not start');
+const reconcileRace = state();
+reconcileRace.request = {
+  id: 'tg-text-u14-m14', text: 'reconcile race request', status: 'queued',
+};
+save(reconcileRace);
+faux.appendResponses([fauxAssistantMessage('reconcile race answer')]);
+await waitFor(() => state().handled?.includes('tg-text-u14-m14'),
+  'request queued during reconciliation did not settle');
+await new Promise((resolve) => setTimeout(resolve, 50));
+assert.equal(existsSync(`${home}/drain-overlapped-reconcile`), false,
+  'drain started while slow reconciliation was in flight');
+assert.equal(userTexts(initialManager).filter((text) => text.includes('reconcile race request')).length, 1);
+assert.equal(Object.values(state().deliveries).filter((body) => body === 'Firstmate · reconcile race answer').length, 1);
 
 faux.appendResponses([
   (context) => {

@@ -496,7 +496,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const drain = async (ctx: ExtensionContext): Promise<void> => {
-    if (drainRunning || !transportOpen) return;
+    if (drainRunning || reconcileRunning || !transportOpen) return;
     const primary = ownsHomeLock();
     const currentMode = mode();
     if (!primary || currentMode !== "on" || pendingAdmission || heldAdmission) return;
