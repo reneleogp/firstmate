@@ -59,8 +59,11 @@ While mirror mode is off, an ordinary Telegram message is answered with `Telegra
 While mirror mode is on:
 
 - each ordinary submission typed in the Pi terminal appears in Telegram as a `You · Terminal` message,
-- Firstmate's final visible reply appears after each completed run, and
+- every completed reply appears as Firstmate finishes it, and
 - gray thinking, tool calls, tool results, shell output, and system, developer, extension, or operational messages never appear.
+
+Messages sent back-to-back often join one continuous run, so Firstmate can answer several times before it goes idle.
+Each of those replies is mirrored on its own, as it completes, rather than only the last one.
 
 A message typed in Telegram is already visible there, so it is not echoed back as a duplicate.
 
@@ -111,4 +114,5 @@ Regression entry points:
 tests/fm-telegram-mirror.test.sh
 tests/fm-telegram-extension.test.sh
 tests/fm-pi-primary-types.test.sh
+FM_TELEGRAM_LIVE_E2E=1 tests/fm-telegram-mirror-live-e2e.test.sh
 ```

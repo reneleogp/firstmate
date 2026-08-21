@@ -117,31 +117,54 @@ if (terminalFrames.length !== 1 || terminalFrames[0].text !== "check the failing
   fail(`unexpected terminal mirroring: ${JSON.stringify(terminalFrames)}`);
 }
 
-// 2. Only the final visible assistant text is mirrored, once the run settles.
-const assistantMessage = (content) => ({ message: { role: "assistant", content } });
+// 2. Every completed reply is mirrored exactly once, as Pi finalizes it, while
+//    thinking, tool narration, and tool results are never mirrored. The five
+//    queued messages below are one continuous run with a single settle: the
+//    regression this pins is Pi visibly answering five times while Telegram
+//    received only the last reply.
+const assistantMessage = (content, stopReason = "stop") =>
+  ({ message: { role: "assistant", content, stopReason } });
+const replyTexts = () => received.filter((frame) => frame.t === "reply").map((frame) => frame.text);
+
 handlers.get("message_end")(assistantMessage([
   { type: "thinking", thinking: "internal reasoning" },
   { type: "text", text: "Looking into it." },
   { type: "toolCall", id: "1", name: "bash", arguments: { command: "ls" } },
-]), ctx);
+], "toolUse"), ctx);
 handlers.get("message_end")({ message: { role: "toolResult", content: "shell output" } }, ctx);
 handlers.get("message_end")(assistantMessage([
   { type: "thinking", thinking: "more internal reasoning" },
-  { type: "text", text: "The test fails on the release branch." },
+  { type: "text", text: "Reply 1" },
 ]), ctx);
-if (received.some((frame) => frame.t === "reply")) {
-  fail("a reply was mirrored before the run settled");
+await waitFor(() => replyTexts().length === 1, "the first completed reply");
+if (replyTexts()[0] !== "Reply 1") {
+  fail(`mirrored the wrong text for the first reply: ${JSON.stringify(replyTexts())}`);
 }
-handlers.get("agent_settled")({}, ctx);
-await waitFor(() => received.some((frame) => frame.t === "reply"), "a reply frame");
-const replies = received.filter((frame) => frame.t === "reply");
-if (replies.length !== 1 || replies[0].text !== "The test fails on the release branch.") {
-  fail(`unexpected reply mirroring: ${JSON.stringify(replies)}`);
+
+// Replies 2 to 5 finalize inside the same continuous run, before any settle.
+for (const text of ["Reply 2", "Reply 3", "Reply 4", "Reply 5"]) {
+  handlers.get("message_end")(assistantMessage([{ type: "text", text }]), ctx);
 }
-handlers.get("agent_settled")({}, ctx);
-await new Promise((resolve) => setTimeout(resolve, 100));
-if (received.filter((frame) => frame.t === "reply").length !== 1) {
-  fail("a settled run with no new assistant text mirrored a stale reply");
+await waitFor(() => replyTexts().length === 5, "all five completed replies");
+if (JSON.stringify(replyTexts())
+    !== JSON.stringify(["Reply 1", "Reply 2", "Reply 3", "Reply 4", "Reply 5"])) {
+  fail(`queued replies were lost or reordered: ${JSON.stringify(replyTexts())}`);
+}
+
+// The single settle that ends the whole continuous run must add nothing.
+handlers.get("agent_settled")?.({}, ctx);
+await new Promise((resolve) => setTimeout(resolve, 200));
+if (replyTexts().length !== 5) {
+  fail(`settling the continuous run duplicated a reply: ${JSON.stringify(replyTexts())}`);
+}
+
+// Interrupted, failed, and still-streaming messages are not completed answers.
+for (const stopReason of ["aborted", "error", "pending", "deferred"]) {
+  handlers.get("message_end")(assistantMessage([{ type: "text", text: `partial ${stopReason}` }], stopReason), ctx);
+}
+await new Promise((resolve) => setTimeout(resolve, 200));
+if (replyTexts().length !== 5) {
+  fail(`an uncompleted response was mirrored: ${JSON.stringify(replyTexts())}`);
 }
 
 // 3. Queued Telegram text enters Pi's own input path in arrival order, with no

@@ -29,6 +29,13 @@ type BotFrame = {
   text?: unknown;
 };
 
+type AssistantPart = { type?: unknown; text?: unknown };
+type FinalizedMessage = {
+  role?: unknown;
+  content?: unknown;
+  stopReason?: unknown;
+};
+
 const RECONNECT_MS = positiveInteger("FM_TELEGRAM_RECONNECT_MS", 2000);
 const RECONNECT_MAX_MS = positiveInteger("FM_TELEGRAM_RECONNECT_MAX_MS", 60000);
 const COMMAND_TIMEOUT_MS = positiveInteger("FM_TELEGRAM_COMMAND_TIMEOUT_MS", 5000);
@@ -58,6 +65,29 @@ function assistantText(message: unknown): string {
     .trim();
 }
 
+// The one white reply Pi shows the captain at the end of a response, and nothing
+// else. Thinking blocks are not text parts, so they never reach here. A message
+// carrying tool calls is the narration Pi prints beside its tool activity rather
+// than the answer, and Pi's agent loop follows it with another assistant
+// message. "stop" and "length" are the two ways a model actually ends a
+// response; "toolUse", "aborted", "error", "pending", and "deferred" are not
+// completed answers.
+//
+// This is decided per finalized message rather than when the agent settles.
+// Pi runs back-to-back submissions as one continuous run, so five queued
+// messages produce five visible replies but only one settle. Flushing one
+// remembered reply at settle mirrored the last one and silently lost the rest,
+// whatever origin the submissions came from.
+function finalVisibleReply(message: unknown): string {
+  const finalized = message as FinalizedMessage | undefined;
+  if (finalized?.role !== "assistant") return "";
+  const content = finalized.content;
+  if (!Array.isArray(content)) return "";
+  if (content.some((part: AssistantPart) => part?.type === "toolCall")) return "";
+  if (finalized.stopReason !== "stop" && finalized.stopReason !== "length") return "";
+  return assistantText(message);
+}
+
 export default function (pi: ExtensionAPI) {
   const socketPath = botSocketPath();
   let socket: Socket | null = null;
@@ -65,7 +95,6 @@ export default function (pi: ExtensionAPI) {
   let stopped = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectDelay = RECONNECT_MS;
-  let finalReply = "";
   let deliveries: Promise<void> = Promise.resolve();
   let commandSequence = 0;
   const commandWaiters = new Map<number, (text: string) => void>();
@@ -214,18 +243,9 @@ export default function (pi: ExtensionAPI) {
     write({ t: "terminal", text: event.text });
   });
 
-  // Only the finalized white assistant text is mirrored: thinking parts, tool
-  // calls, tool results, and shell output never enter these frames.
+  // Every completed reply is mirrored as Pi finalizes it, exactly once.
   pi.on?.("message_end", (event) => {
-    const message = event.message as { role?: string } | undefined;
-    if (message?.role !== "assistant") return;
-    const text = assistantText(event.message);
-    if (text) finalReply = text;
-  });
-
-  pi.on?.("agent_settled", () => {
-    const text = finalReply;
-    finalReply = "";
+    const text = finalVisibleReply(event.message);
     if (text) write({ t: "reply", text });
   });
 
