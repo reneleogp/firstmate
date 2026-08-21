@@ -716,7 +716,7 @@ else
   TELEGRAM_MIGRATION_OUT=
   TELEGRAM_MIGRATION_RC=0
   if [ ! -e "$FM_HOME/.fm-secondmate-home" ] && [ ! -L "$FM_HOME/.fm-secondmate-home" ]; then
-    TELEGRAM_MIGRATION_OUT=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+    TELEGRAM_MIGRATION_OUT=$(env FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
       "$SCRIPT_DIR/fm-telegram.py" --home "$FM_HOME" migrate-wakes 2>&1)
     TELEGRAM_MIGRATION_RC=$?
   fi
