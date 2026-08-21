@@ -1614,6 +1614,51 @@ def mirror_queue_paths_locked(home: Path) -> List[Path]:
     return sorted(inbox.glob("*.json"), key=request_order_key)
 
 
+def legacy_terminal_completion(record: Any) -> bool:
+    if not isinstance(record, dict) or record.get("origin") != "telegram":
+        return False
+    return (
+        record.get("final_sent") is True
+        or record.get("continuation_routed_at") is not None
+        or record.get("continuation_routing") == "routed"
+        or record.get("work_published") is True
+        or record.get("initial_routing_consumed") is True
+    )
+
+
+def migrate_legacy_terminal_records_locked(home: Path) -> None:
+    inbox, handled = request_dirs(home)
+    for path in list(inbox.glob("*.json")):
+        record = read_json(path)
+        if not legacy_terminal_completion(record):
+            continue
+        target = handled / path.name
+        if target.exists():
+            existing = read_json(target)
+            if not isinstance(existing, dict) or existing.get("request_id") != record.get("request_id"):
+                continue
+            durable_unlink(path)
+            continue
+        record["status"] = "handled"
+        record.setdefault("completed_at", now())
+        record["legacy_migrated"] = True
+        clear_claim_owner(record)
+        atomic_json(path, record)
+        durable_replace(path, target)
+        private_file(target)
+    for path in list(handled.glob("*.json")):
+        record = read_json(path)
+        if not legacy_terminal_completion(record):
+            continue
+        if not isinstance(record, dict) or record.get("status") == "handled":
+            continue
+        record["status"] = "handled"
+        record.setdefault("completed_at", now())
+        record["legacy_migrated"] = True
+        clear_claim_owner(record)
+        atomic_json(path, record)
+
+
 def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
                      preserve_requests: Iterable[str] = (), report_held: bool = False,
                      report_deliveries: Iterable[str] = ()) -> int:
@@ -1633,6 +1678,7 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
     delivery_records: List[Tuple[str, Optional[str], Optional[str]]] = []
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
+        migrate_legacy_terminal_records_locked(home)
         if not marker.is_file():
             inbox, handled = request_dirs(home)
             for path in list(handled.glob("*.json")):
@@ -3923,34 +3969,37 @@ def install(home: Path) -> int:
     with FileLock(unit_lock()):
         enabled_by_install = False
         activation_reserved = False
+        restart_existing = False
         try:
             with FileLock(lifecycle_lock(home)):
-                if unit_owned_by(home):
-                    active_result = systemctl("is-active", SERVICE_NAME, check=False)
-                    enabled_result = systemctl("is-enabled", SERVICE_NAME, check=False)
-                    if (active_result.returncode == 0 and active_result.stdout.strip() == "active"
-                            and enabled_result.returncode == 0
-                            and enabled_result.stdout.strip() == "enabled"):
-                        verify_transport_marker(home, True)
-                        print("Telegram service installed and active.")
-                        return 0
-                require_service_runtime_inactive(home)
+                path = unit_path()
+                owned = unit_owned_by(home)
+                if (path.exists() or path.is_symlink()) and not owned:
+                    raise TelegramError("Telegram service unit belongs to another home or installation")
                 config = load_config(home)
                 verified_token_for(home, config)
-                path = unit_path()
-                if (path.exists() or path.is_symlink()) and not unit_owned_by(home):
-                    raise TelegramError("Telegram service unit belongs to another home or installation")
+                active_result = systemctl("is-active", SERVICE_NAME, check=False) if owned else None
+                enabled_result = systemctl("is-enabled", SERVICE_NAME, check=False) if owned else None
+                active_before = bool(
+                    active_result is not None and active_result.returncode == 0
+                    and active_result.stdout.strip() == "active"
+                )
+                was_enabled = bool(
+                    enabled_result is not None and enabled_result.returncode == 0
+                    and enabled_result.stdout.strip() == "enabled"
+                )
+                if not active_before:
+                    require_service_runtime_inactive(home)
                 atomic_bytes(path, unit_contents(home).encode())
                 systemctl("daemon-reload")
-                enabled_result = systemctl("is-enabled", SERVICE_NAME, check=False)
-                was_enabled = (enabled_result.returncode == 0
-                               and enabled_result.stdout.strip() == "enabled")
-                systemctl("enable", SERVICE_NAME)
-                enabled_by_install = not was_enabled
+                if not was_enabled:
+                    systemctl("enable", SERVICE_NAME)
+                    enabled_by_install = True
                 prepare_transport_activation(home)
                 atomic_bytes(service_activation_path(home), b"systemd\n")
                 activation_reserved = True
-            systemctl("start", SERVICE_NAME)
+                restart_existing = active_before
+            systemctl("restart" if restart_existing else "start", SERVICE_NAME)
             wait_for_systemd_runtime_ready(home)
             with FileLock(lifecycle_lock(home)):
                 require_unit_owner(home)
@@ -4183,7 +4232,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_private(reconcile_parser)
     reconcile_parser.add_argument("--preserve-request", action="append", default=[])
     reconcile_parser.add_argument("--report-delivery", action="append", default=[])
-    for name, help_text in (("install", "install and start the user service"), ("start", "start the user service"),
+    for name, help_text in (("install", "install and start the user service, restarting an exactly owned active unit"), ("start", "start the user service"),
                             ("stop", "stop the user service"), ("status", "show user service status"),
                             ("disable", "disable the user service"), ("cleanup", "remove this service and private state")):
         command = sub.add_parser(name, help=help_text)

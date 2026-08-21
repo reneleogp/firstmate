@@ -258,7 +258,7 @@ import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI): void {
-  let injected = false;
+  let injectedFor: unknown = undefined;
   let nested = false;
   const state = globalThis as typeof globalThis & {
     __telegramMirrorSendOtherExtension?: () => void;
@@ -304,15 +304,29 @@ export default function (pi: ExtensionAPI): void {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   });
-  pi.on("agent_end", () => {
-    const state = globalThis as typeof globalThis & { __telegramMirrorInjectOperational?: boolean };
-    if (!state.__telegramMirrorInjectOperational || injected) return;
-    injected = true;
+  const sendOperationalFollowup = (value: unknown): void => {
+    if (!value || injectedFor === value) return;
+    injectedFor = value;
     pi.sendMessage({
       customType: "mirror-test-operational",
       content: "operational follow-up",
       display: false,
     }, { triggerTurn: true, deliverAs: "followUp" });
+  };
+  pi.on("agent_end", () => {
+    const state = globalThis as typeof globalThis & { __telegramMirrorInjectOperational?: unknown };
+    sendOperationalFollowup(state.__telegramMirrorInjectOperational);
+  });
+  pi.on("agent_settled", () => {
+    const state = globalThis as typeof globalThis & {
+      __telegramMirrorInjectOperationalOnSettled?: unknown;
+    };
+    if (!state.__telegramMirrorInjectOperationalOnSettled ||
+        injectedFor === state.__telegramMirrorInjectOperationalOnSettled) return;
+    injectedFor = state.__telegramMirrorInjectOperationalOnSettled;
+    pi.sendUserMessage("\u2063FIRSTMATE_OP: re-arm operational follow-up", {
+      deliverAs: "followUp",
+    });
   });
 }
 TS
@@ -1415,7 +1429,7 @@ assert.equal(faux.state.callCount, callsBeforeExpiringSteer + 2,
   'expired carried terminal delivery reinjected its Telegram request');
 
 const competingRequest = { id: 'tg-text-u9-m9', text: 'paired Telegram request', status: 'queued' };
-globalThis.__telegramMirrorInjectOperational = true;
+globalThis.__telegramMirrorInjectOperational = 'telegram';
 faux.appendResponses([
   (context) => {
     assert.match(context.systemPrompt + JSON.stringify(context.messages), /authenticated Telegram mirror/);
@@ -1453,6 +1467,33 @@ assert.equal(Object.values(current.deliveries).some((body) => body.includes('ope
 assert.equal(Object.values(current.deliveries).some((body) => body.includes('private Telegram reasoning')), false);
 assert.equal(Object.values(current.deliveries).some((body) => body.includes('tool diagnostic payload')), false);
 globalThis.__telegramMirrorInjectOperational = false;
+
+// A terminal turn must settle before the immediate operational re-arm follow-up.
+const terminalRearmEnabled = process.env.FM_TELEGRAM_BASIC_TERMINAL_REARM !== '0';
+globalThis.__telegramMirrorInjectOperationalOnSettled = terminalRearmEnabled ? 'terminal-basic' : false;
+const terminalBasicCalls = faux.state.callCount;
+faux.appendResponses(terminalRearmEnabled
+  ? [fauxAssistantMessage('basic terminal answer'), fauxAssistantMessage('operational re-arm answer')]
+  : [fauxAssistantMessage('basic terminal answer')]);
+await runtime.session.prompt('basic terminal with immediate operational re-arm', { source: 'interactive' });
+await waitFor(() => Object.values(state().deliveries)
+  .some((body) => body === 'Firstmate · basic terminal answer'),
+'basic terminal assistant delivery was masked by the operational re-arm');
+current = state();
+assert.equal(Object.values(current.deliveries)
+  .filter((body) => body === 'You · Terminal\n\nbasic terminal with immediate operational re-arm').length, 1);
+assert.equal(Object.values(current.deliveries)
+  .filter((body) => body === 'Firstmate · basic terminal answer').length, 1);
+assert.equal(Object.values(current.deliveries)
+  .some((body) => body === 'Firstmate · operational re-arm answer'), false);
+assert.equal(faux.state.callCount, terminalBasicCalls + (terminalRearmEnabled ? 2 : 1),
+  'operational re-arm caused an unexpected additional model turn');
+globalThis.__telegramMirrorInjectOperational = false;
+globalThis.__telegramMirrorInjectOperationalOnSettled = false;
+if (process.env.FM_TELEGRAM_BASIC_TERMINAL_ONLY === '1') {
+  console.log(`pass: terminal assistant settlement with immediate operational re-arm (${terminalRearmEnabled ? 'enabled' : 'counterfactual disabled'})`);
+  process.exit(0);
+}
 
 const voice = state();
 voice.request = { id: 'tg-voice-u10-m10', text: 'confirmed voice text', status: 'queued' };

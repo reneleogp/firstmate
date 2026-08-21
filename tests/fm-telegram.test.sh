@@ -596,4 +596,54 @@ base="http://127.0.0.1:$(cat "$home/port")"
 "$PYTHON" "$race_harness" "$SCRIPT" "$home" "$base" parent voice \
   || fail "mode-off voice admission race was not refused atomically"
 
-pass "Telegram mode, queue, voice, chunked delivery, completion, uncertainty, migration, and admission races"
+# Installing an exactly owned active unit must restart the running process onto current bytes.
+service_home="$TMP_ROOT/install-home"
+mkdir -p "$service_home/config" "$service_home/state/telegram/inbox" "$service_home/state/telegram/handled" "$service_home/state/telegram/responses" "$service_home/state/telegram/deliveries"
+printf 'FM_TELEGRAM_BOT_TOKEN=test-only-token\n' >"$service_home/.env"
+chmod 600 "$service_home/.env"
+cat >"$service_home/config/telegram.json" <<'JSON'
+{"user_id":77,"chat_id":77,"bot_id":9901}
+JSON
+chmod 600 "$service_home/config/telegram.json"
+python3 - "$service_home" "$FM_TELEGRAM_UNIT_DIR/firstmate-telegram.service" <<'PY'
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location('fm_telegram_install', 'bin/fm-telegram.py')
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+os.makedirs(os.path.dirname(sys.argv[2]), exist_ok=True)
+open(sys.argv[2], 'w').write(module.unit_contents(__import__('pathlib').Path(sys.argv[1])))
+os.chmod(sys.argv[2], 0o600)
+PY
+fake_systemctl="$TMP_ROOT/fake-systemctl"
+cat >"$fake_systemctl" <<'SH'
+#!/usr/bin/env bash
+set -u
+root=${FM_TELEGRAM_UNIT_DIR:?}
+log="$root/systemctl.log"
+printf '%s\n' "$*" >>"$log"
+case "${2:-}" in
+  is-active) printf 'active\n'; exit 0 ;;
+  is-enabled) printf 'enabled\n'; exit 0 ;;
+  daemon-reload|enable) exit 0 ;;
+  restart|start) rm -f "$FM_HOME/state/.telegram-service-activation"; exit 0 ;;
+  stop|disable) exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$fake_systemctl"
+run_tg_home() {
+  local target=$1; shift
+  env FM_HOME="$target" FM_TELEGRAM_SYSTEMCTL="$fake_systemctl" "$SCRIPT" --test-api-base "http://127.0.0.1:$(cat "$home/port")" "$@"
+}
+run_tg_home "$service_home" install >/dev/null
+ grep -q -- '--user restart firstmate-telegram.service' "$FM_TELEGRAM_UNIT_DIR/systemctl.log" \
+  || fail "owned active Telegram install did not restart the service"
+if grep -q -- '--user start firstmate-telegram.service' "$FM_TELEGRAM_UNIT_DIR/systemctl.log"; then
+  fail "owned active Telegram install used start instead of restart"
+fi
+printf 'foreign unit\n' >"$FM_TELEGRAM_UNIT_DIR/firstmate-telegram.service"
+if run_tg_home "$service_home" install >/dev/null 2>&1; then
+  fail "foreign Telegram unit was accepted by install"
+fi
+[ "$(grep -c -- '--user restart firstmate-telegram.service' "$FM_TELEGRAM_UNIT_DIR/systemctl.log")" -eq 1 ] \
+  || fail "foreign Telegram unit was restarted"
+pass "Telegram mode, queue, voice, chunked delivery, install restart, and migration"

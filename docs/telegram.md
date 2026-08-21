@@ -18,6 +18,8 @@ Pairing verifies the bot identity and private chat, then stores the pinned user,
 Use both `pair` transcriber options together when Parakeet and Whisper wrappers are outside the systemd service PATH; `--help` owns their exact flags and constraints.
 Stop the installed service before replacing its pairing, and run `cleanup` first when changing an identity that still has private Telegram state.
 Install and start the service with `bin/fm-telegram.py --home "$FM_HOME" install`.
+When the exactly owned unit is already active, `install` rewrites the unit, reloads systemd, and restarts that service so the running process uses the current tracked transport bytes.
+It refuses a unit owned by another home or installation and never restarts a foreign service.
 Use `start`, `stop`, `status`, `disable`, and `cleanup` for the service lifecycle.
 Stopping or disabling abandons pending voice confirmations and waiting voice notes and removes temporary audio.
 Cleanup removes this service's unit, pairing, preference, and private Telegram state without editing `.env` or unrelated home records.

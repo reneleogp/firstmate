@@ -137,4 +137,65 @@ printf 'off\n' >"$home/config/telegram-mirror"
 [ ! -e "$home/state/telegram/handled/tg-text-u1-m1.json" ] || fail "live mirror claim moved content into a second route"
 
 rm -f "$owner_script"
-pass "bounded mirror queue, mode preference, and single-primary claim interface"
+
+# Legacy routed records are terminal history, not new Telegram work.
+legacy_home="$TMP_ROOT/legacy-home"
+mkdir -p "$legacy_home/config" "$legacy_home/state/telegram/inbox" "$legacy_home/state/telegram/handled"
+printf 'FM_TELEGRAM_BOT_TOKEN=test-only-token\n' >"$legacy_home/.env"
+chmod 600 "$legacy_home/.env"
+cat >"$legacy_home/config/telegram.json" <<'JSON'
+{"user_id":77,"chat_id":77,"bot_id":9901}
+JSON
+chmod 600 "$legacy_home/config/telegram.json"
+printf 'on\n' >"$legacy_home/config/telegram-mirror"
+chmod 600 "$legacy_home/config/telegram-mirror"
+python3 - "$legacy_home" <<'PY'
+import json, sys, time
+from pathlib import Path
+home = Path(sys.argv[1]); inbox = home / 'state' / 'telegram' / 'inbox'; handled = home / 'state' / 'telegram' / 'handled'
+def write(directory, name, record):
+    (directory / (name + '.json')).write_text(json.dumps(record))
+base = {'origin': 'telegram', 'chat_id': 77, 'message_id': 9, 'update_id': 9,
+        'created_at': int(time.time()), 'text': 'old', 'status': 'queued'}
+routed = dict(base, request_id='tg-text-u9-m9', continuation_routing='routed', continuation_routed_at=10, admission_sequence=1)
+published = dict(base, request_id='tg-text-u10-m10', work_published=True, admission_sequence=2)
+handled_old = dict(base, request_id='tg-text-u11-m11', final_sent=True, admission_sequence=3)
+new_a = dict(base, request_id='tg-text-u103-m103', message_id=103, update_id=103, admission_sequence=103)
+new_b = dict(base, request_id='tg-text-u106-m106', message_id=106, update_id=106, admission_sequence=106)
+write(inbox, 'tg-text-u9-m9', routed); write(inbox, 'tg-text-u10-m10', published)
+write(handled, 'tg-text-u11-m11', handled_old); write(inbox, 'tg-text-u103-m103', new_a); write(inbox, 'tg-text-u106-m106', new_b)
+PY
+legacy_owner="$TMP_ROOT/legacy-owner.py"
+cat >"$legacy_owner" <<'PY'
+import os, subprocess, sys
+from pathlib import Path
+script, home = sys.argv[1:]
+owner = os.getpid(); Path(home, 'state', '.lock').write_text(str(owner) + '\n')
+def run(*args):
+    reader, writer = os.pipe(); os.write(writer, b'a' * 64 + b'\n'); os.close(writer)
+    try:
+        return subprocess.run([script, '--home', home, *args, '--owner-pid', str(owner),
+                               '--capability-fd', str(reader)], text=True, capture_output=True,
+                              pass_fds=(reader,))
+    finally:
+        os.close(reader)
+opened = run('mirror-open')
+assert opened.returncode == 0, opened.stderr
+reconciled = run('mirror-reconcile')
+assert reconciled.returncode == 0, reconciled.stderr
+next_request = run('mirror-next')
+assert next_request.returncode == 0 and next_request.stdout.strip() == 'tg-text-u103-m103', next_request.stdout
+assert run('mirror-claim', 'tg-text-u103-m103').returncode == 0
+read_new = run('mirror-read', 'tg-text-u103-m103')
+assert read_new.returncode == 0 and read_new.stdout == 'old'
+PY
+FM_CONFIG_OVERRIDE="$legacy_home/config" "$PYTHON" "$legacy_owner" "$SCRIPT" "$legacy_home" \
+  || fail "legacy Telegram migration regression failed"
+[ ! -e "$legacy_home/state/telegram/inbox/tg-text-u9-m9.json" ] || fail "routed legacy request remained injectable"
+[ ! -e "$legacy_home/state/telegram/inbox/tg-text-u10-m10.json" ] || fail "published legacy request remained injectable"
+[ -e "$legacy_home/state/telegram/handled/tg-text-u9-m9.json" ] || fail "routed legacy request was not retired"
+[ -e "$legacy_home/state/telegram/handled/tg-text-u10-m10.json" ] || fail "published legacy request was not retired"
+[ -e "$legacy_home/state/telegram/handled/tg-text-u11-m11.json" ] || fail "old handled record disappeared"
+[ -e "$legacy_home/state/telegram/inbox/tg-text-u103-m103.json" ] || fail "new queued request was not preserved"
+[ -e "$legacy_home/state/telegram/inbox/tg-text-u106-m106.json" ] || fail "second new queued request was not preserved"
+pass "bounded mirror queue, mode preference, single-primary claim, and legacy migration"
