@@ -211,6 +211,23 @@ function entriesFromFile(path: string | undefined): SessionEntry[] {
   }
 }
 
+function hasDurableAdmissionUser(
+  entries: SessionEntry[],
+  index: number,
+  state: "admitted" | "carried",
+): boolean {
+  const prefix = state === "admitted" ? "You · Telegram\n\n" : "You · Terminal\n\n";
+  for (const entry of entries.slice(index + 1)) {
+    if (entry.type === "custom_message" ||
+        (entry.type === "custom" && entry.customType === admissionType)) return false;
+    const message = entry.message;
+    if (entry.type !== "message" || !message?.role) continue;
+    if (message.role !== "user") return false;
+    return stripOriginMarker(inputTextOf(message)).startsWith(prefix);
+  }
+  return false;
+}
+
 function admissionStates(entries: SessionEntry[]): Map<string, { state: string; turnId: string; index: number }> {
   const states = new Map<string, { state: string; turnId: string; index: number }>();
   entries.forEach((entry, index) => {
@@ -218,9 +235,10 @@ function admissionStates(entries: SessionEntry[]): Map<string, { state: string; 
     const requestId = entry.data?.requestId;
     const turnId = entry.data?.turnId;
     const state = entry.data?.state;
-    if (typeof requestId === "string" && typeof turnId === "string" && typeof state === "string") {
-      states.set(requestId, { state, turnId, index });
-    }
+    if (typeof requestId !== "string" || typeof turnId !== "string" || typeof state !== "string") return;
+    if ((state === "admitted" || state === "carried") &&
+        !hasDurableAdmissionUser(entries, index, state)) return;
+    states.set(requestId, { state, turnId, index });
   });
   return states;
 }

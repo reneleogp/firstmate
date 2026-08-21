@@ -1101,6 +1101,36 @@ assert.equal(Object.values(state().deliveries)
 assert.equal(faux.state.callCount, callsBeforeCarriedRestart,
   'restart ran the model for a persisted carried Telegram conversation');
 
+const unmatchedCarriedManager = runtime.session.sessionManager;
+const unmatchedCarriedRequestId = 'tg-text-u25-m25';
+const unmatchedCarriedState = state();
+unmatchedCarriedState.request = {
+  id: unmatchedCarriedRequestId, text: 'durable Telegram before unmatched terminal steer',
+  status: 'claimed', owner: process.pid,
+};
+save(unmatchedCarriedState);
+unmatchedCarriedManager.appendCustomEntry('firstmate-telegram-admission', {
+  requestId: unmatchedCarriedRequestId, turnId: 'durable-telegram-before-unmatched-carried',
+  sessionId: unmatchedCarriedManager.getSessionId(), state: 'admitted',
+});
+unmatchedCarriedManager.appendMessage({
+  role: 'user', content: [{ type: 'text', text: 'You · Telegram\n\ndurable Telegram before unmatched terminal steer' }],
+  timestamp: Date.now(),
+});
+unmatchedCarriedManager.appendMessage(fauxAssistantMessage([], { stopReason: 'toolUse' }));
+unmatchedCarriedManager.appendCustomEntry('firstmate-telegram-admission', {
+  requestId: unmatchedCarriedRequestId, turnId: 'unmatched-carried-terminal-turn',
+  sessionId: unmatchedCarriedManager.getSessionId(), state: 'carried',
+});
+const callsBeforeUnmatchedCarriedRestart = faux.state.callCount;
+await runtime.newSession({ parentSession: unmatchedCarriedManager.getSessionFile() });
+await waitFor(() => state().handled?.includes(unmatchedCarriedRequestId),
+  'restart did not abandon a durable admission hidden by an unmatched carried marker');
+assert.equal(userTexts(runtime.session.sessionManager).length, 0,
+  'restart reinjected a durable admission hidden by an unmatched carried marker');
+assert.equal(faux.state.callCount, callsBeforeUnmatchedCarriedRestart,
+  'restart ran the model after an unmatched carried marker hid a durable admission');
+
 const expiredManager = runtime.session.sessionManager;
 const expiredTurn = 'telegram-tg-text-u16-m16-expired';
 expiredManager.appendCustomEntry('firstmate-telegram-admission', {
