@@ -2273,6 +2273,11 @@ test_nonterminal_stale_repairs_missing_or_corrupt_timer() {
 # Both halves of the contract are asserted on the SAME fixture, because the whole
 # point is that only the worktree evidence differs: writing defers, silent
 # escalates on the unchanged schedule.
+# Every wait below is the file's standard one (wait_poll_cycle for an absorbing
+# watcher, a 100-tick wait_for_exit for an escalating one), because the poll these
+# tests assert on is the ONE poll that spawns the bounded worktree walk: on a
+# loaded runner it outlives a fixed liveness budget, and a round reaped before it
+# finished reports a lost deferral instead of the deferral under test.
 test_wedge_escalation_deferred_while_worktree_is_written() {
   local dir state fakebin out drain_out capture_file window key pane_hash sig pid wt back
   dir=$(make_case wedge-worktree-writes); state="$dir/state"; fakebin="$dir/fakebin"
@@ -2303,7 +2308,7 @@ test_wedge_escalation_deferred_while_worktree_is_written() {
     FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
+  if ! wait_poll_cycle "$state" "$pid"; then
     reap "$pid"; fail "watcher wedge-escalated a quiet pane whose worktree was being written: $(cat "$out")"
   fi
   [ ! -s "$out" ] || { reap "$pid"; fail "a written-worktree deferral printed a wake reason: $(cat "$out")"; }
@@ -2326,9 +2331,11 @@ test_wedge_escalation_deferred_while_worktree_is_written() {
     FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || fail "a stalled crew that wrote nothing did not wedge-escalate on the existing schedule"
+  wait_for_exit "$pid" 100 || fail "a stalled crew that wrote nothing did not wedge-escalate on the existing schedule"
   grep -F "$window" "$out" >/dev/null && fail "stalled-worker presentation leaked its private endpoint"
   grep -F "worker has remained unresponsive" "$out" >/dev/null || fail "the stalled-worker escalation omitted why it surfaced"
+  grep -F "stale: $window" "$out" >/dev/null || fail "the stalled-crew escalation did not print a stale wake"
+  grep -F "possible wedge" "$out" >/dev/null || fail "the stalled-crew escalation did not flag a possible wedge"
   [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || true)" = 1 ] || fail "the stalled-crew escalation was not counted"
   [ ! -e "$state/.stale-since-$key" ] || fail "the idle timer was not cleared after a real escalation"
   [ ! -e "$state/.writing-since-$key" ] || fail "the write-deferral chain outlived a real escalation"
@@ -2369,8 +2376,9 @@ test_write_deferral_resurfaces_on_the_bounded_cadence() {
     FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || fail "a long-running write deferral never re-surfaced on the bounded cadence"
+  wait_for_exit "$pid" 100 || fail "a long-running write deferral never re-surfaced on the bounded cadence"
   grep -F "$window" "$out" >/dev/null && fail "write-deferral presentation leaked its private endpoint"
+  grep -F "stale: $window" "$out" >/dev/null || fail "the write-deferral recheck did not print a stale wake"
   grep -F "writing its worktree" "$out" >/dev/null || fail "the write-deferral recheck was not labeled as such"
   grep -F "possible wedge" "$out" >/dev/null && fail "a write-deferral recheck was mislabeled a possible wedge"
   [ -e "$state/.writing-resurfaced-$key" ] || fail "the write-deferral re-surface throttle marker was not recorded"
@@ -2419,9 +2427,11 @@ test_secondmate_home_supervision_churn_is_not_write_evidence() {
     FM_STALE_ESCALATE_SECS=240 FM_BUSY_TURN_MAX_SECS=1 FM_PAUSE_RESURFACE_SECS=999 \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || fail "a mate home's own supervision churn deferred an escalation it must not defer"
+  wait_for_exit "$pid" 100 || fail "a mate home's own supervision churn deferred an escalation it must not defer"
   grep -F "$window" "$out" >/dev/null && fail "mate-home presentation leaked its private endpoint"
   grep -F "worker has remained unresponsive" "$out" >/dev/null || fail "the mate-home escalation omitted why it surfaced"
+  grep -F "stale: $window" "$out" >/dev/null || fail "the mate-home escalation did not print a stale wake"
+  grep -F "possible wedge" "$out" >/dev/null || fail "the mate-home escalation did not flag a possible wedge"
   [ ! -e "$state/.writing-since-$key" ] || fail "a mate's provisioned home was probed as if it were a code tree"
   [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || true)" = 1 ] || fail "the mate escalation was not counted"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the mate escalation failed"
@@ -2486,7 +2496,7 @@ test_timer_repair_drops_a_finished_write_deferral_chain() {
     FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
+  if ! wait_poll_cycle "$state" "$pid"; then
     reap "$pid"
     fail "the first deferral of a new quiet window re-surfaced at once, so it inherited a finished chain: $(cat "$out")"
   fi
@@ -2529,7 +2539,7 @@ test_terminal_first_sight_drops_a_finished_write_deferral_chain() {
     FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
+  if ! wait_poll_cycle "$state" "$pid"; then
     reap "$pid"; fail "the overridden terminal status was not absorbed on first sight: $(cat "$out")"
   fi
   [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] \
@@ -2552,8 +2562,9 @@ test_terminal_first_sight_drops_a_finished_write_deferral_chain() {
     FM_STALE_ESCALATE_SECS=999 FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || fail "a first-sight captain-relevant status was not surfaced"
+  wait_for_exit "$pid" 100 || fail "a first-sight captain-relevant status was not surfaced"
   grep -F "$window" "$out" >/dev/null && fail "first-sight presentation leaked its private endpoint"
+  grep -F "stale: $window" "$out" >/dev/null || fail "the first-sight surface did not print a stale wake"
   [ ! -e "$state/.writing-since-$key" ] \
     || fail "the first-sight surface kept a finished write-deferral chain"
   unset FM_FAKE_CREW_STATE
