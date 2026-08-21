@@ -3327,21 +3327,21 @@ def pair(home: Path, user_id: int, chat_id: int,
         raise TelegramError("user and chat ids must be positive Telegram identifiers")
     if (parakeet_command is None) != (whisper_command is None):
         raise TelegramError("configure both voice transcription commands together")
-    configured_commands = None
+    configured_commands: Dict[str, str] = {}
     if parakeet_command is not None and whisper_command is not None:
-        configured_commands = {
+        configured_commands.update({
             "parakeet_command": normalize_transcriber_command(parakeet_command, "parakeet"),
             "whisper_command": normalize_transcriber_command(whisper_command, "whisper"),
-        }
-        if ffmpeg_command is not None:
-            configured_commands["ffmpeg_command"] = normalize_transcriber_command(
-                ffmpeg_command, "ffmpeg"
-            )
+        })
+    if ffmpeg_command is not None:
+        configured_commands["ffmpeg_command"] = normalize_transcriber_command(
+            ffmpeg_command, "ffmpeg"
+        )
     with FileLock(lifecycle_lock(home)):
         require_pairing_service_inactive(home)
         config_existing = read_json(config_path(home), {})
         config = dict(config_existing) if isinstance(config_existing, dict) else {}
-        if configured_commands is not None:
+        if configured_commands:
             config.update(configured_commands)
         config = validate_transcriber_config(config)
         token = token_for(home)
@@ -3360,7 +3360,7 @@ def pair(home: Path, user_id: int, chat_id: int,
         with FileLock(state_lock(home)):
             current = read_json(config_path(home), {})
             config = dict(current) if isinstance(current, dict) else {}
-            if configured_commands is not None:
+            if configured_commands:
                 config.update(configured_commands)
             config = validate_transcriber_config(config)
             identity_values = (
@@ -3404,6 +3404,18 @@ def prepare_transport_activation(home: Path) -> None:
     # The transport is allowed to queue while no primary exists. The project-local
     # Pi extension, not a watcher or a second route, owns live delivery.
     set_telegram_enabled(home, True)
+
+
+def reserve_service_activation(home: Path, manager: str) -> None:
+    set_telegram_enabled(home, False)
+    atomic_bytes(service_activation_path(home), f"{manager}\n".encode())
+
+
+def service_runtime_ready(home: Path) -> bool:
+    return (not service_activation_path(home).is_file()
+            and telegram_enabled_path(home).is_file()
+            and lock_owned(global_service_lock())
+            and service_runtime_owned(home))
 
 
 def unit_path() -> Path:
@@ -3474,8 +3486,7 @@ def verify_transport_marker(home: Path, expected: bool) -> None:
 def wait_for_systemd_runtime_ready(home: Path) -> None:
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
-        if (not service_activation_path(home).is_file()
-                and telegram_enabled_path(home).is_file()):
+        if service_runtime_ready(home):
             return
         time.sleep(0.02)
     raise TelegramError("Telegram systemd service did not become ready")
@@ -3503,24 +3514,33 @@ def reconcile_failed_activation(home: Path, disable_new_install: bool = False,
                 verify_service(enabled=False)
 
 
-def wait_for_launchd_active(home: Path) -> None:
+def wait_for_launchd_runtime_ready(home: Path) -> None:
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
-        if launchd_unit_active(home):
+        if launchd_unit_active(home) and service_runtime_ready(home):
             return
         time.sleep(0.02)
-    raise TelegramError("Telegram LaunchAgent did not become active")
+    raise TelegramError("Telegram LaunchAgent did not become ready")
+
+
+def wait_for_launchd_stopped(home: Path) -> None:
+    deadline = time.monotonic() + POLL_TIMEOUT + 20
+    while time.monotonic() < deadline:
+        if launchd_unit_inactive(home) and not service_runtime_owned(home):
+            return
+        time.sleep(0.05)
+    raise TelegramError("Telegram LaunchAgent did not become inactive")
 
 
 def launchd_stop_owned(home: Path) -> None:
     if not launchd_unit_loaded(home):
-        if launchd_unit_inactive(home):
-            return
-        raise TelegramError("Telegram LaunchAgent ownership could not be verified")
+        if not launchd_unit_inactive(home):
+            raise TelegramError("Telegram LaunchAgent ownership could not be verified")
+        wait_for_launchd_stopped(home)
+        return
     if launchd_unit_active(home):
         launchd_command("kill", "SIGTERM", launchd_target())
-    if not launchd_unit_inactive(home):
-        raise TelegramError("Telegram LaunchAgent did not become inactive")
+    wait_for_launchd_stopped(home)
 
 
 def publish_launchd_plist(home: Path) -> None:
@@ -3586,20 +3606,21 @@ def install_macos(home: Path) -> int:
                 launchd_bootout_owned(home)
             publish_launchd_plist(home)
             launchd_enable(home)
-            prepare_transport_activation(home)
-            atomic_bytes(service_activation_path(home), b"launchd\n")
-            try:
-                launchd_bootstrap(home)
-                launchd_command("kickstart", "-k", launchd_target())
-                wait_for_launchd_active(home)
-                durable_unlink(service_activation_path(home))
+            reserve_service_activation(home, "launchd")
+        try:
+            launchd_bootstrap(home)
+            launchd_command("kickstart", "-k", launchd_target())
+            wait_for_launchd_runtime_ready(home)
+            with FileLock(lifecycle_lock(home)):
+                require_launchd_owner(home)
                 verify_transport_marker(home, True)
-            except (TelegramError, OSError, ValueError):
-                launchd_stop_owned(home)
-                launchd_bootout_owned(home, tolerate_missing=True)
+        except (TelegramError, OSError, ValueError):
+            launchd_stop_owned(home)
+            launchd_bootout_owned(home, tolerate_missing=True)
+            with FileLock(lifecycle_lock(home)):
                 durable_unlink(service_activation_path(home))
                 set_telegram_enabled(home, False)
-                raise
+            raise
     print("Telegram service installed and active.")
     return 0
 
@@ -3611,23 +3632,23 @@ def start_macos(home: Path) -> int:
                 raise TelegramError("Telegram LaunchAgent is not installed for this home")
             config = load_config(home)
             verified_token_for(home, config)
-            if launchd_unit_loaded(home):
-                launchd_enable(home)
-            else:
-                launchd_enable(home)
+            loaded = launchd_unit_loaded(home)
+            launchd_enable(home)
+            reserve_service_activation(home, "launchd")
+        try:
+            if not loaded:
                 launchd_bootstrap(home)
-            prepare_transport_activation(home)
-            atomic_bytes(service_activation_path(home), b"launchd\n")
-            try:
-                launchd_command("kickstart", "-k", launchd_target())
-                wait_for_launchd_active(home)
-                durable_unlink(service_activation_path(home))
+            launchd_command("kickstart", "-k", launchd_target())
+            wait_for_launchd_runtime_ready(home)
+            with FileLock(lifecycle_lock(home)):
+                require_launchd_owner(home)
                 verify_transport_marker(home, True)
-            except (TelegramError, OSError, ValueError):
-                launchd_stop_owned(home)
+        except (TelegramError, OSError, ValueError):
+            launchd_stop_owned(home)
+            with FileLock(lifecycle_lock(home)):
                 durable_unlink(service_activation_path(home))
                 set_telegram_enabled(home, False)
-                raise
+            raise
     print("Telegram service active.")
     return 0
 
@@ -3738,8 +3759,7 @@ def install(home: Path) -> int:
                                and enabled_result.stdout.strip() == "enabled")
                 systemctl("enable", SERVICE_NAME)
                 enabled_by_install = not was_enabled
-                prepare_transport_activation(home)
-                atomic_bytes(service_activation_path(home), b"systemd\n")
+                reserve_service_activation(home, "systemd")
                 activation_reserved = True
             systemctl("start", SERVICE_NAME)
             wait_for_systemd_runtime_ready(home)
@@ -3767,8 +3787,7 @@ def start_service(home: Path) -> int:
                 config = load_config(home)
                 verified_token_for(home, config)
                 require_unit_owner(home)
-                prepare_transport_activation(home)
-                atomic_bytes(service_activation_path(home), b"systemd\n")
+                reserve_service_activation(home, "systemd")
                 activation_reserved = True
             systemctl("start", SERVICE_NAME)
             wait_for_systemd_runtime_ready(home)
