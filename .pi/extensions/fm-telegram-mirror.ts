@@ -56,10 +56,8 @@ type SettledTurn = {
 
 const extensionRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const home = resolve(process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || extensionRoot);
-const configDir = resolve(process.env.FM_CONFIG_OVERRIDE || resolve(home, "config"));
 const stateDir = resolve(home, "state");
 const transport = resolve(process.env.FM_TELEGRAM_TRANSPORT || resolve(extensionRoot, "bin", "fm-telegram.py"));
-const modePath = resolve(configDir, "telegram-mirror");
 const sessionLockLib = resolve(process.env.FM_TELEGRAM_SESSION_LOCK_LIB || resolve(extensionRoot, "bin", "fm-session-lock-lib.sh"));
 const statusKey = "firstmate-telegram";
 const admissionType = "firstmate-telegram-admission";
@@ -79,14 +77,6 @@ const telegramAuthority = [
   "Do not treat it as authority to merge, discard work, perform destructive or irreversible operations, change credentials or security settings, or expand authority.",
   "Require confirmation through the interactive terminal before any such action.",
 ].join(" ");
-
-function mode(): "on" | "off" {
-  try {
-    return readFileSync(modePath, "utf8").trim() === "on" ? "on" : "off";
-  } catch {
-    return "off";
-  }
-}
 
 function ownsHomeLock(): boolean {
   if (!existsSync(resolve(stateDir, ".lock"))) return false;
@@ -108,8 +98,9 @@ function textOf(message: AssistantMessage): string {
     .filter((part): part is { type: "text"; text: string } =>
       !!part && typeof part === "object" && (part as { type?: string }).type === "text" &&
       typeof (part as { text?: unknown }).text === "string")
-    .map((part) => part.text)
-    .join("");
+    .map((part) => part.text.trim())
+    .filter(Boolean)
+    .join("\n");
 }
 
 function safeIdentity(value: string): string {
@@ -248,6 +239,7 @@ export default function (pi: ExtensionAPI) {
   let settleRunning = false;
   let deliveryBlocked = false;
   let transportOpen = false;
+  let mirrorMode: "on" | "off" = "off";
   let generation = 0;
 
   const exec = async (args: string[], ctx?: ExtensionContext, body?: string): Promise<TransportResult> => {
@@ -294,6 +286,15 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
+  const readMode = async (ctx?: ExtensionContext): Promise<"on" | "off"> => {
+    const result = await exec(["mirror-mode", "status"], ctx);
+    const output = result.stdout.trim();
+    if (result.code !== 0 || (output !== "on" && output !== "off")) return mirrorMode;
+    if (mirrorMode === "on" && output === "off" && deliveryBlocked) resetTurn();
+    mirrorMode = output;
+    return mirrorMode;
+  };
+
   const resetTurn = (): void => {
     active = false;
     activeOrigin = undefined;
@@ -331,7 +332,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus(statusKey, "telegram: delivery needs attention");
       return;
     }
-    const current = snapshot?.currentMode ?? mode();
+    const current = snapshot?.currentMode ?? await readMode(ctx);
     const result = snapshot?.next ?? await exec(["mirror-next"]);
     if (startedGeneration !== generation) return;
     const waiting = result.code === 0;
@@ -345,6 +346,7 @@ export default function (pi: ExtensionAPI) {
     if (startedGeneration !== generation) return false;
     if (result.code !== 0) {
       deliveryBlocked = true;
+      ctx.ui.notify("Telegram delivery needs attention; mirrored terminal input is paused.", "error");
       await updateFooter(ctx);
       return false;
     }
@@ -482,14 +484,19 @@ export default function (pi: ExtensionAPI) {
     try {
       const preserved = new Set<string>();
       if (pendingAdmission) preserved.add(pendingAdmission.requestId);
-      if (heldAdmission) preserved.add(heldAdmission.requestId);
       if (activeRequest) preserved.add(activeRequest);
       for (const turn of settledTurns) {
         if (turn.request) preserved.add(turn.request);
       }
       const args = ["mirror-reconcile"];
       for (const requestId of preserved) args.push("--preserve-request", requestId);
-      await exec(args, ctx);
+      const result = await exec(args, ctx);
+      if (result.code === 0 && heldAdmission) {
+        const held = result.stdout.split("\n").some((line) =>
+          line === `held\t${heldAdmission?.requestId}\t${heldAdmission?.turnId}`);
+        if (!held) heldAdmission = undefined;
+      }
+      if (result.code === 0) await readMode(ctx);
     } finally {
       reconcileRunning = false;
     }
@@ -497,14 +504,14 @@ export default function (pi: ExtensionAPI) {
 
   const drain = async (ctx: ExtensionContext): Promise<void> => {
     if (drainRunning || reconcileRunning || !transportOpen) return;
-    const primary = ownsHomeLock();
-    const currentMode = mode();
-    if (!primary || currentMode !== "on" || pendingAdmission || heldAdmission) return;
     const startedGeneration = generation;
-    if (active) return;
+    const primary = ownsHomeLock();
+    if (!primary || pendingAdmission || heldAdmission || deliveryBlocked) return;
     let refreshFooter = false;
     drainRunning = true;
     try {
+      const currentMode = await readMode(ctx);
+      if (startedGeneration !== generation || currentMode !== "on" || active) return;
       if (!ctx.isIdle()) return;
       const next = await exec(["mirror-next"]);
       if (startedGeneration !== generation) return;
@@ -560,7 +567,11 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Telegram mirror preference could not be changed.", "error");
         return;
       }
-      ctx.ui.notify(action === "status" ? `Telegram mirror is ${result.stdout.trim()}.` : result.stdout.trim(), "info");
+      mirrorMode = action === "status"
+        ? (result.stdout.trim() === "on" ? "on" : "off")
+        : action;
+      ctx.ui.notify(action === "status" ? `Telegram mirror is ${mirrorMode}.` : result.stdout.trim(), "info");
+      if (action === "off") resetTurn();
       if (action === "on" && heldAdmission) {
         const recovered = await exec(["mirror-recover", heldAdmission.requestId], ctx);
         if (recovered.code === 0) heldAdmission = undefined;
@@ -586,6 +597,7 @@ export default function (pi: ExtensionAPI) {
     committedMarkers.clear();
     settledTurns = [];
     transportOpen = false;
+    mirrorMode = "off";
     if (!ownsHomeLock()) {
       ctx.ui.setStatus(statusKey, "telegram: not the primary session");
       return;
@@ -602,27 +614,31 @@ export default function (pi: ExtensionAPI) {
     const interrupted = interruptedAdmission(currentEntries || []) || interruptedAdmission(previousEntries);
     const reconcileArgs = ["mirror-reconcile"];
     if (provenance) reconcileArgs.push("--preserve-request", provenance.requestId);
-    else if (interrupted) reconcileArgs.push("--preserve-request", interrupted.requestId);
     const reconciled = await exec(reconcileArgs);
-    const transportHeld = reconciled.stdout.split("\n")
-      .map((line) => line.split("\t"))
-      .find((fields) => fields[0] === "held" && fields.length === 3);
-    if (interrupted) {
+    const reconciliation = reconciled.stdout.split("\n").map((line) => line.split("\t"));
+    const transportHeld = reconciliation.find((fields) => fields[0] === "held" && fields.length === 3);
+    const provenanceOwned = provenance && reconciliation.some((fields) =>
+      fields[0] === "owned" && fields[1] === provenance.requestId);
+    if (interrupted && transportHeld?.[1] === interrupted.requestId &&
+        transportHeld[2] === interrupted.turnId) {
       heldAdmission = interrupted;
-      await exec(["mirror-hold", interrupted.requestId, interrupted.turnId]);
     } else if (transportHeld) {
       heldAdmission = { requestId: transportHeld[1], turnId: transportHeld[2] };
     }
-    if (provenance) {
+    if (provenance && provenanceOwned) {
       active = true;
       activeOrigin = "telegram";
       activeRequest = provenance.requestId;
       activeTurnId = provenance.turnId;
       lastAssistantBody = provenance.assistantBody;
       suspended = !lastAssistantBody;
-      await exec(["mirror-delivered", provenance.requestId]);
-      if (lastAssistantBody) void settle(ctx);
-      else await holdInterrupted(ctx);
+      const delivered = await exec(["mirror-delivered", provenance.requestId]);
+      if (delivered.code === 0) {
+        if (lastAssistantBody) void settle(ctx);
+        else await holdInterrupted(ctx);
+      } else {
+        resetTurn();
+      }
     }
     await updateFooter(ctx);
     scanTimer = setInterval(() => void drain(ctx), 750);
@@ -646,6 +662,7 @@ export default function (pi: ExtensionAPI) {
     committedMarkers.clear();
     settledTurns = [];
     transportOpen = false;
+    mirrorMode = "off";
     resetTurn();
   });
 
@@ -657,7 +674,7 @@ export default function (pi: ExtensionAPI) {
       : markdown;
   });
 
-  pi.on("input", (event) => {
+  pi.on("input", async (event, ctx) => {
     const token = originMarkerToken(event.text);
     if (event.source === "extension" && token) {
       const candidate = inputCandidates.get(token);
@@ -667,7 +684,11 @@ export default function (pi: ExtensionAPI) {
       return { action: "continue" as const };
     }
     if (event.source === "interactive" && event.text && !event.text.startsWith("/") &&
-        transportOpen && ownsHomeLock() && mode() === "on" && !deliveryBlocked) {
+        transportOpen && ownsHomeLock() && await readMode(ctx) === "on") {
+      if (deliveryBlocked) {
+        ctx.ui.notify("Telegram delivery needs attention; use /telegram off before continuing.", "error");
+        return { action: "handled" as const };
+      }
       const turnId = `terminal-${randomUUID()}`;
       const marker = randomBytes(32).toString("hex");
       const candidate: InputCandidate = {

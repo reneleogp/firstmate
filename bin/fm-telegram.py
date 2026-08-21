@@ -905,15 +905,13 @@ def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> bool
 
 
 def _bounded_cleanup_locked(home: Path, preserve_requests: Iterable[str] = ()) -> None:
-    preserved = set(preserve_requests)
+    del preserve_requests
     inbox, handled = request_dirs(home)
     cleanup_atomic_temps_locked(home)
     cutoff = now() - INBOX_TTL
     inbox_files = sorted(inbox.glob("*.json"), key=request_order_key, reverse=True)
     queued_index = 0
     for path in inbox_files:
-        if path.stem in preserved:
-            continue
         record = read_json(path, {})
         if isinstance(record, dict) and record.get("status") == "claimed":
             owner_pid = record.get("claim_owner_pid")
@@ -1143,7 +1141,9 @@ def reconcile_requests(home: Path) -> None:
 
 
 def mirror_mode_path(home: Path) -> Path:
-    return home / "config" / MIRROR_MODE_NAME
+    override = os.environ.get("FM_CONFIG_OVERRIDE")
+    config_root = Path(override).expanduser().resolve() if override else home / "config"
+    return config_root / MIRROR_MODE_NAME
 
 
 def mirror_mode_enabled(home: Path) -> bool:
@@ -1345,6 +1345,7 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
             return die("Telegram mirror owner is not the invoking extension")
     preserved = {request_id for request_id in preserve_requests if safe_id(request_id)}
     held_records: List[Tuple[str, str]] = []
+    owned_records: List[str] = []
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
         if not marker.is_file():
@@ -1397,6 +1398,7 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
                 record["status"] = "claimed"
                 bind_claim_owner(record, replacing_owner_pid, replacement_identity)
                 atomic_json(path, record)
+                owned_records.append(path.stem)
             elif status == "claimed" and (
                     not owner_alive
                     or (owner == replacing_owner_pid and owner_identity == replacement_identity)):
@@ -1404,6 +1406,8 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
                 clear_claim_owner(record)
                 atomic_json(path, record)
     if report_held:
+        for request_id in owned_records:
+            print(f"owned\t{request_id}")
         for request_id, turn_id in held_records[:1]:
             print(f"held\t{request_id}\t{turn_id}")
     return 0

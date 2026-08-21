@@ -200,8 +200,18 @@ expired_path.write_text(json.dumps({
     'created_at': 1, 'admission_sequence': 899, 'status': 'queued',
     'receipt_text': 'queued', 'receipt_status': 'pending',
 }))
-assert run('mirror-reconcile').returncode == 0
+expired_held_id = 'tg-text-u898-m898'
+expired_held_path = Path(inbox, expired_held_id + '.json')
+expired_held_path.write_text(json.dumps({
+    'request_id': expired_held_id, 'origin': 'telegram', 'text': 'expired held request',
+    'chat_id': 77, 'message_id': 898, 'update_id': 898,
+    'created_at': 1, 'admission_sequence': 898, 'status': 'held',
+    'held_turn_id': 'expired-held-turn', 'held_at': 1,
+    'receipt_text': 'queued', 'receipt_status': 'pending',
+}))
+assert run('mirror-reconcile', '--preserve-request', expired_held_id).returncode == 0
 assert not expired_path.exists()
+assert not expired_held_path.exists()
 Path(home, 'state', '.wake-queue').write_text(
     '2\t2\tcheck\ttelegram:late-legacy\ttelegram late-legacy\n')
 assert run('mirror-next').returncode == 0
@@ -228,6 +238,8 @@ finally:
     stale_owner.terminate(); stale_owner.wait()
 stale_path.unlink()
 assert run('mirror-claim', request).returncode == 0
+owned = run('mirror-reconcile', '--preserve-request', request)
+assert owned.returncode == 0 and f'owned\t{request}' in owned.stdout
 for index in range(260):
     queued_id = f'tg-text-u{1000 + index}-m{1000 + index}'
     Path(inbox, queued_id + '.json').write_text(json.dumps({

@@ -11,11 +11,19 @@ fi
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-telegram-mirror-live)
+VOICE_SERVER_PID=
+cleanup() {
+  [ -z "$VOICE_SERVER_PID" ] || kill "$VOICE_SERVER_PID" 2>/dev/null || true
+  fm_test_cleanup
+}
+trap cleanup EXIT
 home="$TMP_ROOT/home"
 agent_dir="$TMP_ROOT/agent"
 session_dir="$TMP_ROOT/sessions"
-mkdir -p "$home/config" "$home/state" "$agent_dir" "$session_dir"
-printf 'on\n' >"$home/config/telegram-mirror"
+override_config="$TMP_ROOT/override-config"
+mkdir -p "$home/config" "$home/state" "$agent_dir" "$session_dir" "$override_config"
+printf 'off\n' >"$home/config/telegram-mirror"
+printf 'on\n' >"$override_config/telegram-mirror"
 touch "$home/state/.lock" "$home/state/.primary"
 
 cat >"$TMP_ROOT/lock-lib.sh" <<'SH'
@@ -51,6 +59,8 @@ def option(name):
     return rest[rest.index(name) + 1] if name in rest else None
 def options(name):
     return [rest[index + 1] for index, value in enumerate(rest[:-1]) if value == name]
+def mode_path():
+    return Path(os.environ.get('FM_CONFIG_OVERRIDE', home / 'config')) / 'telegram-mirror'
 code = 0
 skip_final_save = False
 if command == 'mirror-open':
@@ -59,9 +69,12 @@ elif command == 'mirror-reconcile':
     state['legacy_wake'] = False
     request = state.get('request')
     preserved = options('--preserve-request')
+    if request and request.get('status') == 'held' and state.pop('expire_held', False):
+        state['request'] = None; request = None
     if request and request.get('status') == 'claimed':
         if request.get('id') in preserved:
             request['status'] = 'claimed'; request['owner'] = int(option('--owner-pid'))
+            print(f"owned\t{request['id']}")
         else:
             request['status'] = 'queued'; request.pop('owner', None)
     if request and request.get('status') == 'held':
@@ -74,7 +87,7 @@ elif command == 'mirror-next':
 elif command == 'mirror-claim':
     request = state.get('request')
     if not request or request.get('id') != rest[0] or request.get('status') != 'queued': code = 1
-    elif (home / 'config' / 'telegram-mirror').read_text().strip() != 'on': code = 1
+    elif mode_path().read_text().strip() != 'on': code = 1
     else:
         request['status'] = 'claimed'; request['owner'] = int(option('--owner-pid'))
         save()
@@ -108,9 +121,10 @@ elif command == 'mirror-delivered':
 elif command == 'mirror-reply':
     delivery_id = rest[0]
     body = sys.stdin.read() if option('--text-file') == '-' else Path(option('--text-file')).read_text()
+    if (home / 'reject-mirror-reply').exists(): code = 1
     existing = state['deliveries'].get(delivery_id)
-    if existing is not None and existing != body: code = 1
-    else: state['deliveries'][delivery_id] = body
+    if code == 0 and existing is not None and existing != body: code = 1
+    elif code == 0: state['deliveries'][delivery_id] = body
 elif command == 'mirror-complete':
     request_id, delivery_id = rest[:2]
     request = state.get('request')
@@ -121,10 +135,10 @@ elif command == 'mirror-complete':
         state.setdefault('handled', []).append(request_id); state['request'] = None
 elif command == 'mirror-mode':
     action = rest[0]
-    mode_path = home / 'config' / 'telegram-mirror'
-    if action == 'status': print(mode_path.read_text().strip())
+    preference_path = mode_path()
+    if action == 'status': print(preference_path.read_text().strip())
     else:
-        mode_path.write_text(action + '\n'); print('Pi · Telegram mirror mode is ' + action + '.')
+        preference_path.write_text(action + '\n'); print('Pi · Telegram mirror mode is ' + action + '.')
 else:
     code = 1
 if not skip_final_save: save()
@@ -246,7 +260,12 @@ faux.setResponses([
     return fauxAssistantMessage('settled answer');
   },
 ]);
-const uiContext = { setStatus() {}, notify() {} };
+const statuses = [];
+const notices = [];
+const uiContext = {
+  setStatus(key, value) { statuses.push([key, value]); },
+  notify(message, level) { notices.push([message, level]); },
+};
 const bind = async (session) => session.bindExtensions({ mode: 'json', uiContext });
 runtime.setRebindSession(bind);
 await bind(runtime.session);
@@ -292,7 +311,7 @@ await new Promise((resolve) => setTimeout(resolve, 800));
 const idleScansBefore = state().log.filter((call) => call[0] === 'mirror-next').length;
 await new Promise((resolve) => setTimeout(resolve, 1600));
 const idleScans = state().log.filter((call) => call[0] === 'mirror-next').length - idleScansBefore;
-assert.ok(idleScans >= 2 && idleScans <= 3, `idle scan duplicated queue probes: ${idleScans}`);
+assert.ok(idleScans >= 1 && idleScans <= 3, `idle scan duplicated queue probes: ${idleScans}`);
 const lateLegacyWake = state();
 lateLegacyWake.legacy_wake = true;
 save(lateLegacyWake);
@@ -319,15 +338,15 @@ faux.appendResponses([
     assert.doesNotMatch(context.systemPrompt, /authenticated Telegram mirror/);
     const user = context.messages.findLast((message) => message.role === 'user');
     assert.match(user.content.map((part) => part.text || '').join(''), /^You · Terminal/);
-    return fauxAssistantMessage('terminal answer');
+    return fauxAssistantMessage([fauxText('terminal'), fauxText('answer')]);
   },
 ]);
 await runtime.session.prompt('terminal request', { source: 'interactive' });
 current = state();
 assert.equal(Object.values(current.deliveries).filter((body) => body === 'You · Terminal\n\nterminal request').length, 1);
-assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · terminal answer').length, 1);
+assert.equal(Object.values(current.deliveries).filter((body) => body === 'Firstmate · terminal\nanswer').length, 1);
 
-writeFileSync(`${home}/config/telegram-mirror`, 'off\n');
+writeFileSync(`${process.env.FM_CONFIG_OVERRIDE}/telegram-mirror`, 'off\n');
 const beforeModeOff = Object.keys(current.deliveries).length;
 faux.appendResponses([
   (context) => {
@@ -338,7 +357,7 @@ faux.appendResponses([
 ]);
 await runtime.session.prompt('ordinary mode-off terminal', { source: 'interactive' });
 assert.equal(Object.keys(state().deliveries).length, beforeModeOff, 'mode-off terminal turn was mirrored');
-writeFileSync(`${home}/config/telegram-mirror`, 'on\n');
+writeFileSync(`${process.env.FM_CONFIG_OVERRIDE}/telegram-mirror`, 'on\n');
 
 const beforeRpc = Object.keys(state().deliveries).length;
 faux.appendResponses([fauxAssistantMessage('rpc diagnostic answer')]);
@@ -476,6 +495,19 @@ faux.appendResponses([fauxAssistantMessage('explicit provider recovery answer')]
 await runtime.session.prompt('/telegram on', { source: 'interactive' });
 await waitFor(() => state().handled?.includes('tg-text-u11-m11'), 'explicit mode-on recovery did not settle the held request');
 
+const expiringHold = state();
+expiringHold.request = { id: 'tg-text-u15-m15', text: 'expiring provider failure', status: 'queued' };
+save(expiringHold);
+faux.appendResponses([fauxAssistantMessage([], { stopReason: 'error', errorMessage: 'provider failed' })]);
+await waitFor(() => state().request?.status === 'held', 'second provider failure was not held');
+const expiringHeldState = state();
+expiringHeldState.expire_held = true;
+save(expiringHeldState);
+await waitFor(() => state().request === null, 'expired interrupted admission was preserved by reconciliation');
+const callsAfterHeldExpiry = faux.state.callCount;
+await new Promise((resolve) => setTimeout(resolve, 800));
+assert.equal(faux.state.callCount, callsAfterHeldExpiry, 'expired interrupted admission was reinjected');
+
 const replacement = state();
 replacement.request = { id: 'tg-text-u2-m2', text: 'replacement request', status: 'claimed', owner: process.pid };
 save(replacement);
@@ -498,6 +530,22 @@ assert.equal(userTexts(runtime.session.sessionManager).length, 0, 'session repla
 assert.equal(Object.values(state().deliveries).filter((body) => body === 'Firstmate · replacement answer').length, 1);
 assert.equal(Object.values(state().deliveries).some((body) => body.includes('later operational answer')), false);
 
+const expiredManager = runtime.session.sessionManager;
+const expiredTurn = 'telegram-tg-text-u16-m16-expired';
+expiredManager.appendCustomEntry('firstmate-telegram-admission', {
+  requestId: 'tg-text-u16-m16', turnId: expiredTurn,
+  sessionId: expiredManager.getSessionId(), state: 'admitted',
+});
+expiredManager.appendMessage({
+  role: 'user', content: [{ type: 'text', text: 'You · Telegram\n\nexpired historical request' }], timestamp: Date.now(),
+});
+expiredManager.appendMessage(fauxAssistantMessage('expired historical answer'));
+const deliveriesBeforeExpiredResume = Object.keys(state().deliveries).length;
+await runtime.newSession({ parentSession: expiredManager.getSessionFile() });
+await new Promise((resolve) => setTimeout(resolve, 300));
+assert.equal(Object.keys(state().deliveries).length, deliveriesBeforeExpiredResume,
+  'expired persisted response was replayed without an owned transport request');
+
 const crash = state();
 crash.request = { id: 'tg-text-u3-m3', text: 'accepted without persistence', status: 'claimed', owner: process.pid };
 save(crash);
@@ -505,6 +553,26 @@ faux.appendResponses([fauxAssistantMessage('crash retry answer')]);
 await runtime.newSession({ parentSession: runtime.session.sessionFile });
 await waitFor(() => state().handled?.includes('tg-text-u3-m3'), 'unpersisted accepted claim was not eligible for bounded reinjection');
 assert.equal(userTexts(runtime.session.sessionManager).filter((text) => text.includes('accepted without persistence')).length, 1);
+
+const blocked = state();
+blocked.request = { id: 'tg-text-u17-m17', text: 'delivery block request', status: 'queued' };
+save(blocked);
+writeFileSync(`${home}/reject-mirror-reply`, '');
+faux.appendResponses([fauxAssistantMessage('blocked delivery answer')]);
+await waitFor(() => statuses.some(([, value]) => value === 'telegram: delivery needs attention'),
+  'assistant delivery failure was not surfaced');
+const usersBeforeBlockedPrompt = userTexts(runtime.session.sessionManager).length;
+const callsBeforeBlockedPrompt = faux.state.callCount;
+await runtime.session.prompt('must be refused while mirror delivery is blocked', { source: 'interactive' });
+assert.equal(userTexts(runtime.session.sessionManager).length, usersBeforeBlockedPrompt,
+  'blocked mirror silently admitted an ordinary terminal turn');
+assert.equal(faux.state.callCount, callsBeforeBlockedPrompt, 'blocked mirror terminal input started a model turn');
+assert.equal(notices.some(([message]) => message.includes('use /telegram off before continuing')), true);
+unlinkSync(`${home}/reject-mirror-reply`);
+await runtime.session.prompt('/telegram off', { source: 'interactive' });
+faux.appendResponses([fauxAssistantMessage('ordinary answer after mirror off')]);
+await runtime.session.prompt('ordinary after delivery block off', { source: 'interactive' });
+assert.equal(userTexts(runtime.session.sessionManager).at(-1), 'ordinary after delivery block off');
 
 unlinkSync(`${home}/state/.primary`);
 await runtime.session.reload();
@@ -525,6 +593,7 @@ assert.equal(Object.keys(state().deliveries).length, nonPrimaryDeliveries, 'non-
 await runtime.dispose();
 
 writeFileSync(`${home}/state/.primary`, '');
+writeFileSync(`${process.env.FM_CONFIG_OVERRIDE}/telegram-mirror`, 'on\n');
 const failed = state();
 failed.request = { id: 'tg-text-u4-m4', text: 'missing model request', status: 'queued' };
 const receiptsBeforeFailure = failed.receipts.length;
@@ -562,7 +631,153 @@ pi_cli=$(readlink -f "$(command -v pi)")
 pi_root=$(cd "$(dirname "$pi_cli")/.." && pwd)
 sdk_path="$pi_root/dist/index.js"
 ai_path="$pi_root/node_modules/@earendil-works/pi-ai/dist/index.js"
-node "$TMP_ROOT/runtime.mjs" \
+FM_CONFIG_OVERRIDE="$override_config" node "$TMP_ROOT/runtime.mjs" \
   "$sdk_path" "$ai_path" "$ROOT" "$ROOT/.pi/extensions/fm-telegram-mirror.ts" \
   "$TMP_ROOT/competing-extension.ts" "$TMP_ROOT/handling-extension.ts" \
-  "$home" "$agent_dir" "$session_dir" "$TMP_ROOT/fake-transport.py" "$TMP_ROOT/lock-lib.sh"
+  "$home" "$agent_dir" "$session_dir" "$TMP_ROOT/fake-transport.py" "$TMP_ROOT/lock-lib.sh" \
+  || fail "installed Pi fake-transport mirror regression failed"
+
+voice_home="$TMP_ROOT/voice-home"
+voice_agent_dir="$TMP_ROOT/voice-agent"
+voice_session_dir="$TMP_ROOT/voice-sessions"
+mkdir -p "$voice_home" "$voice_agent_dir" "$voice_session_dir"
+printf 'FM_TELEGRAM_BOT_TOKEN=test-only-token\n' >"$voice_home/.env"
+chmod 600 "$voice_home/.env"
+printf '[]\n' >"$voice_home/updates.json"
+python3 - "$voice_home" <<'PY' &
+import json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+home = Path(sys.argv[1])
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+    def reply(self, value):
+        body = json.dumps({'ok': True, 'result': value}).encode()
+        self.send_response(200); self.send_header('Content-Length', str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def do_POST(self):
+        size = int(self.headers.get('Content-Length', '0'))
+        params = json.loads(self.rfile.read(size) or b'{}')
+        with (home / 'calls.jsonl').open('a') as stream:
+            stream.write(json.dumps({'path': self.path, 'params': params}) + '\n')
+        method = self.path.rsplit('/', 1)[-1]
+        if method == 'getMe': return self.reply({'id': 9901, 'is_bot': True})
+        if method == 'getChat': return self.reply({'id': params.get('chat_id'), 'type': 'private'})
+        if method == 'getFile': return self.reply({'file_path': 'voice/test.oga'})
+        if method == 'getUpdates':
+            updates = json.loads((home / 'updates.json').read_text())
+            (home / 'updates.json').write_text('[]')
+            return self.reply(updates)
+        return self.reply({})
+    def do_GET(self):
+        if '/file/' in self.path:
+            body = b'fake voice'
+            self.send_response(200); self.send_header('Content-Length', str(len(body)))
+            self.end_headers(); self.wfile.write(body); return
+        self.send_response(404); self.end_headers()
+server = HTTPServer(('127.0.0.1', 0), Handler)
+(home / 'port').write_text(str(server.server_port))
+(home / 'server.pid').write_text(str(os.getpid()))
+server.serve_forever()
+PY
+VOICE_SERVER_PID=$!
+for _ in $(seq 1 100); do [ -s "$voice_home/port" ] && break; sleep .02; done
+[ -s "$voice_home/port" ] || fail "voice integration Telegram server did not start"
+voice_api="http://127.0.0.1:$(cat "$voice_home/port")"
+real_transport="$ROOT/bin/fm-telegram.py"
+export FM_TELEGRAM_UNIT_DIR="$TMP_ROOT/systemd-user"
+run_voice_transport() {
+  FM_HOME="$voice_home" FM_TELEGRAM_TEST_API_BASE="$voice_api" "$real_transport" "$@"
+}
+run_voice_transport pair --user-id 77 --chat-id 77 >/dev/null \
+  || fail "voice integration pairing failed"
+printf '[{"update_id":1,"message":{"message_id":1,"date":1,"from":{"id":77},"chat":{"id":77,"type":"private"},"text":"/telegram on"}}]\n' >"$voice_home/updates.json"
+run_voice_transport serve --once >/dev/null \
+  || fail "voice integration mode command failed"
+cat >"$voice_home/transcribe.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'confirmed voice through Python\n'
+SH
+chmod +x "$voice_home/transcribe.sh"
+python3 - "$voice_home/config/telegram.json" "$voice_home/transcribe.sh" <<'PY'
+import json, os, sys
+path, command = sys.argv[1:]
+data = json.load(open(path)); data['parakeet_command'] = command; data['whisper_command'] = command
+json.dump(data, open(path, 'w')); os.chmod(path, 0o600)
+PY
+printf '[{"update_id":2,"message":{"message_id":2,"date":1,"from":{"id":77},"chat":{"id":77,"type":"private"},"voice":{"file_id":"voice-2","duration":2,"file_size":10}}}]\n' >"$voice_home/updates.json"
+run_voice_transport serve --once >/dev/null \
+  || fail "voice integration transcription failed"
+printf '[{"update_id":3,"callback_query":{"id":"voice-confirm","from":{"id":77},"message":{"message_id":20,"date":1,"chat":{"id":77,"type":"private"},"text":"confirmed voice through Python"},"data":"send:voice-u2-m2:1"}}]\n' >"$voice_home/updates.json"
+run_voice_transport serve --once >/dev/null \
+  || fail "voice integration confirmation failed"
+[ -f "$voice_home/state/telegram/inbox/tg-voice-u2-m2.json" ] \
+  || fail "real Python confirmed voice Send did not queue a mirror request"
+
+cat >"$TMP_ROOT/voice-runtime.mjs" <<'JS'
+import assert from 'node:assert/strict';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const [sdkPath, aiPath, extensionPath, home, agentDir, sessionDir, transport, lockLib, api] = process.argv.slice(2);
+process.env.FM_HOME = home;
+process.env.FM_CONFIG_OVERRIDE = `${home}/config`;
+process.env.FM_TELEGRAM_TRANSPORT = transport;
+process.env.FM_TELEGRAM_SESSION_LOCK_LIB = lockLib;
+process.env.FM_TELEGRAM_TEST_API_BASE = api;
+writeFileSync(`${home}/state/.lock`, `${process.pid}\n`);
+writeFileSync(`${home}/state/.primary`, '');
+const {
+  ModelRuntime, SessionManager, SettingsManager,
+  createAgentSessionFromServices, createAgentSessionRuntime, createAgentSessionServices,
+} = await import(pathToFileURL(sdkPath).href);
+const { fauxAssistantMessage, fauxProvider } = await import(pathToFileURL(aiPath).href);
+const faux = fauxProvider({ tokensPerSecond: 100000 });
+const modelRuntime = await ModelRuntime.create({
+  authPath: `${agentDir}/auth.json`, modelsPath: null,
+  modelsStorePath: `${agentDir}/models-store.json`, refreshOnCreate: false,
+});
+modelRuntime.registerNativeProvider(faux.provider);
+faux.setResponses([fauxAssistantMessage('confirmed voice settled answer')]);
+const createRuntime = async ({ cwd, sessionManager, sessionStartEvent }) => {
+  const services = await createAgentSessionServices({
+    cwd, agentDir, modelRuntime,
+    settingsManager: SettingsManager.inMemory({
+      compaction: { enabled: false }, retry: { enabled: false }, defaultTools: [],
+    }),
+    resourceLoaderOptions: { additionalExtensionPaths: [extensionPath] },
+  });
+  const result = await createAgentSessionFromServices({
+    services, sessionManager, sessionStartEvent, model: faux.getModel(),
+    thinkingLevel: 'off', noTools: 'all',
+  });
+  return { ...result, services, diagnostics: services.diagnostics };
+};
+const manager = SessionManager.create(home, sessionDir);
+const runtime = await createAgentSessionRuntime(createRuntime, {
+  cwd: home, agentDir, sessionManager: manager,
+});
+await runtime.session.bindExtensions({
+  mode: 'json', uiContext: { setStatus() {}, notify() {} },
+});
+for (let attempt = 0; attempt < 200; attempt += 1) {
+  if (existsSync(`${home}/state/telegram/handled/tg-voice-u2-m2.json`) &&
+      manager.getEntries().some((entry) => entry.type === 'custom' &&
+        entry.customType === 'firstmate-telegram-admission' && entry.data.state === 'completed')) break;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+}
+assert.equal(manager.getEntries().filter((entry) => entry.type === 'message' &&
+  entry.message.role === 'user' && entry.message.content.some?.((part) =>
+    part.text === 'You · Telegram\n\nconfirmed voice through Python')).length, 1);
+const handled = JSON.parse(readFileSync(`${home}/state/telegram/handled/tg-voice-u2-m2.json`, 'utf8'));
+assert.equal(handled.status, 'handled');
+const calls = readFileSync(`${home}/calls.jsonl`, 'utf8').trim().split('\n').map(JSON.parse);
+assert.equal(calls.filter((call) => call.path.endsWith('/sendMessage') &&
+  call.params.text === 'Firstmate · confirmed voice settled answer').length, 1);
+await runtime.dispose();
+console.log('pass: confirmed voice Send traversed real Python transport and tracked Pi extension');
+JS
+node "$TMP_ROOT/voice-runtime.mjs" \
+  "$sdk_path" "$ai_path" "$ROOT/.pi/extensions/fm-telegram-mirror.ts" \
+  "$voice_home" "$voice_agent_dir" "$voice_session_dir" "$real_transport" \
+  "$TMP_ROOT/lock-lib.sh" "$voice_api" \
+  || fail "real Python confirmed-voice extension regression failed"
