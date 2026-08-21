@@ -1819,6 +1819,7 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str,
                 if attempts >= MAX_MIRROR_DELIVERY_ATTEMPTS:
                     record["status"] = "rejected"
                     atomic_json(metadata_path, record)
+                    print("delivery-rejected")
                     return 1
                 chunk["telegram_attempts"] = attempts + 1
                 chunk["telegram_status"] = "sending"
@@ -1844,6 +1845,7 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str,
                 if exc.delivery_unknown:
                     return DELIVERY_UNKNOWN_EXIT
                 if attempts + 1 >= MAX_MIRROR_DELIVERY_ATTEMPTS:
+                    print("delivery-rejected")
                     return 1
                 continue
             with FileLock(state_lock(home)):
@@ -1865,6 +1867,42 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str,
                 record.pop("delivery_owner_pid", None)
                 record.pop("delivery_owner_identity", None)
                 atomic_json(metadata_path, record)
+
+
+def mirror_abandon(home: Path, request_id: str, delivery_id: str, owner_pid: int) -> int:
+    if not mirror_owner_is_child(owner_pid):
+        return die("Telegram mirror owner is not the invoking extension")
+    if not safe_id(request_id) or not safe_id(delivery_id):
+        return die("Telegram abandonment identity is invalid")
+    with FileLock(state_lock(home)):
+        require_state_available_locked(home)
+        inbox, handled = request_dirs(home)
+        source = inbox / f"{request_id}.json"
+        target = handled / source.name
+        if target.is_file() and not target.is_symlink():
+            record = read_json(target)
+            return 0 if isinstance(record, dict) and record.get("request_id") == request_id else 1
+        record = read_json(source)
+        if record is None:
+            return 0
+        if (not isinstance(record, dict) or record.get("request_id") != request_id
+                or record.get("status") != "claimed" or not claim_owned_by(record, owner_pid)):
+            return die("Telegram request is not owned by this extension")
+        record["status"] = "abandoned"
+        record["failure_delivery_id"] = delivery_id
+        record["abandoned_at"] = now()
+        clear_claim_owner(record)
+        atomic_json(source, record)
+        durable_replace(source, target)
+        private_file(target)
+        delivery_path = mirror_delivery_dir(home) / f"{delivery_id}.json"
+        delivery = read_json(delivery_path)
+        if (isinstance(delivery, dict)
+                and delivery.get("completion_request_id") == request_id
+                and delivery.get("status") != "sent"):
+            delivery.pop("completion_request_id", None)
+            atomic_json(delivery_path, delivery)
+    return 0
 
 
 def mirror_complete(home: Path, request_id: str, delivery_id: str, owner_pid: int) -> int:
@@ -3306,7 +3344,7 @@ def cleanup(home: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Private one-home Telegram transport for Firstmate.",
-        epilog=("Commands: pair, serve, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-hold, mirror-recover, mirror-validate, mirror-reserve, mirror-cancel, mirror-reply, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
+        epilog=("Commands: pair, serve, mirror-open, mirror-mode, mirror-next, mirror-claim, mirror-read, mirror-delivered, mirror-release, mirror-hold, mirror-recover, mirror-validate, mirror-reserve, mirror-cancel, mirror-reply, mirror-abandon, mirror-complete, mirror-reconcile, install, start, stop, status, disable, cleanup.\n"
                 "Private mirror commands require the lock-owning extension capability on an inherited file descriptor.\n"
                 "Retention limits: 256 queued or interrupted requests for 7 days, 4096 handled requests, and 256 mirror deliveries of up to 256 KiB.\n"
                 "Receipt delivery makes at most 3 attempts with bounded backoff.\n"
@@ -3386,6 +3424,10 @@ def build_parser() -> argparse.ArgumentParser:
     mirror_reply_parser.add_argument("delivery_id")
     mirror_reply_parser.add_argument("--text-file", required=True)
     mirror_reply_parser.add_argument("--request-id", help=argparse.SUPPRESS)
+    abandon_parser = sub.add_parser("mirror-abandon", help="finish an admitted request whose response cannot be delivered")
+    add_private(abandon_parser)
+    abandon_parser.add_argument("request_id")
+    abandon_parser.add_argument("delivery_id")
     complete_parser = sub.add_parser("mirror-complete", help="complete a request after settled delivery")
     add_private(complete_parser)
     complete_parser.add_argument("request_id")
@@ -3457,6 +3499,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return mirror_reply(
                 home, args.delivery_id, args.owner_pid, args.text_file, args.request_id
             )
+        if args.command == "mirror-abandon":
+            return mirror_abandon(home, args.request_id, args.delivery_id, args.owner_pid)
         if args.command == "mirror-complete":
             return mirror_complete(home, args.request_id, args.delivery_id, args.owner_pid)
         if args.command == "mirror-reconcile":

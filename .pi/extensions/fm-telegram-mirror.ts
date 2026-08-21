@@ -229,9 +229,10 @@ function unresolvedAdmission(entries: SessionEntry[]): {
   requestId: string;
   turnId: string;
   assistantBody: string;
+  carried: boolean;
 } | undefined {
   const unresolved = [...admissionStates(entries).entries()]
-    .filter(([, value]) => value.state === "admitted")
+    .filter(([, value]) => value.state === "admitted" || value.state === "carried")
     .sort((left, right) => right[1].index - left[1].index)[0];
   if (!unresolved) return undefined;
   const [requestId, value] = unresolved;
@@ -249,9 +250,18 @@ function unresolvedAdmission(entries: SessionEntry[]): {
     if (message.role === "custom") break;
     if (message.role !== "assistant" || !["stop", "length"].includes(message.stopReason || "")) continue;
     const body = textOf(message);
-    if (body) return { requestId, turnId: value.turnId, assistantBody: body };
+    if (body) {
+      return {
+        requestId,
+        turnId: value.turnId,
+        assistantBody: body,
+        carried: value.state === "carried",
+      };
+    }
   }
-  return userSeen ? { requestId, turnId: value.turnId, assistantBody: "" } : undefined;
+  return userSeen
+    ? { requestId, turnId: value.turnId, assistantBody: "", carried: value.state === "carried" }
+    : undefined;
 }
 
 function interruptedAdmission(entries: SessionEntry[]): HeldAdmission | undefined {
@@ -356,7 +366,7 @@ export default function (pi: ExtensionAPI) {
     requestId: string,
     turnId: string,
     sessionId: string,
-    state: "admitted" | "completed" | "interrupted",
+    state: "admitted" | "carried" | "completed" | "interrupted" | "abandoned",
   ): void => {
     pi.appendEntry(admissionType, { requestId, turnId, sessionId, state });
   };
@@ -380,6 +390,23 @@ export default function (pi: ExtensionAPI) {
     ...(requestId ? ["--request-id", requestId] : []),
     "--text-file", "-",
   ], ctx, body);
+
+  const abandonRequest = async (
+    requestId: string,
+    turnId: string,
+    deliveryId: string,
+    ctx: ExtensionContext,
+  ): Promise<boolean> => {
+    const result = await exec(["mirror-abandon", requestId, safeIdentity(deliveryId)], ctx);
+    if (result.code !== 0) return false;
+    appendAdmission(
+      requestId,
+      turnId,
+      ctx.sessionManager.getSessionId?.() || "session",
+      "abandoned",
+    );
+    return true;
+  };
 
   const updateFooter = async (ctx: ExtensionContext, snapshot?: FooterSnapshot): Promise<void> => {
     const startedGeneration = generation;
@@ -433,11 +460,34 @@ export default function (pi: ExtensionAPI) {
       turn.terminalDelivery.sent = true;
       knownDeliveryRecords.add(turn.terminalDelivery.deliveryId);
     }
+    const assistantBody = `Firstmate · ${turn.body}`;
+    const validated = await validateDelivery(assistantBody, ctx);
+    if (startedGeneration !== generation) return false;
+    if (validated.code !== 0) {
+      if (turn.request && !await abandonRequest(
+        turn.request,
+        turn.requestTurnId || turn.turnId,
+        deliveryId,
+        ctx,
+      )) return false;
+      ctx.ui.notify("An undeliverable mirror response was abandoned without another model turn.", "error");
+      return true;
+    }
     turn.assistantAttempted = true;
     knownDeliveryRecords.add(deliveryId);
-    const result = await deliver(deliveryId, `Firstmate · ${turn.body}`, ctx, turn.request);
+    const result = await deliver(deliveryId, assistantBody, ctx, turn.request);
     if (startedGeneration !== generation) return false;
     if (result.code === 0) knownDeliveryRecords.add(deliveryId);
+    if (result.code !== 0 && result.stdout.trim() === "delivery-rejected") {
+      if (turn.request && !await abandonRequest(
+        turn.request,
+        turn.requestTurnId || turn.turnId,
+        deliveryId,
+        ctx,
+      )) return false;
+      ctx.ui.notify("A rejected mirror response was abandoned without another model turn.", "error");
+      return true;
+    }
     if (result.code === 0 && turn.request) {
       const completed = await exec(["mirror-complete", turn.request, deliveryId], ctx);
       if (startedGeneration !== generation) return false;
@@ -564,6 +614,14 @@ export default function (pi: ExtensionAPI) {
         attempted: false,
       };
       activeTerminalDelivery = terminalDelivery;
+      if (carriedRequest) {
+        appendAdmission(
+          carriedRequest,
+          segment.turnId,
+          ctx.sessionManager.getSessionId?.() || "session",
+          "carried",
+        );
+      }
       const reserved = await reserve(terminalDelivery.deliveryId, terminalDelivery.body, ctx);
       if (reserved.code === 0) knownDeliveryRecords.add(terminalDelivery.deliveryId);
       if (reserved.code === 0 && !deliveryBlocked && settledTurns.length === 0) {
@@ -604,8 +662,8 @@ export default function (pi: ExtensionAPI) {
     await exec(["mirror-delivered", pending.requestId], ctx);
   };
 
-  const reconcile = async (ctx: ExtensionContext): Promise<void> => {
-    if (reconcileRunning || drainRunning || settleRunning || !transportOpen || !ownsHomeLock()) return;
+  const reconcile = async (ctx: ExtensionContext): Promise<boolean> => {
+    if (reconcileRunning || drainRunning || settleRunning || !transportOpen || !ownsHomeLock()) return false;
     reconcileRunning = true;
     const startedGeneration = generation;
     const reportedHeldAdmission = heldAdmission;
@@ -647,23 +705,51 @@ export default function (pi: ExtensionAPI) {
         }
         if (missing.size > 0) {
           const abandonedDeliveryIds = new Set<string>();
-          const activeExpired = activeOrigin === "terminal" && !activeRequest &&
+          let abandoned = false;
+          const activeExpired = activeOrigin === "terminal" &&
             !!activeTerminalDelivery && missing.has(activeTerminalDelivery.deliveryId);
           if (activeExpired && activeTerminalDelivery) {
-            abandonedDeliveryIds.add(activeTerminalDelivery.deliveryId);
-            resetTurn();
+            const requestId = activeRequest;
+            const requestTurnId = activeRequestTurnId || activeTurnId;
+            const requestAbandoned = !requestId || !requestTurnId || await abandonRequest(
+              requestId,
+              requestTurnId,
+              activeTerminalDelivery.deliveryId,
+              ctx,
+            );
+            if (requestAbandoned) {
+              abandonedDeliveryIds.add(activeTerminalDelivery.deliveryId);
+              resetTurn();
+              abandoned = true;
+            }
           }
-          const retained = settledTurns.filter((turn) => {
-            const terminalExpired = turn.origin === "terminal" && !turn.request &&
-              !!turn.terminalDelivery && missing.has(turn.terminalDelivery.deliveryId);
+          const retained: SettledTurn[] = [];
+          for (const turn of settledTurns) {
+            const terminalExpired = !!turn.terminalDelivery &&
+              missing.has(turn.terminalDelivery.deliveryId);
             const assistantId = safeIdentity(`assistant-${turn.turnId}`);
             const assistantExpired = !!turn.assistantAttempted && missing.has(assistantId);
-            if (!terminalExpired && !assistantExpired) return true;
+            if (!terminalExpired && !assistantExpired) {
+              retained.push(turn);
+              continue;
+            }
+            const failedDeliveryId = terminalExpired && turn.terminalDelivery
+              ? turn.terminalDelivery.deliveryId
+              : assistantId;
+            if (turn.request && !await abandonRequest(
+              turn.request,
+              turn.requestTurnId || turn.turnId,
+              failedDeliveryId,
+              ctx,
+            )) {
+              retained.push(turn);
+              continue;
+            }
             if (turn.terminalDelivery) abandonedDeliveryIds.add(turn.terminalDelivery.deliveryId);
             abandonedDeliveryIds.add(assistantId);
-            return false;
-          });
-          if (activeExpired || retained.length !== settledTurns.length) {
+            abandoned = true;
+          }
+          if (abandoned) {
             settledTurns = retained;
             for (const deliveryId of abandonedDeliveryIds) knownDeliveryRecords.delete(deliveryId);
             deliveryBlocked = false;
@@ -676,6 +762,7 @@ export default function (pi: ExtensionAPI) {
     } finally {
       reconcileRunning = false;
     }
+    return true;
   };
 
   const drain = async (ctx: ExtensionContext): Promise<void> => {
@@ -751,7 +838,10 @@ export default function (pi: ExtensionAPI) {
         const recovered = await exec(["mirror-recover", heldAdmission.requestId], ctx);
         if (recovered.code === 0) heldAdmission = undefined;
       }
-      if (action === "on" && deliveryBlocked) await reconcile(ctx);
+      if (action === "on" && deliveryBlocked && !await reconcile(ctx)) {
+        ctx.ui.notify("Telegram delivery reconciliation is still in progress.", "warning");
+        return;
+      }
       if (action === "on" && deliveryBlocked) deliveryBlocked = false;
       if (action === "on" && !await flushSettledTurns(ctx)) return;
       if (action === "on") await settle(ctx);
@@ -819,8 +909,17 @@ export default function (pi: ExtensionAPI) {
       suspended = !lastAssistantBody;
       const delivered = await exec(["mirror-delivered", provenance.requestId]);
       if (delivered.code === 0) {
-        if (lastAssistantBody) void settle(ctx);
-        else await holdInterrupted(ctx);
+        if (lastAssistantBody) {
+          void settle(ctx);
+        } else if (await abandonRequest(
+          provenance.requestId,
+          provenance.turnId,
+          `assistant-${provenance.turnId}`,
+          ctx,
+        )) {
+          ctx.ui.notify("An interrupted persisted Telegram turn was abandoned without reinjection.", "warning");
+          resetTurn();
+        }
       } else {
         resetTurn();
       }

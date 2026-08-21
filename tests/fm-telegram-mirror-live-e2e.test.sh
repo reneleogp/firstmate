@@ -137,7 +137,9 @@ elif command == 'mirror-validate':
     body = sys.stdin.read() if option('--text-file') == '-' else Path(option('--text-file')).read_text()
     units = sum(2 if ord(character) > 0xffff else 1 for character in body)
     chunks = (units + 4095) // 4096
-    if not body or len(body.encode()) > 256 * 1024 or chunks > 64: code = 1
+    if (not body or len(body.encode()) > 256 * 1024 or chunks > 64
+            or ((home / 'reject-assistant-validation').exists()
+                and body.startswith('Firstmate ·'))): code = 1
 elif command == 'mirror-reserve':
     delivery_id = rest[0]
     body = sys.stdin.read() if option('--text-file') == '-' else Path(option('--text-file')).read_text()
@@ -177,6 +179,16 @@ elif command == 'mirror-reply':
             (home / 'assistant-reply-delayed').touch()
             time.sleep(0.6)
             (home / 'assistant-reply-delayed').unlink(missing_ok=True)
+elif command == 'mirror-abandon':
+    request_id, delivery_id = rest[:2]
+    request = state.get('request')
+    if request and request.get('id') == request_id and request.get('status') == 'claimed':
+        state.setdefault('handled', []).append(request_id)
+        state.setdefault('abandoned', []).append([request_id, delivery_id])
+        state['request'] = None
+        state['completion_requests'].pop(delivery_id, None)
+    elif request is not None:
+        code = 1
 elif command == 'mirror-complete':
     request_id, delivery_id = rest[:2]
     request = state.get('request')
@@ -517,6 +529,27 @@ assert.equal(faux.state.callCount, callsBeforeOversizedTerminal,
   'oversized terminal input started a model turn');
 assert.equal(notices.some(([message]) => message.includes('within its delivery limits')), true);
 
+const oversizedResponse = state();
+oversizedResponse.request = {
+  id: 'tg-text-u22-m22', text: 'request with oversized assistant response', status: 'queued',
+};
+save(oversizedResponse);
+const callsBeforeOversizedResponse = faux.state.callCount;
+writeFileSync(`${home}/reject-assistant-validation`, '');
+faux.appendResponses([fauxAssistantMessage('assistant exceeds the configured transport boundary')]);
+await waitFor(() => state().abandoned?.some(([id]) => id === 'tg-text-u22-m22'),
+  'oversized assistant response did not abandon its admitted request');
+assert.equal(userTexts(initialManager)
+  .filter((text) => text.includes('request with oversized assistant response')).length, 1);
+assert.equal(faux.state.callCount, callsBeforeOversizedResponse + 1,
+  'oversized assistant response reinjected its Telegram request');
+assert.equal(state().log.some((call) => call[0] === 'mirror-reply' &&
+  call[1].startsWith('assistant-telegram-tg-text-u22-m22-')), false,
+  'oversized assistant body reached Telegram delivery');
+assert.equal(notices.some(([message]) =>
+  message === 'An undeliverable mirror response was abandoned without another model turn.'), true);
+unlinkSync(`${home}/reject-assistant-validation`);
+
 faux.appendResponses([fauxAssistantMessage('long preflight answer')]);
 globalThis.__telegramMirrorDelayInteractiveInput = true;
 const callsBeforeLongPreflight = faux.state.callCount;
@@ -840,6 +873,57 @@ assert.equal(faux.state.callCount, callsBeforeSteer + 2,
 assert.equal(initialManager.getEntries().some((entry) =>
   entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
     && entry.data.requestId === 'tg-text-u19-m19' && entry.data.state === 'interrupted'), false);
+assert.equal(initialManager.getEntries().some((entry) =>
+  entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
+    && entry.data.requestId === 'tg-text-u19-m19' && entry.data.state === 'carried'), true);
+
+const expiringSteer = state();
+expiringSteer.request = {
+  id: 'tg-text-u23-m23', text: 'Telegram request with expiring terminal steer', status: 'queued',
+};
+save(expiringSteer);
+writeFileSync(`${home}/reject-user-reply`, '');
+globalThis.__telegramMirrorHoldTool = true;
+globalThis.__telegramMirrorTerminateTool = true;
+globalThis.__telegramMirrorToolStarted = false;
+const callsBeforeExpiringSteer = faux.state.callCount;
+faux.appendResponses([
+  fauxAssistantMessage([
+    fauxToolCall('mirror_test_tool', {}, { id: 'mirror-expiring-steer-tool-call' }),
+  ], { stopReason: 'toolUse' }),
+  fauxAssistantMessage('answer paired with expiring terminal steer'),
+]);
+await waitFor(() => globalThis.__telegramMirrorToolStarted === true,
+  'expiring terminal steer did not reach tool execution');
+const expiringSteerPrompt = runtime.session.prompt('terminal steer whose delivery expires', {
+  source: 'interactive', streamingBehavior: 'steer',
+});
+await new Promise((resolve) => setTimeout(resolve, 50));
+globalThis.__telegramMirrorHoldTool = false;
+await expiringSteerPrompt;
+globalThis.__telegramMirrorTerminateTool = false;
+await waitFor(() => statuses.at(-1)?.[1] === 'telegram: delivery needs attention',
+  'expiring carried terminal delivery did not block settlement');
+const expiringSteerDelivery = [...state().log].reverse().find((call) =>
+  call[0] === 'mirror-reply' && call[1].startsWith('user-terminal-') &&
+  state().delivery_records[call[1]] === 'rejected');
+assert.ok(expiringSteerDelivery, 'expiring carried terminal delivery had no stable identity');
+const expiringSteerId = expiringSteerDelivery[1];
+const expireSteerState = state();
+expireSteerState.expire_deliveries = [expiringSteerId];
+save(expireSteerState);
+await waitFor(() => state().abandoned?.some(([id]) => id === 'tg-text-u23-m23'),
+  'expired carried terminal delivery did not abandon its Telegram request');
+unlinkSync(`${home}/reject-user-reply`);
+const expiringSteerAttempts = state().log.filter((call) =>
+  call[0] === 'mirror-reply' && call[1] === expiringSteerId).length;
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await new Promise((resolve) => setTimeout(resolve, 600));
+assert.equal(state().log.filter((call) =>
+  call[0] === 'mirror-reply' && call[1] === expiringSteerId).length, expiringSteerAttempts,
+  'expired carried terminal delivery replayed history');
+assert.equal(faux.state.callCount, callsBeforeExpiringSteer + 2,
+  'expired carried terminal delivery reinjected its Telegram request');
 
 const competing = state();
 competing.request = { id: 'tg-text-u9-m9', text: 'paired Telegram request', status: 'queued' };
@@ -987,6 +1071,35 @@ await waitFor(() => state().handled?.includes('tg-text-u2-m2'), 'session replace
 assert.equal(userTexts(runtime.session.sessionManager).length, 0, 'session replacement reinjected represented Telegram input');
 assert.equal(Object.values(state().deliveries).filter((body) => body === 'Firstmate · replacement answer').length, 1);
 assert.equal(Object.values(state().deliveries).some((body) => body.includes('later operational answer')), false);
+
+const carriedManager = runtime.session.sessionManager;
+const carriedRequestId = 'tg-text-u24-m24';
+const carriedTurnId = 'terminal-persisted-carried-turn';
+const carriedState = state();
+carriedState.request = {
+  id: carriedRequestId, text: 'persisted Telegram before terminal steer',
+  status: 'claimed', owner: process.pid,
+};
+save(carriedState);
+carriedManager.appendCustomEntry('firstmate-telegram-admission', {
+  requestId: carriedRequestId, turnId: carriedTurnId,
+  sessionId: carriedManager.getSessionId(), state: 'carried',
+});
+carriedManager.appendMessage({
+  role: 'user', content: [{ type: 'text', text: 'You · Terminal\n\npersisted terminal steer' }],
+  timestamp: Date.now(),
+});
+carriedManager.appendMessage(fauxAssistantMessage('persisted answer after terminal steer'));
+const callsBeforeCarriedRestart = faux.state.callCount;
+await runtime.newSession({ parentSession: carriedManager.getSessionFile() });
+await waitFor(() => state().handled?.includes(carriedRequestId),
+  'restart did not settle a persisted Telegram request carried by a terminal steer');
+assert.equal(userTexts(runtime.session.sessionManager).length, 0,
+  'restart reinjected a persisted carried Telegram conversation');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · persisted answer after terminal steer').length, 1);
+assert.equal(faux.state.callCount, callsBeforeCarriedRestart,
+  'restart ran the model for a persisted carried Telegram conversation');
 
 const expiredManager = runtime.session.sessionManager;
 const expiredTurn = 'telegram-tg-text-u16-m16-expired';

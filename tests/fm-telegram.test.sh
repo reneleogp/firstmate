@@ -316,6 +316,21 @@ complete = run('mirror-complete', request, 'delivery-long')
 assert complete.returncode == 0, complete.stderr
 completed_delivery = json.loads(Path(delivery_root, 'delivery-long.json').read_text())
 assert 'completion_request_id' not in completed_delivery
+abandoned_request = 'tg-text-u200-m200'
+abandoned_path = Path(home, 'state', 'telegram', 'inbox', abandoned_request + '.json')
+abandoned_path.write_text(json.dumps({
+    'request_id': abandoned_request, 'origin': 'telegram', 'text': 'undeliverable response',
+    'chat_id': 77, 'status': 'claimed', 'created_at': int(time.time()),
+    'claim_owner_pid': int(owner), 'claim_owner_identity': owner_identity,
+}))
+abandoned = run('mirror-abandon', abandoned_request, 'assistant-undeliverable')
+assert abandoned.returncode == 0, abandoned.stderr
+assert not abandoned_path.exists()
+abandoned_record = json.loads(Path(
+    home, 'state', 'telegram', 'handled', abandoned_request + '.json'
+).read_text())
+assert abandoned_record['status'] == 'abandoned'
+assert abandoned_record['failure_delivery_id'] == 'assistant-undeliverable'
 for delivery_id in capacity_ids:
     Path(delivery_root, delivery_id + '.json').unlink()
     Path(delivery_root, delivery_id + '.txt').unlink()
