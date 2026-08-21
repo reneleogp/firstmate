@@ -1931,6 +1931,43 @@ assert.equal(Object.values(state().deliveries)
 assert.equal(faux.state.callCount, callsBeforeCarriedRestart,
   'restart ran the model for a persisted carried Telegram conversation');
 
+const carriedFallbackManager = runtime.session.sessionManager;
+const carriedFallbackRequestId = 'tg-text-u34-m34';
+const carriedFallbackTurnId = 'terminal-persisted-fallback-turn';
+const carriedFallbackState = state();
+carriedFallbackState.request = {
+  id: carriedFallbackRequestId, text: 'persisted Telegram before oversized carried answer',
+  status: 'claimed', owner: process.pid,
+};
+save(carriedFallbackState);
+carriedFallbackManager.appendCustomEntry('firstmate-telegram-admission', {
+  requestId: carriedFallbackRequestId, turnId: carriedFallbackTurnId,
+  sessionId: carriedFallbackManager.getSessionId(), state: 'carried',
+});
+carriedFallbackManager.appendMessage({
+  role: 'user', content: [{ type: 'text', text: 'You · Terminal\n\npersisted terminal steer before fallback' }],
+  timestamp: Date.now(),
+});
+carriedFallbackManager.appendMessage(fauxAssistantMessage('z'.repeat(256 * 1024)));
+const callsBeforeCarriedFallbackRestart = faux.state.callCount;
+const fallbacksBeforeCarriedRestart = Object.values(state().deliveries)
+  .filter((body) => body === parityFallback).length;
+await runtime.newSession({ parentSession: carriedFallbackManager.getSessionFile() });
+await waitFor(() => state().handled?.includes(carriedFallbackRequestId),
+  'restart did not settle the fallback for a persisted carried response');
+const carriedFallbackAfterRestart = state();
+assert.equal(
+  carriedFallbackAfterRestart.deliveries[`assistant-fallback-${carriedFallbackTurnId}`],
+  parityFallback,
+  'restart did not preserve the carried terminal fallback identity',
+);
+assert.equal(Object.values(carriedFallbackAfterRestart.deliveries)
+  .filter((body) => body === parityFallback).length, fallbacksBeforeCarriedRestart + 1);
+assert.equal(carriedFallbackAfterRestart.deliveries[`assistant-${carriedFallbackTurnId}`], undefined,
+  'restart replayed an oversized persisted assistant body');
+assert.equal(faux.state.callCount, callsBeforeCarriedFallbackRestart,
+  'restart invoked the model while settling a persisted carried fallback');
+
 const unmatchedCarriedManager = runtime.session.sessionManager;
 const unmatchedCarriedRequestId = 'tg-text-u25-m25';
 const unmatchedCarriedState = state();

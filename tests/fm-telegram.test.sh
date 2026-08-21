@@ -334,6 +334,68 @@ assert abandoned_record['failure_delivery_id'] == 'assistant-undeliverable'
 for delivery_id in capacity_ids:
     Path(delivery_root, delivery_id + '.json').unlink()
     Path(delivery_root, delivery_id + '.txt').unlink()
+for path in Path(delivery_root).glob('*'):
+    path.unlink()
+fallback_request = 'tg-text-u300-m300'
+fallback_request_path = Path(home, 'state', 'telegram', 'inbox', fallback_request + '.json')
+fallback_request_path.write_text(json.dumps({
+    'request_id': fallback_request, 'origin': 'telegram', 'text': 'fallback capacity race',
+    'chat_id': 77, 'status': 'claimed', 'created_at': int(time.time()),
+    'claim_owner_pid': int(owner), 'claim_owner_identity': owner_identity,
+}))
+failed_delivery = 'assistant-capacity-rejected'
+failed_text = 'Firstmate · rejected before fallback'
+Path(delivery_root, failed_delivery + '.txt').write_text(failed_text)
+Path(delivery_root, failed_delivery + '.json').write_text(json.dumps({
+    'delivery_id': failed_delivery,
+    'sha256': __import__('hashlib').sha256(failed_text.encode()).hexdigest(),
+    'status': 'rejected', 'created_at': int(time.time()), 'chunks': [],
+    'completion_request_id': fallback_request,
+}))
+fallback_capacity_ids = []
+for index in range(255):
+    delivery_id = f'fallback-capacity-{index}'
+    fallback_capacity_ids.append(delivery_id)
+    text = f'protected fallback capacity {index}'
+    Path(delivery_root, delivery_id + '.txt').write_text(text)
+    Path(delivery_root, delivery_id + '.json').write_text(json.dumps({
+        'delivery_id': delivery_id,
+        'sha256': __import__('hashlib').sha256(text.encode()).hexdigest(),
+        'status': 'reserved', 'created_at': int(time.time()), 'chunks': [],
+        'reservation_owner_pid': int(owner),
+        'reservation_owner_identity': owner_identity,
+    }))
+fallback_body_path = Path(home, 'fallback-capacity.txt')
+fallback_body_path.write_text('Firstmate · Response could not be mirrored; view it in the terminal.')
+fallback_delivery = 'assistant-fallback-capacity'
+fallback = run(
+    'mirror-reply', fallback_delivery, '--request-id', fallback_request,
+    '--text-file', str(fallback_body_path),
+)
+assert fallback.returncode == 0, fallback.stderr
+assert fallback_request_path.exists(), 'fallback admission evicted its live request'
+assert not Path(delivery_root, failed_delivery + '.json').exists()
+assert not Path(delivery_root, failed_delivery + '.txt').exists()
+fallback_record = json.loads(Path(delivery_root, fallback_delivery + '.json').read_text())
+assert fallback_record['status'] == 'sent'
+assert fallback_record['completion_request_id'] == fallback_request
+assert run('mirror-complete', fallback_request, fallback_delivery).returncode == 0
+for path in Path(delivery_root).glob('*'):
+    path.unlink()
+orphan_delivery = 'assistant-orphaned-completion'
+orphan_text = 'Firstmate · paired request vanished'
+Path(delivery_root, orphan_delivery + '.txt').write_text(orphan_text)
+Path(delivery_root, orphan_delivery + '.json').write_text(json.dumps({
+    'delivery_id': orphan_delivery,
+    'sha256': __import__('hashlib').sha256(orphan_text.encode()).hexdigest(),
+    'status': 'sent', 'created_at': int(time.time()), 'chunks': [],
+    'completion_request_id': 'tg-text-u301-m301',
+}))
+orphan_report = run('mirror-reconcile', '--report-delivery', orphan_delivery)
+assert orphan_report.returncode == 0, orphan_report.stderr
+assert f'request-missing\t{orphan_delivery}\ttg-text-u301-m301' in orphan_report.stdout.splitlines()
+Path(delivery_root, orphan_delivery + '.json').unlink()
+Path(delivery_root, orphan_delivery + '.txt').unlink()
 for index, status in enumerate(('rejected', 'delivery_unknown'), start=201):
     request_id = f'tg-text-u{index}-m{index}'
     request_path = Path(home, 'state', 'telegram', 'inbox', request_id + '.json')
@@ -402,7 +464,8 @@ python3 - "$home/calls.jsonl" "$home/long-reply.txt" <<'PY'
 import json, sys
 calls = [json.loads(line) for line in open(sys.argv[1])]
 body = open(sys.argv[2]).read()
-chunks = [call['params']['text'] for call in calls if call['path'].endswith('/sendMessage') and call['params']['text'].startswith(('Firstmate · ', '😀'))]
+fallback = 'Firstmate · Response could not be mirrored; view it in the terminal.'
+chunks = [call['params']['text'] for call in calls if call['path'].endswith('/sendMessage') and call['params']['text'] != fallback and call['params']['text'].startswith(('Firstmate · ', '😀'))]
 assert len(chunks) == 3
 assert ''.join(chunks[1:]) == body
 assert all(len(chunk.encode('utf-16-le')) // 2 <= 4096 for chunk in chunks)

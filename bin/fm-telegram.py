@@ -868,8 +868,39 @@ def cleanup_failed_completion_request_locked(home: Path, record: Dict[str, Any])
     if (path is None or path.parent.name != "inbox" or not isinstance(request, dict)
             or request.get("request_id") != request_id or request.get("status") != "claimed"):
         return
+    root = mirror_delivery_dir(home)
+    for candidate_path in root.glob("*.json"):
+        candidate = read_json(candidate_path)
+        if (not isinstance(candidate, dict)
+                or candidate.get("delivery_id") == record.get("delivery_id")
+                or candidate.get("completion_request_id") != request_id):
+            continue
+        delivery_pid = candidate.get("delivery_owner_pid")
+        delivery_identity = candidate.get("delivery_owner_identity")
+        delivery_live = bool(
+            strict_int(delivery_pid)
+            and isinstance(delivery_identity, str)
+            and process_identity(delivery_pid) == delivery_identity
+        )
+        if candidate.get("status") == "sent" or delivery_live:
+            return
     consume_safe_wakes(home, [request_id])
     durable_unlink(path)
+
+
+def retire_superseded_completion_deliveries_locked(
+        home: Path, request_id: str, delivery_id: str) -> None:
+    root = mirror_delivery_dir(home)
+    for metadata_path in root.glob("*.json"):
+        if metadata_path.stem == delivery_id:
+            continue
+        record = read_json(metadata_path)
+        if (not isinstance(record, dict)
+                or record.get("completion_request_id") != request_id
+                or record.get("status") not in {"rejected", "delivery_unknown"}):
+            continue
+        durable_unlink(metadata_path)
+        durable_unlink(root / f"{metadata_path.stem}.txt")
 
 
 def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> bool:
@@ -950,21 +981,11 @@ def _bounded_cleanup_locked(home: Path, preserve_requests: Iterable[str] = ()) -
     inbox, handled = request_dirs(home)
     cleanup_atomic_temps_locked(home)
     cutoff = now() - INBOX_TTL
-    failed_completion_requests = set()
-    delivery_root = state_dir(home) / "deliveries"
-    if delivery_root.is_dir() and not delivery_root.is_symlink():
-        for metadata_path in delivery_root.glob("*.json"):
-            delivery = read_json(metadata_path, {})
-            request_id = delivery.get("completion_request_id") if isinstance(delivery, dict) else None
-            if (isinstance(request_id, str)
-                    and delivery.get("status") in {"rejected", "delivery_unknown"}):
-                failed_completion_requests.add(request_id)
     inbox_files = sorted(inbox.glob("*.json"), key=request_order_key, reverse=True)
     queued_index = 0
     for path in inbox_files:
         record = read_json(path, {})
-        if (isinstance(record, dict) and record.get("status") == "claimed"
-                and path.stem not in failed_completion_requests):
+        if isinstance(record, dict) and record.get("status") == "claimed":
             owner_pid = record.get("claim_owner_pid")
             owner_identity = record.get("claim_owner_identity")
             if (strict_int(owner_pid) and isinstance(owner_identity, str)
@@ -1400,7 +1421,7 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
     }
     held_records: List[Tuple[str, str]] = []
     owned_records: List[str] = []
-    delivery_records: List[Tuple[str, Optional[str]]] = []
+    delivery_records: List[Tuple[str, Optional[str], Optional[str]]] = []
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
         if not marker.is_file():
@@ -1464,15 +1485,32 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
         for delivery_id in sorted(reported_delivery_ids):
             record = read_json(delivery_root / f"{delivery_id}.json")
             status = record.get("status") if isinstance(record, dict) else None
-            delivery_records.append((delivery_id, status if isinstance(status, str) else None))
+            completion_request = (record.get("completion_request_id")
+                                  if isinstance(record, dict) else None)
+            completion_path = (request_path(home, completion_request)
+                               if isinstance(completion_request, str) else None)
+            completion_record = read_json(completion_path) if completion_path is not None else None
+            request_missing = completion_request if (
+                isinstance(completion_request, str)
+                and (not isinstance(completion_record, dict)
+                     or completion_record.get("request_id") != completion_request
+                     or completion_record.get("status") != "claimed")
+            ) else None
+            delivery_records.append((
+                delivery_id,
+                status if isinstance(status, str) else None,
+                request_missing,
+            ))
     if report_held:
         for request_id in owned_records:
             print(f"owned\t{request_id}")
         for request_id, turn_id in held_records[:1]:
             print(f"held\t{request_id}\t{turn_id}")
-        for delivery_id, status in delivery_records:
+        for delivery_id, status, request_missing in delivery_records:
             if status is None:
                 print(f"delivery-missing\t{delivery_id}")
+            elif request_missing is not None:
+                print(f"request-missing\t{delivery_id}\t{request_missing}")
             else:
                 print(f"delivery\t{delivery_id}\t{status}")
     return 0
@@ -1739,6 +1777,8 @@ def mirror_reply(home: Path, delivery_id: str, owner_pid: int, text_file: str,
         return die("Telegram delivery process identity is unavailable")
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
+        if request_id is not None:
+            retire_superseded_completion_deliveries_locked(home, request_id, delivery_id)
         existing = read_json(metadata_path)
         if isinstance(existing, dict):
             if existing.get("sha256") != digest:

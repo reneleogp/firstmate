@@ -1006,7 +1006,7 @@ export default function (pi: ExtensionAPI) {
     startupInterrupted.clear();
     if (!provenance) return;
     active = true;
-    activeOrigin = "telegram";
+    activeOrigin = provenance.carried ? "terminal" : "telegram";
     activeRequest = provenance.requestId;
     activeRequestTurnId = provenance.turnId;
     activeTurnId = provenance.turnId;
@@ -1103,9 +1103,10 @@ export default function (pi: ExtensionAPI) {
         if (!held) heldAdmission = undefined;
       }
       const missing = new Set(lines
-        .filter((line) => line.startsWith("delivery-missing\t"))
-        .map((line) => line.slice("delivery-missing\t".length))
-        .filter((deliveryId) => reportedDeliveries.has(deliveryId)));
+        .filter((line) => line.startsWith("delivery-missing\t") || line.startsWith("request-missing\t"))
+        .map((line) => line.split("\t")[1])
+        .filter((deliveryId): deliveryId is string =>
+          !!deliveryId && reportedDeliveries.has(deliveryId)));
       const ownedRequestIds = new Set(lines
         .filter((line) => line.startsWith("owned\t"))
         .map((line) => line.split("\t")[1])
