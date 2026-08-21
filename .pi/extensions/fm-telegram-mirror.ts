@@ -67,6 +67,10 @@ const configuredAdmissionTimeout = Number(process.env.FM_TELEGRAM_ADMISSION_TIME
 const admissionTimeoutMs = Number.isFinite(configuredAdmissionTimeout)
   ? Math.max(100, Math.min(configuredAdmissionTimeout, 30_000))
   : 30_000;
+const configuredReconcileInterval = Number(process.env.FM_TELEGRAM_RECONCILE_INTERVAL_MS || "30000");
+const reconcileIntervalMs = Number.isFinite(configuredReconcileInterval)
+  ? Math.max(100, Math.min(configuredReconcileInterval, 300_000))
+  : 30_000;
 const capabilityState = globalThis as typeof globalThis & { __firstmateTelegramCapability?: string };
 const capability = capabilityState.__firstmateTelegramCapability ?? randomBytes(32).toString("hex");
 capabilityState.__firstmateTelegramCapability = capability;
@@ -238,7 +242,9 @@ export default function (pi: ExtensionAPI) {
   let settledTurns: SettledTurn[] = [];
   let lastAssistantBody = "";
   let scanTimer: ReturnType<typeof setInterval> | undefined;
+  let reconcileTimer: ReturnType<typeof setInterval> | undefined;
   let drainRunning = false;
+  let reconcileRunning = false;
   let settleRunning = false;
   let deliveryBlocked = false;
   let transportOpen = false;
@@ -470,6 +476,25 @@ export default function (pi: ExtensionAPI) {
     await exec(["mirror-delivered", pending.requestId], ctx);
   };
 
+  const reconcile = async (ctx: ExtensionContext): Promise<void> => {
+    if (reconcileRunning || drainRunning || settleRunning || !transportOpen || !ownsHomeLock()) return;
+    reconcileRunning = true;
+    try {
+      const preserved = new Set<string>();
+      if (pendingAdmission) preserved.add(pendingAdmission.requestId);
+      if (heldAdmission) preserved.add(heldAdmission.requestId);
+      if (activeRequest) preserved.add(activeRequest);
+      for (const turn of settledTurns) {
+        if (turn.request) preserved.add(turn.request);
+      }
+      const args = ["mirror-reconcile"];
+      for (const requestId of preserved) args.push("--preserve-request", requestId);
+      await exec(args, ctx);
+    } finally {
+      reconcileRunning = false;
+    }
+  };
+
   const drain = async (ctx: ExtensionContext): Promise<void> => {
     if (drainRunning || !transportOpen) return;
     const primary = ownsHomeLock();
@@ -547,6 +572,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (event, ctx) => {
     generation += 1;
+    if (scanTimer) clearInterval(scanTimer);
+    if (reconcileTimer) clearInterval(reconcileTimer);
+    scanTimer = undefined;
+    reconcileTimer = undefined;
     resetTurn();
     pendingAdmission = undefined;
     heldAdmission = undefined;
@@ -597,13 +626,16 @@ export default function (pi: ExtensionAPI) {
     }
     await updateFooter(ctx);
     scanTimer = setInterval(() => void drain(ctx), 750);
+    reconcileTimer = setInterval(() => void reconcile(ctx), reconcileIntervalMs);
     void drain(ctx);
   });
 
   pi.on("session_shutdown", () => {
     generation += 1;
     if (scanTimer) clearInterval(scanTimer);
+    if (reconcileTimer) clearInterval(reconcileTimer);
     scanTimer = undefined;
+    reconcileTimer = undefined;
     if (pendingAdmission?.timer) clearTimeout(pendingAdmission.timer);
     pendingAdmission = undefined;
     heldAdmission = undefined;

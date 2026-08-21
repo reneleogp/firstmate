@@ -904,57 +904,64 @@ def cleanup_mirror_deliveries_locked(home: Path, reserve_slots: int = 0) -> bool
     return retained <= keep
 
 
+def _bounded_cleanup_locked(home: Path, preserve_requests: Iterable[str] = ()) -> None:
+    preserved = set(preserve_requests)
+    inbox, handled = request_dirs(home)
+    cleanup_atomic_temps_locked(home)
+    cutoff = now() - INBOX_TTL
+    inbox_files = sorted(inbox.glob("*.json"), key=request_order_key, reverse=True)
+    queued_index = 0
+    for path in inbox_files:
+        if path.stem in preserved:
+            continue
+        record = read_json(path, {})
+        if isinstance(record, dict) and record.get("status") == "claimed":
+            owner_pid = record.get("claim_owner_pid")
+            owner_identity = record.get("claim_owner_identity")
+            if (strict_int(owner_pid) and isinstance(owner_identity, str)
+                    and process_identity(owner_pid) == owner_identity):
+                continue
+        created = record.get("created_at", 0) if isinstance(record, dict) else 0
+        should_remove = (queued_index >= MAX_INBOX or not strict_int(created)
+                         or created < cutoff)
+        queued_index += 1
+        if should_remove:
+            try:
+                consume_safe_wakes(home, [path.stem])
+                durable_unlink(path)
+            except (OSError, TelegramError):
+                pass
+    handled_files = sorted(handled.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in handled_files[MAX_HANDLED:]:
+        try:
+            durable_unlink(path)
+        except OSError:
+            pass
+    cleanup_mirror_deliveries_locked(home)
+    pending = state_dir(home) / "pending.json"
+    data = read_json(pending)
+    try:
+        expired = (isinstance(data, dict)
+                   and now() - int(data.get("created_at", 0)) >= PENDING_TTL)
+    except (TypeError, ValueError):
+        expired = True
+    if expired:
+        if isinstance(data, dict):
+            pending_id = data.get("pending_id")
+            finalize_pending_cleanup_locked(home, data)
+            if isinstance(pending_id, str):
+                remove_pending_voice_locked(home, pending_id)
+        else:
+            remove_pending(home)
+    queued_voices, queue_changed = load_pending_voice_queue_locked(home)
+    if queue_changed:
+        save_pending_voice_queue_locked(home, queued_voices)
+
+
 def bounded_cleanup(home: Path) -> None:
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
-        inbox, handled = request_dirs(home)
-        cleanup_atomic_temps_locked(home)
-        cutoff = now() - INBOX_TTL
-        inbox_files = sorted(inbox.glob("*.json"), key=request_order_key, reverse=True)
-        queued_index = 0
-        for path in inbox_files:
-            record = read_json(path, {})
-            if isinstance(record, dict) and record.get("status") == "claimed":
-                owner_pid = record.get("claim_owner_pid")
-                owner_identity = record.get("claim_owner_identity")
-                if (strict_int(owner_pid) and isinstance(owner_identity, str)
-                        and process_identity(owner_pid) == owner_identity):
-                    continue
-            created = record.get("created_at", 0) if isinstance(record, dict) else 0
-            should_remove = (queued_index >= MAX_INBOX or not strict_int(created)
-                             or created < cutoff)
-            queued_index += 1
-            if should_remove:
-                try:
-                    consume_safe_wakes(home, [path.stem])
-                    durable_unlink(path)
-                except (OSError, TelegramError):
-                    pass
-        handled_files = sorted(handled.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for path in handled_files[MAX_HANDLED:]:
-            try:
-                durable_unlink(path)
-            except OSError:
-                pass
-        cleanup_mirror_deliveries_locked(home)
-        pending = state_dir(home) / "pending.json"
-        data = read_json(pending)
-        try:
-            expired = (isinstance(data, dict)
-                       and now() - int(data.get("created_at", 0)) >= PENDING_TTL)
-        except (TypeError, ValueError):
-            expired = True
-        if expired:
-            if isinstance(data, dict):
-                pending_id = data.get("pending_id")
-                finalize_pending_cleanup_locked(home, data)
-                if isinstance(pending_id, str):
-                    remove_pending_voice_locked(home, pending_id)
-            else:
-                remove_pending(home)
-        queued_voices, queue_changed = load_pending_voice_queue_locked(home)
-        if queue_changed:
-            save_pending_voice_queue_locked(home, queued_voices)
+        _bounded_cleanup_locked(home)
 
 
 def deterministic_request_id(source: str, update_id: int, message_id: int) -> str:
@@ -1336,6 +1343,7 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
         replacement_identity = claim_owner_identity(replacing_owner_pid)
         if replacement_identity is None:
             return die("Telegram mirror owner is not the invoking extension")
+    preserved = {request_id for request_id in preserve_requests if safe_id(request_id)}
     held_records: List[Tuple[str, str]] = []
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
@@ -1365,8 +1373,8 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
                 clear_claim_owner(record)
                 atomic_json(path, record)
             atomic_bytes(marker, b"v2\n")
+        _bounded_cleanup_locked(home, preserved)
         consume_safe_wakes(home)
-        preserved = {request_id for request_id in preserve_requests if safe_id(request_id)}
         for path in mirror_queue_paths_locked(home):
             record = read_json(path)
             if not isinstance(record, dict):

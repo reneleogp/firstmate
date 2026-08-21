@@ -191,14 +191,23 @@ def run(*args, api=base):
         os.close(reader)
 request = 'tg-text-u3-m3'
 assert run('mirror-open').returncode == 0
+inbox = Path(home, 'state', 'telegram', 'inbox')
+expired_id = 'tg-text-u899-m899'
+expired_path = Path(inbox, expired_id + '.json')
+expired_path.write_text(json.dumps({
+    'request_id': expired_id, 'origin': 'telegram', 'text': 'expired while service stopped',
+    'chat_id': 77, 'message_id': 899, 'update_id': 899,
+    'created_at': 1, 'admission_sequence': 899, 'status': 'queued',
+    'receipt_text': 'queued', 'receipt_status': 'pending',
+}))
 assert run('mirror-reconcile').returncode == 0
+assert not expired_path.exists()
 Path(home, 'state', '.wake-queue').write_text(
     '2\t2\tcheck\ttelegram:late-legacy\ttelegram late-legacy\n')
 assert run('mirror-next').returncode == 0
 assert 'telegram:late-legacy' in Path(home, 'state', '.wake-queue').read_text()
 assert run('mirror-reconcile').returncode == 0
 assert 'telegram:' not in Path(home, 'state', '.wake-queue').read_text()
-inbox = Path(home, 'state', 'telegram', 'inbox')
 stale_owner = subprocess.Popen(['sleep', '30'])
 stale_id = 'tg-text-u900-m900'
 stale_path = Path(inbox, stale_id + '.json')

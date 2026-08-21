@@ -41,6 +41,7 @@ skip_final_save = False
 if command == 'mirror-open':
     pass
 elif command == 'mirror-reconcile':
+    state['legacy_wake'] = False
     request = state.get('request')
     preserved = options('--preserve-request')
     if request and request.get('status') == 'claimed':
@@ -177,6 +178,7 @@ process.env.FM_HOME = home;
 process.env.FM_TELEGRAM_TRANSPORT = transport;
 process.env.FM_TELEGRAM_SESSION_LOCK_LIB = lockLib;
 process.env.FM_TELEGRAM_ADMISSION_TIMEOUT_MS = '150';
+process.env.FM_TELEGRAM_RECONCILE_INTERVAL_MS = '500';
 const {
   ModelRuntime,
   SessionManager,
@@ -276,6 +278,10 @@ const idleScansBefore = state().log.filter((call) => call[0] === 'mirror-next').
 await new Promise((resolve) => setTimeout(resolve, 1600));
 const idleScans = state().log.filter((call) => call[0] === 'mirror-next').length - idleScansBefore;
 assert.ok(idleScans >= 2 && idleScans <= 3, `idle scan duplicated queue probes: ${idleScans}`);
+const lateLegacyWake = state();
+lateLegacyWake.legacy_wake = true;
+save(lateLegacyWake);
+await waitFor(() => state().legacy_wake === false, 'slow reconciliation did not retire a late legacy wake');
 
 faux.appendResponses([
   (context) => {
