@@ -136,7 +136,8 @@ elif command == 'mirror-release':
     else: request['status'] = 'queued'; request.pop('owner', None)
 elif command == 'mirror-hold':
     request = state.get('request')
-    if not request or request.get('id') != rest[0] or request.get('status') not in ('claimed', 'held'): code = 1
+    if (home / 'reject-mirror-hold').exists(): code = 1
+    elif not request or request.get('id') != rest[0] or request.get('status') not in ('claimed', 'held'): code = 1
     else:
         request['status'] = 'held'; request['turn_id'] = rest[1]; request.pop('owner', None)
 elif command == 'mirror-recover':
@@ -333,6 +334,12 @@ process.env.FM_TELEGRAM_SESSION_LOCK_LIB = lockLib;
 process.env.FM_TELEGRAM_ADMISSION_TIMEOUT_MS = '150';
 process.env.FM_TELEGRAM_RECONCILE_INTERVAL_MS = '500';
 process.env.FM_TELEGRAM_MAX_INPUT_CANDIDATES = '256';
+const nativeSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (callback, delay, ...args) => nativeSetTimeout(
+  callback,
+  delay === 30_000 && existsSync(`${home}/delay-assistant-reply`) ? 200 : delay,
+  ...args,
+);
 const {
   ModelRuntime,
   SessionManager,
@@ -966,6 +973,49 @@ assert.equal(initialManager.getEntries().some((entry) =>
   entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
     && entry.data.requestId === 'tg-text-u19-m19' && entry.data.state === 'carried'), true);
 
+const modeOffSteered = state();
+modeOffSteered.request = {
+  id: 'tg-text-u31-m31', text: 'Telegram tool loop before mode-off local steer', status: 'queued',
+};
+save(modeOffSteered);
+globalThis.__telegramMirrorHoldTool = true;
+globalThis.__telegramMirrorTerminateTool = true;
+globalThis.__telegramMirrorToolStarted = false;
+const callsBeforeModeOffSteer = faux.state.callCount;
+const deliveriesBeforeModeOffSteer = Object.keys(state().deliveries).length;
+faux.appendResponses([
+  fauxAssistantMessage([
+    fauxToolCall('mirror_test_tool', {}, { id: 'mirror-mode-off-steer-tool-call' }),
+  ], { stopReason: 'toolUse' }),
+  fauxAssistantMessage('unmirrored mode-off local answer'),
+]);
+await waitFor(() => globalThis.__telegramMirrorToolStarted === true,
+  'mode-off steer Telegram tool loop did not reach tool execution');
+await runtime.session.prompt('/telegram off', { source: 'interactive' });
+const modeOffLocalSteer = runtime.session.prompt('ordinary local steer while mirror is off', {
+  source: 'interactive', streamingBehavior: 'steer',
+});
+await new Promise((resolve) => setTimeout(resolve, 50));
+globalThis.__telegramMirrorHoldTool = false;
+await modeOffLocalSteer;
+globalThis.__telegramMirrorTerminateTool = false;
+await waitFor(() => state().handled?.includes('tg-text-u31-m31'),
+  'mode-off local steer did not end the accepted request without requeue');
+assert.equal(userTexts(initialManager)
+  .filter((text) => text.includes('Telegram tool loop before mode-off local steer')).length, 1);
+assert.equal(userTexts(initialManager).at(-1), 'ordinary local steer while mirror is off');
+assert.equal(Object.keys(state().deliveries).length, deliveriesBeforeModeOffSteer,
+  'mode-off local steer or its assistant was mirrored');
+assert.equal(faux.state.callCount, callsBeforeModeOffSteer + 2,
+  'mode-off local steer added an unexpected model pass');
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await new Promise((resolve) => setTimeout(resolve, 300));
+assert.equal(userTexts(initialManager)
+  .filter((text) => text.includes('Telegram tool loop before mode-off local steer')).length, 1,
+  'mode-on reinjected the accepted Telegram request after a local mode-off steer');
+assert.equal(faux.state.callCount, callsBeforeModeOffSteer + 2,
+  'mode-on reran the model after a local mode-off steer');
+
 const slashSteered = state();
 slashSteered.request = {
   id: 'tg-text-u27-m27', text: 'Telegram tool loop before excluded slash', status: 'queued',
@@ -1240,6 +1290,40 @@ faux.appendResponses([fauxAssistantMessage('explicit deferred failure recovery')
 await runtime.session.prompt('/telegram on', { source: 'interactive' });
 await waitFor(() => state().handled?.includes('tg-text-u26-m26'),
   'explicit recovery did not settle the deferred provider failure');
+
+const failedHold = state();
+failedHold.request = { id: 'tg-text-u30-m30', text: 'provider failure with delayed hold', status: 'queued' };
+save(failedHold);
+writeFileSync(`${home}/reject-mirror-hold`, '');
+const callsBeforeFailedHold = faux.state.callCount;
+faux.appendResponses([
+  fauxAssistantMessage([], { stopReason: 'error', errorMessage: 'provider failed before hold transition' }),
+]);
+await waitFor(() => state().log.some((call) =>
+  call[0] === 'mirror-hold' && call[1] === 'tg-text-u30-m30'),
+'provider failure did not attempt its bounded hold transition');
+await new Promise((resolve) => setTimeout(resolve, 900));
+assert.equal(state().request?.status, 'claimed',
+  'failed hold transition released the accepted Telegram claim');
+assert.equal(initialManager.getEntries().some((entry) =>
+  entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
+    && entry.data.requestId === 'tg-text-u30-m30' && entry.data.state === 'interrupted'), false,
+'failed hold transition persisted an unconfirmed interrupted state');
+assert.equal(userTexts(initialManager)
+  .filter((text) => text.includes('provider failure with delayed hold')).length, 1);
+assert.equal(faux.state.callCount, callsBeforeFailedHold + 1,
+  'failed hold transition reinjected the accepted Telegram request');
+unlinkSync(`${home}/reject-mirror-hold`);
+await waitFor(() => state().request?.status === 'held' && initialManager.getEntries().some((entry) =>
+  entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
+    && entry.data.requestId === 'tg-text-u30-m30' && entry.data.state === 'interrupted'),
+'accepted Telegram claim did not retry only its hold transition');
+assert.equal(faux.state.callCount, callsBeforeFailedHold + 1,
+  'successful hold retry invoked another model turn');
+faux.appendResponses([fauxAssistantMessage('explicit delayed hold recovery')]);
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await waitFor(() => state().handled?.includes('tg-text-u30-m30'),
+  'explicit delayed-hold recovery did not settle');
 
 const failedTurn = state();
 failedTurn.request = { id: 'tg-text-u11-m11', text: 'provider failure request', status: 'queued' };

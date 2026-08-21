@@ -46,7 +46,7 @@ type PendingAdmission = {
 type InputSegment =
   | { origin: "telegram"; pending: PendingAdmission }
   | { origin: "terminal"; turnId: string; text: string; deliveryId: string }
-  | { origin: "excluded"; slashContinuation?: boolean };
+  | { origin: "excluded"; slashContinuation?: boolean; modeOffContinuation?: boolean };
 type InputCandidate = {
   segment: InputSegment;
   busyGeneration?: number;
@@ -87,6 +87,7 @@ const configuredReconcileInterval = Number(process.env.FM_TELEGRAM_RECONCILE_INT
 const reconcileIntervalMs = Number.isFinite(configuredReconcileInterval)
   ? Math.max(100, Math.min(configuredReconcileInterval, 300_000))
   : 30_000;
+const mirrorReplyTimeoutMs = 64 * 3 * 45_000 + 30_000;
 const capabilityState = globalThis as typeof globalThis & { __firstmateTelegramCapability?: string };
 const capability = capabilityState.__firstmateTelegramCapability ?? randomBytes(32).toString("hex");
 capabilityState.__firstmateTelegramCapability = capability;
@@ -172,6 +173,10 @@ function markedInput(marker: string, label: Origin, text: string): string {
 
 function markedExcludedSlash(marker: string, text: string): string {
   return `\u2063firstmate-excluded-slash:${marker}\u2063\n${text}`;
+}
+
+function markedExcludedInput(marker: string, text: string): string {
+  return `\u2063firstmate-origin:${marker}\u2063\n${text}`;
 }
 
 function stripOriginMarker(text: string): string {
@@ -389,6 +394,7 @@ export default function (pi: ExtensionAPI) {
   let activeTerminalDelivery: TerminalDelivery | undefined;
   let pendingAdmission: PendingAdmission | undefined;
   let heldAdmission: HeldAdmission | undefined;
+  let modeOffContinuationPending: RecoveredAdmission | undefined;
   const inputCandidates = new Map<string, InputCandidate>();
   const committedMarkers = new Set<string>();
   const committedExcludedSlashMarkers = new Set<string>();
@@ -400,6 +406,8 @@ export default function (pi: ExtensionAPI) {
   let drainRunning = false;
   let reconcileRunning = false;
   let settleRunning = false;
+  let holdRunning = false;
+  let holdTransitionPending = false;
   let deliveryBlocked = false;
   let transportOpen = false;
   let mirrorMode: "on" | "off" = "off";
@@ -438,7 +446,7 @@ export default function (pi: ExtensionAPI) {
       const timeout = setTimeout(() => {
         killed = true;
         child.kill("SIGKILL");
-      }, 30_000);
+      }, args[0] === "mirror-reply" ? mirrorReplyTimeoutMs : 30_000);
       signal?.addEventListener("abort", abort, { once: true });
       child.stdout?.setEncoding("utf8");
       child.stderr?.setEncoding("utf8");
@@ -472,6 +480,8 @@ export default function (pi: ExtensionAPI) {
     activeTurnId = undefined;
     suspended = false;
     activeTerminalDelivery = undefined;
+    holdTransitionPending = false;
+    modeOffContinuationPending = undefined;
     lastAssistantBody = "";
   };
 
@@ -667,18 +677,32 @@ export default function (pi: ExtensionAPI) {
   };
 
   const holdInterrupted = async (ctx: ExtensionContext): Promise<void> => {
+    if (holdRunning) return;
+    const startedGeneration = generation;
     const requestId = activeRequest;
     const turnId = activeTurnId;
     const terminalDelivery = activeTerminalDelivery;
     if (requestId && turnId) {
-      heldAdmission = { requestId, turnId };
-      await exec(["mirror-hold", requestId, turnId], ctx);
-      appendAdmission(
-        requestId,
-        turnId,
-        ctx.sessionManager.getSessionId?.() || "session",
-        "interrupted",
-      );
+      holdRunning = true;
+      holdTransitionPending = true;
+      suspended = true;
+      try {
+        const result = await exec(["mirror-hold", requestId, turnId], ctx);
+        if (startedGeneration !== generation || activeRequest !== requestId || activeTurnId !== turnId) return;
+        if (result.code !== 0) {
+          ctx.ui.notify("Telegram interruption could not be recorded; the accepted turn remains owned.", "warning");
+          return;
+        }
+        heldAdmission = { requestId, turnId };
+        appendAdmission(
+          requestId,
+          turnId,
+          ctx.sessionManager.getSessionId?.() || "session",
+          "interrupted",
+        );
+      } finally {
+        holdRunning = false;
+      }
     }
     if (terminalDelivery && !terminalDelivery.sent) {
       await cancelReservation(terminalDelivery.deliveryId, ctx);
@@ -708,6 +732,19 @@ export default function (pi: ExtensionAPI) {
     if (active) {
       if (segment.origin === "excluded" && segment.slashContinuation &&
           !suspended && !lastAssistantBody) return;
+      if (segment.origin === "excluded" && segment.modeOffContinuation && activeRequest &&
+          activeTurnId && !suspended && !lastAssistantBody) {
+        const requestId = activeRequest;
+        const turnId = activeRequestTurnId || activeTurnId;
+        suspended = true;
+        modeOffContinuationPending = {
+          requestId,
+          turnId,
+          assistantBody: "",
+          carried: false,
+        };
+        return;
+      }
       if (!queueActiveTurn()) {
         if (segment.origin === "terminal" && !suspended) {
           carriedRequest = activeRequest;
@@ -715,6 +752,7 @@ export default function (pi: ExtensionAPI) {
           resetTurn();
         } else {
           await holdInterrupted(ctx);
+          if (active) return;
         }
       }
     }
@@ -829,7 +867,10 @@ export default function (pi: ExtensionAPI) {
             candidate.turnId,
             `assistant-${candidate.turnId}`,
             ctx,
-          )) recoveryAbandons.delete(requestId);
+          )) {
+            recoveryAbandons.delete(requestId);
+            if (activeRequest === requestId) resetTurn();
+          }
         }
         if (missing.size > 0) {
           let abandoned = false;
@@ -892,7 +933,12 @@ export default function (pi: ExtensionAPI) {
     if (drainRunning || reconcileRunning || settleRunning || settledTurns.length > 0 || !transportOpen) return;
     const startedGeneration = generation;
     const primary = ownsHomeLock();
-    if (!primary || pendingAdmission || heldAdmission || deliveryBlocked) return;
+    if (!primary) return;
+    if (holdTransitionPending) {
+      await holdInterrupted(ctx);
+      return;
+    }
+    if (pendingAdmission || heldAdmission || deliveryBlocked) return;
     let refreshFooter = false;
     drainRunning = true;
     try {
@@ -1136,7 +1182,10 @@ export default function (pi: ExtensionAPI) {
     }
     if (event.source === "interactive" && ctx.isIdle() && !ctx.hasPendingMessages()) {
       for (const [marker, candidate] of inputCandidates) {
-        if (candidate.segment.origin === "terminal") inputCandidates.delete(marker);
+        if (candidate.segment.origin === "terminal" ||
+            (candidate.segment.origin === "excluded" && candidate.segment.modeOffContinuation)) {
+          inputCandidates.delete(marker);
+        }
       }
     }
     if (event.source === "interactive" && event.text.startsWith("/") && active &&
@@ -1158,7 +1207,28 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Telegram mirror preference could not be read; this input was not mirrored.", "error");
           return { action: "continue" as const };
         }
-        if (currentMode !== "on") return { action: "continue" as const };
+        if (currentMode !== "on") {
+          if (active && activeOrigin === "telegram" && activeRequest &&
+              !suspended && !lastAssistantBody) {
+            if (inputCandidates.size >= maxInputCandidates) {
+              ctx.ui.notify("Telegram cannot accept another local continuation yet.", "error");
+              return { action: "handled" as const };
+            }
+            const marker = newOriginMarker();
+            inputCandidates.set(marker, {
+              busyGeneration: ctx.isIdle() && event.streamingBehavior === undefined
+                ? undefined
+                : inputGeneration,
+              segment: { origin: "excluded", modeOffContinuation: true },
+            });
+            return { action: "transform" as const, text: markedExcludedInput(marker, event.text) };
+          }
+          return { action: "continue" as const };
+        }
+        if (holdTransitionPending || holdRunning) {
+          ctx.ui.notify("Telegram is recording an interrupted turn; try again shortly.", "warning");
+          return { action: "handled" as const };
+        }
         if (deliveryBlocked) {
           ctx.ui.notify("Telegram delivery needs attention; use /telegram off before continuing.", "error");
           return { action: "handled" as const };
@@ -1300,12 +1370,27 @@ export default function (pi: ExtensionAPI) {
   ): Promise<void> => {
     if (settledSessionGeneration !== generation || settledInputGeneration !== inputGeneration) return;
     for (const [marker, candidate] of inputCandidates) {
-      if (candidate.segment.origin === "terminal" && candidate.busyGeneration !== undefined &&
-          candidate.busyGeneration <= settledInputGeneration) {
+      if (candidate.busyGeneration !== undefined && candidate.busyGeneration <= settledInputGeneration) {
         inputCandidates.delete(marker);
       }
     }
     if (active && activeOrigin) {
+      if (suspended && modeOffContinuationPending) {
+        const pending = modeOffContinuationPending;
+        if (await abandonRequest(
+          pending.requestId,
+          pending.turnId,
+          `assistant-${pending.turnId}`,
+          ctx,
+        )) {
+          resetTurn();
+        } else {
+          recoveryAbandons.set(pending.requestId, pending);
+          ctx.ui.notify("The accepted Telegram turn remains owned while local continuation is unmirrored.", "warning");
+        }
+        await updateFooter(ctx);
+        return;
+      }
       if (suspended) return;
       if (!lastAssistantBody) {
         await holdInterrupted(ctx);
