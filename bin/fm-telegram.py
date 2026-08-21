@@ -1356,7 +1356,8 @@ def mirror_queue_paths_locked(home: Path) -> List[Path]:
 
 
 def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
-                     preserve_requests: Iterable[str] = (), report_held: bool = False) -> int:
+                     preserve_requests: Iterable[str] = (), report_held: bool = False,
+                     report_deliveries: Iterable[str] = ()) -> int:
     marker = state_dir(home) / ".mirror-migration-v2"
     replacement_identity = None
     if replacing_owner_pid is not None:
@@ -1364,8 +1365,13 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
         if replacement_identity is None:
             return die("Telegram mirror owner is not the invoking extension")
     preserved = {request_id for request_id in preserve_requests if safe_id(request_id)}
+    reported_delivery_ids = {
+        delivery_id for delivery_id in report_deliveries
+        if safe_id(delivery_id) and len(delivery_id) <= 160
+    }
     held_records: List[Tuple[str, str]] = []
     owned_records: List[str] = []
+    delivery_records: List[Tuple[str, Optional[str]]] = []
     with FileLock(state_lock(home)):
         require_state_available_locked(home)
         if not marker.is_file():
@@ -1425,11 +1431,21 @@ def mirror_reconcile(home: Path, replacing_owner_pid: Optional[int] = None,
                 record["status"] = "queued"
                 clear_claim_owner(record)
                 atomic_json(path, record)
+        delivery_root = mirror_delivery_dir(home)
+        for delivery_id in sorted(reported_delivery_ids):
+            record = read_json(delivery_root / f"{delivery_id}.json")
+            status = record.get("status") if isinstance(record, dict) else None
+            delivery_records.append((delivery_id, status if isinstance(status, str) else None))
     if report_held:
         for request_id in owned_records:
             print(f"owned\t{request_id}")
         for request_id, turn_id in held_records[:1]:
             print(f"held\t{request_id}\t{turn_id}")
+        for delivery_id, status in delivery_records:
+            if status is None:
+                print(f"delivery-missing\t{delivery_id}")
+            else:
+                print(f"delivery\t{delivery_id}\t{status}")
     return 0
 
 
@@ -3349,6 +3365,7 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_parser = sub.add_parser("mirror-reconcile", help="requeue claims after process or session replacement")
     add_private(reconcile_parser)
     reconcile_parser.add_argument("--preserve-request", action="append", default=[])
+    reconcile_parser.add_argument("--report-delivery", action="append", default=[])
     for name, help_text in (("install", "install and start the user service"), ("start", "start the user service"),
                             ("stop", "stop the user service"), ("status", "show user service status"),
                             ("disable", "disable the user service"), ("cleanup", "remove this service and private state")):
@@ -3415,7 +3432,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if args.command == "mirror-complete":
             return mirror_complete(home, args.request_id, args.delivery_id, args.owner_pid)
         if args.command == "mirror-reconcile":
-            return mirror_reconcile(home, args.owner_pid, args.preserve_request, report_held=True)
+            return mirror_reconcile(
+                home, args.owner_pid, args.preserve_request,
+                report_held=True, report_deliveries=args.report_delivery,
+            )
         if args.command == "install":
             return install(home)
         if args.command == "start":

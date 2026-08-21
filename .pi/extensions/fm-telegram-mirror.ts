@@ -42,19 +42,25 @@ type InputSegment =
   | { origin: "telegram"; pending: PendingAdmission }
   | { origin: "terminal"; turnId: string; text: string; deliveryId: string }
   | { origin: "excluded" };
-type InputCandidate = { segment: InputSegment };
+type InputCandidate = {
+  segment: InputSegment;
+  busyGeneration?: number;
+};
 type TerminalDelivery = {
   deliveryId: string;
   body: string;
   sent: boolean;
+  attempted: boolean;
 };
 type HeldAdmission = { requestId: string; turnId: string };
 type SettledTurn = {
   origin: Origin;
   request?: string;
+  requestTurnId?: string;
   turnId: string;
   body: string;
   terminalDelivery?: TerminalDelivery;
+  assistantAttempted?: boolean;
 };
 
 const extensionRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -260,6 +266,7 @@ export default function (pi: ExtensionAPI) {
   let active = false;
   let activeOrigin: Origin | undefined;
   let activeRequest: string | undefined;
+  let activeRequestTurnId: string | undefined;
   let activeTurnId: string | undefined;
   let suspended = false;
   let activeTerminalDelivery: TerminalDelivery | undefined;
@@ -267,6 +274,7 @@ export default function (pi: ExtensionAPI) {
   let heldAdmission: HeldAdmission | undefined;
   const inputCandidates = new Map<string, InputCandidate>();
   const committedMarkers = new Set<string>();
+  const knownDeliveryRecords = new Set<string>();
   let settledTurns: SettledTurn[] = [];
   let lastAssistantBody = "";
   let scanTimer: ReturnType<typeof setInterval> | undefined;
@@ -278,6 +286,8 @@ export default function (pi: ExtensionAPI) {
   let transportOpen = false;
   let mirrorMode: "on" | "off" = "off";
   let generation = 0;
+  let inputGeneration = 0;
+  let interactivePreflights = 0;
 
   const exec = async (args: string[], ctx?: ExtensionContext, body?: string): Promise<TransportResult> => {
     const signal = ctx?.signal;
@@ -335,6 +345,7 @@ export default function (pi: ExtensionAPI) {
     active = false;
     activeOrigin = undefined;
     activeRequest = undefined;
+    activeRequestTurnId = undefined;
     activeTurnId = undefined;
     suspended = false;
     activeTerminalDelivery = undefined;
@@ -386,8 +397,17 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const current = snapshot?.currentMode ?? await readMode(ctx);
+    if (startedGeneration !== generation) return;
+    if (deliveryBlocked) {
+      ctx.ui.setStatus(statusKey, "telegram: delivery needs attention");
+      return;
+    }
     const result = snapshot?.next ?? await exec(["mirror-next"]);
     if (startedGeneration !== generation) return;
+    if (deliveryBlocked) {
+      ctx.ui.setStatus(statusKey, "telegram: delivery needs attention");
+      return;
+    }
     const waiting = result.code === 0;
     ctx.ui.setStatus(statusKey, current === "on" && waiting ? "telegram: on · queued" : `telegram: ${current}`);
   };
@@ -396,6 +416,7 @@ export default function (pi: ExtensionAPI) {
     const startedGeneration = generation;
     const deliveryId = safeIdentity(`assistant-${turn.turnId}`);
     if (turn.terminalDelivery && !turn.terminalDelivery.sent) {
+      turn.terminalDelivery.attempted = true;
       const terminalResult = await deliver(
         turn.terminalDelivery.deliveryId,
         turn.terminalDelivery.body,
@@ -409,16 +430,19 @@ export default function (pi: ExtensionAPI) {
         return false;
       }
       turn.terminalDelivery.sent = true;
+      knownDeliveryRecords.add(turn.terminalDelivery.deliveryId);
     }
+    turn.assistantAttempted = true;
     const result = await deliver(deliveryId, `Firstmate · ${turn.body}`, ctx, turn.request);
     if (startedGeneration !== generation) return false;
+    if (result.code === 0) knownDeliveryRecords.add(deliveryId);
     if (result.code === 0 && turn.request) {
       const completed = await exec(["mirror-complete", turn.request, deliveryId], ctx);
       if (startedGeneration !== generation) return false;
       if (completed.code === 0) {
         appendAdmission(
           turn.request,
-          turn.turnId,
+          turn.requestTurnId || turn.turnId,
           ctx.sessionManager.getSessionId?.() || "session",
           "completed",
         );
@@ -438,6 +462,7 @@ export default function (pi: ExtensionAPI) {
     settledTurns.push({
       origin: activeOrigin,
       request: activeRequest,
+      requestTurnId: activeRequestTurnId,
       turnId: activeTurnId,
       body: lastAssistantBody,
       terminalDelivery: activeTerminalDelivery,
@@ -457,6 +482,8 @@ export default function (pi: ExtensionAPI) {
           completed = false;
           break;
         }
+        if (turn.terminalDelivery) knownDeliveryRecords.delete(turn.terminalDelivery.deliveryId);
+        knownDeliveryRecords.delete(safeIdentity(`assistant-${turn.turnId}`));
         settledTurns.shift();
       }
     } finally {
@@ -506,13 +533,25 @@ export default function (pi: ExtensionAPI) {
   };
 
   const transitionSegment = async (segment: InputSegment, ctx: ExtensionContext): Promise<void> => {
+    let carriedRequest: string | undefined;
+    let carriedRequestTurnId: string | undefined;
     if (active) {
-      if (!queueActiveTurn()) await holdInterrupted(ctx);
+      if (!queueActiveTurn()) {
+        if (segment.origin === "terminal" && !suspended) {
+          carriedRequest = activeRequest;
+          carriedRequestTurnId = activeRequestTurnId || activeTurnId;
+          resetTurn();
+        } else {
+          await holdInterrupted(ctx);
+        }
+      }
     }
     if (segment.origin === "excluded") return;
     if (segment.origin === "terminal") {
       active = true;
       activeOrigin = "terminal";
+      activeRequest = carriedRequest;
+      activeRequestTurnId = carriedRequestTurnId;
       activeTurnId = segment.turnId;
       suspended = false;
       lastAssistantBody = "";
@@ -520,12 +559,18 @@ export default function (pi: ExtensionAPI) {
         deliveryId: segment.deliveryId,
         body: `You · Terminal\n\n${segment.text}`,
         sent: false,
+        attempted: false,
       };
       activeTerminalDelivery = terminalDelivery;
       const reserved = await reserve(terminalDelivery.deliveryId, terminalDelivery.body, ctx);
+      if (reserved.code === 0) knownDeliveryRecords.add(terminalDelivery.deliveryId);
       if (reserved.code === 0 && !deliveryBlocked && settledTurns.length === 0) {
+        terminalDelivery.attempted = true;
         const result = await deliver(terminalDelivery.deliveryId, terminalDelivery.body, ctx);
-        if (result.code === 0) terminalDelivery.sent = true;
+        if (result.code === 0) {
+          terminalDelivery.sent = true;
+          knownDeliveryRecords.add(terminalDelivery.deliveryId);
+        }
         else deliveryBlocked = true;
       } else if (reserved.code !== 0) {
         deliveryBlocked = true;
@@ -549,6 +594,7 @@ export default function (pi: ExtensionAPI) {
     active = true;
     activeOrigin = "telegram";
     activeRequest = pending.requestId;
+    activeRequestTurnId = pending.turnId;
     activeTurnId = pending.turnId;
     suspended = false;
     lastAssistantBody = "";
@@ -559,6 +605,7 @@ export default function (pi: ExtensionAPI) {
   const reconcile = async (ctx: ExtensionContext): Promise<void> => {
     if (reconcileRunning || drainRunning || settleRunning || !transportOpen || !ownsHomeLock()) return;
     reconcileRunning = true;
+    const startedGeneration = generation;
     try {
       const preserved = new Set<string>();
       if (pendingAdmission) preserved.add(pendingAdmission.requestId);
@@ -566,15 +613,64 @@ export default function (pi: ExtensionAPI) {
       for (const turn of settledTurns) {
         if (turn.request) preserved.add(turn.request);
       }
+      const reportedDeliveries = new Set<string>(knownDeliveryRecords);
+      if (activeOrigin === "terminal" && !activeRequest && activeTerminalDelivery?.attempted) {
+        reportedDeliveries.add(activeTerminalDelivery.deliveryId);
+      }
+      for (const turn of settledTurns) {
+        if (turn.origin !== "terminal" || turn.request) continue;
+        if (turn.terminalDelivery?.attempted) reportedDeliveries.add(turn.terminalDelivery.deliveryId);
+        if (turn.assistantAttempted) reportedDeliveries.add(safeIdentity(`assistant-${turn.turnId}`));
+      }
       const args = ["mirror-reconcile"];
       for (const requestId of preserved) args.push("--preserve-request", requestId);
+      for (const deliveryId of reportedDeliveries) args.push("--report-delivery", deliveryId);
       const result = await exec(args, ctx);
-      if (result.code === 0 && heldAdmission) {
-        const held = result.stdout.split("\n").some((line) =>
-          line === `held\t${heldAdmission?.requestId}\t${heldAdmission?.turnId}`);
-        if (!held) heldAdmission = undefined;
+      if (startedGeneration !== generation) return;
+      if (result.code === 0) {
+        const lines = result.stdout.split("\n");
+        if (heldAdmission) {
+          const held = lines.some((line) =>
+            line === `held\t${heldAdmission?.requestId}\t${heldAdmission?.turnId}`);
+          if (!held) heldAdmission = undefined;
+        }
+        const missing = new Set(lines
+          .filter((line) => line.startsWith("delivery-missing\t"))
+          .map((line) => line.slice("delivery-missing\t".length))
+          .filter((deliveryId) => knownDeliveryRecords.has(deliveryId)));
+        for (const line of lines) {
+          const fields = line.split("\t");
+          if (fields[0] === "delivery" && fields.length === 3) knownDeliveryRecords.add(fields[1]);
+        }
+        if (missing.size > 0) {
+          const abandonedDeliveryIds = new Set<string>();
+          const activeExpired = activeOrigin === "terminal" && !activeRequest &&
+            !!activeTerminalDelivery && missing.has(activeTerminalDelivery.deliveryId);
+          if (activeExpired && activeTerminalDelivery) {
+            abandonedDeliveryIds.add(activeTerminalDelivery.deliveryId);
+            resetTurn();
+          }
+          const retained = settledTurns.filter((turn) => {
+            if (turn.origin !== "terminal" || turn.request) return true;
+            const terminalExpired = !!turn.terminalDelivery &&
+              missing.has(turn.terminalDelivery.deliveryId);
+            const assistantId = safeIdentity(`assistant-${turn.turnId}`);
+            const assistantExpired = missing.has(assistantId);
+            if (!terminalExpired && !assistantExpired) return true;
+            if (turn.terminalDelivery) abandonedDeliveryIds.add(turn.terminalDelivery.deliveryId);
+            abandonedDeliveryIds.add(assistantId);
+            return false;
+          });
+          if (activeExpired || retained.length !== settledTurns.length) {
+            settledTurns = retained;
+            for (const deliveryId of abandonedDeliveryIds) knownDeliveryRecords.delete(deliveryId);
+            deliveryBlocked = false;
+            ctx.ui.notify("An expired blocked terminal mirror turn was abandoned without replay.", "warning");
+            void flushSettledTurns(ctx);
+          }
+        }
+        await readMode(ctx);
       }
-      if (result.code === 0) await readMode(ctx);
     } finally {
       reconcileRunning = false;
     }
@@ -677,10 +773,12 @@ export default function (pi: ExtensionAPI) {
     heldAdmission = undefined;
     inputCandidates.clear();
     committedMarkers.clear();
+    knownDeliveryRecords.clear();
     settledTurns = [];
     deliveryBlocked = false;
     transportOpen = false;
     mirrorMode = "off";
+    inputGeneration = 0;
     if (!ownsHomeLock()) {
       ctx.ui.setStatus(statusKey, "telegram: not the primary session");
       return;
@@ -712,6 +810,7 @@ export default function (pi: ExtensionAPI) {
       active = true;
       activeOrigin = "telegram";
       activeRequest = provenance.requestId;
+      activeRequestTurnId = provenance.turnId;
       activeTurnId = provenance.turnId;
       lastAssistantBody = provenance.assistantBody;
       suspended = !lastAssistantBody;
@@ -745,6 +844,7 @@ export default function (pi: ExtensionAPI) {
     await Promise.all(reservations.map((delivery) => cancelReservation(delivery.deliveryId)));
     inputCandidates.clear();
     committedMarkers.clear();
+    knownDeliveryRecords.clear();
     settledTurns = [];
     deliveryBlocked = false;
     transportOpen = false;
@@ -775,37 +875,50 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (event.source === "interactive" && event.text && !event.text.startsWith("/") &&
-        transportOpen && ownsHomeLock() && await readMode(ctx) === "on") {
-      if (deliveryBlocked) {
-        ctx.ui.notify("Telegram delivery needs attention; use /telegram off before continuing.", "error");
-        return { action: "handled" as const };
+        transportOpen && ownsHomeLock()) {
+      interactivePreflights += 1;
+      try {
+        if (await readMode(ctx) !== "on") return { action: "continue" as const };
+        if (deliveryBlocked) {
+          ctx.ui.notify("Telegram delivery needs attention; use /telegram off before continuing.", "error");
+          return { action: "handled" as const };
+        }
+        const terminalCandidates = [...inputCandidates.values()].filter(
+          (candidate) => candidate.segment.origin === "terminal",
+        ).length;
+        if (terminalCandidates + settledTurns.length + (active ? 1 : 0) >= maxInputCandidates) {
+          ctx.ui.notify("Telegram cannot accept another mirrored terminal turn yet.", "error");
+          return { action: "handled" as const };
+        }
+        const body = `You · Terminal\n\n${event.text}`;
+        const validated = await validateDelivery(body, ctx);
+        if (validated.code !== 0) {
+          ctx.ui.notify("Telegram cannot mirror this terminal input within its delivery limits.", "error");
+          return { action: "handled" as const };
+        }
+        const marker = newOriginMarker();
+        const turnId = `terminal-${marker}`;
+        inputCandidates.set(marker, {
+          busyGeneration: ctx.isIdle() && event.streamingBehavior === undefined
+            ? undefined
+            : inputGeneration,
+          segment: {
+            origin: "terminal",
+            turnId,
+            text: event.text,
+            deliveryId: safeIdentity(`user-${turnId}`),
+          },
+        });
+        return { action: "transform" as const, text: markedInput(marker, "terminal", event.text) };
+      } finally {
+        interactivePreflights -= 1;
       }
-      const terminalCandidates = [...inputCandidates.values()].filter(
-        (candidate) => candidate.segment.origin === "terminal",
-      ).length;
-      if (terminalCandidates + settledTurns.length + (active ? 1 : 0) >= maxInputCandidates) {
-        ctx.ui.notify("Telegram cannot accept another mirrored terminal turn yet.", "error");
-        return { action: "handled" as const };
-      }
-      const body = `You · Terminal\n\n${event.text}`;
-      const validated = await validateDelivery(body, ctx);
-      if (validated.code !== 0) {
-        ctx.ui.notify("Telegram cannot mirror this terminal input within its delivery limits.", "error");
-        return { action: "handled" as const };
-      }
-      const marker = newOriginMarker();
-      const turnId = `terminal-${marker}`;
-      inputCandidates.set(marker, {
-        segment: {
-          origin: "terminal",
-          turnId,
-          text: event.text,
-          deliveryId: safeIdentity(`user-${turnId}`),
-        },
-      });
-      return { action: "transform" as const, text: markedInput(marker, "terminal", event.text) };
     }
     return { action: "continue" as const };
+  });
+
+  pi.on("agent_start", () => {
+    inputGeneration += 1;
   });
 
   pi.on("message_start", async (event, ctx) => {
@@ -870,17 +983,33 @@ export default function (pi: ExtensionAPI) {
     if (body) lastAssistantBody = body;
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
-    if (active && activeOrigin) {
-      if (suspended) return;
-      if (!lastAssistantBody) {
-        await holdInterrupted(ctx);
-        await updateFooter(ctx);
-        return;
+  pi.on("agent_settled", (_event, ctx) => {
+    const settledInputGeneration = inputGeneration;
+    const settledSessionGeneration = generation;
+    const finishSettlement = async (): Promise<void> => {
+      if (settledSessionGeneration !== generation || settledInputGeneration !== inputGeneration) return;
+      for (const [marker, candidate] of inputCandidates) {
+        if (candidate.segment.origin === "terminal" && candidate.busyGeneration !== undefined &&
+            candidate.busyGeneration <= settledInputGeneration) {
+          inputCandidates.delete(marker);
+        }
       }
-      queueActiveTurn();
-    }
-    if (!await flushSettledTurns(ctx)) return;
-    void drain(ctx);
+      if (active && activeOrigin) {
+        if (interactivePreflights > 0 || suspended) return;
+        if (!lastAssistantBody) {
+          await holdInterrupted(ctx);
+          await updateFooter(ctx);
+          return;
+        }
+        queueActiveTurn();
+      }
+      if (!await flushSettledTurns(ctx)) return;
+      void drain(ctx);
+    };
+    const pendingBusyInput = [...inputCandidates.values()].some((candidate) =>
+      candidate.segment.origin === "terminal" && candidate.busyGeneration !== undefined &&
+      candidate.busyGeneration <= settledInputGeneration);
+    if (pendingBusyInput && ctx.hasPendingMessages()) return;
+    return finishSettlement();
   });
 }

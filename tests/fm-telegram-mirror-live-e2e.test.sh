@@ -52,6 +52,7 @@ fcntl.flock(lock, fcntl.LOCK_EX)
 path = home / 'fake-state.json'
 state = json.loads(path.read_text()) if path.exists() else {'request': None, 'deliveries': {}, 'log': []}
 state.setdefault('reservations', {})
+state.setdefault('delivery_records', {})
 state.setdefault('log', []).append([command, *rest])
 def save():
     temporary = path.with_name(f'.{path.name}.{os.getpid()}')
@@ -80,6 +81,15 @@ elif command == 'mirror-reconcile':
             request['status'] = 'queued'; request.pop('owner', None)
     if request and request.get('status') == 'held':
         print(f"held\t{request['id']}\t{request['turn_id']}")
+    expired_deliveries = set(state.pop('expire_deliveries', []))
+    for delivery_id in expired_deliveries:
+        state['delivery_records'].pop(delivery_id, None)
+        state['deliveries'].pop(delivery_id, None)
+        state['reservations'].pop(delivery_id, None)
+    for delivery_id in options('--report-delivery'):
+        status = state['delivery_records'].get(delivery_id)
+        if status is None: print(f"delivery-missing\t{delivery_id}")
+        else: print(f"delivery\t{delivery_id}\t{status}")
 elif command == 'mirror-next':
     request = state.get('request')
     if request and request.get('status') == 'queued': print(request['id'])
@@ -127,9 +137,12 @@ elif command == 'mirror-reserve':
     elif (home / 'reject-user-reserve').exists(): code = 1
     elif delivery_id in state['reservations'] and state['reservations'][delivery_id] != body: code = 1
     elif delivery_id in state['deliveries'] and state['deliveries'][delivery_id] != body: code = 1
-    else: state['reservations'][delivery_id] = body
+    else:
+        state['reservations'][delivery_id] = body
+        state['delivery_records'][delivery_id] = 'reserved'
 elif command == 'mirror-cancel':
     state['reservations'].pop(rest[0], None)
+    state['delivery_records'].pop(rest[0], None)
 elif command == 'mirror-delivered':
     request = state.get('request')
     if not request or request.get('id') != rest[0] or request.get('status') != 'claimed': code = 1
@@ -144,7 +157,8 @@ elif command == 'mirror-reply':
     if (home / 'reject-assistant-reply').exists() and body.startswith('Firstmate ·'): code = 1
     existing = state['deliveries'].get(delivery_id)
     if code == 0 and existing is not None and existing != body: code = 1
-    elif code == 0:
+    state['delivery_records'][delivery_id] = 'rejected' if code != 0 else 'sent'
+    if code == 0:
         state['deliveries'][delivery_id] = body
         state['reservations'].pop(delivery_id, None)
         if body == 'Firstmate · slow settlement A answer' and (home / 'delay-assistant-reply').exists():
@@ -188,7 +202,20 @@ export default function (pi: ExtensionAPI): void {
     description: "Return a diagnostic payload for structural mirror exclusion coverage",
     parameters: Type.Object({}),
     async execute() {
-      return { content: [{ type: "text" as const, text: "tool diagnostic payload" }], details: {} };
+      const state = globalThis as typeof globalThis & {
+        __telegramMirrorHoldTool?: boolean;
+        __telegramMirrorToolStarted?: boolean;
+        __telegramMirrorTerminateTool?: boolean;
+      };
+      state.__telegramMirrorToolStarted = true;
+      while (state.__telegramMirrorHoldTool) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      return {
+        content: [{ type: "text" as const, text: "tool diagnostic payload" }],
+        details: {},
+        terminate: state.__telegramMirrorTerminateTool === true,
+      };
     },
   });
   pi.on("input", async (event) => {
@@ -221,6 +248,7 @@ export default function (pi: ExtensionAPI): void {
       __telegramMirrorHandleExtensionInput?: boolean;
       __telegramMirrorHandleInteractiveInput?: boolean;
       __telegramMirrorDelayInteractiveInput?: boolean;
+      __telegramMirrorHandledInteractiveCount?: number;
     };
     if (state.__telegramMirrorDelayInteractiveInput && event.source === "interactive") {
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -229,6 +257,8 @@ export default function (pi: ExtensionAPI): void {
       return { action: "handled" as const };
     }
     if (state.__telegramMirrorHandleInteractiveInput && event.source === "interactive") {
+      state.__telegramMirrorHandledInteractiveCount =
+        (state.__telegramMirrorHandledInteractiveCount || 0) + 1;
       return { action: "handled" as const };
     }
   });
@@ -246,7 +276,7 @@ process.env.FM_TELEGRAM_TRANSPORT = transport;
 process.env.FM_TELEGRAM_SESSION_LOCK_LIB = lockLib;
 process.env.FM_TELEGRAM_ADMISSION_TIMEOUT_MS = '150';
 process.env.FM_TELEGRAM_RECONCILE_INTERVAL_MS = '500';
-process.env.FM_TELEGRAM_MAX_INPUT_CANDIDATES = '4';
+process.env.FM_TELEGRAM_MAX_INPUT_CANDIDATES = '256';
 const {
   ModelRuntime,
   SessionManager,
@@ -410,7 +440,9 @@ faux.appendResponses([
   fauxAssistantMessage('queued user block A answer'),
   fauxAssistantMessage('queued user block B answer'),
 ]);
-const queuedUserBlockA = runtime.session.prompt('queued user block A', { source: 'interactive' });
+const queuedUserBlockA = runtime.session.prompt('queued user block A', {
+  source: 'interactive', streamingBehavior: 'followUp',
+});
 const queuedUserBlockB = runtime.session.prompt('queued user block B', {
   source: 'interactive', streamingBehavior: 'followUp',
 });
@@ -495,32 +527,41 @@ assert.equal(Object.values(state().deliveries)
   .filter((body) => body === 'Firstmate · long preflight answer').length, 1);
 
 const callsBeforeCandidateCap = faux.state.callCount;
+globalThis.__telegramMirrorHoldCandidateRoot = true;
+globalThis.__telegramMirrorHandledInteractiveCount = 0;
 faux.appendResponses([
   async () => {
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    while (globalThis.__telegramMirrorHoldCandidateRoot) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     return fauxAssistantMessage('candidate cap root answer');
   },
-  fauxAssistantMessage('candidate cap follow-up 0 answer'),
-  fauxAssistantMessage('candidate cap follow-up 1 answer'),
-  fauxAssistantMessage('candidate cap follow-up 2 answer'),
+  fauxAssistantMessage('valid answer after busy handled flood'),
 ]);
-const candidateCapRoot = runtime.session.prompt('candidate cap root', { source: 'interactive' });
+const candidateCapRoot = runtime.session.prompt('candidate cap root', { source: 'rpc' });
 await waitFor(() => userTexts(initialManager).some((text) => text.includes('candidate cap root')),
   'candidate cap root did not start');
-for (let index = 0; index < 4; index += 1) {
-  await runtime.session.prompt(`candidate cap follow-up ${index}`, {
+globalThis.__telegramMirrorHandleInteractiveInput = true;
+for (let index = 0; index < 257; index += 1) {
+  await runtime.session.prompt(`handled busy candidate ${index}`, {
     source: 'interactive', streamingBehavior: 'followUp',
   });
 }
+globalThis.__telegramMirrorHandleInteractiveInput = false;
+assert.equal(globalThis.__telegramMirrorHandledInteractiveCount, 256,
+  'bounded candidate capacity did not reach the later input handler');
+assert.equal(faux.state.callCount, callsBeforeCandidateCap + 1,
+  'handled busy candidates started model turns');
+globalThis.__telegramMirrorHoldCandidateRoot = false;
 await candidateCapRoot;
-await waitFor(() => Object.values(state().deliveries)
-  .some((body) => body === 'Firstmate · candidate cap follow-up 2 answer'),
-'accepted candidate-cap follow-ups did not settle');
-assert.equal(faux.state.callCount, callsBeforeCandidateCap + 4,
-  'candidate cap admitted an excess model turn');
-assert.equal(userTexts(initialManager)
-  .some((text) => text.includes('candidate cap follow-up 3')), false,
-'excess candidate-cap follow-up entered Pi');
+await new Promise((resolve) => setTimeout(resolve, 25));
+await runtime.session.prompt('valid terminal after busy handled flood', { source: 'interactive' });
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'You · Terminal\n\nvalid terminal after busy handled flood').length, 1);
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · valid answer after busy handled flood').length, 1);
+assert.equal(faux.state.callCount, callsBeforeCandidateCap + 2,
+  'stale handled candidates suppressed a valid post-settlement turn');
 assert.equal(notices.some(([message]) => message.includes('cannot accept another mirrored terminal turn')), true);
 
 writeFileSync(`${home}/delay-assistant-reply`, '');
@@ -561,6 +602,36 @@ assert.equal(faux.state.callCount, callsAfterTerminalBlock,
   'blocked terminal assistant retry invoked the model');
 assert.equal(userTexts(initialManager)
   .filter((text) => text.includes('terminal with blocked assistant')).length, 1);
+
+writeFileSync(`${home}/reject-assistant-reply`, '');
+faux.appendResponses([fauxAssistantMessage('expired blocked terminal answer')]);
+await runtime.session.prompt('terminal whose blocked delivery expires', { source: 'interactive' });
+await waitFor(() => statuses.at(-1)?.[1] === 'telegram: delivery needs attention',
+  'expiring terminal delivery did not enter blocked state');
+const expiringDeliveryCall = [...state().log].reverse().find((call) =>
+  call[0] === 'mirror-reply' && call[1].startsWith('assistant-terminal-'));
+assert.ok(expiringDeliveryCall, 'expiring terminal assistant had no stable delivery identity');
+const expiringDeliveryId = expiringDeliveryCall[1];
+await waitFor(() => state().log.filter((call) =>
+  call[0] === 'mirror-reconcile' && call.includes(expiringDeliveryId)).length >= 2,
+'expiring terminal delivery was not tracked by reconciliation');
+const expiringDeliveryState = state();
+expiringDeliveryState.expire_deliveries = [expiringDeliveryId];
+save(expiringDeliveryState);
+await waitFor(() => notices.some(([message]) =>
+  message === 'An expired blocked terminal mirror turn was abandoned without replay.'),
+'expired blocked terminal turn was not abandoned visibly');
+unlinkSync(`${home}/reject-assistant-reply`);
+const expiredDeliveryAttempts = state().log.filter((call) =>
+  call[0] === 'mirror-reply' && call[1] === expiringDeliveryId).length;
+const callsAfterTerminalDeliveryExpiry = faux.state.callCount;
+await runtime.session.prompt('/telegram on', { source: 'interactive' });
+await new Promise((resolve) => setTimeout(resolve, 600));
+assert.equal(state().log.filter((call) =>
+  call[0] === 'mirror-reply' && call[1] === expiringDeliveryId).length, expiredDeliveryAttempts,
+'expired terminal delivery was recreated and replayed');
+assert.equal(faux.state.callCount, callsAfterTerminalDeliveryExpiry,
+  'expired terminal delivery recovery invoked the model');
 
 writeFileSync(`${home}/reject-assistant-reply`, '');
 const callsBeforeOrderedBlock = faux.state.callCount;
@@ -684,6 +755,45 @@ current.request = null;
 save(current);
 assert.equal(userTexts(initialManager).some((text) => text.includes('handled by later extension')), false);
 assert.equal(current.receipts?.includes('tg-text-u12-m12') ?? false, false);
+
+const steered = state();
+steered.request = { id: 'tg-text-u19-m19', text: 'Telegram tool-loop request', status: 'queued' };
+save(steered);
+globalThis.__telegramMirrorHoldTool = true;
+globalThis.__telegramMirrorTerminateTool = true;
+globalThis.__telegramMirrorToolStarted = false;
+const callsBeforeSteer = faux.state.callCount;
+faux.appendResponses([
+  fauxAssistantMessage([
+    fauxToolCall('mirror_test_tool', {}, { id: 'mirror-steer-tool-call' }),
+  ], { stopReason: 'toolUse' }),
+  fauxAssistantMessage('answer after terminal steer'),
+]);
+await waitFor(() => globalThis.__telegramMirrorToolStarted === true,
+  'Telegram tool loop did not reach tool execution');
+const terminalSteer = runtime.session.prompt('terminal steer during Telegram tool loop', {
+  source: 'interactive', streamingBehavior: 'steer',
+});
+await new Promise((resolve) => setTimeout(resolve, 50));
+globalThis.__telegramMirrorHoldTool = false;
+await terminalSteer;
+globalThis.__telegramMirrorTerminateTool = false;
+await waitFor(() => state().handled?.includes('tg-text-u19-m19'),
+  'terminal steer did not complete the original Telegram request');
+assert.equal(userTexts(initialManager)
+  .filter((text) => text.includes('Telegram tool-loop request')).length, 1);
+assert.equal(userTexts(initialManager)
+  .filter((text) => text.includes('terminal steer during Telegram tool loop')).length, 1);
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'You · Terminal\n\nterminal steer during Telegram tool loop').length, 1,
+  'terminal steer was not mirrored');
+assert.equal(Object.values(state().deliveries)
+  .filter((body) => body === 'Firstmate · answer after terminal steer').length, 1);
+assert.equal(faux.state.callCount, callsBeforeSteer + 2,
+  'terminal steer reinjected the original Telegram request');
+assert.equal(initialManager.getEntries().some((entry) =>
+  entry.type === 'custom' && entry.customType === 'firstmate-telegram-admission'
+    && entry.data.requestId === 'tg-text-u19-m19' && entry.data.state === 'interrupted'), false);
 
 const competing = state();
 competing.request = { id: 'tg-text-u9-m9', text: 'paired Telegram request', status: 'queued' };

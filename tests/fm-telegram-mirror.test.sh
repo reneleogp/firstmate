@@ -77,8 +77,20 @@ reserved = run('mirror-reserve', 'user-terminal-reserved', '--text-file', str(re
 assert reserved.returncode == 0, reserved.stderr
 reservation = Path(home, 'state', 'telegram', 'deliveries', 'user-terminal-reserved.json')
 assert json.loads(reservation.read_text())['status'] == 'reserved'
+reported = run(
+    'mirror-reconcile', '--preserve-request', 'tg-text-u1-m1',
+    '--report-delivery', 'user-terminal-reserved',
+)
+assert reported.returncode == 0, reported.stderr
+assert 'delivery\tuser-terminal-reserved\treserved' in reported.stdout.splitlines()
 assert run('mirror-cancel', 'user-terminal-reserved').returncode == 0
 assert not reservation.exists()
+missing = run(
+    'mirror-reconcile', '--preserve-request', 'tg-text-u1-m1',
+    '--report-delivery', 'user-terminal-reserved',
+)
+assert missing.returncode == 0, missing.stderr
+assert 'delivery-missing\tuser-terminal-reserved' in missing.stdout.splitlines()
 second = Path(home, 'state', 'telegram', 'inbox', 'tg-text-u2-m2.json')
 second.write_text('{"request_id":"tg-text-u2-m2","origin":"telegram","text":"off","status":"queued"}')
 mode_path.write_text('off\\n')
