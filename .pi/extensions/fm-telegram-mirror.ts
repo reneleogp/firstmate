@@ -18,7 +18,16 @@
 // extension is the client, because the bot outlives every Pi session. The wire
 // protocol is stated once in that script's header.
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  writeFileSync,
+} from "node:fs";
 import { connect, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -173,7 +182,11 @@ function clipboardMime(name: string): string | undefined {
   return undefined;
 }
 
-type ClipboardScan = { images: QueuedImage[]; caption: string };
+type ClipboardScan = { images: QueuedImage[]; caption: string; recognized: boolean; omitted: boolean };
+type ClipboardArtifact =
+  | { kind: "invalid" }
+  | { kind: "refused" }
+  | { kind: "accepted"; image: QueuedImage };
 
 function escapeForRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -189,11 +202,12 @@ function clipboardScan(text: string): ClipboardScan {
     `^${escapeForRegExp(prefix)}${CLIPBOARD_UUID}\\.(${CLIPBOARD_EXTENSIONS})(?![A-Za-z0-9._-])`,
   );
   const images: QueuedImage[] = [];
-  const accepted: Array<[number, number]> = [];
+  const proven: Array<[number, number]> = [];
   let index = 0;
   let previousEnd = -1;
   let total = 0;
-  while (index < text.length && images.length < MAX_CLIPBOARD_IMAGES) {
+  let omitted = false;
+  while (index < text.length) {
     const at = text.indexOf(prefix, index);
     if (at < 0) break;
     const startsCleanly = at === 0 || at === previousEnd || /\s/.test(text[at - 1] ?? "");
@@ -204,18 +218,22 @@ function clipboardScan(text: string): ClipboardScan {
     }
     const token = match[0];
     const end = at + token.length;
-    const image = readClipboardArtifact(token, total);
-    if (image) {
-      total += Buffer.byteLength(image.data, "base64");
-      images.push(image);
-      accepted.push([at, end]);
+    const artifactResult = readClipboardArtifact(token, total, images.length);
+    if (artifactResult.kind !== "invalid") {
+      proven.push([at, end]);
       previousEnd = end;
+      if (artifactResult.kind === "accepted") {
+        total += Buffer.byteLength(artifactResult.image.data, "base64");
+        images.push(artifactResult.image);
+      } else {
+        omitted = true;
+      }
     }
     index = end;
   }
   // Only proven artifacts leave the caption; anything that failed a check is
   // ordinary text the captain wrote and stays exactly as written.
-  const removed = accepted.map(([start, end]): [number, number] => {
+  const removed = proven.map(([start, end]): [number, number] => {
     if (/[ \t]/.test(text[end] ?? "")) return [start, end + 1];
     if (end === text.length && /[ \t]/.test(text[start - 1] ?? "")) return [start - 1, end];
     return [start, end];
@@ -224,26 +242,40 @@ function clipboardScan(text: string): ClipboardScan {
   for (const [start, end] of [...removed].reverse()) {
     caption = `${caption.slice(0, start)}${caption.slice(end)}`;
   }
-  return { images, caption };
+  return { images, caption, recognized: proven.length > 0, omitted };
 }
 
-function readClipboardArtifact(token: string, alreadyTaken: number): QueuedImage | undefined {
+function readClipboardArtifact(
+  token: string,
+  alreadyTaken: number,
+  imageCount: number,
+): ClipboardArtifact {
   const declared = clipboardMime(basename(token));
-  if (!declared) return undefined;
+  if (!declared) return { kind: "invalid" };
   try {
     // lstat, so a symlink pointing somewhere else is refused rather than
     // followed, and only this account's own regular file is read.
     const info = lstatSync(token);
-    if (!info.isFile() || info.isSymbolicLink()) return undefined;
-    if (info.size <= 0 || info.size > MAX_CLIPBOARD_BYTES) return undefined;
-    if (typeof process.getuid === "function" && info.uid !== process.getuid()) return undefined;
-    if (alreadyTaken + info.size > MAX_CLIPBOARD_TOTAL_BYTES) return undefined;
-    const bytes = readFileSync(token);
+    if (!info.isFile() || info.isSymbolicLink() || info.size <= 0) return { kind: "invalid" };
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
+      return { kind: "invalid" };
+    }
+    const descriptor = openSync(token, "r");
+    const header = Buffer.alloc(Math.min(info.size, 12));
+    try {
+      readSync(descriptor, header, 0, header.length, 0);
+    } finally {
+      closeSync(descriptor);
+    }
     // The bytes decide, not the name: a renamed file is not an image.
-    if (imageMimeFromMagic(bytes) !== declared) return undefined;
-    return { data: bytes.toString("base64"), mime: declared };
+    if (imageMimeFromMagic(header) !== declared) return { kind: "invalid" };
+    if (info.size > MAX_CLIPBOARD_BYTES || imageCount >= MAX_CLIPBOARD_IMAGES ||
+        alreadyTaken + info.size > MAX_CLIPBOARD_TOTAL_BYTES) return { kind: "refused" };
+    const bytes = readFileSync(token);
+    if (imageMimeFromMagic(bytes) !== declared) return { kind: "invalid" };
+    return { kind: "accepted", image: { data: bytes.toString("base64"), mime: declared } };
   } catch {
-    return undefined;
+    return { kind: "invalid" };
   }
 }
 
@@ -514,12 +546,15 @@ export default function (pi: ExtensionAPI) {
     // The local path is Pi's own plumbing and means nothing on a phone, so the
     // caption keeps only what the captain actually wrote around it. Firstmate
     // still receives the submission exactly as typed.
-    const caption = pasted.images.length > 0 ? pasted.caption : text;
+    const caption = pasted.recognized ? pasted.caption : text;
+    if (pasted.omitted) {
+      activeCtx?.ui.notify("Telegram image was not mirrored because it exceeds clipboard image limits.", "warning");
+    }
     // An image-only submission has no text but is still a real submission.
     if (!caption.trim() && images.length === 0) return;
     const written = write(images.length > 0
       ? { t: "terminal", text: caption, images }
-      : { t: "terminal", text });
+      : { t: "terminal", text: caption });
     if (!written && images.length > 0) {
       if (caption.trim()) write({ t: "terminal", text: caption });
       activeCtx?.ui.notify("Telegram image was not mirrored because its transport queue is full.", "warning");

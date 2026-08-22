@@ -347,6 +347,28 @@ if (negatives.length !== 8) {
   fail(`operational input was mirrored or a probe was dropped: ${negatives.length}`);
 }
 
+// Once a canonical artifact is proven, an admission-limit refusal must omit
+// only its local plumbing path while preserving the accepted media and prose.
+const framesBeforeImageCountLimit = received.filter((frame) => frame.t === "terminal").length;
+const noticesBeforeImageCountLimit = notifications.length;
+handlers.get("input")({
+  text: `keep ${Array(11).fill(genuine).join(" ")} this`,
+  source: "interactive",
+}, ctx);
+await waitFor(
+  () => received.filter((frame) => frame.t === "terminal").length === framesBeforeImageCountLimit + 1,
+  "the clipboard image-count refusal",
+);
+const countLimited = received.filter((frame) => frame.t === "terminal").at(-1);
+if (countLimited.images?.length !== 10 || countLimited.text !== "keep this") {
+  fail(`a refused canonical artifact leaked its path or changed accepted media: ${JSON.stringify(countLimited.text)}`);
+}
+if (countLimited.text.includes("pi-clipboard-") ||
+    notifications[noticesBeforeImageCountLimit]?.message !==
+      "Telegram image was not mirrored because it exceeds clipboard image limits.") {
+  fail(`the clipboard image-count refusal was not reported safely: ${JSON.stringify(notifications.slice(noticesBeforeImageCountLimit))}`);
+}
+
 for (const path of [genuine, genuineJpeg, arbitrary, wrongMagic, oversized, linkTarget, symlinked]) {
   try { unlinkSync(path); } catch {}
 }
