@@ -11,11 +11,12 @@
 #
 # SESSION-LOCK RECORD FORMAT (state/.lock), owned here and nowhere else:
 #
-#   line 1: <pid>          the session's verified-harness pid, unchanged since
-#                          the lock's first format, so every first-line reader
-#                          keeps working across the transition
-#   line 2: gen=<token>    that pid's kernel process-generation identity as of
-#                          publication (current format; see fm_process_generation)
+#   current line 1: <pid>       the session's verified-harness pid, unchanged
+#                               since the lock's first format, so every
+#                               first-line reader keeps working in transition
+#   current line 2: gen=<token> that pid's kernel process-generation identity as
+#                               of publication (see fm_process_generation)
+#   legacy line 1:  <pid>       the accepted pre-generation compatibility shape
 #
 # A pid alone identifies nothing durable: pids are recycled, and the replacement
 # can be another genuine Pi-family process that satisfies every name-based
@@ -23,8 +24,8 @@
 # that pid is what makes "is this still the process that published the lock?"
 # answerable instead of guessed.
 #
-# A record in any other shape - a non-numeric pid, a second line that is not a
-# well-formed gen=, an empty token, or a third line - is malformed and grants
+# Any shape other than those two - a non-numeric pid, a second line that is not
+# a well-formed gen=, an empty token, or a third line - is malformed and grants
 # nothing. Callers read the binding through fm_session_lock_generation_verdict:
 #
 #   bound     current-format record whose recorded generation still matches the
@@ -36,11 +37,12 @@
 #   mismatch  a proven or unverifiable identity change; never grants authority
 #
 # COMPATIBILITY PATH: a home whose lock predates this format keeps working. Its
-# legacy record is accepted for that home's OWN ancestry-proven ownership
-# (bound/compat/unbound) and is rewritten in the current format the next time its
-# true owner runs bin/fm-lock.sh, which is every session start. External peer
-# authorization is stricter and takes only bound or compat, so an unprovable
-# legacy record can never authorize a process outside the session's ancestry.
+# legacy record is accepted for that home's OWN ancestry-proven ownership when
+# its verdict is compat or unbound, and is rewritten in the current format the
+# next time its true owner runs bin/fm-lock.sh, which is every session start.
+# External peer authorization is stricter and takes only bound or compat, so an
+# unprovable legacy record can never authorize a process outside the session's
+# ancestry.
 
 # Cursor process identity is NOT expressible as a command-name pattern and is
 # deliberately not added to the tables below: Cursor's installed names are
@@ -225,16 +227,28 @@ fm_proc_boot_anchor() {
   printf 'btime-%s' "$boot"
 }
 
+# Print pid $1's portable ps lstart value in a stable locale, or return 1.
+# FM_SESSION_LOCK_PS_COMMAND is an executable override used by platform tests.
+fm_ps_lstart() {  # <pid>
+  local pid=$1 ps_command raw
+  ps_command=${FM_SESSION_LOCK_PS_COMMAND:-ps}
+  raw=$(LC_ALL=C "$ps_command" -o lstart= -p "$pid" 2>/dev/null \
+    | awk 'NF { if (found) exit 2; $1=$1; print; found=1 } END { if (!found) exit 1 }') || return 1
+  printf '%s' "$raw" | grep -Eq \
+    '^[A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}$' \
+    || return 1
+  printf '%s' "$raw"
+}
+
 # Print pid $1's kernel process-generation identity as one opaque token, or
 # return 1 when this host exposes neither source.
 #
-# proc:<boot-anchor>:<start-ticks> is the portable positive source currently
-# available to this repository. ps lstart is deliberately not an identity
-# source: its one-second resolution lets a same-second recycled pid inherit the
-# token. A host without positive higher-resolution evidence uses the explicit
-# legacy compatibility path instead of publishing an unverifiable generation.
+# proc:<boot-anchor>:<start-ticks> is preferred where procfs exists because its
+# sub-second resolution narrows the PID-recycle boundary. ps:<lstart> is the
+# portable macOS/BSD source; underscores encode lstart's spaces so the complete
+# value remains one self-contained record token.
 fm_process_generation() {  # <pid>
-  local pid=$1 ticks anchor
+  local pid=$1 ticks anchor lstart
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
@@ -242,23 +256,37 @@ fm_process_generation() {  # <pid>
     printf 'proc:%s:%s' "$anchor" "$ticks"
     return 0
   fi
+  if lstart=$(fm_ps_lstart "$pid"); then
+    printf 'ps:%s' "${lstart// /_}"
+    return 0
+  fi
   return 1
 }
 
-# Print pid $1's start time in whole epoch seconds, or return 1. procfs only:
-# this is used exclusively for the legacy-record disproof below, and every host
-# that lacks procfs simply has no such evidence to offer.
+# Print pid $1's start time in whole epoch seconds, or return 1. The procfs path
+# is preferred; portable ps lstart plus the host's date implementation keeps the
+# legacy-record disproof available on macOS/BSD.
 fm_process_start_epoch() {  # <pid>
-  local pid=$1 ticks btime hz
-  ticks=$(fm_proc_start_ticks "$pid") || return 1
-  btime=$(awk '$1 == "btime" && $2 ~ /^[0-9]+$/ { print $2; found=1; exit } END { if (!found) exit 1 }' \
-    "$(fm_session_lock_proc_root)/stat" 2>/dev/null) || return 1
-  hz=$(getconf CLK_TCK 2>/dev/null) || return 1
-  case "$hz" in
+  local pid=$1 ticks btime hz lstart epoch
+  if ticks=$(fm_proc_start_ticks "$pid"); then
+    btime=$(awk '$1 == "btime" && $2 ~ /^[0-9]+$/ { print $2; found=1; exit } END { if (!found) exit 1 }' \
+      "$(fm_session_lock_proc_root)/stat" 2>/dev/null) || return 1
+    hz=$(getconf CLK_TCK 2>/dev/null) || return 1
+    case "$hz" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$hz" -gt 0 ] 2>/dev/null || return 1
+    awk -v boot="$btime" -v ticks="$ticks" -v hz="$hz" 'BEGIN { printf "%d", boot + (ticks / hz) }'
+    return 0
+  fi
+  lstart=$(fm_ps_lstart "$pid") || return 1
+  epoch=$(LC_ALL=C date -d "$lstart" +%s 2>/dev/null) \
+    || epoch=$(LC_ALL=C date -j -f '%a %b %e %T %Y' "$lstart" +%s 2>/dev/null) \
+    || return 1
+  case "$epoch" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  [ "$hz" -gt 0 ] 2>/dev/null || return 1
-  awk -v boot="$btime" -v ticks="$ticks" -v hz="$hz" 'BEGIN { printf "%d", boot + (ticks / hz) }'
+  printf '%s' "$epoch"
 }
 
 # Print file $1's mtime in epoch seconds, or return 1. GNU stat first, BSD stat
@@ -401,8 +429,8 @@ fm_session_lock_generation_verdict() {  # <state>
 }
 
 # True when state dir $1's record still binds to its pid well enough for this
-# home's own session to act on it: proven (bound), disproved-recycled (compat),
-# or a legacy record no evidence can decide (unbound, the pre-generation posture
+# home's own session to act on it: proven (bound), not disproved (compat), or a
+# legacy record no evidence can decide (unbound, the pre-generation posture
 # this migration must not regress).
 fm_session_lock_generation_holds() {  # <state>
   local verdict
@@ -425,10 +453,11 @@ fm_session_lock_generation_verified() {  # <state>
   return 1
 }
 
-# Print one canonical snapshot of state dir $1's complete validated lock
-# identity. Consumers that defer mutation carry this opaque value and ask this
-# owner whether it still holds, so replacing a lock with the same recycled pid
-# cannot preserve authority.
+# Print one canonical snapshot of state dir $1's complete accepted lock identity.
+# Consumers that defer mutation carry this opaque value and ask this owner
+# whether it still holds, so replacing a generation-bound lock with the same
+# recycled pid cannot preserve authority and legacy records retain their declared
+# compatibility behavior.
 fm_session_lock_identity() {  # <state>
   local state=$1 verdict pid gen
   fm_session_lock_parse "$state" || return 1
@@ -450,10 +479,11 @@ fm_session_lock_identity_holds() {  # <state> <identity>
   [ "$current" = "$2" ]
 }
 
-# True when state dir $1's lock names a live verified harness that is still the
-# same process generation, i.e. some session genuinely holds this home right now.
-# This is the predicate that separates "another live session owns the home" from
-# "a dead session left its pid behind and something else now answers to it".
+# True when state dir $1's lock names a live verified harness accepted by the
+# generation or legacy-compatibility verdict, i.e. some session may genuinely
+# hold this home right now. This is the predicate that separates "another live
+# session owns the home" from a stale record whenever the available evidence can
+# make that distinction.
 fm_session_lock_holder_live() {  # <state>
   local state=$1 pid
   pid=$(fm_session_lock_pid "$state") || return 1
@@ -461,9 +491,9 @@ fm_session_lock_holder_live() {  # <state>
   fm_session_lock_generation_holds "$state"
 }
 
-# True when state dir $1 holds a regular, non-symlink session lock naming a
-# live verified harness, still in its recorded process generation, in process
-# $2's own harness ancestry. Membership is the honest test of that question,
+# True when state dir $1 holds a regular, non-symlink session lock naming a live
+# verified harness accepted by the generation or legacy-compatibility verdict in
+# process $2's own harness ancestry. Membership is the honest test of that question,
 # because the lock owner sits at an unknown depth in a contiguous Claude run - it
 # is the outermost pid when a hook fires inside the session's nested worker
 # chain, and an inner pid when a harness-named daemon parents the session. A

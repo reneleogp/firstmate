@@ -111,6 +111,15 @@ function positiveInteger(name: string, fallback: number): number {
   return Math.floor(value);
 }
 
+function pidAlive(pid: string): boolean {
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function lockOwnership(): LockOwnership {
   const result = spawnSync(`${fmRoot}/bin/fm-lock.sh`, ["ownership", String(process.pid)], {
     env: { ...process.env, FM_STATE_OVERRIDE: state },
