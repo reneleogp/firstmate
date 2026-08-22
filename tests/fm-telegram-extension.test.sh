@@ -259,11 +259,16 @@ const shot = submissions[3];
 if (!Array.isArray(shot.content)) {
   fail(`a screenshot was not sent as image content: ${JSON.stringify(shot)}`);
 }
+// The caption stays, and a generic marker makes the attachment visible in a
+// terminal that renders no preview. Nothing names where the image came from.
 if (JSON.stringify(shot.content) !== JSON.stringify([
-  { type: "text", text: "look at this failure" },
+  { type: "text", text: "look at this failure\n\n[Image attached]" },
   { type: "image", data: pixels, mimeType: "image/png" },
 ])) {
   fail(`unexpected screenshot content: ${JSON.stringify(shot.content)}`);
+}
+if (/telegram/i.test(JSON.stringify(shot.content))) {
+  fail("a screenshot message told Firstmate where it came from");
 }
 if (shot.options?.deliverAs !== "steer") {
   fail("a screenshot did not take Pi's ordinary input path");
@@ -276,13 +281,14 @@ if (received.some((frame) => frame.t === "terminal" && String(frame.text).includ
   fail("a Telegram screenshot was echoed back to Telegram");
 }
 
-// A caption-free screenshot carries only the image.
+// A caption-free screenshot still says an image arrived, and still carries it.
 botWrite({ t: "deliver", id: "m5", text: "", image: { data: pixels, mime: "image/webp" } });
 await waitFor(() => submissions.length === 5, "the caption-free screenshot");
 if (JSON.stringify(submissions[4].content) !== JSON.stringify([
+  { type: "text", text: "[Image attached]" },
   { type: "image", data: pixels, mimeType: "image/webp" },
 ])) {
-  fail(`a caption-free screenshot carried extra content: ${JSON.stringify(submissions[4].content)}`);
+  fail(`unexpected caption-free screenshot content: ${JSON.stringify(submissions[4].content)}`);
 }
 
 // 5. /telegram is transport, never conversation text: bare, it toggles.

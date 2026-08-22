@@ -208,7 +208,12 @@ for line in lines:
         url = str(images[0].get("image_url", {}).get("url", ""))
         if not url.startswith("data:image/png;base64,") or len(url) < 60:
             raise SystemExit(1)
-        if wanted and wanted not in " ".join(texts):
+        joined = " ".join(texts)
+        # The terminal renders no preview, so the message must say an image is
+        # there, and must not say where it came from.
+        if "[Image attached]" not in joined or "elegram" in joined:
+            raise SystemExit(1)
+        if wanted and wanted not in joined:
             continue
         raise SystemExit(0)
 raise SystemExit(1)
@@ -227,10 +232,10 @@ start_pi
 printf 'Okay what is this image\n' >"$HOME_DIR/inject-image.txt"
 wait_for_image_payload "Okay what is this image" \
   || fail "a captioned screenshot never reached the model as an image (Pi $PI_VERSION)"
-pass "a captioned Telegram screenshot reaches the model as one message carrying both the caption and the image (Pi $PI_VERSION)"
+pass "a captioned Telegram screenshot reaches the model as one message carrying the caption, the [Image attached] marker, and the image (Pi $PI_VERSION)"
 
 : >"$PAYLOADS"
 printf ' \n' >"$HOME_DIR/inject-image.txt"
 wait_for_image_payload "" \
   || fail "a screenshot without a caption never reached the model as image content (Pi $PI_VERSION)"
-pass "a Telegram screenshot without a caption still reaches the model as image content (Pi $PI_VERSION)"
+pass "a Telegram screenshot without a caption reaches the model as the [Image attached] marker plus the image (Pi $PI_VERSION)"

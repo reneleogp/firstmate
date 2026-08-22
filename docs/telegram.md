@@ -115,8 +115,9 @@ Messages still reach Firstmate exactly as before, and an accepted message still 
 
 ## Screenshots and images
 
-Send a screenshot from the paired chat and Firstmate receives it exactly as an image pasted into the terminal, with no marker saying it came from Telegram.
+Send a screenshot from the paired chat and Firstmate receives it exactly as an image pasted into the terminal, with nothing saying it came from Telegram.
 A caption travels with it as the text of the same message.
+Because the terminal shows no preview of an attached image, the message also carries a plain `[Image attached]` line so you can see one arrived; with a caption it reads as the caption followed by that line, and without one it is that line alone.
 
 - Photos and image files are accepted as PNG, JPEG, or WebP; anything else is refused with a short reply and never downloaded.
 - Telegram sends several renditions of a photo, and the sharpest one is used.

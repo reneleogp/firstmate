@@ -53,6 +53,10 @@ const COMMAND_TIMEOUT_MS = positiveInteger("FM_TELEGRAM_COMMAND_TIMEOUT_MS", 500
 // item is shown. It is stored beside the bot's private directory so it survives
 // a restart and can still be read while the bot is unreachable.
 const FOOTER_KEY = "firstmate-telegram";
+// Pi's terminal does not preview an attached image, so every image message
+// carries this marker as its visible text. It names no origin: an image sent
+// from anywhere reads the same to Firstmate.
+const IMAGE_MARKER = "[Image attached]";
 const DISPLAY_SETTING_FILE = "pi-display-status";
 
 function positiveInteger(name: string, fallback: number): number {
@@ -301,9 +305,11 @@ export default function (pi: ExtensionAPI) {
   function queueDelivery(id: string, text: string, image?: QueuedImage): void {
     deliveries = deliveries.then(async () => {
       if (image) {
-        const content: Array<Record<string, unknown>> = [];
-        if (text.trim()) content.push({ type: "text", text });
-        content.push({ type: "image", data: image.data, mimeType: image.mime });
+        const caption = text.trim();
+        const content = [
+          { type: "text", text: caption ? `${caption}\n\n${IMAGE_MARKER}` : IMAGE_MARKER },
+          { type: "image", data: image.data, mimeType: image.mime },
+        ];
         await pi.sendUserMessage(content as never, { deliverAs: "steer" });
       } else {
         await pi.sendUserMessage(text, { deliverAs: "steer" });
