@@ -260,6 +260,62 @@ if (twoShots.text !== "and") {
   fail(`unexpected caption for a two-image paste: ${JSON.stringify(twoShots.text)}`);
 }
 
+// Pi concatenates two pastes with nothing between them, which is exactly what
+// the captain sent, so adjacency must parse as two artifacts and no prose.
+const framesBeforeAdjacent = received.filter((frame) => frame.t === "terminal").length;
+handlers.get("input")({ text: `${genuine}${genuineJpeg}`, source: "interactive" }, ctx);
+await waitFor(
+  () => received.filter((frame) => frame.t === "terminal").length === framesBeforeAdjacent + 1,
+  "the adjacent two-image paste",
+);
+const adjacent = received.filter((frame) => frame.t === "terminal").at(-1);
+if (JSON.stringify(adjacent.images?.map((image) => image.mime)) !==
+    JSON.stringify(["image/png", "image/jpeg"])) {
+  fail(`adjacent pastes were not both recognised: ${JSON.stringify(adjacent.images?.length)}`);
+}
+if (adjacent.images[0].data !== pngBytes.toString("base64")
+    || adjacent.images[1].data !== jpegBytes.toString("base64")) {
+  fail("adjacent pastes lost their order or their bytes");
+}
+if (adjacent.text !== "") {
+  fail(`an adjacent paste left plumbing in the caption: ${JSON.stringify(adjacent.text)}`);
+}
+
+// The same, wrapped in the captain's own words.
+handlers.get("input")({ text: `look ${genuine}${genuineJpeg} at these two`, source: "interactive" }, ctx);
+await waitFor(
+  () => received.filter((frame) => frame.t === "terminal").length === framesBeforeAdjacent + 2,
+  "the adjacent paste with surrounding text",
+);
+const wrapped = received.filter((frame) => frame.t === "terminal").at(-1);
+if (wrapped.images?.length !== 2) {
+  fail(`surrounded adjacent pastes were not both recognised: ${JSON.stringify(wrapped.images?.length)}`);
+}
+if (wrapped.text !== "look at these two") {
+  fail(`surrounding text was not preserved cleanly: ${JSON.stringify(wrapped.text)}`);
+}
+
+// A genuine artifact glued to an invalid suffix is prose, not an artifact, and
+// must not be split at the extension to smuggle the file out.
+const framesBeforeAmbiguous = received.filter((frame) => frame.t === "terminal").length;
+handlers.get("input")({ text: `${genuine}.backup`, source: "interactive" }, ctx);
+handlers.get("input")({ text: `${genuine}${genuineJpeg}.backup`, source: "interactive" }, ctx);
+handlers.get("input")({ text: `prefix${genuine}`, source: "interactive" }, ctx);
+handlers.get("input")({ text: `/home${genuine}`, source: "interactive" }, ctx);
+await new Promise((resolve) => setTimeout(resolve, 300));
+const ambiguous = received.filter((frame) => frame.t === "terminal").slice(framesBeforeAmbiguous);
+if (ambiguous.length !== 4) {
+  fail(`ambiguity probes were dropped: ${ambiguous.length}`);
+}
+if (ambiguous[0].images || ambiguous[2].images || ambiguous[3].images) {
+  fail("a path-like word was treated as a genuine paste");
+}
+// Only the leading artifact of the glued pair is genuine; the suffixed one is not.
+if (ambiguous[1].images?.length !== 1
+    || ambiguous[1].images[0].data !== pngBytes.toString("base64")) {
+  fail(`a glued valid+invalid pair was parsed wrongly: ${JSON.stringify(ambiguous[1].images?.length)}`);
+}
+
 // Nothing else may ever be uploaded, however it is named or linked.
 const framesBeforeNegatives = received.filter((frame) => frame.t === "terminal").length;
 for (const probe of [arbitrary, wrongMagic, oversized, symlinked, missing,

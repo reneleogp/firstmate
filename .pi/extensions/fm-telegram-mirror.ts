@@ -143,8 +143,10 @@ function asQueuedImage(value: unknown): QueuedImage | undefined {
 // in Pi's own temp directory, a real file this account owns, and bytes whose
 // magic matches the extension. A path merely typed into the terminal never
 // qualifies, so naming a file cannot make the mirror upload it.
-const CLIPBOARD_NAME =
-  /^pi-clipboard-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(png|jpg|jpeg|webp)$/;
+// One owner for the artifact shape: Pi's own uuid file name and the image
+// extensions its clipboard paste can produce.
+const CLIPBOARD_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const CLIPBOARD_EXTENSIONS = "png|jpg|jpeg|webp";
 const MAX_CLIPBOARD_BYTES = positiveInteger("FM_TELEGRAM_MAX_IMAGE_BYTES", 10 * 1024 * 1024);
 const MAX_CLIPBOARD_TOTAL_BYTES = MAX_CLIPBOARD_BYTES * 3;
 const MAX_CLIPBOARD_IMAGES = 10;
@@ -167,37 +169,74 @@ function clipboardMime(name: string): string | undefined {
   return undefined;
 }
 
-type ClipboardPaste = { token: string; image: QueuedImage };
+type ClipboardScan = { images: QueuedImage[]; caption: string };
 
-function clipboardPastes(text: string): ClipboardPaste[] {
-  const directory = tmpdir();
-  const found: ClipboardPaste[] = [];
+function escapeForRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Pi concatenates two pastes with nothing between them, so artifacts are found
+// by scanning spans rather than splitting on whitespace. A span may start at the
+// beginning, after whitespace, or exactly where the previous artifact ended;
+// anywhere else it is part of a longer word and stays ordinary prose.
+function clipboardScan(text: string): ClipboardScan {
+  const prefix = join(tmpdir(), "pi-clipboard-");
+  const artifact = new RegExp(
+    `^${escapeForRegExp(prefix)}${CLIPBOARD_UUID}\\.(${CLIPBOARD_EXTENSIONS})(?![A-Za-z0-9._-])`,
+  );
+  const images: QueuedImage[] = [];
+  const accepted: Array<[number, number]> = [];
+  let index = 0;
+  let previousEnd = -1;
   let total = 0;
-  for (const token of text.split(/\s+/)) {
-    if (found.length >= MAX_CLIPBOARD_IMAGES) break;
-    if (dirname(token) !== directory) continue;
-    const name = basename(token);
-    if (!CLIPBOARD_NAME.test(name)) continue;
-    const declared = clipboardMime(name);
-    if (!declared) continue;
-    try {
-      // lstat, so a symlink pointing somewhere else is refused rather than
-      // followed, and only this account's own regular file is read.
-      const info = lstatSync(token);
-      if (!info.isFile() || info.isSymbolicLink()) continue;
-      if (info.size <= 0 || info.size > MAX_CLIPBOARD_BYTES) continue;
-      if (typeof process.getuid === "function" && info.uid !== process.getuid()) continue;
-      if (total + info.size > MAX_CLIPBOARD_TOTAL_BYTES) continue;
-      const bytes = readFileSync(token);
-      // The bytes decide, not the name: a renamed file is not an image.
-      if (imageMimeFromMagic(bytes) !== declared) continue;
-      total += info.size;
-      found.push({ token, image: { data: bytes.toString("base64"), mime: declared } });
-    } catch {
+  while (index < text.length && images.length < MAX_CLIPBOARD_IMAGES) {
+    const at = text.indexOf(prefix, index);
+    if (at < 0) break;
+    const startsCleanly = at === 0 || at === previousEnd || /\s/.test(text[at - 1] ?? "");
+    const match = startsCleanly ? artifact.exec(text.slice(at)) : null;
+    if (!match) {
+      index = at + prefix.length;
       continue;
     }
+    const token = match[0];
+    const end = at + token.length;
+    const image = readClipboardArtifact(token, total);
+    if (image) {
+      total += Buffer.byteLength(image.data, "base64");
+      images.push(image);
+      accepted.push([at, end]);
+      previousEnd = end;
+    }
+    index = end;
   }
-  return found;
+  let caption = text;
+  // Only proven artifacts leave the caption; anything that failed a check is
+  // ordinary text the captain wrote and stays exactly as written.
+  for (const [start, end] of [...accepted].reverse()) {
+    caption = `${caption.slice(0, start)} ${caption.slice(end)}`;
+  }
+  if (accepted.length > 0) caption = caption.replace(/[ \t]+/g, " ").trim();
+  return { images, caption };
+}
+
+function readClipboardArtifact(token: string, alreadyTaken: number): QueuedImage | undefined {
+  const declared = clipboardMime(basename(token));
+  if (!declared) return undefined;
+  try {
+    // lstat, so a symlink pointing somewhere else is refused rather than
+    // followed, and only this account's own regular file is read.
+    const info = lstatSync(token);
+    if (!info.isFile() || info.isSymbolicLink()) return undefined;
+    if (info.size <= 0 || info.size > MAX_CLIPBOARD_BYTES) return undefined;
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) return undefined;
+    if (alreadyTaken + info.size > MAX_CLIPBOARD_TOTAL_BYTES) return undefined;
+    const bytes = readFileSync(token);
+    // The bytes decide, not the name: a renamed file is not an image.
+    if (imageMimeFromMagic(bytes) !== declared) return undefined;
+    return { data: bytes.toString("base64"), mime: declared };
+  } catch {
+    return undefined;
+  }
 }
 
 // Pi hands attached images to the input event as its own image content; the
@@ -452,16 +491,14 @@ export default function (pi: ExtensionAPI) {
     if (event.source !== "interactive") return;
     const text = typeof event.text === "string" ? event.text : "";
     if (text.trim() && classifyFirstmateOperationalText(text) !== undefined) return;
-    const pastes = clipboardPastes(text);
-    const images = [...terminalImages(event.images), ...pastes.map((paste) => paste.image)];
+    const pasted = clipboardScan(text);
+    const images = [...terminalImages(event.images), ...pasted.images];
     // The local path is Pi's own plumbing and means nothing on a phone, so the
     // caption keeps only what the captain actually wrote around it. Firstmate
     // still receives the submission exactly as typed.
-    let caption = text;
-    for (const paste of pastes) caption = caption.split(paste.token).join(" ");
-    caption = caption.replace(/\s+/g, " ").trim();
+    const caption = pasted.images.length > 0 ? pasted.caption : text;
     // An image-only submission has no text but is still a real submission.
-    if (!caption && images.length === 0) return;
+    if (!caption.trim() && images.length === 0) return;
     write(images.length > 0
       ? { t: "terminal", text: caption, images }
       : { t: "terminal", text });
