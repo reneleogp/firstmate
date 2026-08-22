@@ -470,7 +470,7 @@ class MirrorBot:
         else:
             # A caption rides along when Telegram allows its length; a longer
             # submission is its own message so nothing is truncated away.
-            caption = label if len(label) <= TELEGRAM_CAPTION_LIMIT else ""
+            caption = label if utf16_length(label) <= TELEGRAM_CAPTION_LIMIT else ""
             if not caption:
                 await self.send(label)
             await self.send_photos(accepted, caption)
@@ -557,7 +557,7 @@ class MirrorBot:
         params: dict[str, Any] = {
             "chat_id": self.config.chat_id,
             "message_id": message_id,
-            "text": text[:TELEGRAM_TEXT_LIMIT],
+            "text": utf16_prefix(text, TELEGRAM_TEXT_LIMIT),
         }
         params["reply_markup"] = markup if markup is not None else {"inline_keyboard": []}
         try:
@@ -765,7 +765,7 @@ class MirrorBot:
         finally:
             for process in started:
                 self.transcribers.discard(process)
-        if len(transcript) > TRANSCRIPT_CARD_LIMIT:
+        if utf16_length(transcript) > TRANSCRIPT_CARD_LIMIT:
             remove_file(audio)
             await self.send(TRANSCRIPT_TOO_LONG_REPLY, reply_to=voice_id)
             return
@@ -815,6 +815,10 @@ class MirrorBot:
         if revision != entry.revision:
             await self.answer_callback(callback_id, "This transcript has already moved on.")
             return
+        if action == "send" and not self.mirror_on:
+            await self.answer_callback(callback_id, "Telegram mirror is off.")
+            await self.send(MIRROR_OFF_REPLY, reply_to=entry.voice_id)
+            return
         await self.answer_callback(callback_id)
         if action == "send":
             await self.finish_voice(entry, SENT_FOOTER)
@@ -844,7 +848,7 @@ class MirrorBot:
         if entry is None:
             await self.send("That transcript is no longer active.", reply_to=message_id)
             return
-        if len(text) > TRANSCRIPT_CARD_LIMIT:
+        if utf16_length(text) > TRANSCRIPT_CARD_LIMIT:
             await self.send(TRANSCRIPT_EDIT_TOO_LONG_REPLY, reply_to=message_id)
             return
         entry.text = text
@@ -1124,9 +1128,29 @@ class MirrorBot:
 # --- pure helpers -----------------------------------------------------------
 
 
-def chunk_text(text: str) -> list[str]:
+def utf16_length(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def utf16_prefix(text: str, limit: int) -> str:
+    units = 0
+    for index, char in enumerate(text):
+        units += 2 if ord(char) > 0xFFFF else 1
+        if units > limit:
+            return text[:index]
+    return text
+
+
+def chunk_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
     body = text if text.strip() else "(empty message)"
-    return [body[i:i + TELEGRAM_TEXT_LIMIT] for i in range(0, len(body), TELEGRAM_TEXT_LIMIT)] or [body]
+    chunks: list[str] = []
+    while body:
+        chunk = utf16_prefix(body, limit)
+        if not chunk:
+            chunk = body[0]
+        chunks.append(chunk)
+        body = body[len(chunk):]
+    return chunks
 
 
 # --- Telegram HTML ----------------------------------------------------------
@@ -1301,18 +1325,20 @@ def split_semantic_markdown(text: str, limit: int) -> list[tuple[str, bool, str]
     remaining = text
     while remaining:
         rendered = telegram_html(remaining)
-        if len(remaining) <= limit and rendered is not None and len(rendered) <= limit:
+        if (utf16_length(remaining) <= limit and rendered is not None
+                and utf16_length(rendered) <= limit):
             pieces.append((remaining, True, remaining))
             break
+        prefix_length = len(utf16_prefix(remaining, limit))
         candidates = [
-            index for index in range(1, min(len(remaining), limit) + 1)
+            index for index in range(1, prefix_length + 1)
             if remaining[index - 1].isspace() and inline_boundary_is_safe(remaining[:index])
         ]
         chosen = ""
         for index in reversed(candidates):
             candidate = remaining[:index]
             rendered = telegram_html(candidate)
-            if rendered is not None and len(rendered) <= limit:
+            if rendered is not None and utf16_length(rendered) <= limit:
                 chosen = candidate
                 break
         if not chosen:
@@ -1343,7 +1369,7 @@ def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[st
             chunk = f"{chunk.rstrip(chr(10))}\n```"
         chunk = chunk.strip("\n")
         rendered = telegram_html(chunk)
-        if rendered is not None and len(rendered) <= limit:
+        if rendered is not None and utf16_length(rendered) <= limit:
             chunks.append((chunk, True, owned))
         else:
             chunks.extend(split_semantic_markdown(owned, limit))
@@ -1354,14 +1380,15 @@ def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[st
         marker = line.lstrip()
         is_fence = marker.startswith("```")
         if is_fence and not inside:
-            if current and len(current) + len(line) > limit:
+            if current and utf16_length(current + line) > limit:
                 flush()
             current += line
             owned += line
             inside = True
             fence = marker[3:].strip()
             rendered_opener = telegram_html(f"{line.rstrip(chr(10))}\n```")
-            plain_fence = rendered_opener is None or len(rendered_opener) > limit
+            plain_fence = (rendered_opener is None
+                           or utf16_length(rendered_opener) > limit)
             continue
         if is_fence and inside:
             if plain_fence:
@@ -1371,7 +1398,7 @@ def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[st
                 current = ""
                 owned = ""
             else:
-                if len(current) + len(line) > limit:
+                if utf16_length(current + line) > limit:
                     flush()
                 current += line
                 owned += line
@@ -1384,23 +1411,27 @@ def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[st
                 current += line
                 owned += line
                 continue
-            piece_limit = max(1, (limit - len(fence) - 32) // 5)
+            piece_limit = max(1, (limit - utf16_length(fence) - 32) // 5)
             while line:
-                available = piece_limit - max(0, len(current) - len(fence) - 4)
+                current_body_units = max(
+                    0, utf16_length(current) - utf16_length(fence) - 4,
+                )
+                available = piece_limit - current_body_units
                 if available <= 0:
                     flush()
                     continue
-                if len(line) > available and len(line) <= piece_limit:
+                line_units = utf16_length(line)
+                if line_units > available and line_units <= piece_limit:
                     flush()
                     continue
-                piece = line[:available]
+                piece = utf16_prefix(line, available)
                 current += piece
                 owned += piece
-                line = line[available:]
+                line = line[len(piece):]
                 if line:
                     flush()
             continue
-        if current and len(current) + len(line) > limit:
+        if current and utf16_length(current + line) > limit:
             flush()
         current += line
         owned += line
@@ -1546,7 +1577,7 @@ def main_markup(voice_id: int, revision: int) -> dict[str, Any]:
 
 def edit_markup(entry: Voice) -> dict[str, Any]:
     row: list[dict[str, Any]] = []
-    if len(entry.text) <= COPY_TEXT_LIMIT:
+    if utf16_length(entry.text) <= COPY_TEXT_LIMIT:
         row.append({"text": "Copy text", "copy_text": {"text": entry.text}})
     row.append({"text": "Back", "callback_data": f"v:{entry.voice_id}:{entry.revision}:back"})
     return {"inline_keyboard": [row]}

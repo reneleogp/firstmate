@@ -940,13 +940,13 @@ class MirrorTestCase(unittest.TestCase):
         self.telegram.push_photo(901, [
             {"file_id": "photo-small", "width": 90, "height": 60, "file_size": 4},
             {"file_id": "photo-big", "width": 1280, "height": 800, "file_size": len(self.PNG)},
-        ], caption="look at this failure")
+        ], caption="  look at this failure  ")
         frame = pi.read()
         self.assertEqual(frame["t"], "deliver")
         # The captain sent one screenshot: the sharpest rendition is the one.
         self.assertEqual(base64.b64decode(frame["image"]["data"]), self.PNG)
         self.assertEqual(frame["image"]["mime"], "image/png")
-        self.assertEqual(frame["text"], "look at this failure")
+        self.assertEqual(frame["text"], "  look at this failure  ")
         pi.send({"t": "accepted", "id": frame["id"]})
         receipt = self.telegram.wait_sent(lambda m: m.get("text") == "Pi · Sent to Firstmate.")
         self.assertEqual(receipt["reply_parameters"]["message_id"], 901)
@@ -1151,6 +1151,21 @@ class MirrorTestCase(unittest.TestCase):
         # Real bytes, not a path and not base64 text.
         self.assertEqual(files[0][2], self.PNG)
         self.assertNotIn("/tmp/", json.dumps(fields))
+
+    def test_unicode_terminal_caption_uses_telegram_utf16_units(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        text = "😀" * 510
+        pi.send({"t": "terminal", "text": text,
+                 "images": [{"data": base64.b64encode(self.PNG).decode(), "mime": "image/png"}]})
+        mirrored = self.telegram.wait_sent(lambda m: m.get("text") == f"You · Terminal\n{text}")
+        self.assertTrue(mirrored)
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline and not self.telegram.uploads:
+            time.sleep(0.05)
+        self.assertTrue(self.telegram.uploads)
+        _method, fields, _files = self.telegram.uploads[0]
+        self.assertNotIn("caption", fields)
 
     def test_a_terminal_image_without_text_still_reaches_telegram(self) -> None:
         pi = self.connect_pi()
@@ -1537,6 +1552,85 @@ class MirrorTestCase(unittest.TestCase):
         else:
             raise AssertionError("a repeated tap was not refused")
         pi.expect_nothing()
+
+    def test_voice_send_waits_for_mirroring_to_be_enabled(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.telegram.push_voice(78)
+        card_id = self.card_id_for("please rebase the branch")
+
+        self.telegram.push_text("/telegram_off", 780)
+        self.telegram.wait_sent(lambda m: str(m.get("text", "")).startswith("Mirror is off"))
+        edits_before = len(self.telegram.edits)
+        self.telegram.push_callback("v:78:1:send", card_id, "cb-off")
+        refusal = self.telegram.wait_sent(
+            lambda m: m.get("text") == "Telegram mirror is off. Send /telegram_on to enable it."
+            and m.get("reply_parameters", {}).get("message_id") == 78
+        )
+        self.assertTrue(refusal)
+        self.assertEqual(len(self.telegram.edits), edits_before)
+        pi.expect_nothing()
+
+        self.telegram.push_text("/telegram_on", 781)
+        self.telegram.wait_sent(lambda m: str(m.get("text", "")).startswith("Mirror is on"))
+        self.telegram.push_callback("v:78:1:send", card_id, "cb-on")
+        self.assertEqual(pi.read()["text"], "please rebase the branch")
+        self.telegram.wait_edit(lambda e: str(e.get("text", "")).endswith("Sent to Firstmate"))
+
+    def test_unicode_limits_use_telegram_utf16_units(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        reply = "😀" * 3000
+        before = len(self.telegram.sent)
+        pi.send({"t": "reply", "text": reply})
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline:
+            delivered = self.telegram.sent[before:]
+            if "".join(str(message.get("text", "")) for message in delivered) == reply:
+                break
+            time.sleep(0.05)
+        delivered = self.telegram.sent[before:]
+        self.assertEqual("".join(str(message.get("text", "")) for message in delivered), reply)
+        self.assertTrue(all(len(message["text"].encode("utf-16-le")) // 2 <= 3900
+                            for message in delivered))
+
+        self.transcript_file.write_text("😀" * 1901, encoding="utf-8")
+        self.telegram.push_voice(791)
+        refusal = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 791
+            and "3,800 characters" in str(m.get("text", ""))
+        )
+        self.assertTrue(refusal)
+        pi.expect_nothing()
+
+        self.transcript_file.write_text("😀" * 128, encoding="utf-8")
+        self.telegram.push_voice(792)
+        card_id = self.card_id_for("😀" * 128)
+        self.telegram.push_callback("v:792:1:edit", card_id, "cb-copy-limit")
+        edit_view = self.telegram.wait_edit(lambda e: e.get("message_id") == card_id)
+        buttons = [button["text"] for row in edit_view["reply_markup"]["inline_keyboard"]
+                   for button in row]
+        self.assertEqual(buttons, ["Copy text", "Back"])
+        prompt = self.telegram.wait_sent(
+            lambda m: m.get("text") == "Reply to this message with the corrected text."
+        )
+        self.telegram.push_text("😀" * 1901, 793, reply_to=int(prompt["message_id"]))
+        edit_refusal = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 793
+            and "3,800 characters or fewer" in str(m.get("text", ""))
+        )
+        self.assertTrue(edit_refusal)
+
+        self.transcript_file.write_text("😀" * 129, encoding="utf-8")
+        self.telegram.push_voice(794)
+        second_card_id = self.card_id_for("😀" * 129)
+        self.telegram.push_callback("v:794:1:edit", second_card_id, "cb-copy-over")
+        second_edit = self.telegram.wait_edit(lambda e: e.get("message_id") == second_card_id)
+        second_buttons = [
+            button["text"] for row in second_edit["reply_markup"]["inline_keyboard"]
+            for button in row
+        ]
+        self.assertEqual(second_buttons, ["Back"])
 
     def test_long_transcripts_never_create_multi_message_cards(self) -> None:
         pi = self.connect_pi()

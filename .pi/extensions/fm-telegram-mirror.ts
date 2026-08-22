@@ -443,9 +443,8 @@ export default function (pi: ExtensionAPI) {
   function queueDelivery(id: string, text: string, image?: QueuedImage): void {
     deliveries = deliveries.then(async () => {
       if (image) {
-        const caption = text.trim();
         const content = [
-          { type: "text", text: caption ? `${caption}\n\n${IMAGE_MARKER}` : IMAGE_MARKER },
+          { type: "text", text: text.trim() ? `${text}\n\n${IMAGE_MARKER}` : IMAGE_MARKER },
           { type: "image", data: image.data, mimeType: image.mime },
         ];
         await pi.sendUserMessage(content as never, { deliverAs: "steer" });

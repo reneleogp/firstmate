@@ -503,7 +503,7 @@ const pixels = Buffer.from("89504e470d0a1a0a0102030405", "hex").toString("base64
 botWrite({
   t: "deliver",
   id: "m4",
-  text: "look at this failure",
+  text: "  look at this failure  ",
   image: { data: pixels, mime: "image/png" },
 });
 await waitFor(() => submissions.length === 4, "the screenshot submission");
@@ -514,7 +514,7 @@ if (!Array.isArray(shot.content)) {
 // The caption stays, and a generic marker makes the attachment visible in a
 // terminal that renders no preview. Nothing names where the image came from.
 if (JSON.stringify(shot.content) !== JSON.stringify([
-  { type: "text", text: "look at this failure\n\n[Image attached]" },
+  { type: "text", text: "  look at this failure  \n\n[Image attached]" },
   { type: "image", data: pixels, mimeType: "image/png" },
 ])) {
   fail(`unexpected screenshot content: ${JSON.stringify(shot.content)}`);
