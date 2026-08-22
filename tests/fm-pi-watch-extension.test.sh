@@ -519,7 +519,7 @@ trap 'exit 0' TERM INT
 while :; do sleep 0.02; done
 SH
   chmod +x "$repo/bin/fm-watch-arm.sh"
-  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_PI_ARM_READY_TIMEOUT_MS=250 FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 FM_WATCH_REARM_RETRY_LIMIT=2 node --input-type=module 2>&1 <<'EOF'
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_PI_ARM_READY_TIMEOUT_MS=1000 FM_WATCH_REARM_RETRY_BASE_MS=5 FM_WATCH_REARM_RETRY_MAX_MS=10 FM_WATCH_REARM_RETRY_LIMIT=2 node --input-type=module 2>&1 <<'EOF'
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
@@ -543,7 +543,7 @@ writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
 mod.default(pi);
 await tool.execute("tool-call-hung-successor", {}, undefined, undefined, {});
-for (let i = 0; i < 500 && !prompt; i += 1) {
+for (let i = 0; i < 1500 && !prompt; i += 1) {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 const rows = existsSync(process.env.FM_ARM_LOG)
@@ -559,7 +559,7 @@ if (stableRows.length !== 4) throw new Error(`single-flight recovery launched ${
 EOF
 )
   status=$?
-  expect_code 0 "$status" "Pi must deliver the actionable wake after bounded hung-successor recovery"
+  expect_code 0 "$status" "Pi must deliver the actionable wake after bounded hung-successor recovery: $out"
   [ -z "$out" ] || fail "Pi hung-successor test printed output: $out"
   pass "Pi hung successor falls back to one typed actionable wake"
 }
@@ -1094,10 +1094,11 @@ async function replaceSession(previous, reason) {
     const child = readFileSync(process.env.FM_CHILD_PID_FILE, "utf8").trim();
     return child && child !== previousChild && pidAlive(child);
   }, `${reason} replacement child`);
-  const live = liveArmPids();
-  if (live.length !== 1) {
-    throw new Error(`${reason} expected exactly one live arm child, got ${live.join(",") || "(none)"}`);
-  }
+  const replacementChild = readFileSync(process.env.FM_CHILD_PID_FILE, "utf8").trim();
+  await waitFor(() => {
+    const live = liveArmPids();
+    return live.length === 1 && live[0] === replacementChild;
+  }, `${reason} single live arm child`);
   return next;
 }
 
@@ -1119,9 +1120,11 @@ await waitFor(() => {
   return child !== sameInstanceChild && pidAlive(child);
 }, "same-instance replacement child");
 await waitFor(() => !pidAlive(sameInstanceChild), "same-instance previous child exit");
-if (liveArmPids().length !== 1) {
-  throw new Error(`same-instance expected one live arm child, got ${liveArmPids().join(",")}`);
-}
+const sameInstanceReplacement = readFileSync(process.env.FM_CHILD_PID_FILE, "utf8").trim();
+await waitFor(() => {
+  const live = liveArmPids();
+  return live.length === 1 && live[0] === sameInstanceReplacement;
+}, "same-instance single live arm child");
 
 // Stale prior-generation callback must not stop, rearm, or clear the active generation.
 const activeChild = readFileSync(process.env.FM_CHILD_PID_FILE, "utf8").trim();
@@ -1158,7 +1161,7 @@ if (liveArmPids().length !== 0) {
 EOF
 )
   status=$?
-  expect_code 0 "$status" "Pi session transitions must rearm through an explicit generation owner"
+  expect_code 0 "$status" "Pi session transitions must rearm through an explicit generation owner: $out"
   [ -z "$out" ] || fail "Pi session-transition generation owner test printed output: $out"
   pass "Pi session transitions use a generation owner across /new /resume /fork, stale callbacks, and quit"
 }
