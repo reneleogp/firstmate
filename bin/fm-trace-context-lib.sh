@@ -140,7 +140,8 @@ fm_trace_context_enabled() {  # <config-dir>
 # Echo the lock pid that owns the effective-state file's home, or fail when the
 # adjacent session lock is absent or malformed. Binding the decision to this
 # token makes a prior session's record inactive even if publication cannot
-# replace or remove that stale file.
+# replace or remove that stale file. The lock's first line is its pid field;
+# bin/fm-session-lock-lib.sh owns that record format.
 fm_trace_context_session_lock() {  # <effective-state-file>
   local effective_file=$1 state_dir lock_pid
   state_dir=${effective_file%/*}

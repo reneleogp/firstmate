@@ -23,6 +23,10 @@ fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 lock_is_in_ancestry() {
   local lock_pid pid=$$ _
   [ -f "$STATE/.lock" ] || return 1
+  # The lock's first line is its pid field; bin/fm-session-lock-lib.sh owns that
+  # record format. This gate deliberately stays looser than the lib's harness
+  # and generation verdicts because every failure path here must exit 0 rather
+  # than block session initialization, and its only effect is one extra nudge.
   IFS= read -r lock_pid < "$STATE/.lock" 2>/dev/null || return 1
   case "$lock_pid" in
     ''|*[!0-9]*|1) return 1 ;;
