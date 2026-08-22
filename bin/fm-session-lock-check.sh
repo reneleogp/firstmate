@@ -30,10 +30,9 @@ LOCK_TIME_TOLERANCE_SECONDS=1
 PROC_ROOT=${FM_TELEGRAM_PROC_ROOT:-/proc}
 proc_stat=$(cat "$PROC_ROOT/$lock_pid/stat" 2>/dev/null) || exit 1
 proc_fields=${proc_stat##*) }
-set -- $proc_fields
-[ "$#" -ge 20 ] || exit 1
-shift 19
-start_ticks=$1
+read -r -a proc_field_array <<< "$proc_fields"
+[ "${#proc_field_array[@]}" -ge 20 ] || exit 1
+start_ticks=${proc_field_array[19]}
 boot_time=$(awk '$1 == "btime" && $2 ~ /^[0-9]+$/ { print $2; found=1; exit } END { if (!found) exit 1 }' "$PROC_ROOT/stat" 2>/dev/null) || exit 1
 clock_ticks=$(getconf CLK_TCK 2>/dev/null) || exit 1
 lock_time=$(stat -c %Y -- "$lock_path" 2>/dev/null) || exit 1
