@@ -11,6 +11,11 @@
 #        fm-lock.sh generation-check  exit 0 only while the record's identity
 #                                     binding still holds (for validators that
 #                                     must not re-derive the binding themselves)
+#        fm-lock.sh ownership <pid>   print owned, other, or missing after the
+#                                     complete record and generation verdict
+#        fm-lock.sh holder            print the validated live holder pid and
+#                                     opaque complete lock identity
+#        fm-lock.sh identity-check ID exit 0 only while ID still holds
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,6 +50,39 @@ fi
 
 if [ "${1:-}" = "generation-check" ]; then
   fm_session_lock_generation_holds "$STATE" || exit 1
+  exit 0
+fi
+
+if [ "${1:-}" = "holder" ]; then
+  holder_identity=$(fm_session_lock_identity "$STATE") || exit 1
+  fm_session_lock_holder_live "$STATE" || exit 1
+  holder_pid=$(fm_session_lock_pid "$STATE") || exit 1
+  [ "$(fm_session_lock_identity "$STATE")" = "$holder_identity" ] || exit 1
+  printf '%s\n%s\n' "$holder_pid" "$holder_identity"
+  exit 0
+fi
+
+if [ "${1:-}" = "identity-check" ]; then
+  fm_session_lock_identity_holds "$STATE" "${2:-}" || exit 1
+  exit 0
+fi
+
+if [ "${1:-}" = "ownership" ]; then
+  start_pid=${2:-}
+  case "$start_pid" in ''|*[!0-9]*) exit 2 ;; esac
+  if fm_session_lock_owned_by_pid "$STATE" "$start_pid"; then
+    printf 'owned\n'
+  elif [ ! -e "$LOCK" ] && [ ! -L "$LOCK" ]; then
+    printf 'missing\n'
+  elif ! fm_session_lock_parse "$STATE"; then
+    printf 'other\n'
+  elif ! fm_session_lock_generation_holds "$STATE"; then
+    printf 'missing\n'
+  elif fm_session_lock_holder_live "$STATE"; then
+    printf 'other\n'
+  else
+    printf 'missing\n'
+  fi
   exit 0
 fi
 

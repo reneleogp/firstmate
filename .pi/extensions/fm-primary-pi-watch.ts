@@ -111,54 +111,16 @@ function positiveInteger(name: string, fallback: number): number {
   return Math.floor(value);
 }
 
-function parentPid(pid: string): string {
-  const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
-  if (result.status !== 0) return "";
-  return result.stdout.trim();
-}
-
-function pidAlive(pid: string): boolean {
-  try {
-    process.kill(Number(pid), 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// bin/fm-session-lock-lib.sh owns the session-lock record: its first line is
-// the publishing session's pid, and the rest binds that pid to the kernel
-// process generation that published it. This reads the pid field only, and asks
-// the owning script whether the binding still holds rather than re-deriving it
-// here, so a recycled pid - even another genuine Pi process - can never make
-// this session stand down for a session that is already gone.
-function lockGenerationHolds(): boolean {
-  const result = spawnSync(`${fmRoot}/bin/fm-lock.sh`, ["generation-check"], {
+function lockOwnership(): LockOwnership {
+  const result = spawnSync(`${fmRoot}/bin/fm-lock.sh`, ["ownership", String(process.pid)], {
     env: { ...process.env, FM_STATE_OVERRIDE: state },
     encoding: "utf8",
   });
-  // Only a verdict the owner actually returned may demote a live recorded owner
-  // to "gone". If the script could not run at all, keep the conservative answer
-  // and stand down, exactly as this extension did before the binding existed.
-  if (result.error || result.status === null) return true;
-  return result.status === 0;
-}
-
-function lockOwnership(): LockOwnership {
-  let lockPid = "";
-  try {
-    lockPid = readFileSync(`${state}/.lock`, "utf8").split("\n")[0].trim();
-  } catch {
-    return "missing";
-  }
-  if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return "other";
-  let pid = String(process.pid);
-  for (let i = 0; i < 8; i += 1) {
-    if (pid === lockPid) return "owned";
-    pid = parentPid(pid);
-    if (!pid || pid === "1") break;
-  }
-  return pidAlive(lockPid) && lockGenerationHolds() ? "other" : "missing";
+  if (result.error || result.status === null || result.status !== 0) return "other";
+  const verdict = result.stdout.trim();
+  return verdict === "owned" || verdict === "missing" || verdict === "other"
+    ? verdict
+    : "other";
 }
 
 function markLoaded(): void {

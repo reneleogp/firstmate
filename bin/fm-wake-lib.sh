@@ -191,19 +191,17 @@ fm_pi_extension_version() {
   fi
 }
 
-# fm_pi_extension_loaded <marker> <expected-version> <session-lock>
-# True when <marker> records <expected-version> and names the session process in
-# <session-lock>, i.e. the session holding this home loaded exactly this build.
-# The lock's first line is its pid field; bin/fm-session-lock-lib.sh owns that
-# record format and every ownership verdict drawn from it.
+# fm_pi_extension_loaded <marker> <expected-version> <session-pid>
+# True when <marker> records <expected-version> and names <session-pid>.
+# The caller obtains that pid and its complete lock identity from fm-lock.sh,
+# which is the only session-lock record parser.
 fm_pi_extension_loaded() {
-  local marker=$1 expected_version=$2 lock=$3 marker_version marker_pid lock_pid
-  [ -f "$marker" ] && [ -f "$lock" ] && [ -n "$expected_version" ] || return 1
+  local marker=$1 expected_version=$2 session_pid=$3 marker_version marker_pid
+  [ -f "$marker" ] && [ -n "$expected_version" ] && [ -n "$session_pid" ] || return 1
   marker_version=$(sed -n '1p' "$marker")
   marker_pid=$(sed -n '2p' "$marker")
-  lock_pid=$(sed -n '1p' "$lock")
   [ -n "$marker_pid" ] || return 1
-  [ "$marker_version" = "$expected_version" ] && [ "$marker_pid" = "$lock_pid" ]
+  [ "$marker_version" = "$expected_version" ] && [ "$marker_pid" = "$session_pid" ]
 }
 
 # fm_pi_extension_owns_supervision <state> <root>
@@ -214,18 +212,20 @@ fm_pi_extension_loaded() {
 # backstop that catches a cycle the watch extension failed to restore, so a home
 # missing it has no benign hand-off to tolerate.
 fm_pi_extension_owns_supervision() {
-  local state=$1 root=$2 lock session_pid pair source marker version
-  lock="$state/.lock"
+  local state=$1 root=$2 holder session_pid lock_identity pair source marker version
+  holder=$(FM_STATE_OVERRIDE="$state" "$root/bin/fm-lock.sh" holder 2>/dev/null) || return 1
+  session_pid=$(printf '%s\n' "$holder" | sed -n '1p')
+  lock_identity=$(printf '%s\n' "$holder" | sed -n '2p')
+  [ -n "$session_pid" ] && [ -n "$lock_identity" ] || return 1
   for pair in \
     "fm-primary-pi-watch.ts:.pi-watch-extension-loaded" \
     "fm-primary-turnend-guard.ts:.pi-turnend-extension-loaded"; do
     source=${pair%%:*}
     marker=${pair#*:}
     version=$(fm_pi_extension_version "$root/.pi/extensions/$source") || return 1
-    fm_pi_extension_loaded "$state/$marker" "$version" "$lock" || return 1
+    fm_pi_extension_loaded "$state/$marker" "$version" "$session_pid" || return 1
   done
-  session_pid=$(sed -n '1p' "$lock" 2>/dev/null)
-  fm_pid_alive "$session_pid"
+  FM_STATE_OVERRIDE="$state" "$root/bin/fm-lock.sh" identity-check "$lock_identity" >/dev/null 2>&1
 }
 
 # fm_watcher_supervision_verdict <state> <watch-path> [grace] [home] [root]
