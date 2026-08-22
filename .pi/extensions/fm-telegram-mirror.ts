@@ -522,6 +522,7 @@ export default function (pi: ExtensionAPI) {
       ? { t: "terminal", text: caption, images }
       : { t: "terminal", text });
     if (!written && images.length > 0) {
+      if (caption.trim()) write({ t: "terminal", text: caption });
       activeCtx?.ui.notify("Telegram image was not mirrored because its transport queue is full.", "warning");
     }
   });

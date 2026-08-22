@@ -380,7 +380,9 @@ await waitFor(
   "the bounded image write",
 );
 await waitFor(
-  () => received.some((frame) => frame.t === "terminal" && frame.text === "required text behind image")
+  () => received.some((frame) => frame.t === "terminal" && frame.text === "refused queued image"
+      && !frame.images)
+    && received.some((frame) => frame.t === "terminal" && frame.text === "required text behind image")
     && received.some((frame) => frame.t === "reply" && frame.text === "required reply behind image")
     && received.some((frame) => frame.t === "accepted" && frame.id === "m-budget"),
   "required frames behind the full image budget",
@@ -391,6 +393,12 @@ const backpressureFrames = received.filter(
 ).slice(imageFramesBeforeBackpressure);
 if (backpressureFrames.length !== 1 || backpressureFrames[0].text !== "first queued image") {
   fail(`the image transport backlog was not bounded: ${JSON.stringify(backpressureFrames.map((frame) => frame.text))}`);
+}
+const refusedCaptions = received.filter(
+  (frame) => frame.t === "terminal" && frame.text === "refused queued image" && !frame.images,
+);
+if (refusedCaptions.length !== 1) {
+  fail(`the refused image caption was not mirrored exactly once: ${refusedCaptions.length}`);
 }
 if (notifications.at(-1)?.message !==
     "Telegram image was not mirrored because its transport queue is full.") {

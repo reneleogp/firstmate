@@ -518,8 +518,9 @@ class MirrorBot:
                    markup: Optional[dict[str, Any]] = None,
                    formatted: bool = False) -> Optional[dict[str, Any]]:
         result: Optional[dict[str, Any]] = None
-        chunks = split_markdown(text) if formatted else [(chunk, False) for chunk in chunk_text(text)]
-        for index, (chunk, chunk_formatted) in enumerate(chunks):
+        chunks = (split_markdown(text) if formatted else
+                  [(chunk, False, chunk) for chunk in chunk_text(text)])
+        for index, (chunk, chunk_formatted, source) in enumerate(chunks):
             params: dict[str, Any] = {"chat_id": self.config.chat_id, "text": chunk}
             if chunk_formatted:
                 rendered = telegram_html(chunk)
@@ -543,7 +544,7 @@ class MirrorBot:
                 # goes out plain rather than the captain losing the message.
                 log(f"formatting was rejected, sending plain text instead: {exc}")
                 params.pop("parse_mode")
-                params["text"] = chunk
+                params["text"] = source
                 try:
                     result = await self.api.call("sendMessage", params)
                 except TelegramError as plain_exc:
@@ -1295,13 +1296,13 @@ def inline_boundary_is_safe(text: str) -> bool:
     return not any((ticks, stars, underscores, strikes, brackets))
 
 
-def split_semantic_markdown(text: str, limit: int) -> list[tuple[str, bool]]:
-    pieces: list[tuple[str, bool]] = []
+def split_semantic_markdown(text: str, limit: int) -> list[tuple[str, bool, str]]:
+    pieces: list[tuple[str, bool, str]] = []
     remaining = text
     while remaining:
         rendered = telegram_html(remaining)
         if len(remaining) <= limit and rendered is not None and len(rendered) <= limit:
-            pieces.append((remaining, True))
+            pieces.append((remaining, True, remaining))
             break
         candidates = [
             index for index in range(1, min(len(remaining), limit) + 1)
@@ -1315,17 +1316,17 @@ def split_semantic_markdown(text: str, limit: int) -> list[tuple[str, bool]]:
                 chosen = candidate
                 break
         if not chosen:
-            pieces.extend((piece, False) for piece in chunk_text(remaining))
+            pieces.extend((piece, False, piece) for piece in chunk_text(remaining))
             break
-        pieces.append((chosen, True))
+        pieces.append((chosen, True, chosen))
         remaining = remaining[len(chosen):]
     return pieces
 
 
-def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[str, bool]]:
-    """Return bounded text chunks and whether each is safe to format."""
+def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[str, bool, str]]:
+    """Return bounded chunks, formatting safety, and their owned source text."""
     body = text if text.strip() else "(empty message)"
-    chunks: list[tuple[str, bool]] = []
+    chunks: list[tuple[str, bool, str]] = []
     current = ""
     owned = ""
     fence = ""
@@ -1343,7 +1344,7 @@ def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[st
         chunk = chunk.strip("\n")
         rendered = telegram_html(chunk)
         if rendered is not None and len(rendered) <= limit:
-            chunks.append((chunk, True))
+            chunks.append((chunk, True, owned))
         else:
             chunks.extend(split_semantic_markdown(owned, limit))
         current = f"```{fence}\n" if inside else ""
@@ -1366,7 +1367,7 @@ def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[st
             if plain_fence:
                 current += line
                 owned += line
-                chunks.extend((piece, False) for piece in chunk_text(owned))
+                chunks.extend((piece, False, piece) for piece in chunk_text(owned))
                 current = ""
                 owned = ""
             else:
@@ -1405,10 +1406,10 @@ def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[st
         owned += line
     if owned:
         if plain_fence:
-            chunks.extend((piece, False) for piece in chunk_text(owned))
+            chunks.extend((piece, False, piece) for piece in chunk_text(owned))
         else:
             flush()
-    return chunks or [(body, True)]
+    return chunks or [(body, True, body)]
 
 
 def is_image_document(document: Any) -> bool:

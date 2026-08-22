@@ -761,6 +761,27 @@ class MirrorTestCase(unittest.TestCase):
                      and "parse_mode" not in m]
         self.assertEqual(len(delivered), 1, "the fallback duplicated the reply")
 
+    def test_rejected_split_fence_falls_back_to_owned_source(self) -> None:
+        self.telegram.reject_parse_mode = True
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        code = "".join(f"line {index}: {'x' * 40}\n" for index in range(300))
+        source = f"Before\n\n```python\n{code}```\n\nAfter"
+        before = len(self.telegram.sent)
+        pi.send({"t": "reply", "text": source})
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline:
+            delivered = self.telegram.sent[before:]
+            if "".join(str(message.get("text", "")) for message in delivered) == source:
+                break
+            time.sleep(0.05)
+        delivered = self.telegram.sent[before:]
+        self.assertGreater(len(delivered), 1, "the fenced reply was not split")
+        self.assertEqual(
+            "".join(str(message.get("text", "")) for message in delivered), source,
+        )
+        self.assertTrue(all("parse_mode" not in message for message in delivered))
+
     def test_without_the_markdown_parser_replies_are_sent_plain(self) -> None:
         # The parser is an installed package; a home without it must still
         # mirror, unformatted, rather than dropping replies.
