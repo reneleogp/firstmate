@@ -404,10 +404,7 @@ class Queued:
     text: str
     reply_to: int
     image: Optional[dict[str, str]] = None
-
-    @property
-    def image_bytes(self) -> int:
-        return len(self.image["data"]) if self.image else 0
+    image_bytes: int = 0
 
 
 @dataclass
@@ -676,8 +673,10 @@ class MirrorBot:
         })
 
     async def accept_text(self, text: str, reply_to: int,
-                          image: Optional[dict[str, str]] = None) -> None:
-        item = Queued(id=self.next_id(), text=text, reply_to=reply_to, image=image)
+                          image: Optional[dict[str, str]] = None,
+                          image_bytes: int = 0) -> None:
+        item = Queued(id=self.next_id(), text=text, reply_to=reply_to,
+                      image=image, image_bytes=image_bytes)
         self.queue.append(item)
         if not self.connected:
             await self.send(OFFLINE_REPLY, reply_to=reply_to)
@@ -879,10 +878,13 @@ class MirrorBot:
         if actual_mime is None or (mime is not None and mime != actual_mime):
             await self.send(UNSUPPORTED_IMAGE_REPLY, reply_to=message_id)
             return
+        if self.queued_image_bytes() + len(data) > MAX_QUEUED_IMAGE_BYTES:
+            await self.send(OVERSIZED_IMAGE_REPLY, reply_to=message_id)
+            return
         mime = actual_mime
         image = {"data": base64.b64encode(data).decode("ascii"), "mime": mime}
         await self.accept_text(caption if isinstance(caption, str) else "",
-                               message_id, image=image)
+                               message_id, image=image, image_bytes=len(data))
 
     # --- Pi extension socket ---
 
@@ -1216,17 +1218,99 @@ def telegram_html(text: str) -> Optional[str]:
     return rendered or None
 
 
+def inline_boundary_is_safe(text: str) -> bool:
+    escaped = False
+    ticks = 0
+    stars = 0
+    underscores = 0
+    strikes = 0
+    brackets = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\":
+            escaped = True
+            index += 1
+            continue
+        if char == "`":
+            run = 1
+            while index + run < len(text) and text[index + run] == "`":
+                run += 1
+            ticks ^= run
+            index += run
+            continue
+        if ticks:
+            index += 1
+            continue
+        pair = text[index:index + 2]
+        if pair == "**":
+            stars ^= 1
+            index += 2
+            continue
+        if pair == "__":
+            underscores ^= 1
+            index += 2
+            continue
+        if pair == "~~":
+            strikes ^= 1
+            index += 2
+            continue
+        if char == "*":
+            stars ^= 1
+        elif char == "_":
+            underscores ^= 1
+        elif char == "[":
+            brackets += 1
+        elif char == "]" and brackets:
+            brackets -= 1
+        index += 1
+    return not any((ticks, stars, underscores, strikes, brackets))
+
+
+def split_semantic_markdown(text: str, limit: int) -> list[tuple[str, bool]]:
+    pieces: list[tuple[str, bool]] = []
+    remaining = text
+    while remaining:
+        rendered = telegram_html(remaining)
+        if len(remaining) <= limit and rendered is not None and len(rendered) <= limit:
+            pieces.append((remaining, True))
+            break
+        candidates = [
+            index for index in range(1, min(len(remaining), limit) + 1)
+            if remaining[index - 1].isspace() and inline_boundary_is_safe(remaining[:index])
+        ]
+        chosen = ""
+        for index in reversed(candidates):
+            candidate = remaining[:index]
+            rendered = telegram_html(candidate)
+            if rendered is not None and len(rendered) <= limit:
+                chosen = candidate
+                break
+        if not chosen:
+            pieces.extend((piece, False) for piece in chunk_text(remaining))
+            break
+        pieces.append((chosen, True))
+        remaining = remaining[len(chosen):]
+    return pieces
+
+
 def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[str, bool]]:
     """Return bounded text chunks and whether each is safe to format."""
     body = text if text.strip() else "(empty message)"
     chunks: list[tuple[str, bool]] = []
     current = ""
+    owned = ""
     fence = ""
     inside = False
+    plain_fence = False
 
     def flush() -> None:
-        nonlocal current
-        if not current.strip():
+        nonlocal current, owned
+        if not owned:
             current = f"```{fence}\n" if inside else ""
             return
         chunk = current
@@ -1237,8 +1321,9 @@ def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[st
         if rendered is not None and len(rendered) <= limit:
             chunks.append((chunk, True))
         else:
-            chunks.extend((piece, False) for piece in chunk_text(chunk))
+            chunks.extend(split_semantic_markdown(owned, limit))
         current = f"```{fence}\n" if inside else ""
+        owned = ""
 
     for line in body.splitlines(keepends=True):
         marker = line.lstrip()
@@ -1247,39 +1332,58 @@ def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[st
             if current and len(current) + len(line) > limit:
                 flush()
             current += line
+            owned += line
             inside = True
             fence = marker[3:].strip()
+            rendered_opener = telegram_html(f"{line.rstrip(chr(10))}\n```")
+            plain_fence = rendered_opener is None or len(rendered_opener) > limit
             continue
         if is_fence and inside:
-            if len(current) + len(line) > limit:
-                flush()
-            current += line
+            if plain_fence:
+                current += line
+                owned += line
+                chunks.extend((piece, False) for piece in chunk_text(owned))
+                current = ""
+                owned = ""
+            else:
+                if len(current) + len(line) > limit:
+                    flush()
+                current += line
+                owned += line
             inside = False
+            plain_fence = False
             fence = ""
             continue
         if inside:
-            # Five is the largest HTML escape expansion. Conservatively sized
-            # code pieces therefore remain valid after Mistune adds its tags.
+            if plain_fence:
+                current += line
+                owned += line
+                continue
             piece_limit = max(1, (limit - len(fence) - 32) // 5)
             while line:
                 available = piece_limit - max(0, len(current) - len(fence) - 4)
                 if available <= 0:
                     flush()
                     continue
-                current += line[:available]
+                if len(line) > available and len(line) <= piece_limit:
+                    flush()
+                    continue
+                piece = line[:available]
+                current += piece
+                owned += piece
                 line = line[available:]
                 if line:
                     flush()
             continue
-        if len(line) > limit:
-            flush()
-            chunks.extend((piece, False) for piece in chunk_text(line))
-            continue
         if current and len(current) + len(line) > limit:
             flush()
         current += line
-    if current.strip():
-        flush()
+        owned += line
+    if owned:
+        if plain_fence:
+            chunks.extend((piece, False) for piece in chunk_text(owned))
+        else:
+            flush()
     return chunks or [(body, True)]
 
 

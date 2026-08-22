@@ -662,6 +662,39 @@ class MirrorTestCase(unittest.TestCase):
         self.assertEqual("".join(str(m["text"]) for m in delivered), inline)
         self.assertTrue(all("parse_mode" not in message for message in delivered))
 
+    def test_oversized_fence_opener_falls_back_without_duplication(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        source = f"```{'x' * 4000}\npayload\n```"
+        before = len(self.telegram.sent)
+        pi.send({"t": "reply", "text": source})
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline:
+            delivered = self.telegram.sent[before:]
+            if "".join(str(message.get("text", "")) for message in delivered) == source:
+                break
+            time.sleep(0.05)
+        delivered = self.telegram.sent[before:]
+        self.assertEqual("".join(str(message.get("text", "")) for message in delivered), source)
+        self.assertTrue(all("parse_mode" not in message for message in delivered))
+
+    def test_many_inline_constructs_split_at_formatting_boundaries(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        source = " ".join(f"**item{index}**" for index in range(500))
+        before = len(self.telegram.sent)
+        pi.send({"t": "reply", "text": source})
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline:
+            delivered = self.telegram.sent[before:]
+            if sum(str(message.get("text", "")).count("<b>item") for message in delivered) == 500:
+                break
+            time.sleep(0.05)
+        delivered = self.telegram.sent[before:]
+        self.assertGreater(len(delivered), 1)
+        self.assertTrue(all(message.get("parse_mode") == "HTML" for message in delivered))
+        self.assertEqual(sum(message["text"].count("<b>item") for message in delivered), 500)
+
     def test_rejected_formatting_falls_back_to_plain_text_once(self) -> None:
         self.telegram.reject_parse_mode = True
         pi = self.connect_pi()
@@ -933,6 +966,45 @@ class MirrorTestCase(unittest.TestCase):
         later = self.connect_pi()
         frame = later.read()
         self.assertEqual(base64.b64decode(frame["image"]["data"]), self.PNG)
+
+    def test_queued_image_limit_counts_decoded_bytes_and_incoming_image(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        pi.close()
+        time.sleep(0.3)
+        ten_megabytes = self.PNG[:8] + b"a" * (10 * 1024 * 1024 - 8)
+        for index in range(3):
+            file_id = f"queued-large-{index}"
+            self.telegram.files[file_id] = ten_megabytes
+            message_id = 960 + index
+            self.telegram.push_photo(message_id, [{
+                "file_id": file_id,
+                "width": 1000,
+                "height": 1000,
+                "file_size": len(ten_megabytes),
+            }])
+            self.telegram.wait_sent(
+                lambda message, expected=message_id:
+                message.get("reply_parameters", {}).get("message_id") == expected
+                and "queued" in str(message.get("text", ""))
+            )
+        three_megabytes = self.PNG[:8] + b"b" * (3 * 1024 * 1024 - 8)
+        self.telegram.files["over-raw-cap"] = three_megabytes
+        self.telegram.push_photo(963, [{
+            "file_id": "over-raw-cap",
+            "width": 1000,
+            "height": 1000,
+            "file_size": len(three_megabytes),
+        }])
+        refusal = self.telegram.wait_sent(
+            lambda message: message.get("reply_parameters", {}).get("message_id") == 963
+        )
+        self.assertIn("too large", refusal["text"])
+        later = self.connect_pi()
+        delivered = [later.read() for _ in range(3)]
+        self.assertEqual([len(base64.b64decode(frame["image"]["data"])) for frame in delivered],
+                         [len(ten_megabytes)] * 3)
+        later.expect_nothing()
 
     def test_an_image_is_refused_when_the_session_cannot_render_one(self) -> None:
         # The live failure: a bot newer than the connected bridge delivered an
