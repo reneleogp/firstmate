@@ -632,6 +632,36 @@ class MirrorTestCase(unittest.TestCase):
             "splitting lost or duplicated code lines",
         )
 
+    def test_long_indivisible_markdown_preserves_every_character(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        code = "z" * 8000
+        pi.send({"t": "reply", "text": f"```text\n{code}\n```"})
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline:
+            formatted = [m for m in self.telegram.sent if m.get("parse_mode") == "HTML"]
+            if sum(m["text"].count("z") for m in formatted) >= len(code):
+                break
+            time.sleep(0.05)
+        formatted = [m for m in self.telegram.sent if m.get("parse_mode") == "HTML"]
+        self.assertGreater(len(formatted), 1)
+        self.assertEqual(sum(m["text"].count("z") for m in formatted), len(code))
+        for message in formatted:
+            self.assertEqual(message["text"].count("<pre"), message["text"].count("</pre>"))
+
+        inline = "**" + "q" * 8000 + "**"
+        before = len(self.telegram.sent)
+        pi.send({"t": "reply", "text": inline})
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline:
+            delivered = self.telegram.sent[before:]
+            if sum(len(str(m.get("text", ""))) for m in delivered) >= len(inline):
+                break
+            time.sleep(0.05)
+        delivered = self.telegram.sent[before:]
+        self.assertEqual("".join(str(m["text"]) for m in delivered), inline)
+        self.assertTrue(all("parse_mode" not in message for message in delivered))
+
     def test_rejected_formatting_falls_back_to_plain_text_once(self) -> None:
         self.telegram.reject_parse_mode = True
         pi = self.connect_pi()
@@ -840,6 +870,17 @@ class MirrorTestCase(unittest.TestCase):
                                      if params.get("file_id") == "doc-zip"])
         pi.expect_nothing()
 
+    def test_an_image_document_with_mismatched_bytes_is_refused(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.telegram.files["lying-png"] = self.JPEG
+        self.telegram.push_document(913, "lying-png", "image/png", size=len(self.JPEG))
+        refusal = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 913
+        )
+        self.assertIn("not supported", refusal["text"])
+        pi.expect_nothing()
+
     def test_an_oversized_image_is_refused_without_downloading(self) -> None:
         pi = self.connect_pi()
         self.enable_mirror(pi)
@@ -998,6 +1039,22 @@ class MirrorTestCase(unittest.TestCase):
         self.assertEqual([blob for _name, _filename, blob in files], blobs)
         self.assertEqual(media[0]["caption"], "You · Terminal\nthree shots")
         self.assertNotIn("caption", media[1])
+
+    def test_full_aggregate_terminal_images_fit_the_wire_frame(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        blobs = [self.PNG[:8] + bytes([index]) * (9 * 1024 * 1024 - 8) for index in range(3)]
+        pi.send({"t": "terminal", "text": "large album", "images": [
+            {"data": base64.b64encode(blob).decode(), "mime": "image/png"} for blob in blobs
+        ]})
+        deadline = time.time() + 20
+        while time.time() < deadline and not self.telegram.uploads:
+            time.sleep(0.05)
+        self.assertTrue(self.telegram.uploads, "a valid aggregate image frame was dropped")
+        method, _fields, files = self.telegram.uploads[0]
+        self.assertEqual(method, "sendMediaGroup")
+        self.assertEqual([len(blob) for _name, _filename, blob in files],
+                         [len(blob) for blob in blobs])
 
     def test_terminal_images_respect_the_size_and_type_bounds(self) -> None:
         pi = self.connect_pi()
@@ -1334,6 +1391,24 @@ class MirrorTestCase(unittest.TestCase):
             time.sleep(0.02)
         else:
             raise AssertionError("a repeated tap was not refused")
+        pi.expect_nothing()
+
+    def test_long_transcripts_never_create_multi_message_cards(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.transcript_file.write_text("v" * 3801, encoding="utf-8")
+        self.telegram.push_voice(79)
+        refusal = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 79
+            and "3,800 characters" in str(m.get("text", ""))
+        )
+        self.assertNotIn("reply_markup", refusal)
+        self.assertFalse(any(m.get("reply_markup") for m in self.telegram.sent
+                             if m.get("reply_parameters", {}).get("message_id") == 79))
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline and (self.home / "audio" / "79.ogg").exists():
+            time.sleep(0.05)
+        self.assertFalse((self.home / "audio" / "79.ogg").exists())
         pi.expect_nothing()
 
     def test_voice_note_cancel_sends_nothing(self) -> None:

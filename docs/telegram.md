@@ -129,7 +129,7 @@ Send a screenshot from the paired chat and Firstmate receives it exactly as an i
 A caption travels with it as the text of the same message.
 Because the terminal shows no preview of an attached image, the message also carries a plain `[Image attached]` line so you can see one arrived; with a caption it reads as the caption followed by that line, and without one it is that line alone.
 
-- Photos and image files are accepted as PNG, JPEG, or WebP; anything else is refused with a short reply and never downloaded.
+- Photos and image files are accepted as PNG, JPEG, or WebP; downloaded bytes must match the declared type, and anything else is refused.
 - Telegram sends several renditions of a photo, and the sharpest one is used.
 - Images over 10 MB are refused, as is a backlog of queued images past 32 MB.
 - Images keep their place in the queue alongside text and confirmed voice notes, and produce the same `Pi · Sent to Firstmate.` reply on the original message when confirmations are on.
@@ -140,7 +140,7 @@ If you see that reply, update the extension and `/reload` Pi.
 An image waiting for Firstmate is held in memory only, exactly like queued text, and is dropped when it is accepted or when the bot stops.
 The no-durable-queue limitation therefore covers screenshots too: an image that has not reached Firstmate is lost if the bot restarts.
 
-While mirror mode is off, an ordinary Telegram message is answered with `Telegram mirror is off. Send /telegram on to enable it.` and never reaches Pi.
+While mirror mode is off, an ordinary Telegram message is answered with `Telegram mirror is off. Send /telegram_on to enable it.` and never reaches Pi.
 
 While mirror mode is on:
 
@@ -197,6 +197,7 @@ Threading is presentation only either way, and never changes what Firstmate sees
 
 `Edit` replaces the buttons with `Copy text` and `Back` and opens a reply prompt bound to that transcript.
 Copy the text, paste it into the reply, correct it, and send: the original transcript message updates and the main buttons return, as often as you like.
+A transcript card is limited to 3,800 characters so it always remains one editable message; longer transcriptions are refused and their temporary audio is removed.
 `Back` leaves the transcript unchanged and restores the main buttons.
 Telegram limits a copy button to 256 characters, so a longer transcript shows only `Back`; copy that text from the transcript message itself.
 

@@ -124,6 +124,10 @@ SENT_FOOTER = "Sent to Firstmate"
 CANCELLED_FOOTER = "Cancelled"
 EDIT_PROMPT = "Reply to this message with the corrected text."
 TRANSCRIBE_FAILED_REPLY = "Transcription failed. Nothing was sent to Firstmate."
+TRANSCRIPT_TOO_LONG_REPLY = (
+    "That transcript is over 3,800 characters. Nothing was sent to Firstmate."
+)
+TRANSCRIPT_EDIT_TOO_LONG_REPLY = "Transcript edits must be 3,800 characters or fewer."
 UNSUPPORTED_REPLY = "Only text, voice notes, and images are mirrored."
 UNSUPPORTED_IMAGE_REPLY = "That file type is not supported. Send a PNG, JPEG, or WebP image."
 OVERSIZED_IMAGE_REPLY = "That image is too large to send to Firstmate."
@@ -169,14 +173,15 @@ MAX_QUEUED_IMAGE_BYTES = 32 * 1024 * 1024
 # Outbound: Telegram's own album and caption limits.
 MAX_MEDIA_GROUP = 10
 TELEGRAM_CAPTION_LIMIT = 1024
-# One frame can carry a screenshot, which is far past asyncio's default 64 KiB
-# line limit; without this the reader would fail and drop the session the first
-# time an image was mirrored from the terminal.
-MAX_FRAME_BYTES = MAX_QUEUED_IMAGE_BYTES + 2 * 1024 * 1024
+# One frame can carry the aggregate image allowance encoded as base64 plus JSON.
+# Keep the wire boundary explicit and bounded while allowing every valid image
+# submission through the reader.
+MAX_FRAME_BYTES = ((MAX_QUEUED_IMAGE_BYTES + 2) // 3) * 4 + 2 * 1024 * 1024
 # Delivery confirmations are switched by their own Telegram commands and by Pi's
 # settings; both write the one persistent setting the bot owns.
 MIRROR_COMMAND_NAMES = ("on", "off", "status", "confirmations-on", "confirmations-off")
 TELEGRAM_TEXT_LIMIT = 3900
+TRANSCRIPT_CARD_LIMIT = 3800
 COPY_TEXT_LIMIT = 256
 TRANSCRIBE_TIMEOUT = 180
 POLL_TIMEOUT = 25
@@ -498,10 +503,10 @@ class MirrorBot:
                    markup: Optional[dict[str, Any]] = None,
                    formatted: bool = False) -> Optional[dict[str, Any]]:
         result: Optional[dict[str, Any]] = None
-        chunks = split_markdown(text) if formatted else chunk_text(text)
-        for index, chunk in enumerate(chunks):
+        chunks = split_markdown(text) if formatted else [(chunk, False) for chunk in chunk_text(text)]
+        for index, (chunk, chunk_formatted) in enumerate(chunks):
             params: dict[str, Any] = {"chat_id": self.config.chat_id, "text": chunk}
-            if formatted:
+            if chunk_formatted:
                 rendered = telegram_html(chunk)
                 if rendered is not None:
                     params["text"] = rendered
@@ -736,6 +741,10 @@ class MirrorBot:
         finally:
             for process in started:
                 self.transcribers.discard(process)
+        if len(transcript) > TRANSCRIPT_CARD_LIMIT:
+            remove_file(audio)
+            await self.send(TRANSCRIPT_TOO_LONG_REPLY, reply_to=voice_id)
+            return
         card = await self.send(transcript, reply_to=voice_id, markup=main_markup(voice_id, 1))
         if card is None:
             remove_file(audio)
@@ -811,6 +820,9 @@ class MirrorBot:
         if entry is None:
             await self.send("That transcript is no longer active.", reply_to=message_id)
             return
+        if len(text) > TRANSCRIPT_CARD_LIMIT:
+            await self.send(TRANSCRIPT_EDIT_TOO_LONG_REPLY, reply_to=message_id)
+            return
         entry.text = text
         entry.revision += 1
         self.clear_prompt(entry)
@@ -863,10 +875,11 @@ class MirrorBot:
             log(f"image download failed: {exc}")
             await self.send(IMAGE_FAILED_REPLY, reply_to=message_id)
             return
-        mime = mime or sniff_image_mime(data) or "image/jpeg"
-        if mime not in IMAGE_MIME_TYPES:
+        actual_mime = sniff_image_mime(data)
+        if actual_mime is None or (mime is not None and mime != actual_mime):
             await self.send(UNSUPPORTED_IMAGE_REPLY, reply_to=message_id)
             return
+        mime = actual_mime
         image = {"data": base64.b64encode(data).decode("ascii"), "mime": mime}
         await self.accept_text(caption if isinstance(caption, str) else "",
                                message_id, image=image)
@@ -1203,15 +1216,10 @@ def telegram_html(text: str) -> Optional[str]:
     return rendered or None
 
 
-def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
-    """Split before conversion, so every chunk converts to complete markup.
-
-    Splitting converted HTML instead would cut tags in half and Telegram would
-    reject the whole message. A fenced block that spans a split is closed and
-    reopened so each chunk still reads as code.
-    """
+def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[tuple[str, bool]]:
+    """Return bounded text chunks and whether each is safe to format."""
     body = text if text.strip() else "(empty message)"
-    chunks: list[str] = []
+    chunks: list[tuple[str, bool]] = []
     current = ""
     fence = ""
     inside = False
@@ -1219,31 +1227,60 @@ def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
     def flush() -> None:
         nonlocal current
         if not current.strip():
-            current = ""
+            current = f"```{fence}\n" if inside else ""
             return
-        chunks.append((current + "\n```" if inside else current).strip("\n"))
+        chunk = current
+        if inside:
+            chunk = f"{chunk.rstrip(chr(10))}\n```"
+        chunk = chunk.strip("\n")
+        rendered = telegram_html(chunk)
+        if rendered is not None and len(rendered) <= limit:
+            chunks.append((chunk, True))
+        else:
+            chunks.extend((piece, False) for piece in chunk_text(chunk))
         current = f"```{fence}\n" if inside else ""
 
     for line in body.splitlines(keepends=True):
         marker = line.lstrip()
-        if marker.startswith("```"):
-            if inside:
-                inside, fence = False, ""
-            else:
-                inside, fence = True, marker[3:].strip()
-        # Inside a fence, leave room for the closing line this chunk needs and
-        # the header the next one reopens with.
-        budget = limit - (len(fence) + 9 if inside else 0)
-        while len(line) > budget:
+        is_fence = marker.startswith("```")
+        if is_fence and not inside:
+            if current and len(current) + len(line) > limit:
+                flush()
+            current += line
+            inside = True
+            fence = marker[3:].strip()
+            continue
+        if is_fence and inside:
+            if len(current) + len(line) > limit:
+                flush()
+            current += line
+            inside = False
+            fence = ""
+            continue
+        if inside:
+            # Five is the largest HTML escape expansion. Conservatively sized
+            # code pieces therefore remain valid after Mistune adds its tags.
+            piece_limit = max(1, (limit - len(fence) - 32) // 5)
+            while line:
+                available = piece_limit - max(0, len(current) - len(fence) - 4)
+                if available <= 0:
+                    flush()
+                    continue
+                current += line[:available]
+                line = line[available:]
+                if line:
+                    flush()
+            continue
+        if len(line) > limit:
             flush()
-            head, line = line[:budget], line[budget:]
-            chunks.append(head)
-        if current and len(current) + len(line) > budget:
+            chunks.extend((piece, False) for piece in chunk_text(line))
+            continue
+        if current and len(current) + len(line) > limit:
             flush()
         current += line
     if current.strip():
-        chunks.append(current.strip("\n"))
-    return chunks or [body]
+        flush()
+    return chunks or [(body, True)]
 
 
 def is_image_document(document: Any) -> bool:
