@@ -11,6 +11,21 @@ command -v node >/dev/null 2>&1 || { echo "skip: node not found for the Telegram
 TMP_ROOT=$(fm_test_tmproot fm-telegram-extension)
 trap fm_test_cleanup EXIT
 
+cat >"$TMP_ROOT/codex-report.js" <<'JS'
+setTimeout(() => {}, 30000);
+JS
+node "$TMP_ROOT/codex-report.js" &
+NEAR_MATCH_PID=$!
+mkdir -p "$TMP_ROOT/near-match-state"
+printf '%s\n' "$NEAR_MATCH_PID" >"$TMP_ROOT/near-match-state/.lock"
+if "$ROOT/bin/fm-session-lock-check.sh" "$TMP_ROOT/near-match-state" "$NEAR_MATCH_PID"; then
+  kill "$NEAR_MATCH_PID" 2>/dev/null || true
+  wait "$NEAR_MATCH_PID" 2>/dev/null || true
+  fail "an unrelated node process with a harness substring authenticated as Pi"
+fi
+kill "$NEAR_MATCH_PID" 2>/dev/null || true
+wait "$NEAR_MATCH_PID" 2>/dev/null || true
+
 printf 'const value: number = 1;\nexport default value;\n' >"$TMP_ROOT/probe.ts"
 if ! node -e 'import(process.argv[1]).catch(() => process.exit(1))' "$TMP_ROOT/probe.ts" >/dev/null 2>&1; then
   echo "skip: this node does not strip TypeScript types"
@@ -377,6 +392,22 @@ if (countLimited.text.includes("pi-clipboard-") ||
   fail(`the clipboard image-count refusal was not reported safely: ${JSON.stringify(notifications.slice(noticesBeforeImageCountLimit))}`);
 }
 
+const repeatedLarge = join(clipboardDir, `pi-clipboard-44444444-1111-2222-3333-444455556666.png`);
+writeFileSync(repeatedLarge, Buffer.concat([pngBytes, Buffer.alloc(6 * 1024)]));
+const framesBeforeRepeatedLarge = received.filter((frame) => frame.t === "terminal").length;
+handlers.get("input")({
+  text: Array(1000).fill(repeatedLarge).join(" "),
+  source: "interactive",
+}, ctx);
+await waitFor(
+  () => received.filter((frame) => frame.t === "terminal").length === framesBeforeRepeatedLarge + 1,
+  "the bounded repeated-artifact scan",
+);
+const repeatedLargeFrame = received.filter((frame) => frame.t === "terminal").at(-1);
+if (repeatedLargeFrame.images?.length !== 10 || repeatedLargeFrame.text !== "") {
+  fail(`repeated artifacts were not bounded and admitted in order: ${JSON.stringify(repeatedLargeFrame.text)}`);
+}
+
 const raced = join(clipboardDir, `pi-clipboard-55555555-1111-2222-3333-444455556666.png`);
 const racedStage = `${raced}.stage`;
 const racedSecret = join(clipboardDir, "fm-telegram-race-secret.png");
@@ -416,7 +447,7 @@ if (raceFrames.some((frame) => frame.images?.some(
 }
 
 for (const path of [genuine, genuineJpeg, arbitrary, wrongMagic, oversized, linkTarget, symlinked,
-                    raced, racedStage, racedSecret, raceScript]) {
+                    repeatedLarge, raced, racedStage, racedSecret, raceScript]) {
   try { unlinkSync(path); } catch {}
 }
 
@@ -530,6 +561,14 @@ await new Promise((resolve) => setTimeout(resolve, 200));
 if (replyTexts().length !== 5) {
   fail(`an uncompleted response was mirrored: ${JSON.stringify(replyTexts())}`);
 }
+
+const indentedReply = "  command\n    nested\n";
+handlers.get("message_end")(assistantMessage([{ type: "text", text: indentedReply }]), ctx);
+await waitFor(() => replyTexts().length === 6, "the whitespace-preserving final reply");
+if (replyTexts().at(-1) !== indentedReply) {
+  fail(`a final reply lost leading or trailing whitespace: ${JSON.stringify(replyTexts().at(-1))}`);
+}
+received.splice(received.findLastIndex((frame) => frame.t === "reply"), 1);
 
 // 3. Queued Telegram text enters Pi's own input path in arrival order, with no
 //    origin marker, and each one is confirmed back to the bot.

@@ -179,8 +179,7 @@ function clipboardMime(name: string): string | undefined {
 type ClipboardScan = { images: QueuedImage[]; caption: string; recognized: boolean; omitted: boolean };
 type ClipboardArtifact =
   | { kind: "invalid" }
-  | { kind: "refused" }
-  | { kind: "accepted"; image: QueuedImage };
+  | { kind: "proven"; image?: QueuedImage; bytes?: number };
 
 function escapeForRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -197,6 +196,7 @@ function clipboardScan(text: string): ClipboardScan {
   );
   const images: QueuedImage[] = [];
   const proven: Array<[number, number]> = [];
+  const artifacts = new Map<string, ClipboardArtifact>();
   let index = 0;
   let previousEnd = -1;
   let total = 0;
@@ -212,12 +212,21 @@ function clipboardScan(text: string): ClipboardScan {
     }
     const token = match[0];
     const end = at + token.length;
-    const artifactResult = readClipboardArtifact(token, total, images.length);
-    if (artifactResult.kind !== "invalid") {
+    let artifactResult = artifacts.get(token);
+    if (!artifactResult) {
+      const remaining = images.length >= MAX_CLIPBOARD_IMAGES
+        ? 0
+        : MAX_CLIPBOARD_TOTAL_BYTES - total;
+      artifactResult = readClipboardArtifact(token, remaining);
+      artifacts.set(token, artifactResult);
+    }
+    if (artifactResult.kind === "proven") {
       proven.push([at, end]);
       previousEnd = end;
-      if (artifactResult.kind === "accepted") {
-        total += Buffer.byteLength(artifactResult.image.data, "base64");
+      const bytes = artifactResult.bytes ?? 0;
+      if (artifactResult.image && images.length < MAX_CLIPBOARD_IMAGES &&
+          total + bytes <= MAX_CLIPBOARD_TOTAL_BYTES) {
+        total += bytes;
         images.push(artifactResult.image);
       } else {
         omitted = true;
@@ -239,11 +248,7 @@ function clipboardScan(text: string): ClipboardScan {
   return { images, caption, recognized: proven.length > 0, omitted };
 }
 
-function readClipboardArtifact(
-  token: string,
-  alreadyTaken: number,
-  imageCount: number,
-): ClipboardArtifact {
+function readClipboardArtifact(token: string, remaining: number): ClipboardArtifact {
   const declared = clipboardMime(basename(token));
   if (!declared) return { kind: "invalid" };
   let descriptor: number | undefined;
@@ -253,6 +258,13 @@ function readClipboardArtifact(
     if (!info.isFile() || info.size <= 0) return { kind: "invalid" };
     if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
       return { kind: "invalid" };
+    }
+    if (info.size > MAX_CLIPBOARD_BYTES || info.size > remaining) {
+      const header = Buffer.alloc(12);
+      const length = readSync(descriptor, header, 0, header.length, null);
+      return imageMimeFromMagic(header.subarray(0, length)) === declared
+        ? { kind: "proven" }
+        : { kind: "invalid" };
     }
     const parts: Buffer[] = [];
     let length = 0;
@@ -265,9 +277,14 @@ function readClipboardArtifact(
     }
     const bytes = Buffer.concat(parts, length);
     if (imageMimeFromMagic(bytes) !== declared) return { kind: "invalid" };
-    if (bytes.length > MAX_CLIPBOARD_BYTES || imageCount >= MAX_CLIPBOARD_IMAGES ||
-        alreadyTaken + bytes.length > MAX_CLIPBOARD_TOTAL_BYTES) return { kind: "refused" };
-    return { kind: "accepted", image: { data: bytes.toString("base64"), mime: declared } };
+    if (bytes.length > MAX_CLIPBOARD_BYTES || bytes.length > remaining) {
+      return { kind: "proven" };
+    }
+    return {
+      kind: "proven",
+      image: { data: bytes.toString("base64"), mime: declared },
+      bytes: bytes.length,
+    };
   } catch {
     return { kind: "invalid" };
   } finally {
@@ -303,8 +320,7 @@ function assistantText(message: unknown): string {
       (part as { type?: unknown }).type === "text" &&
       typeof (part as { text?: unknown }).text === "string")
     .map((part) => part.text)
-    .join("")
-    .trim();
+    .join("");
 }
 
 // The one white reply Pi shows the captain at the end of a response, and nothing
@@ -564,7 +580,7 @@ export default function (pi: ExtensionAPI) {
   // Every completed reply is mirrored as Pi finalizes it, exactly once.
   pi.on?.("message_end", (event) => {
     const text = finalVisibleReply(event.message);
-    if (text) write({ t: "reply", text });
+    if (text.trim()) write({ t: "reply", text });
   });
 
   pi.registerCommand?.("telegram", {
