@@ -752,9 +752,9 @@ class MirrorBot:
 
     async def handle_voice(self, message: dict[str, Any]) -> None:
         voice_id = int(message["message_id"])
-        # One Telegram message covers the whole voice note: this placeholder is
-        # edited in place into the transcript card, or into whatever ended the
-        # note, so the chat never keeps "Transcribing…" beside a second result.
+        # When Telegram accepts edits, one message covers the whole voice note:
+        # this placeholder becomes the transcript card or terminal outcome.
+        # A failed edit falls back to sending the result rather than losing it.
         placeholder = await self.send(TRANSCRIBING_REPLY, reply_to=voice_id)
         card_id = int(placeholder["message_id"]) if placeholder is not None else None
         audio = audio_dir(self.config.home) / f"{voice_id}.ogg"
@@ -805,7 +805,7 @@ class MirrorBot:
 
     async def retire_placeholder(self, card_id: Optional[int], voice_id: int,
                                  text: str) -> None:
-        """End a voice note in its own message, never beside a live placeholder."""
+        """Prefer ending a voice note in its placeholder, with a sent fallback."""
         if card_id is not None and await self.edit_card(card_id, text, None):
             return
         await self.send(text, reply_to=voice_id)
