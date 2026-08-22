@@ -1,0 +1,11 @@
+# skip: claude is not installed on this machine, so its identity is unverified here
+# skip: codex is not installed on this machine, so its identity is unverified here
+# skip: opencode is not installed on this machine, so its identity is unverified here
+# pi 0.84.2: pid=2552440 generation=proc:boot-b1cde263-b5af-459f-9e32-8e73607a1d38:8749075
+ok - session-lock identity: pi 0.84.2 publishes a bound record that retires with its process
+# skip: pi-signed is not installed on this machine, so its identity is unverified here
+# skip: grok is not installed on this machine, so its identity is unverified here
+# skip: kimi is not installed on this machine, so its identity is unverified here
+# skip: cursor is not installed on this machine, so its identity is unverified here
+# unverified on this machine (not installed): claude codex opencode pi-signed grok kimi cursor
+# checked 1 installed harness(es)

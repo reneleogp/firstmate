@@ -1,0 +1,18 @@
+$ fm-lock.sh (run from a live Pi-family harness)
+lock acquired: harness pid 2505248
+$ cat state/.lock
+2505248
+gen=proc:boot-b1cde263-b5af-459f-9e32-8e73607a1d38:8727753
+$ fm-lock.sh status (legitimate current owner)
+lock: held by live harness pid 2505248
+$ fm_process_generation with procfs hidden (portable ps lstart fallback)
+ps:Sat_Aug_22_18:29:44_2026
+$ fm-lock.sh status (same live harness PID, mismatched generation)
+lock: stale (pid 2505248 is dead, not a harness, or a different process generation than the one that published this lock)
+$ fm-lock.sh (next real session reclaims the stale lock)
+lock acquired: harness pid 2505544
+$ fm-lock.sh (host exposing neither generation source)
+lock acquired: harness pid 2505843
+lock: process generation is unavailable on this host, so this record keeps only the legacy pid binding
+$ cat legacy/state/.lock
+2505843
