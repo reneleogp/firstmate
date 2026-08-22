@@ -84,6 +84,15 @@ service() {  # <command> [mode]
     python3 "$BOT" "$command" 2>&1
 }
 
+fake_launchctl() {
+  env -u WSL_DISTRO_NAME \
+    HOME="$CASE_DIR/home" \
+    FM_TELEGRAM_API_BASE="http://127.0.0.1:9" \
+    FM_TELEGRAM_TESTING=1 \
+    FM_FAKE_LAUNCHD_STATE="$CASE_DIR/launchd.json" \
+    "$FIXTURES/fake-launchctl.py" "$@" 2>&1
+}
+
 # One question about the launchd state, by name.
 launchd_query() {  # <loaded|launches|disabled|pid|pids>
   python3 - "$CASE_DIR/launchd.json" "$LABEL" "$1" <<'PY'
@@ -178,6 +187,10 @@ test_install_starts_one_service_and_waits_for_that_child() {
   [ -n "$marker_id" ] && [ "$marker_id" = "$plist_id" ] \
     || fail "the child that reported ready was not the generation this install launched"
   [ -S "$CASE_HOME/bot.sock" ] || fail "the started service is not serving its socket"
+  [ -f "$CASE_HOME/service.log" ] && [ ! -L "$CASE_HOME/service.log" ] \
+    || fail "the started service did not open its private log as a regular file"
+  [ "$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$CASE_HOME/service.log")" = 0o600 ] \
+    || fail "the started service log is not owner-only"
   pass "telegram macOS: install starts exactly one service and waits for that child to serve"
 }
 
@@ -216,6 +229,39 @@ test_install_refuses_a_service_log_symlink() {
   assert_absent "$PLIST" "a service-log refusal still published a LaunchAgent"
   job_loaded && fail "a service-log refusal still started a job"
   pass "telegram macOS: install refuses a service-log symlink before publication"
+}
+
+test_a_login_launch_refuses_a_swapped_service_log_symlink() {
+  local out victim pid attempts
+  new_case
+  out=$(service install-service) || fail "install-service failed: $out"
+  out=$(service stop-service) || fail "stop-service failed: $out"
+  victim="$CASE_DIR/victim.log"
+  printf 'do not overwrite\n' >"$victim"
+  rm -f "$CASE_HOME/service.log"
+  ln -s "$victim" "$CASE_HOME/service.log"
+  out=$(fake_launchctl bootstrap "gui/$(id -u)" "$PLIST") \
+    || fail "the simulated login could not load the published LaunchAgent: $out"
+  [ "$(launch_count)" = 2 ] \
+    || fail "the simulated login did not launch the installed child"
+  pid=$(running_pid)
+  attempts=0
+  while kill -0 "$pid" 2>/dev/null && [ "$attempts" -lt 50 ]; do
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  sleep 0.2
+  out=$(fake_launchctl print "gui/$(id -u)/$LABEL") \
+    || fail "the simulated login job disappeared before its refusal was observed: $out"
+  case "$out" in
+    *"last exit code = 1"*) : ;;
+    *) fail "the launched child did not refuse the swapped service-log symlink: $out" ;;
+  esac
+  [ "$(cat "$victim")" = "do not overwrite" ] \
+    || fail "a login launch wrote through the swapped service-log symlink"
+  [ -L "$CASE_HOME/service.log" ] \
+    || fail "a login launch replaced the swapped service-log symlink"
+  pass "telegram macOS: every login launch refuses a swapped service-log symlink"
 }
 
 test_update_relaunches_once_and_ignores_the_previous_marker() {
@@ -597,6 +643,7 @@ PY
 test_install_starts_one_service_and_waits_for_that_child
 test_the_published_definition_carries_no_secret
 test_install_refuses_a_service_log_symlink
+test_a_login_launch_refuses_a_swapped_service_log_symlink
 test_update_relaunches_once_and_ignores_the_previous_marker
 test_a_stale_marker_never_reports_a_new_launch_ready
 test_a_failed_install_leaves_nothing_that_starts_at_login

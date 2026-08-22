@@ -361,6 +361,26 @@ def prepare_private_file(target: Path) -> None:
         require_private_descriptor(handle.fileno(), target)
 
 
+def redirect_service_log(home: Path) -> None:
+    target = service_log(home)
+    try:
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            require_private_descriptor(descriptor, target)
+            os.dup2(descriptor, sys.stdout.fileno())
+            os.dup2(descriptor, sys.stderr.fileno())
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise TelegramError(
+            f"could not open {target} without following a symlink: {exc}"
+        ) from exc
+
+
 def publish_ready_marker(home: Path) -> None:
     """Say that THIS process is the one now serving.
 
@@ -2293,8 +2313,8 @@ class LaunchdService(ServiceManager):
             "ThrottleInterval": 5,
             "ProcessType": "Background",
             "ExitTimeOut": LAUNCHD_EXIT_TIMEOUT,
-            "StandardOutPath": str(service_log(self.home)),
-            "StandardErrorPath": str(service_log(self.home)),
+            "StandardOutPath": os.devnull,
+            "StandardErrorPath": os.devnull,
         }
 
     def unit_text(self) -> str:
@@ -2733,6 +2753,8 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     home = private_dir(home_dir())
     if args.command == "run":
+        if os.environ.get("FM_TELEGRAM_LAUNCH_ID"):
+            redirect_service_log(home)
         return run(home)
     if args.command == "pair":
         return pair(home)
