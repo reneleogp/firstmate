@@ -908,10 +908,10 @@ class MirrorBot:
         )
 
     async def retire_prompt(self, entry: Voice) -> None:
-        """Leaving edit mode takes the instruction message out of the chat too.
+        """Back takes the instruction message out of the chat too.
 
-        The binding is dropped first, so even a refused delete cannot leave a
-        message that still looks like a live correction target.
+        The binding is dropped first, so even a refused delete cannot leave the
+        message acting as a live correction target.
         """
         prompt_id = entry.prompt_id
         self.clear_prompt(entry)
