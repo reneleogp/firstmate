@@ -31,6 +31,10 @@ VOICE_BYTES = b"OggS-fake-voice"
 DEADLINE = 10.0
 
 
+class ParseModeRejected(Exception):
+    """The fake API's stand-in for Telegram's 400 on unparsable markup."""
+
+
 class FakeTelegram:
     """Minimal Bot API surface: getUpdates, sendMessage, edits, callbacks, files."""
 
@@ -41,6 +45,8 @@ class FakeTelegram:
         self.edits: list[dict[str, Any]] = []
         self.callback_answers: list[dict[str, Any]] = []
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        # Telegram refuses markup it cannot parse; the bot must recover.
+        self.reject_parse_mode = False
         self.next_message_id = 1000
         self.next_update_id = 1
         harness = self
@@ -53,6 +59,17 @@ class FakeTelegram:
                 body = json.dumps({"ok": True, "result": payload}).encode("utf-8")
                 try:
                     self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def _error(self, status: int, detail: str) -> None:
+                body = json.dumps({"ok": False, "description": f"Bad Request: {detail}"}).encode()
+                try:
+                    self.send_response(status)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
@@ -74,7 +91,10 @@ class FakeTelegram:
                 length = int(self.headers.get("Content-Length") or 0)
                 params = json.loads(self.rfile.read(length) or b"{}")
                 method = self.path.rsplit("/", 1)[-1]
-                self._json(harness.dispatch(method, params))
+                try:
+                    self._json(harness.dispatch(method, params))
+                except ParseModeRejected as exc:
+                    self._error(400, str(exc))
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.handle_error = lambda *_args: None  # a killed bot is expected
@@ -104,6 +124,8 @@ class FakeTelegram:
                 time.sleep(0.01)
             return []
         if method == "sendMessage":
+            if self.reject_parse_mode and "parse_mode" in params:
+                raise ParseModeRejected("can't parse entities: unsupported start tag")
             with self.lock:
                 self.next_message_id += 1
                 message = dict(params)
@@ -471,6 +493,152 @@ class MirrorTestCase(unittest.TestCase):
         self.assertLessEqual(len(retained), 32, f"retained {len(retained)} voice files")
         self.assertIn("539", retained, "the newest transcript was dropped instead of the oldest")
         self.assertNotIn("500", retained, "the oldest transcript was never retired")
+
+    def test_replies_are_formatted_as_telegram_html(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        pi.send({"t": "reply", "text": (
+            "Captain, the fix is in.\n\n"
+            "**What broke:** the bridge kept one `finalReply`.\n\n"
+            "```sh\ngrep -c 'reply' frames.log\n```\n\n"
+            "Compare a < b && c > d, and see [the PR](https://example.com/pull/12)."
+        )})
+        sent = self.telegram.wait_sent(lambda m: "What broke" in str(m.get("text")))
+        self.assertEqual(sent["parse_mode"], "HTML")
+        body = sent["text"]
+        self.assertIn("<b>What broke:</b>", body)
+        self.assertIn("<code>finalReply</code>", body)
+        self.assertIn('<pre><code class="language-sh">', body)
+        self.assertIn('<a href="https://example.com/pull/12">the PR</a>', body)
+        # Only <, > and & need escaping, and they must never reach Telegram raw.
+        self.assertIn("a &lt; b &amp;&amp; c &gt; d", body)
+        self.assertNotIn("a < b", body)
+
+    def test_transport_statuses_stay_plain(self) -> None:
+        pi = self.connect_pi()
+        self.telegram.push_text("anything", 601)
+        refusal = self.telegram.wait_sent(
+            lambda m: str(m.get("text", "")).startswith("Telegram mirror is off")
+        )
+        self.assertNotIn("parse_mode", refusal)
+        self.enable_mirror(pi)
+        self.telegram.push_text("do the thing", 602)
+        frame = pi.read()
+        pi.send({"t": "accepted", "id": frame["id"]})
+        receipt = self.telegram.wait_sent(lambda m: m.get("text") == "Pi · Sent to Firstmate.")
+        self.assertNotIn("parse_mode", receipt)
+        pi.send({"t": "terminal", "text": "echoed **verbatim**"})
+        echo = self.telegram.wait_sent(lambda m: "echoed" in str(m.get("text")))
+        self.assertEqual(echo["text"], "You · Terminal\nechoed **verbatim**")
+        self.assertNotIn("parse_mode", echo)
+
+    def test_a_long_reply_is_split_before_conversion(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        code = "\n".join(f"line_{index} = {index}" for index in range(700))
+        pi.send({"t": "reply", "text": f"Here it is:\n\n```python\n{code}\n```"})
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline:
+            formatted = [m for m in self.telegram.sent if m.get("parse_mode") == "HTML"]
+            if formatted and sum(m["text"].count("line_") for m in formatted) >= 700:
+                break
+            time.sleep(0.05)
+        formatted = [m for m in self.telegram.sent if m.get("parse_mode") == "HTML"]
+        self.assertGreater(len(formatted), 1, "the long reply was not split")
+        for message in formatted:
+            self.assertLessEqual(len(message["text"]), 4096)
+            # A chunk cut out of converted HTML would leave a half-open tag and
+            # Telegram would reject the whole message.
+            self.assertEqual(message["text"].count("<pre"), message["text"].count("</pre>"))
+            self.assertEqual(message["text"].count("<code"), message["text"].count("</code>"))
+        self.assertEqual(
+            sum(message["text"].count("line_") for message in formatted), 700,
+            "splitting lost or duplicated code lines",
+        )
+
+    def test_rejected_formatting_falls_back_to_plain_text_once(self) -> None:
+        self.telegram.reject_parse_mode = True
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        pi.send({"t": "reply", "text": "**bold** and `code`"})
+        plain = self.telegram.wait_sent(
+            lambda m: m.get("text") == "**bold** and `code`" and "parse_mode" not in m
+        )
+        self.assertTrue(plain)
+        time.sleep(0.6)
+        delivered = [m for m in self.telegram.sent if "bold" in str(m.get("text"))
+                     and "parse_mode" not in m]
+        self.assertEqual(len(delivered), 1, "the fallback duplicated the reply")
+
+    def test_without_the_markdown_parser_replies_are_sent_plain(self) -> None:
+        # The parser is an installed package; a home without it must still
+        # mirror, unformatted, rather than dropping replies.
+        shim = Path(self.tmp.name) / "noparser"
+        shim.mkdir(exist_ok=True)
+        (shim / "mistune.py").write_text(
+            "raise ImportError('no mistune in this fixture')\n", encoding="utf-8"
+        )
+        self.stop_bot()
+        self.environment["PYTHONPATH"] = str(shim)
+        self.start_bot()
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        pi.send({"t": "reply", "text": "**bold** stays literal"})
+        sent = self.telegram.wait_sent(lambda m: "bold" in str(m.get("text")))
+        self.assertEqual(sent["text"], "**bold** stays literal")
+        self.assertNotIn("parse_mode", sent)
+
+    def test_a_second_session_cannot_take_over_or_leak_into_the_chat(self) -> None:
+        primary = self.connect_pi()
+        self.enable_mirror(primary)
+
+        # A crewmate or scout that reaches this socket must be refused outright,
+        # never promoted over the session the captain is talking to.
+        worker = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        worker.settimeout(DEADLINE)
+        worker.connect(str(self.socket_path))
+        self.addCleanup(worker.close)
+        worker_leak = (
+            "# Task\nImplement the captain-approved scout brief.\n\n"
+            "# Definition of done\nAppend done: PR {url} and stop."
+        )
+        for frame in (
+            {"t": "hello"},
+            {"t": "terminal", "text": worker_leak},
+            {"t": "reply", "text": "Confirmed, captain. Starting the investigation."},
+            {"t": "reply", "text": "Captain, shipshape."},
+            {"t": "command", "id": 99, "command": "off"},
+        ):
+            try:
+                worker.sendall((json.dumps(frame) + "\n").encode("utf-8"))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
+        time.sleep(1.5)
+
+        # The refused session is closed, and nothing it said reached Telegram.
+        worker.settimeout(2)
+        try:
+            self.assertEqual(worker.recv(65536), b"", "the bot kept the second session open")
+        except (socket.timeout, TimeoutError, ConnectionResetError, OSError):
+            pass
+        chat = " ".join(self.telegram.sent_texts())
+        for leaked in ("Definition of done", "scout brief", "Confirmed, captain",
+                       "Captain, shipshape.", "Implement the captain-approved"):
+            self.assertNotIn(leaked, chat, f"a worker session leaked {leaked!r} into the chat")
+
+        # The captain's own session still owns the mirror, unchanged.
+        primary.send({"t": "command", "id": 4, "command": "status"})
+        self.assertIn("Mirror is on", primary.read()["text"])
+        primary.send({"t": "reply", "text": "Everything is green."})
+        mirrored = self.telegram.wait_sent(lambda m: "Everything is green." in str(m.get("text")))
+        self.assertTrue(mirrored)
+
+        # And once the captain's session ends, a fresh one may take over.
+        primary.close()
+        time.sleep(0.5)
+        replacement = self.connect_pi()
+        replacement.send({"t": "command", "id": 5, "command": "status"})
+        self.assertIn("Firstmate is connected", replacement.read()["text"])
 
     def test_menu_aliases_are_published_and_switch_the_mirror(self) -> None:
         pi = self.connect_pi()

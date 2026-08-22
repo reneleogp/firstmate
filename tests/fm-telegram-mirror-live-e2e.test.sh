@@ -33,12 +33,13 @@ TMP_ROOT=$(fm_test_tmproot fm-telegram-live-e2e)
 SOCKET="fm-telegram-live-$$"
 SESSION=telegram-mirror-e2e
 HOME_DIR="$TMP_ROOT/home"
+FM_LAB_HOME="$TMP_ROOT/fmhome"
 WORK="$TMP_ROOT/work"
 PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 MODEL_PID=
 BOT_PID=
 
-mkdir -p "$HOME_DIR" "$WORK"
+mkdir -p "$HOME_DIR" "$WORK" "$FM_LAB_HOME/state"
 
 cleanup() {
   tmux -L "$SOCKET" kill-server 2>/dev/null || true
@@ -121,10 +122,15 @@ start_pi() {
   : >"$HOME_DIR/frames.log"
   rm -f "$HOME_DIR/inject.txt"
   tmux -L "$SOCKET" kill-server 2>/dev/null || true
+  # The bridge mirrors only for the session that holds the Firstmate home's
+  # lock, so this fixture launches Pi as that session: the shell records its own
+  # pid as the lock holder and then execs Pi into it.
+  mkdir -p "$FM_LAB_HOME/state"
   tmux -L "$SOCKET" new-session -d -s "$SESSION" -x 200 -y 50 -c "$WORK" \
-    "FM_TELEGRAM_DIR='$HOME_DIR' FAKE_MODEL_PORT='$PORT' pi --no-session --no-context-files \
-     --no-extensions --no-skills --no-tools -e '$FIXTURES/fake-provider.ts' -e '$EXT' \
-     --model fakelab/slow-fake"
+    "printf '%s\n' \$\$ >'$FM_LAB_HOME/state/.lock'; \
+     FM_HOME='$FM_LAB_HOME' FM_TELEGRAM_DIR='$HOME_DIR' FAKE_MODEL_PORT='$PORT' \
+     exec pi --no-session --no-context-files --no-extensions --no-skills --no-tools \
+     -e '$FIXTURES/fake-provider.ts' -e '$EXT' --model fakelab/slow-fake"
   local i=0
   while [ "$i" -lt 150 ]; do
     [ "$(frames_of hello)" -ge 1 ] && return 0

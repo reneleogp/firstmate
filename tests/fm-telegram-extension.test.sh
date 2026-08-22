@@ -27,6 +27,9 @@ if [ ! -f "$PI_PACKAGE_DIR/package.json" ]; then
 fi
 FIXTURE="$TMP_ROOT/ext"
 mkdir -p "$FIXTURE/lib" "$FIXTURE/node_modules/@earendil-works"
+# This node process stands in for the one live Firstmate session: the bridge
+# only mirrors when it runs inside the session that holds the home's lock.
+mkdir -p "$TMP_ROOT/fmhome/state" "$TMP_ROOT/workerhome/state"
 cp "$ROOT/.pi/extensions/fm-telegram-mirror.ts" "$FIXTURE/fm-telegram-mirror.ts"
 cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$FIXTURE/lib/fm-operational-input.ts"
 ln -s "$PI_PACKAGE_DIR" "$FIXTURE/node_modules/@earendil-works/pi-coding-agent"
@@ -35,13 +38,16 @@ printf '%s\n' '{"type":"module"}' >"$FIXTURE/package.json"
 
 OUT="$TMP_ROOT/node-output"
 if ! (cd "$FIXTURE" && \
+  timeout 90 env \
   EXT="$FIXTURE/fm-telegram-mirror.ts" \
   OPERATIONAL_INPUT="$ROOT/bin/fm-operational-input.sh" \
   FM_OPERATIONAL_INPUT_SCRIPT="$ROOT/bin/fm-operational-input.sh" \
   FM_TELEGRAM_DIR="$TMP_ROOT/home" \
+  FM_HOME="$TMP_ROOT/fmhome" \
+  WORKER_HOME="$TMP_ROOT/workerhome" \
   node --input-type=module >"$OUT" 2>&1) <<'JS'
 import { execFileSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -49,6 +55,13 @@ import { pathToFileURL } from "node:url";
 const home = process.env.FM_TELEGRAM_DIR;
 mkdirSync(home, { recursive: true });
 const socketPath = join(home, "bot.sock");
+
+// Bounded by construction: if any await below never settles, this fixture
+// fails loudly instead of hanging the suite.
+const watchdog = setTimeout(() => {
+  console.error("fm-telegram-mirror fixture timed out before completing its checks");
+  process.exit(3);
+}, 45000);
 
 const received = [];
 let connections = 0;
@@ -109,6 +122,8 @@ const ctx = {
 };
 const footerText = () => footer.get("firstmate-telegram");
 
+// The live session's lock names this process, so this instance is the primary.
+writeFileSync(join(process.env.FM_HOME, "state", ".lock"), `${process.pid}\n`);
 const extension = await import(pathToFileURL(process.env.EXT).href);
 extension.default(pi);
 handlers.get("session_start")({ reason: "startup" }, ctx);
@@ -282,16 +297,43 @@ if (connections !== connectionsAfterShutdown) {
 handlers.get("session_start")({ reason: "resume" }, ctx);
 await waitFor(() => connections > connectionsAfterShutdown, "a reconnect on the next session");
 
-// 8. While the bot is unreachable the footer says so rather than guessing.
-await waitFor(() => footerText() === "telegram: unavailable" || footerText() === "telegram: off",
-  "the footer to report the reconnected session");
-server.close();
-await new Promise((resolve) => setTimeout(resolve, 50));
+// 8. A worker session is inert. Crewmates and scouts are Pi sessions too, and a
+//    globally installed copy of this bridge loads in every one of them; only
+//    the session that holds the Firstmate home's lock may mirror.
+const connectionsBeforeWorker = connections;
+mkdirSync(join(process.env.WORKER_HOME, "state"), { recursive: true });
+// A live pid that is not this process's ancestor: exactly a crewmate's shape.
+writeFileSync(join(process.env.WORKER_HOME, "state", ".lock"), "1\n");
+process.env.FM_HOME = process.env.WORKER_HOME;
+const workerHandlers = new Map();
+const workerCommands = [];
+const workerFooter = new Map();
+const worker = await import(`${pathToFileURL(process.env.EXT).href}?worker=${Date.now()}`);
+worker.default({
+  on: (event, handler) => workerHandlers.set(event, handler),
+  registerCommand: (name) => workerCommands.push(name),
+  sendUserMessage: () => fail("a worker session submitted text to Pi"),
+});
+if (workerHandlers.size !== 0 || workerCommands.length !== 0) {
+  fail(`a worker session registered ${workerCommands.length} command(s) and ${workerHandlers.size} handler(s)`);
+}
+await new Promise((resolve) => setTimeout(resolve, 600));
+if (connections !== connectionsBeforeWorker) {
+  fail("a worker session connected to the Telegram bot");
+}
+if (workerFooter.size !== 0) {
+  fail("a worker session published a Telegram footer");
+}
+process.env.FM_HOME = process.env.WORKER_HOME.replace("workerhome", "fmhome");
+
 handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+await new Promise((resolve) => server.close(resolve));
+clearTimeout(watchdog);
 JS
 then
   fail "Telegram mirror extension checks failed: $(cat "$OUT")"
 fi
 [ -s "$OUT" ] && fail "Telegram mirror extension test printed output: $(cat "$OUT")"
 
-pass "the Pi mirror bridge mirrors terminal submissions and final replies only, hides thinking, tools, and operational input, submits queued Telegram text through Pi's own input path in order, toggles with bare /telegram, and keeps the footer on the bot's published state"
+pass "the Pi mirror bridge mirrors only the live session's terminal submissions and final replies, hides thinking, tools, and operational input, submits queued Telegram text through Pi's own input path in order, toggles with bare /telegram, keeps the footer on the bot's published state, and stays completely inert in a worker session"

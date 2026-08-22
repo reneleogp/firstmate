@@ -83,6 +83,8 @@ import json
 import os
 import shlex
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -92,8 +94,14 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from html import escape
 from pathlib import Path
 from typing import Any, Optional
+
+try:  # Debian/Ubuntu: python3-mistune
+    import mistune
+except ImportError:  # pragma: no cover - exercised by its own regression
+    mistune = None
 
 SERVICE_NAME = "firstmate-telegram.service"
 DEFAULT_API_BASE = "https://api.telegram.org"
@@ -353,11 +361,17 @@ class MirrorBot:
         return f"m{self._sequence}"
 
     async def send(self, text: str, reply_to: Optional[int] = None,
-                   markup: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+                   markup: Optional[dict[str, Any]] = None,
+                   formatted: bool = False) -> Optional[dict[str, Any]]:
         result: Optional[dict[str, Any]] = None
-        chunks = chunk_text(text)
+        chunks = split_markdown(text) if formatted else chunk_text(text)
         for index, chunk in enumerate(chunks):
             params: dict[str, Any] = {"chat_id": self.config.chat_id, "text": chunk}
+            if formatted:
+                rendered = telegram_html(chunk)
+                if rendered is not None:
+                    params["text"] = rendered
+                    params["parse_mode"] = "HTML"
             if reply_to is not None:
                 params["reply_parameters"] = {
                     "message_id": reply_to,
@@ -368,8 +382,19 @@ class MirrorBot:
             try:
                 result = await self.api.call("sendMessage", params)
             except TelegramError as exc:
-                log(str(exc))
-                return None
+                if "parse_mode" not in params or not rejected_formatting(exc):
+                    log(str(exc))
+                    return None
+                # Telegram refused the markup, so it sent nothing: the same text
+                # goes out plain rather than the captain losing the message.
+                log(f"formatting was rejected, sending plain text instead: {exc}")
+                params.pop("parse_mode")
+                params["text"] = chunk
+                try:
+                    result = await self.api.call("sendMessage", params)
+                except TelegramError as plain_exc:
+                    log(str(plain_exc))
+                    return None
         return result
 
     async def edit_card(self, message_id: int, text: str,
@@ -685,10 +710,18 @@ class MirrorBot:
 
     async def handle_client(self, reader: asyncio.StreamReader,
                             writer: asyncio.StreamWriter) -> None:
-        previous = self.client
-        if previous is not None:
-            await self.drop_client(previous)
+        # One mirrored session, first come, never displaced. A crewmate or scout
+        # that reached this socket must not be able to take the captain's chat
+        # away from the live Firstmate session, so a second connection is
+        # refused rather than promoted.
+        if self.client is not None and not self.client.is_closing():
+            log(f"refused a second Pi connection from {peer_description(writer)}; "
+                "the connected Firstmate session keeps the mirror")
+            with contextlib.suppress(OSError):
+                writer.close()
+            return
         self.client = writer
+        log(f"mirroring for {peer_description(writer)}")
         await self.broadcast_state()
         await self.pump()
         try:
@@ -727,7 +760,7 @@ class MirrorBot:
             # statuses below still reply to the exact message they describe,
             # because the bot knows those precisely.
             if self.mirror_on and isinstance(frame.get("text"), str):
-                await self.send(frame["text"])
+                await self.send(frame["text"], formatted=True)
             return
         if kind == "command":
             command = str(frame.get("command"))
@@ -846,6 +879,164 @@ class MirrorBot:
 def chunk_text(text: str) -> list[str]:
     body = text if text.strip() else "(empty message)"
     return [body[i:i + TELEGRAM_TEXT_LIMIT] for i in range(0, len(body), TELEGRAM_TEXT_LIMIT)] or [body]
+
+
+# --- Telegram HTML ----------------------------------------------------------
+#
+# Telegram accepts a small documented tag set, and only <, > and & have to be
+# escaped. Mistune does the Markdown parsing; this renderer can only emit those
+# documented tags, so no sanitizer stands between them and the API, and any
+# construct it does not model degrades to its own text.
+
+if mistune is not None:
+
+    class TelegramHtmlRenderer(mistune.HTMLRenderer):  # type: ignore[misc]
+        def text(self, text: str) -> str:
+            return escape(text, quote=False)
+
+        def paragraph(self, text: str) -> str:
+            return f"{text}\n\n"
+
+        def heading(self, text: str, level: int, **attrs: Any) -> str:
+            return f"<b>{text}</b>\n\n"
+
+        def strong(self, text: str) -> str:
+            return f"<b>{text}</b>"
+
+        def emphasis(self, text: str) -> str:
+            return f"<i>{text}</i>"
+
+        def strikethrough(self, text: str) -> str:
+            return f"<s>{text}</s>"
+
+        def codespan(self, text: str) -> str:
+            return f"<code>{escape(text, quote=False)}</code>"
+
+        def linebreak(self) -> str:
+            return "\n"
+
+        def softbreak(self) -> str:
+            return "\n"
+
+        def blank_line(self) -> str:
+            return ""
+
+        def thematic_break(self) -> str:
+            return "\n"
+
+        def block_text(self, text: str) -> str:
+            return text
+
+        def block_code(self, code: str, info: Optional[str] = None) -> str:
+            body = escape(code, quote=False)
+            if info:
+                language = escape(info.split()[0], quote=True)
+                return f'<pre><code class="language-{language}">{body}</code></pre>\n'
+            return f"<pre>{body}</pre>\n"
+
+        def block_quote(self, text: str) -> str:
+            return f"<blockquote>{text.strip()}</blockquote>\n"
+
+        def list(self, text: str, ordered: bool, **attrs: Any) -> str:
+            return f"{text}\n"
+
+        def list_item(self, text: str) -> str:
+            return f"- {text.strip()}\n"
+
+        def link(self, text: str, url: str, title: Optional[str] = None) -> str:
+            return f'<a href="{escape(url, quote=True)}">{text or escape(url, quote=False)}</a>'
+
+        def image(self, text: str, url: str, title: Optional[str] = None) -> str:
+            return escape(text or url, quote=False)
+
+        def inline_html(self, html: str) -> str:
+            return escape(html, quote=False)
+
+        def block_html(self, html: str) -> str:
+            return escape(html, quote=False)
+
+    _render_markdown = mistune.create_markdown(
+        renderer=TelegramHtmlRenderer(escape=False), plugins=["strikethrough"],
+    )
+else:
+    _render_markdown = None
+
+
+def telegram_html(text: str) -> Optional[str]:
+    """Telegram-safe HTML, or None to send this text plain."""
+    if _render_markdown is None:
+        return None
+    try:
+        rendered = str(_render_markdown(text)).strip()
+    except Exception as exc:  # a parser fault must never cost the message
+        log(f"could not format a message, sending it plain: {exc}")
+        return None
+    return rendered or None
+
+
+def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Split before conversion, so every chunk converts to complete markup.
+
+    Splitting converted HTML instead would cut tags in half and Telegram would
+    reject the whole message. A fenced block that spans a split is closed and
+    reopened so each chunk still reads as code.
+    """
+    body = text if text.strip() else "(empty message)"
+    chunks: list[str] = []
+    current = ""
+    fence = ""
+    inside = False
+
+    def flush() -> None:
+        nonlocal current
+        if not current.strip():
+            current = ""
+            return
+        chunks.append((current + "\n```" if inside else current).strip("\n"))
+        current = f"```{fence}\n" if inside else ""
+
+    for line in body.splitlines(keepends=True):
+        marker = line.lstrip()
+        if marker.startswith("```"):
+            if inside:
+                inside, fence = False, ""
+            else:
+                inside, fence = True, marker[3:].strip()
+        # Inside a fence, leave room for the closing line this chunk needs and
+        # the header the next one reopens with.
+        budget = limit - (len(fence) + 9 if inside else 0)
+        while len(line) > budget:
+            flush()
+            head, line = line[:budget], line[budget:]
+            chunks.append(head)
+        if current and len(current) + len(line) > budget:
+            flush()
+        current += line
+    if current.strip():
+        chunks.append(current.strip("\n"))
+    return chunks or [body]
+
+
+def peer_description(writer: asyncio.StreamWriter) -> str:
+    """Kernel-supplied identity of the connected process, never client-supplied."""
+    try:
+        sock = writer.get_extra_info("socket")
+        credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                      struct.calcsize("3i"))
+        pid, uid, _gid = struct.unpack("3i", credentials)
+    except (OSError, AttributeError, struct.error):
+        return "an unidentified process"
+    try:
+        command = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+    except OSError:
+        command = "unknown"
+    return f"pid {pid} ({command}, uid {uid})"
+
+
+def rejected_formatting(error: TelegramError) -> bool:
+    """True when Telegram refused the markup itself, so nothing was sent."""
+    detail = str(error).lower()
+    return "parse" in detail or "entities" in detail or "tag" in detail
 
 
 def mirror_command(text: str) -> Optional[str]:

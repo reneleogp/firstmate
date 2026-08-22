@@ -17,10 +17,12 @@
 // The bot owns the Unix socket (bin/fm-telegram.py's "bot.sock") and this
 // extension is the client, because the bot outlives every Pi session. The wire
 // protocol is stated once in that script's header.
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { getSettingsListTheme, type ExtensionAPI, type ExtensionContext }
   from "@earendil-works/pi-coding-agent";
 import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
@@ -62,6 +64,42 @@ function botHome(): string {
 
 function botSocketPath(): string {
   return join(botHome(), "bot.sock");
+}
+
+// Only the one Firstmate session the captain is talking to may mirror. Every
+// crewmate and scout is a Pi session too, and a globally installed copy of this
+// extension loads in all of them, so without this gate a worker's brief, its
+// replies and its tool activity would flow into the captain's private chat the
+// moment it connected. Primacy is decided the way the tracked watcher extension
+// decides it: the Firstmate home's session lock names the live session, and only
+// a process inside that session's own ancestry owns it.
+function firstmateHome(): string {
+  return process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE ||
+    resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+}
+
+function parentPid(pid: string): string {
+  const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
+  if (result.status !== 0) return "";
+  return result.stdout.trim();
+}
+
+function ownsSessionLock(): boolean {
+  const stateDir = process.env.FM_STATE_OVERRIDE || join(firstmateHome(), "state");
+  let lockPid = "";
+  try {
+    lockPid = readFileSync(join(stateDir, ".lock"), "utf8").trim();
+  } catch {
+    return false;
+  }
+  if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return false;
+  let pid = String(process.pid);
+  for (let step = 0; step < 8; step += 1) {
+    if (pid === lockPid) return true;
+    pid = parentPid(pid);
+    if (!pid || pid === "1") break;
+  }
+  return false;
 }
 
 function readDisplayStatus(): boolean {
@@ -120,6 +158,8 @@ function finalVisibleReply(message: unknown): string {
 }
 
 export default function (pi: ExtensionAPI) {
+  // A worker session stays completely inert: no socket, no footer, no commands.
+  if (!ownsSessionLock()) return;
   const socketPath = botSocketPath();
   let socket: Socket | null = null;
   let buffer = "";

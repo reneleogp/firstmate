@@ -13,9 +13,10 @@ DRIVER="$ROOT/tests/fm-telegram-mirror.test.py"
 OUT=$(mktemp "${TMPDIR:-/tmp}/fm-telegram-mirror.XXXXXX")
 trap 'rm -f "$OUT"' EXIT
 
-if ! python3 "$DRIVER" >"$OUT" 2>&1; then
+# Bounded: a wedged fixture must fail the suite, never stall it.
+if ! timeout 600 python3 "$DRIVER" >"$OUT" 2>&1; then
   cat "$OUT" >&2
-  fail "bin/fm-telegram.py acceptance tests failed"
+  fail "bin/fm-telegram.py acceptance tests failed or timed out"
 fi
 
 pass "the Telegram mirror bot pairs to one chat, defaults mirror mode off, mirrors terminal and reply text, queues Telegram text to Pi in order, and drives the voice send, edit, and cancel flow"

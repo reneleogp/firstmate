@@ -32,7 +32,15 @@ The bot never starts Firstmate, never creates a second session, and contains no 
    It defaults to `parakeet-tdt-0.6b-v3`, and the audio path replaces `{audio}` or is appended.
    Transcription is local Parakeet only; there is no Whisper fallback or retry button.
 
-5. Install the WSL user service so the bot starts whenever WSL starts:
+5. Install the Markdown parser used to format Firstmate's replies:
+
+   ```sh
+   sudo apt install python3-mistune
+   ```
+
+   Without it the mirror still works and simply sends every reply as plain text.
+
+6. Install the WSL user service so the bot starts whenever WSL starts:
 
    ```sh
    bin/fm-telegram.py install-service   # writes ~/.config/systemd/user/firstmate-telegram.service
@@ -44,6 +52,20 @@ The bot never starts Firstmate, never creates a second session, and contains no 
 
 The Pi half loads automatically with the other tracked Firstmate extensions in `.pi/extensions/` when Pi runs in a trusted Firstmate home.
 It connects to the bot when a Pi session starts and retries on a widening delay while the bot is absent, so a home without the bot pays nothing but an occasional failed connection.
+
+## Only your own session is mirrored
+
+Workers are Pi sessions too.
+If this extension is installed globally, it loads in every crewmate and scout as well, and without a gate one of their conversations could become the mirrored session and push its instructions, replies, and tool activity into your private chat.
+
+Two independent rules prevent that:
+
+- The extension mirrors only from the session that holds the Firstmate home's session lock, checked against the running process's own ancestry.
+  Every other Pi session stays completely inert: no connection, no footer, no commands.
+- The bot serves one session at a time and refuses a second connection instead of handing the chat over to it.
+  When your session ends, the next one may take over.
+
+If you install the extension globally, keep it out of auto-discovery for worker sessions unless you want to rely on the gate alone.
 
 ## Mirror mode
 
@@ -116,6 +138,17 @@ A queued message that has not reached Pi is lost if the bot restarts or WSL stop
 If Pi disappears between accepting a message and confirming it, that one message is sent again when the session returns.
 Both are deliberate limitations of this version rather than bugs.
 
+## Formatting
+
+Firstmate's replies are converted to Telegram's own HTML, so code blocks, inline code, bold, links, quotes, and lists render the way they do in the terminal.
+Only `<`, `>`, and `&` need escaping, and the converter can only emit tags Telegram documents, so nothing else in a reply can turn into markup.
+
+Long replies are split before conversion, never after, because cutting converted markup in half makes Telegram reject the whole message.
+A code block that spans a split is closed and reopened so each part still reads as code.
+
+If Telegram refuses the markup anyway, that message is sent again immediately as plain text.
+A refusal means Telegram sent nothing, so the retry cannot double-post.
+
 ## Reply threading
 
 Every status the bot itself produces replies to the exact Telegram message it describes: `Transcribing…`, the transcript card, `Pi · Sent to Firstmate.`, and the mirror-off and offline notices.
@@ -145,7 +178,10 @@ Every button action is bound to the current transcript revision, so a stale or r
 
 ## Boundaries
 
-- One paired account, one private chat, one Firstmate session.
+- One paired account, one private chat, one Firstmate session; a second session is refused rather than promoted (see Only your own session is mirrored).
+- Firstmate's replies are rendered as Telegram HTML so code, commands, and emphasis stay readable; if Telegram refuses the markup, the same text is sent again as plain text rather than lost.
+  Formatting needs `python3-mistune` (`sudo apt install python3-mistune`); without it every reply is simply sent plain.
+- Transport statuses, terminal echoes, and voice transcripts are sent as plain text, so they arrive exactly as written.
 - The bot owns mirror mode and delivery confirmations for both surfaces; the terminal only shows and changes what the bot publishes.
 - Stopping or restarting the service is bounded: a running transcription and everything it started are ended, the connected terminal session is released, and the bot exits rather than waiting on work it cannot interrupt.
   The installed unit sets `TimeoutStopSec=20` to match.
