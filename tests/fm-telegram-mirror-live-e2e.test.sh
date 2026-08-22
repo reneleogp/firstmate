@@ -49,6 +49,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+PAYLOADS="$TMP_ROOT/payloads.jsonl"
+export FM_FAKE_MODEL_PAYLOADS="$PAYLOADS"
 python3 "$FIXTURES/fake-model.py" "$PORT" 0.6 >"$TMP_ROOT/model.log" 2>&1 &
 MODEL_PID=$!
 FM_TELEGRAM_DIR="$HOME_DIR" python3 "$FIXTURES/fake-bot.py" >"$TMP_ROOT/bot.log" 2>&1 &
@@ -180,3 +182,55 @@ assert_every_visible_reply_mirrored "terminal-origin burst"
 terminal_replies=$VISIBLE_REPLIES
 [ "$(frames_of terminal)" -eq 5 ] || fail "terminal-origin burst: not every submission was mirrored"
 pass "five terminal submissions typed back-to-back mirror every one of the $terminal_replies replies Pi rendered, exactly once (Pi $PI_VERSION)"
+
+# C: a screenshot must reach the model as a real image, with its caption in the
+# same message. The live failure delivered a caption-only turn and, without a
+# caption, an empty one, with no image anywhere in the session.
+wait_for_image_payload() {  # <expected caption>
+  local caption=$1 i=0
+  while [ "$i" -lt 200 ]; do
+    if python3 - "$PAYLOADS" "$caption" <<'PY'
+import json, sys
+try:
+    lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit(1)
+wanted = sys.argv[2]
+for line in lines:
+    for message in json.loads(line).get("messages", []):
+        content = message.get("content")
+        if message.get("role") != "user" or not isinstance(content, list):
+            continue
+        images = [part for part in content if part.get("type") == "image_url"]
+        texts = [part.get("text", "") for part in content if part.get("type") == "text"]
+        if not images:
+            continue
+        url = str(images[0].get("image_url", {}).get("url", ""))
+        if not url.startswith("data:image/png;base64,") or len(url) < 60:
+            raise SystemExit(1)
+        if wanted and wanted not in " ".join(texts):
+            continue
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    then
+      return 0
+    fi
+    sleep 0.2
+    i=$((i + 1))
+  done
+  return 1
+}
+
+start_pi
+: >"$PAYLOADS"
+printf 'Okay what is this image\n' >"$HOME_DIR/inject-image.txt"
+wait_for_image_payload "Okay what is this image" \
+  || fail "a captioned screenshot never reached the model as an image (Pi $PI_VERSION)"
+pass "a captioned Telegram screenshot reaches the model as one message carrying both the caption and the image (Pi $PI_VERSION)"
+
+: >"$PAYLOADS"
+printf ' \n' >"$HOME_DIR/inject-image.txt"
+wait_for_image_payload "" \
+  || fail "a screenshot without a caption never reached the model as image content (Pi $PI_VERSION)"
+pass "a Telegram screenshot without a caption still reaches the model as image content (Pi $PI_VERSION)"

@@ -267,11 +267,12 @@ class FakePi:
         self.sock.connect(str(path))
         self.buffer = b""
         self.states: list[dict[str, Any]] = []
-        self.send({"t": "hello"})
+        # The real bridge announces what it can render; these fixtures stand in
+        # for a current one unless a test deliberately connects an older shape.
+        self.send({"t": "hello", "features": ["image"]})
 
     def send(self, frame: dict[str, Any]) -> None:
         self.sock.sendall((json.dumps(frame) + "\n").encode("utf-8"))
-
     def read_frame(self, timeout: float = DEADLINE) -> dict[str, Any]:
         """Next frame of any kind, including the bot's state broadcasts."""
         deadline = time.time() + timeout
@@ -855,6 +856,60 @@ class MirrorTestCase(unittest.TestCase):
         later = self.connect_pi()
         frame = later.read()
         self.assertEqual(base64.b64decode(frame["image"]["data"]), self.PNG)
+
+    def test_an_image_is_refused_when_the_session_cannot_render_one(self) -> None:
+        # The live failure: a bot newer than the connected bridge delivered an
+        # image the bridge ignored, so a captioned screenshot reached Firstmate
+        # as text only and a captionless one as an empty message, with nothing
+        # anywhere saying an image had been dropped.
+        legacy = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        legacy.settimeout(DEADLINE)
+        legacy.connect(str(self.socket_path))
+        self.addCleanup(legacy.close)
+        legacy.sendall(b'{"t":"hello"}\n')          # no features: the old bridge
+        legacy.sendall(json.dumps({"t": "command", "id": 1, "command": "on"}).encode() + b"\n")
+        deadline = time.time() + DEADLINE
+        buffer = b""
+        while time.time() < deadline and b"Mirror is on" not in buffer:
+            buffer += legacy.recv(65536)
+
+        self.telegram.files["legacy-shot"] = self.PNG
+        self.telegram.push_photo(951, [
+            {"file_id": "legacy-shot", "width": 800, "height": 600,
+             "file_size": len(self.PNG)},
+        ], caption="Okay what is this image")
+        refusal = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 951
+        )
+        self.assertIn("cannot receive images yet", refusal["text"])
+
+        self.telegram.push_photo(952, [
+            {"file_id": "legacy-shot", "width": 800, "height": 600,
+             "file_size": len(self.PNG)},
+        ])
+        self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 952
+        )
+
+        # Neither screenshot may be handed over as a text-only or empty turn.
+        legacy.settimeout(1.5)
+        delivered = b""
+        try:
+            while True:
+                chunk = legacy.recv(65536)
+                if not chunk:
+                    break
+                delivered += chunk
+        except (socket.timeout, TimeoutError, OSError):
+            pass
+        for line in delivered.decode("utf-8", "replace").splitlines():
+            if not line.strip():
+                continue
+            frame = json.loads(line)
+            self.assertNotEqual(
+                frame.get("t"), "deliver",
+                f"an image was handed to a session that cannot render one: {frame}",
+            )
 
     def test_menu_aliases_are_published_and_switch_the_mirror(self) -> None:
         pi = self.connect_pi()

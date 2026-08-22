@@ -239,7 +239,9 @@ export default function (pi: ExtensionAPI) {
       reconnectDelay = RECONNECT_MS;
       connected = true;
       refreshFooter();
-      write({ t: "hello" });
+      // The bot sends only what this bridge announces it can deliver, so an
+      // older bridge never receives an image it would silently drop.
+      write({ t: "hello", features: ["image"] });
     });
     client.on("data", (chunk: Buffer) => {
       buffer += chunk.toString("utf8");

@@ -123,6 +123,9 @@ A caption travels with it as the text of the same message.
 - Images over 10 MB are refused, as is a backlog of queued images past 32 MB.
 - Images keep their place in the queue alongside text and confirmed voice notes, and produce the same `Pi · Sent to Firstmate.` reply on the original message when confirmations are on.
 
+The terminal side tells the bot what it can render when it connects, so a Pi session running an older copy of the extension is told plainly that it cannot receive images instead of quietly turning your screenshot into a text-only message.
+If you see that reply, update the extension and `/reload` Pi.
+
 An image waiting for Firstmate is held in memory only, exactly like queued text, and is dropped when it is accepted or when the bot stops.
 The no-durable-queue limitation therefore covers screenshots too: an image that has not reached Firstmate is lost if the bot restarts.
 

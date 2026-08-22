@@ -6,6 +6,7 @@ can drive Pi's run collapsing without a credential, a vendor quota, or any
 network call. Usage: fake-model.py <port> [chunk-delay-seconds]
 """
 import json
+import os
 import sys
 import threading
 import time
@@ -22,7 +23,11 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        record = os.environ.get("FM_FAKE_MODEL_PAYLOADS")
+        if record:
+            with open(record, "a", encoding="utf-8") as handle:
+                handle.write(body.decode("utf-8", "replace") + "\n")
         with LOCK:
             index = next(COUNTER)
         self.send_response(200)

@@ -24,15 +24,19 @@ overridden by FM_TELEGRAM_DIR):
 
 Wire protocol (newline-delimited JSON, both directions):
 
-  extension -> bot  {"t":"hello"}
+  extension -> bot  {"t":"hello","features":["image"]}
                     {"t":"terminal","text":...}     terminal submission
                     {"t":"reply","text":...}        final visible Firstmate text
                     {"t":"command","id":N,"command":"toggle"|"on"|"off"|"status"}
                     {"t":"set","id":N,"setting":"confirmations","value":bool}
                     {"t":"accepted","id":"..."}     Pi accepted that message
-  bot -> extension  {"t":"deliver","id":"...","text":...}
+  bot -> extension  {"t":"deliver","id":"...","text":...,"image":{...}}
                     {"t":"command_result","id":N,"text":...}
                     {"t":"state","mirror":bool,"confirmations":bool}
+
+The hello frame's features decide what the bot may send. A bridge older than
+this bot does not announce "image", and an image sent to it would be silently
+dropped into a text-only turn, so the bot refuses the image and says so instead.
 
 The bot owns mirror mode and the confirmations setting and pushes a state frame
 on connect and after every change from either surface, so Pi's footer and its
@@ -122,6 +126,10 @@ UNSUPPORTED_REPLY = "Only text, voice notes, and images are mirrored."
 UNSUPPORTED_IMAGE_REPLY = "That file type is not supported. Send a PNG, JPEG, or WebP image."
 OVERSIZED_IMAGE_REPLY = "That image is too large to send to Firstmate."
 IMAGE_FAILED_REPLY = "That image could not be downloaded. Nothing was sent to Firstmate."
+IMAGE_UNSUPPORTED_SESSION_REPLY = (
+    "This Firstmate session cannot receive images yet. "
+    "Update the Telegram extension and reload Pi, then send it again."
+)
 HELP_REPLY = (
     "Firstmate terminal mirror.\n"
     "/telegram_on or /telegram on - start mirroring\n"
@@ -372,6 +380,7 @@ class MirrorBot:
     voices: dict[int, Voice] = field(default_factory=dict)
     prompts: dict[int, int] = field(default_factory=dict)
     client: Optional[asyncio.StreamWriter] = None
+    client_features: set = field(default_factory=set)
     background: set = field(default_factory=set)
     transcribers: set = field(default_factory=set)
     _sequence: int = 0
@@ -577,6 +586,13 @@ class MirrorBot:
     async def pump(self) -> None:
         while self.queue and self.client is not None:
             item = self.queue.popleft()
+            if item.image and "image" not in self.client_features:
+                # The session that turned up cannot render an image, and
+                # delivering it anyway would arrive as a text-only or empty
+                # turn with nothing to show for it.
+                log("dropping a queued image: this Firstmate session has no image support")
+                await self.send(IMAGE_UNSUPPORTED_SESSION_REPLY, reply_to=item.reply_to)
+                continue
             frame: dict[str, Any] = {"t": "deliver", "id": item.id, "text": item.text}
             if item.image:
                 frame["image"] = item.image
@@ -724,6 +740,15 @@ class MirrorBot:
         if selection is None:
             await self.send(UNSUPPORTED_IMAGE_REPLY, reply_to=message_id)
             return
+        # A bridge that does not announce image support would turn this into a
+        # text-only turn, or an empty one with no caption, and nothing would say
+        # so. Refuse visibly instead of delivering something that vanishes.
+        # While no session is connected the capability is simply unknown, so the
+        # image queues like any other message and pump() decides on delivery.
+        if self.connected and "image" not in self.client_features:
+            log("refusing an image: the connected Firstmate session has no image support")
+            await self.send(IMAGE_UNSUPPORTED_SESSION_REPLY, reply_to=message_id)
+            return
         file_id, mime, declared_size = selection
         if declared_size and declared_size > MAX_IMAGE_BYTES:
             await self.send(OVERSIZED_IMAGE_REPLY, reply_to=message_id)
@@ -766,6 +791,7 @@ class MirrorBot:
         if self.client is not writer:
             return
         self.client = None
+        self.client_features = set()
         # Anything delivered but not yet confirmed goes back to the front of the
         # queue in order. A session that vanished between accepting a message
         # and confirming it can therefore see that one message twice, which is
@@ -791,9 +817,10 @@ class MirrorBot:
                 writer.close()
             return
         self.client = writer
+        self.client_features = set()
         log(f"mirroring for {peer_description(writer)}")
         await self.broadcast_state()
-        await self.pump()
+        # The queue drains once hello names what this session can render.
         try:
             while True:
                 line = await reader.readline()
@@ -813,6 +840,12 @@ class MirrorBot:
     async def handle_frame(self, frame: dict[str, Any]) -> None:
         kind = frame.get("t")
         if kind == "hello":
+            # The bridge declares what it can render; anything it does not claim
+            # is never sent to it.
+            features = frame.get("features")
+            self.client_features = {
+                str(name) for name in features if isinstance(name, str)
+            } if isinstance(features, list) else set()
             # State already went out when the connection was accepted.
             await self.pump()
             return
