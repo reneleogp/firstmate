@@ -1,0 +1,45 @@
+{
+  "cancel": {
+    "bot_messages_threaded_to_voice": [
+      "Transcribing…"
+    ],
+    "cancelled_edit_message_id": 1002,
+    "cancelled_text": "please rebase the branch\n\nCancelled",
+    "placeholder_message_id": 1002
+  },
+  "rejected_initial_edit_fallback": {
+    "actions": [
+      "Send to Firstmate",
+      "Edit",
+      "Cancel"
+    ],
+    "fallback_card_message_id": 1005,
+    "fallback_card_text": "fallback transcript",
+    "placeholder_message_id": 1004
+  },
+  "successful_send": {
+    "actions": [
+      "Send to Firstmate",
+      "Edit",
+      "Cancel"
+    ],
+    "bot_message_ids": [
+      1001
+    ],
+    "delivered_to_firstmate": "please rebase the branch",
+    "placeholder_message_id": 1001,
+    "sent_edit_message_id": 1001,
+    "sent_text": "please rebase the branch\n\nSent to Firstmate",
+    "separate_transcript_send_count": 0,
+    "transcript_edit_message_id": 1001,
+    "voice_note_message_id": 900
+  },
+  "transcription_failure": {
+    "bot_messages_threaded_to_voice": [
+      "Transcribing…"
+    ],
+    "failure_edit_message_id": 1003,
+    "failure_text": "Transcription failed. Nothing was sent to Firstmate.",
+    "placeholder_message_id": 1003
+  }
+}
