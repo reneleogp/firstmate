@@ -75,10 +75,12 @@ In Telegram, these switch it and are never sent to Firstmate as conversation tex
 
 - `/telegram on` - start mirroring in both directions.
 - `/telegram off` - stop new mirroring.
-- `/telegram status` - report whether mirroring is on and whether Firstmate is connected.
+- `/telegram status` - report mirroring, whether Firstmate is connected, and whether confirmations are on.
 
-Telegram's own command menu cannot contain a space, so the same three commands are published to the paired chat as `/telegram_on`, `/telegram_off`, and `/telegram_status`.
+Telegram's own command menu cannot contain a space, so the same commands are published to the paired chat as `/telegram_on`, `/telegram_off`, `/telegram_status`, `/telegram_confirmations_on`, and `/telegram_confirmations_off`.
 Both spellings do the same thing; the menu aliases exist so the commands are visible and tappable in Telegram.
+
+While mirror mode is off, an ordinary message is answered with `Telegram mirror is off. Send /telegram_on to enable it.`, naming a command you can tap straight from the menu.
 
 In the Pi terminal there are two commands: `/telegram` toggles mirror mode, and `/telegram-settings` opens the settings.
 
@@ -96,20 +98,33 @@ The bot owns mirror mode and publishes every change, so the footer updates promp
 `Display Telegram status` shows or hides the footer item.
 It is a terminal-side preference stored as `~/.firstmate-telegram/pi-display-status`, so it survives a restart and still applies while the bot is unavailable.
 
-`Delivery confirmations` is the same setting as the Telegram button described below, and both surfaces always show the same value.
+`Delivery confirmations` is the same setting as the Telegram commands described below, and both surfaces always show the same value.
 While the bot is unavailable it reads `unavailable` and cannot be changed there, because the bot owns it.
 
 ## Delivery confirmations
 
 `Pi · Sent to Firstmate.` is on by default and can be turned off from either surface.
-In Telegram, every reply to `/telegram on`, `/telegram off`, or `/telegram status` carries one button that reads `Disable confirmations` while they are on and `Enable confirmations` while they are off; tapping it switches the setting and updates that same message.
-In the terminal it is the second toggle in `/telegram-settings`.
+In Telegram, use `/telegram_confirmations_on` and `/telegram_confirmations_off` from the command menu.
+In the terminal, use the second toggle in `/telegram-settings`.
 
 The current state is part of the status line, and the choice is stored in `~/.firstmate-telegram/config.json` as `confirmations`, so it survives a bot or WSL restart.
 Because the bot owns the setting and publishes every change, the two surfaces cannot drift apart.
 
 Turning it off hides only the receipt.
 Messages still reach Firstmate exactly as before, and an accepted message still leaves the queue, so nothing is delivered twice.
+
+## Screenshots and images
+
+Send a screenshot from the paired chat and Firstmate receives it exactly as an image pasted into the terminal, with no marker saying it came from Telegram.
+A caption travels with it as the text of the same message.
+
+- Photos and image files are accepted as PNG, JPEG, or WebP; anything else is refused with a short reply and never downloaded.
+- Telegram sends several renditions of a photo, and the sharpest one is used.
+- Images over 10 MB are refused, as is a backlog of queued images past 32 MB.
+- Images keep their place in the queue alongside text and confirmed voice notes, and produce the same `Pi · Sent to Firstmate.` reply on the original message when confirmations are on.
+
+An image waiting for Firstmate is held in memory only, exactly like queued text, and is dropped when it is accepted or when the bot stops.
+The no-durable-queue limitation therefore covers screenshots too: an image that has not reached Firstmate is lost if the bot restarts.
 
 While mirror mode is off, an ordinary Telegram message is answered with `Telegram mirror is off. Send /telegram on to enable it.` and never reaches Pi.
 
@@ -141,6 +156,7 @@ Both are deliberate limitations of this version rather than bugs.
 ## Formatting
 
 Firstmate's replies are converted to Telegram's own HTML, so code blocks, inline code, bold, links, quotes, and lists render the way they do in the terminal.
+Numbered lists keep their numbering and bulleted lists their dashes, with items kept compact rather than spread across blank lines.
 Only `<`, `>`, and `&` need escaping, and the converter can only emit tags Telegram documents, so nothing else in a reply can turn into markup.
 
 Long replies are split before conversion, never after, because cutting converted markup in half makes Telegram reject the whole message.
@@ -182,13 +198,14 @@ Every button action is bound to the current transcript revision, so a stale or r
 - Firstmate's replies are rendered as Telegram HTML so code, commands, and emphasis stay readable; if Telegram refuses the markup, the same text is sent again as plain text rather than lost.
   Formatting needs `python3-mistune` (`sudo apt install python3-mistune`); without it every reply is simply sent plain.
 - Transport statuses, terminal echoes, and voice transcripts are sent as plain text, so they arrive exactly as written.
+- Only the paired chat can send images, and the primary-session rule covers them: a worker session can neither receive nor deliver one.
 - The bot owns mirror mode and delivery confirmations for both surfaces; the terminal only shows and changes what the bot publishes.
 - Stopping or restarting the service is bounded: a running transcription and everything it started are ended, the connected terminal session is released, and the bot exits rather than waiting on work it cannot interrupt.
   The installed unit sets `TimeoutStopSec=20` to match.
 - At most 32 untouched voice transcripts are kept; older ones are dropped with their temporary audio, so cards you never answer cannot pile up.
 - Transport statuses stay attached to the exact message they describe, while Firstmate's replies are never threaded (see Reply threading).
 - The service unit holds no token and no message content; the token stays in `~/.firstmate-telegram/env` and pairing stays in `config.json`.
-- Temporary voice audio is owner-only and is deleted after send, cancel, failure, and at bot start and stop.
+- Temporary voice audio is owner-only and is deleted after send, cancel, failure, and at bot start and stop; images are never written to disk at all.
 - Transcription memory belongs to the local speech model, not the bot: the bot stays around 34 MB while a transcription child can hold well over a gigabyte for its model.
   A service memory figure covers the whole service, children included, and its peak stays at that high-water mark for the rest of the run even after the child exits.
 - `FM_TELEGRAM_DIR` moves the private directory; `bin/fm-telegram.py --help` owns the remaining flags and environment.

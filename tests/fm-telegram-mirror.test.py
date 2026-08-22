@@ -8,6 +8,7 @@ local Parakeet command. Nothing here inspects the bot's source.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import signal
@@ -49,6 +50,11 @@ class FakeTelegram:
         self.reject_parse_mode = False
         self.next_message_id = 1000
         self.next_update_id = 1
+        self.files: dict[str, bytes] = {}
+        # Offset semantics like the real API: an update stays available until a
+        # poll acknowledges past it. A destructive queue silently lost updates
+        # to a dying bot's in-flight poll across a restart.
+        self.confirmed_through = 0
         harness = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -78,12 +84,14 @@ class FakeTelegram:
                     pass
 
             def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                name = self.path.rsplit("/", 1)[-1]
+                data = harness.files.get(name, VOICE_BYTES)
                 try:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/octet-stream")
-                    self.send_header("Content-Length", str(len(VOICE_BYTES)))
+                    self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
-                    self.wfile.write(VOICE_BYTES)
+                    self.wfile.write(data)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
@@ -115,12 +123,19 @@ class FakeTelegram:
             with self.lock:
                 self.calls.append((method, params))
         if method == "getUpdates":
+            offset = params.get("offset")
+            with self.lock:
+                if isinstance(offset, int):
+                    self.confirmed_through = max(self.confirmed_through, offset)
+                    self.pending = [u for u in self.pending
+                                    if u["update_id"] >= self.confirmed_through]
             deadline = time.time() + 0.2
             while time.time() < deadline:
                 with self.lock:
-                    if self.pending:
-                        updates, self.pending = self.pending, []
-                        return updates
+                    ready = [u for u in self.pending
+                             if u["update_id"] >= self.confirmed_through]
+                    if ready:
+                        return ready
                 time.sleep(0.01)
             return []
         if method == "sendMessage":
@@ -141,7 +156,7 @@ class FakeTelegram:
                 self.callback_answers.append(dict(params))
                 return True
         if method == "getFile":
-            return {"file_path": "voice/note.oga"}
+            return {"file_path": f"files/{params.get('file_id')}"}
         return True
 
     # --- update injection ---
@@ -173,6 +188,30 @@ class FakeTelegram:
             "voice": {"file_id": f"file-{message_id}", "duration": 3},
         }})
         return message_id
+
+    def push_photo(self, message_id: int, renditions: list[dict[str, Any]],
+                   caption: Optional[str] = None) -> None:
+        message: dict[str, Any] = {
+            "message_id": message_id,
+            "from": {"id": USER_ID},
+            "chat": {"id": CHAT_ID, "type": "private"},
+            "photo": renditions,
+        }
+        if caption is not None:
+            message["caption"] = caption
+        self.push({"message": message})
+
+    def push_document(self, message_id: int, file_id: str, mime: str,
+                      size: int = 64, caption: Optional[str] = None) -> None:
+        message: dict[str, Any] = {
+            "message_id": message_id,
+            "from": {"id": USER_ID},
+            "chat": {"id": CHAT_ID, "type": "private"},
+            "document": {"file_id": file_id, "mime_type": mime, "file_size": size},
+        }
+        if caption is not None:
+            message["caption"] = caption
+        self.push({"message": message})
 
     def push_callback(self, data: str, card_id: int, callback_id: str = "cb") -> None:
         self.push({"callback_query": {
@@ -356,7 +395,7 @@ class MirrorTestCase(unittest.TestCase):
         pi = self.connect_pi()
         self.telegram.push_text("do the thing", 11)
         reply = self.telegram.wait_sent(
-            lambda m: m.get("text") == "Telegram mirror is off. Send /telegram on to enable it."
+            lambda m: m.get("text") == "Telegram mirror is off. Send /telegram_on to enable it."
         )
         self.assertEqual(reply["reply_parameters"]["message_id"], 11)
         pi.expect_nothing()
@@ -640,13 +679,189 @@ class MirrorTestCase(unittest.TestCase):
         replacement.send({"t": "command", "id": 5, "command": "status"})
         self.assertIn("Firstmate is connected", replacement.read()["text"])
 
+    def test_mirror_off_names_a_real_telegram_command(self) -> None:
+        pi = self.connect_pi()
+        published = self.telegram.wait_call("setMyCommands")
+        names = [entry["command"] for entry in published["commands"]]
+        self.telegram.push_text("do the thing", 801)
+        refusal = self.telegram.wait_sent(
+            lambda m: str(m.get("text", "")).startswith("Telegram mirror is off")
+        )
+        # The guidance must name a command the captain can actually tap.
+        self.assertEqual(
+            refusal["text"], "Telegram mirror is off. Send /telegram_on to enable it."
+        )
+        self.assertIn("telegram_on", names)
+        pi.expect_nothing()
+        # And that command works exactly as the message promises.
+        self.telegram.push_text("/telegram_on", 802)
+        self.telegram.wait_sent(lambda m: str(m.get("text", "")).startswith("Mirror is on"))
+        self.telegram.push_text("now it flows", 803)
+        self.assertEqual(pi.read()["text"], "now it flows")
+
+    def test_lists_and_prose_render_as_telegram_html(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        pi.send({"t": "reply", "text": (
+            "Captain, three things:\n\n"
+            "1. The bridge mirrors every reply, using `finalVisibleReply`.\n"
+            "2. The stop is bounded.\n"
+            "3. Screenshots arrive as pasted images.\n\n"
+            "Then the loose ends:\n\n"
+            "- first with `code`\n"
+            "- second\n\n"
+            "Closing paragraph."
+        )})
+        body = self.telegram.wait_sent(lambda m: "three things" in str(m.get("text")))["text"]
+        self.assertIn("1. The bridge mirrors every reply, using <code>finalVisibleReply</code>.", body)
+        self.assertIn("2. The stop is bounded.", body)
+        self.assertIn("3. Screenshots arrive as pasted images.", body)
+        self.assertIn("- first with <code>code</code>", body)
+        self.assertIn("- second", body)
+        # Compact: numbered items sit on their own lines with no blank line
+        # between them, and never collapse into one another.
+        self.assertNotIn("1. The bridge mirrors every reply, using <code>finalVisibleReply</code>.\n\n2.", body)
+        self.assertIn("three things:\n\n1.", body)
+        self.assertIn("Closing paragraph.", body)
+        self.assertNotIn("<ol>", body)
+        self.assertNotIn("<li>", body)
+
+    def test_a_nested_list_keeps_its_items_apart(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        pi.send({"t": "reply", "text": "1. outer one\n   - inner a\n   - inner b\n2. outer two"})
+        body = self.telegram.wait_sent(lambda m: "outer one" in str(m.get("text")))["text"]
+        self.assertIn("1. outer one", body)
+        self.assertIn("2. outer two", body)
+        self.assertIn("- inner a", body)
+        self.assertNotIn("outer one- inner a", body)
+
+    def test_a_long_reply_ending_in_a_list_chunks_cleanly(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        filler = "\n\n".join(f"Paragraph {index} of the audit." for index in range(180))
+        items = "\n".join(f"{index}. finding {index}" for index in range(1, 41))
+        pi.send({"t": "reply", "text": f"{filler}\n\n{items}"})
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline:
+            formatted = [m for m in self.telegram.sent if m.get("parse_mode") == "HTML"]
+            if sum(m["text"].count("finding ") for m in formatted) >= 40:
+                break
+            time.sleep(0.05)
+        formatted = [m for m in self.telegram.sent if m.get("parse_mode") == "HTML"]
+        self.assertGreater(len(formatted), 1, "the long reply was not split")
+        for message in formatted:
+            self.assertLessEqual(len(message["text"]), 4096)
+        joined = "\n".join(m["text"] for m in formatted)
+        for index in (1, 20, 40):
+            self.assertIn(f"{index}. finding {index}", joined)
+
+    PNG = b"\x89PNG\r\n\x1a\n" + b"pixels" * 4
+    JPEG = b"\xff\xd8\xff" + b"jpegbytes" * 4
+
+    def test_a_screenshot_reaches_pi_as_an_image_with_its_caption(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.telegram.files["photo-big"] = self.PNG
+        self.telegram.files["photo-small"] = b"tiny"
+        self.telegram.push_photo(901, [
+            {"file_id": "photo-small", "width": 90, "height": 60, "file_size": 4},
+            {"file_id": "photo-big", "width": 1280, "height": 800, "file_size": len(self.PNG)},
+        ], caption="look at this failure")
+        frame = pi.read()
+        self.assertEqual(frame["t"], "deliver")
+        # The captain sent one screenshot: the sharpest rendition is the one.
+        self.assertEqual(base64.b64decode(frame["image"]["data"]), self.PNG)
+        self.assertEqual(frame["image"]["mime"], "image/png")
+        self.assertEqual(frame["text"], "look at this failure")
+        pi.send({"t": "accepted", "id": frame["id"]})
+        receipt = self.telegram.wait_sent(lambda m: m.get("text") == "Pi · Sent to Firstmate.")
+        self.assertEqual(receipt["reply_parameters"]["message_id"], 901)
+        # The image is not echoed back into the chat it came from.
+        self.assertNotIn("You · Terminal", " ".join(self.telegram.sent_texts()))
+        # Nothing is retained once it has been accepted.
+        self.assertEqual(list((self.home / "audio").glob("*")), [])
+
+    def test_an_image_document_is_accepted_and_other_documents_are_refused(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.telegram.files["doc-jpeg"] = self.JPEG
+        self.telegram.push_document(911, "doc-jpeg", "image/jpeg", size=len(self.JPEG))
+        frame = pi.read()
+        self.assertEqual(base64.b64decode(frame["image"]["data"]), self.JPEG)
+        self.assertEqual(frame["image"]["mime"], "image/jpeg")
+        self.assertEqual(frame["text"], "")
+        pi.send({"t": "accepted", "id": frame["id"]})
+
+        self.telegram.push_document(912, "doc-zip", "application/zip", size=10)
+        refusal = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 912
+        )
+        self.assertIn("not supported", refusal["text"])
+        # A refused file is never fetched.
+        self.assertNotIn("getFile", [name for name, params in self.telegram.calls
+                                     if params.get("file_id") == "doc-zip"])
+        pi.expect_nothing()
+
+    def test_an_oversized_image_is_refused_without_downloading(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.telegram.push_photo(921, [
+            {"file_id": "huge", "width": 8000, "height": 6000,
+             "file_size": 40 * 1024 * 1024},
+        ], caption="way too big")
+        refusal = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 921
+        )
+        self.assertIn("too large", refusal["text"])
+        self.assertEqual([params for name, params in self.telegram.calls
+                          if name == "getFile" and params.get("file_id") == "huge"], [])
+        pi.expect_nothing()
+
+    def test_images_keep_their_place_in_the_queue(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.telegram.files["shot"] = self.PNG
+        self.telegram.push_text("before the screenshot", 931)
+        self.telegram.push_photo(932, [
+            {"file_id": "shot", "width": 800, "height": 600, "file_size": len(self.PNG)},
+        ], caption="the screenshot")
+        self.telegram.push_text("after the screenshot", 933)
+        seen = []
+        for _ in range(3):
+            frame = pi.read()
+            seen.append((frame["text"], "image" in frame))
+            pi.send({"t": "accepted", "id": frame["id"]})
+        self.assertEqual(seen, [
+            ("before the screenshot", False),
+            ("the screenshot", True),
+            ("after the screenshot", False),
+        ])
+
+    def test_a_screenshot_while_firstmate_is_away_waits_in_memory(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        pi.close()
+        time.sleep(0.3)
+        self.telegram.files["queued-shot"] = self.PNG
+        self.telegram.push_photo(941, [
+            {"file_id": "queued-shot", "width": 800, "height": 600, "file_size": len(self.PNG)},
+        ])
+        self.telegram.wait_sent(
+            lambda m: m.get("text") == "Firstmate is not running. Your message is queued until it starts."
+        )
+        # Held in memory only: never written beside the voice notes.
+        self.assertEqual(list((self.home / "audio").glob("*")), [])
+        later = self.connect_pi()
+        frame = later.read()
+        self.assertEqual(base64.b64decode(frame["image"]["data"]), self.PNG)
+
     def test_menu_aliases_are_published_and_switch_the_mirror(self) -> None:
         pi = self.connect_pi()
         published = self.telegram.wait_call("setMyCommands")
-        self.assertEqual(
-            [entry["command"] for entry in published["commands"]],
-            ["telegram_on", "telegram_off", "telegram_status"],
-        )
+        names = [entry["command"] for entry in published["commands"]]
+        for expected in ("telegram_on", "telegram_off", "telegram_status"):
+            self.assertIn(expected, names)
         self.assertTrue(all(entry.get("description") for entry in published["commands"]))
         self.assertEqual(published["scope"], {"type": "chat", "chat_id": CHAT_ID})
 
@@ -679,49 +894,67 @@ class MirrorTestCase(unittest.TestCase):
         self.telegram.push_text("an ordinary message", 75)
         self.assertEqual(pi.read()["text"], "an ordinary message")
 
-    def test_confirmations_default_on_toggle_persists_and_gates_only_the_receipt(self) -> None:
+    def test_confirmation_commands_switch_the_setting_for_both_surfaces(self) -> None:
         pi = self.connect_pi()
         self.enable_mirror(pi)
+        published = self.telegram.wait_call("setMyCommands")
+        self.assertEqual(
+            [entry["command"] for entry in published["commands"]],
+            ["telegram_on", "telegram_off", "telegram_status",
+             "telegram_confirmations_on", "telegram_confirmations_off"],
+        )
+
         self.telegram.push_text("/telegram_status", 201)
         card = self.telegram.wait_sent(
             lambda m: m.get("reply_parameters", {}).get("message_id") == 201
         )
         self.assertIn("Confirmations are on.", card["text"])
-        self.assertEqual(
-            card["reply_markup"]["inline_keyboard"][0][0]["text"], "Disable confirmations"
-        )
-        card_id = int(card["message_id"])
+        # The setting moved to its own commands; no button rides along any more.
+        self.assertNotIn("reply_markup", card)
 
-        # A delivered message is still confirmed while the setting is on.
-        self.telegram.push_text("before the toggle", 202)
+        self.telegram.push_text("before the switch", 202)
         frame = pi.read()
         pi.send({"t": "accepted", "id": frame["id"]})
         receipt = self.telegram.wait_sent(lambda m: m.get("text") == "Pi · Sent to Firstmate.")
         self.assertEqual(receipt["reply_parameters"]["message_id"], 202)
 
-        self.telegram.push_callback("c:confirmations", card_id, "cb-confirm")
-        toggled = self.telegram.wait_edit(lambda e: "Confirmations are off." in str(e.get("text")))
-        self.assertEqual(
-            toggled["reply_markup"]["inline_keyboard"][0][0]["text"], "Enable confirmations"
+        self.telegram.push_text("/telegram_confirmations_off", 203)
+        off = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 203
         )
+        self.assertIn("Confirmations are off.", off["text"])
+        self.assertNotIn("reply_markup", off)
         self.assertIs(json.loads((self.home / "config.json").read_text())["confirmations"], False)
+        # Pi is told, so its settings and footer show the same value.
+        deadline = time.time() + DEADLINE
+        published_off = False
+        while time.time() < deadline and not published_off:
+            try:
+                frame = pi.read_frame(timeout=1)
+            except (socket.timeout, TimeoutError):
+                continue
+            published_off = frame.get("t") == "state" and frame.get("confirmations") is False
+        self.assertTrue(published_off, "Pi was never told the new confirmations value")
 
-        # With the setting off the receipt is gone, but the message must still
-        # leave the pending queue: reconnecting may not deliver it a second time.
-        receipts_before = len([m for m in self.telegram.sent if m.get("text") == "Pi · Sent to Firstmate."])
-        self.telegram.push_text("after the toggle", 203)
+        # With confirmations off the receipt is gone, but the message must still
+        # leave pending state so a reconnect cannot deliver it twice.
+        receipts_before = len([m for m in self.telegram.sent
+                               if m.get("text") == "Pi · Sent to Firstmate."])
+        self.telegram.push_text("after the switch", 204)
         second = pi.read()
-        self.assertEqual(second["text"], "after the toggle")
+        self.assertEqual(second["text"], "after the switch")
         pi.send({"t": "accepted", "id": second["id"]})
         time.sleep(0.6)
-        receipts_after = len([m for m in self.telegram.sent if m.get("text") == "Pi · Sent to Firstmate."])
-        self.assertEqual(receipts_after, receipts_before)
+        self.assertEqual(
+            len([m for m in self.telegram.sent if m.get("text") == "Pi · Sent to Firstmate."]),
+            receipts_before,
+        )
         pi.close()
         time.sleep(0.3)
         later = self.connect_pi()
         later.expect_nothing(1.0)
 
-        # The choice survives a restart, and the mirror still starts off.
+        # The choice survives a restart, and Pi's own settings still write it.
         self.stop_bot()
         deadline = time.time() + DEADLINE
         while self.socket_path.exists() and time.time() < deadline:
@@ -733,88 +966,13 @@ class MirrorTestCase(unittest.TestCase):
             restarted.read()["text"],
             "Mirror is off. Firstmate is connected. Confirmations are off.",
         )
-
-    def test_voice_send_without_confirmations_still_reaches_pi(self) -> None:
-        pi = self.connect_pi()
-        self.enable_mirror(pi)
-        self.telegram.push_text("/telegram_status", 211)
-        card = self.telegram.wait_sent(
-            lambda m: m.get("reply_parameters", {}).get("message_id") == 211
+        restarted.send({"t": "set", "id": 4, "setting": "confirmations", "value": True})
+        self.assertIn("Confirmations are on", restarted.read()["text"])
+        self.telegram.push_text("/telegram_status", 205)
+        after_pi = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 205
         )
-        self.telegram.push_callback("c:confirmations", int(card["message_id"]), "cb-off")
-        self.telegram.wait_edit(lambda e: "Confirmations are off." in str(e.get("text")))
-
-        self.telegram.push_voice(212)
-        transcript_id = self.card_id_for("please rebase the branch")
-        self.telegram.push_callback("v:212:1:send", transcript_id, "cb-voice-send")
-        self.telegram.wait_edit(lambda e: str(e.get("text", "")).endswith("Sent to Firstmate"))
-        frame = pi.read()
-        self.assertEqual(frame["text"], "please rebase the branch")
-        pi.send({"t": "accepted", "id": frame["id"]})
-        time.sleep(0.6)
-        self.assertNotIn("Pi · Sent to Firstmate.", self.telegram.sent_texts())
-        self.assertFalse((self.home / "audio" / "212.ogg").exists())
-
-    def test_state_frames_track_both_surfaces_and_the_pi_toggle(self) -> None:
-        pi = self.connect_pi()
-        # A connecting session is told the current state without asking.
-        first = pi.read_frame()
-        self.assertEqual(first, {"t": "state", "mirror": False, "confirmations": True})
-
-        # Telegram turning the mirror on must reach Pi's footer.
-        self.telegram.push_text("/telegram_on", 301)
-        self.assertEqual(pi.read_frame(), {"t": "state", "mirror": True, "confirmations": True})
-
-        # Bare /telegram in Pi toggles, and answers with the same status line.
-        pi.send({"t": "command", "id": 1, "command": "toggle"})
-        result = pi.read_frame()
-        self.assertEqual(result["t"], "command_result")
-        self.assertIn("Mirror is off", result["text"])
-        self.assertEqual(pi.read_frame(), {"t": "state", "mirror": False, "confirmations": True})
-        pi.send({"t": "command", "id": 2, "command": "toggle"})
-        self.assertIn("Mirror is on", pi.read_frame()["text"])
-        self.assertEqual(pi.read_frame(), {"t": "state", "mirror": True, "confirmations": True})
-
-        # A toggle from Pi is visible to Telegram too.
-        self.telegram.push_text("/telegram_status", 302)
-        card = self.telegram.wait_sent(
-            lambda m: m.get("reply_parameters", {}).get("message_id") == 302
-        )
-        self.assertIn("Mirror is on", card["text"])
-
-    def test_confirmations_toggle_from_pi_settings_matches_telegram(self) -> None:
-        pi = self.connect_pi()
-        self.assertEqual(pi.read_frame(), {"t": "state", "mirror": False, "confirmations": True})
-
-        # Pi's settings UI writes through the same owner as the Telegram button.
-        pi.send({"t": "set", "id": 5, "setting": "confirmations", "value": False})
-        result = pi.read_frame()
-        self.assertEqual(result["t"], "command_result")
-        self.assertIn("Confirmations are off", result["text"])
-        self.assertEqual(pi.read_frame(), {"t": "state", "mirror": False, "confirmations": False})
-        self.assertIs(json.loads((self.home / "config.json").read_text())["confirmations"], False)
-
-        # Telegram shows the same value, and its button now offers the opposite.
-        self.telegram.push_text("/telegram_status", 311)
-        card = self.telegram.wait_sent(
-            lambda m: m.get("reply_parameters", {}).get("message_id") == 311
-        )
-        self.assertIn("Confirmations are off", card["text"])
-        self.assertEqual(
-            card["reply_markup"]["inline_keyboard"][0][0]["text"], "Enable confirmations"
-        )
-
-        # Toggling back from Telegram publishes the new value to Pi.
-        self.telegram.push_callback("c:confirmations", int(card["message_id"]), "cb-back-on")
-        deadline = time.time() + DEADLINE
-        published = None
-        while time.time() < deadline:
-            frame = pi.read_frame(timeout=2)
-            if frame.get("t") == "state" and frame.get("confirmations") is True:
-                published = frame
-                break
-        self.assertIsNotNone(published, "the Telegram toggle was never published to Pi")
-        self.assertIs(json.loads((self.home / "config.json").read_text())["confirmations"], True)
+        self.assertIn("Confirmations are on.", after_pi["text"])
 
     def test_telegram_text_reaches_pi_unchanged_and_is_confirmed(self) -> None:
         pi = self.connect_pi()
@@ -929,7 +1087,7 @@ class MirrorTestCase(unittest.TestCase):
         self.assertIn("Mirror is off", pi.read()["text"])
         self.telegram.push_text("after the burst", 110)
         refusal = self.telegram.wait_sent(
-            lambda m: m.get("text") == "Telegram mirror is off. Send /telegram on to enable it."
+            lambda m: m.get("text") == "Telegram mirror is off. Send /telegram_on to enable it."
         )
         self.assertEqual(refusal["reply_parameters"]["message_id"], 110)
 

@@ -32,9 +32,12 @@ type BotFrame = {
   t?: string;
   id?: unknown;
   text?: unknown;
+  image?: unknown;
   mirror?: unknown;
   confirmations?: unknown;
 };
+
+type QueuedImage = { data: string; mime: string };
 
 type AssistantPart = { type?: unknown; text?: unknown };
 type FinalizedMessage = {
@@ -119,6 +122,13 @@ function writeDisplayStatus(shown: boolean): void {
     const detail = error instanceof Error ? error.message : String(error);
     console.error(`fm-telegram-mirror: could not persist the status display choice: ${detail}`);
   }
+}
+
+function asQueuedImage(value: unknown): QueuedImage | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const candidate = value as { data?: unknown; mime?: unknown };
+  if (typeof candidate.data !== "string" || typeof candidate.mime !== "string") return undefined;
+  return { data: candidate.data, mime: candidate.mime };
 }
 
 function assistantText(message: unknown): string {
@@ -260,7 +270,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (frame.t === "deliver" && typeof frame.text === "string" && typeof frame.id === "string") {
-      queueDelivery(frame.id, frame.text);
+      queueDelivery(frame.id, frame.text, asQueuedImage(frame.image));
       return;
     }
     if (frame.t === "state") {
@@ -283,9 +293,19 @@ export default function (pi: ExtensionAPI) {
   // continuation behavior from there. "steer" is what Pi's own terminal uses
   // for text submitted while a run is streaming, and Pi ignores it when idle,
   // so this is the same path as typing the message in the terminal.
-  function queueDelivery(id: string, text: string): void {
+  //
+  // A screenshot travels the same way, as Pi's own image content, so Firstmate
+  // receives exactly what pasting it into the terminal would send.
+  function queueDelivery(id: string, text: string, image?: QueuedImage): void {
     deliveries = deliveries.then(async () => {
-      await pi.sendUserMessage(text, { deliverAs: "steer" });
+      if (image) {
+        const content: Array<Record<string, unknown>> = [];
+        if (text.trim()) content.push({ type: "text", text });
+        content.push({ type: "image", data: image.data, mimeType: image.mime });
+        await pi.sendUserMessage(content as never, { deliverAs: "steer" });
+      } else {
+        await pi.sendUserMessage(text, { deliverAs: "steer" });
+      }
       write({ t: "accepted", id });
     }).catch((error: unknown) => {
       const detail = error instanceof Error ? error.message : String(error);

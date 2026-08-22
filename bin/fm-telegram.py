@@ -17,7 +17,7 @@ overridden by FM_TELEGRAM_DIR):
                                     path replaces {audio} or is appended)
                  confirmations      send "Pi · Sent to Firstmate." or not
                                     (boolean, default true, persisted by the
-                                    Telegram control button)
+                                    Telegram commands and Pi's settings)
   bot.sock     Unix socket the Pi extension connects to
   audio/       temporary voice downloads, deleted after send, cancel, failure,
                and at start and stop
@@ -43,6 +43,7 @@ Firstmate as conversation text:
 
   /telegram on | off | status        Telegram
   /telegram_on | /telegram_off | /telegram_status
+  /telegram_confirmations_on | /telegram_confirmations_off
                                      Telegram menu aliases, published to the
                                      paired chat with setMyCommands because
                                      Telegram's menu rejects a space
@@ -78,6 +79,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -107,7 +109,7 @@ SERVICE_NAME = "firstmate-telegram.service"
 DEFAULT_API_BASE = "https://api.telegram.org"
 DEFAULT_TRANSCRIBE_COMMAND = "parakeet-tdt-0.6b-v3"
 
-MIRROR_OFF_REPLY = "Telegram mirror is off. Send /telegram on to enable it."
+MIRROR_OFF_REPLY = "Telegram mirror is off. Send /telegram_on to enable it."
 OFFLINE_REPLY = "Firstmate is not running. Your message is queued until it starts."
 ACCEPTED_REPLY = "Pi · Sent to Firstmate."
 TRANSCRIBING_REPLY = "Transcribing…"
@@ -116,7 +118,10 @@ SENT_FOOTER = "Sent to Firstmate"
 CANCELLED_FOOTER = "Cancelled"
 EDIT_PROMPT = "Reply to this message with the corrected text."
 TRANSCRIBE_FAILED_REPLY = "Transcription failed. Nothing was sent to Firstmate."
-UNSUPPORTED_REPLY = "Only text and voice notes are mirrored."
+UNSUPPORTED_REPLY = "Only text, voice notes, and images are mirrored."
+UNSUPPORTED_IMAGE_REPLY = "That file type is not supported. Send a PNG, JPEG, or WebP image."
+OVERSIZED_IMAGE_REPLY = "That image is too large to send to Firstmate."
+IMAGE_FAILED_REPLY = "That image could not be downloaded. Nothing was sent to Firstmate."
 HELP_REPLY = (
     "Firstmate terminal mirror.\n"
     "/telegram_on or /telegram on - start mirroring\n"
@@ -132,17 +137,28 @@ MIRROR_ALIASES = {
     "/telegram_on": "on",
     "/telegram_off": "off",
     "/telegram_status": "status",
+    "/telegram_confirmations_on": "confirmations-on",
+    "/telegram_confirmations_off": "confirmations-off",
 }
 MENU_COMMANDS = [
     {"command": "telegram_on", "description": "Start mirroring the Firstmate terminal"},
     {"command": "telegram_off", "description": "Stop mirroring"},
     {"command": "telegram_status", "description": "Show mirror and Firstmate state"},
+    {"command": "telegram_confirmations_on",
+     "description": "Confirm each message Firstmate accepts"},
+    {"command": "telegram_confirmations_off",
+     "description": "Stop confirming accepted messages"},
 ]
-# The delivery-confirmation setting is a Telegram-side preference, so its only
-# control is this button on the command replies. Pi gets no command for it.
-CONFIRMATIONS_CALLBACK = "c:confirmations"
-DISABLE_CONFIRMATIONS_LABEL = "Disable confirmations"
-ENABLE_CONFIRMATIONS_LABEL = "Enable confirmations"
+# Images the captain can send from the paired chat. Anything else is refused
+# before a byte is downloaded.
+IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/webp"}
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+# Queued images live in memory only, like every other queued message, so the
+# total is bounded rather than growing while Firstmate is away.
+MAX_QUEUED_IMAGE_BYTES = 32 * 1024 * 1024
+# Delivery confirmations are switched by their own Telegram commands and by Pi's
+# settings; both write the one persistent setting the bot owns.
+MIRROR_COMMAND_NAMES = ("on", "off", "status", "confirmations-on", "confirmations-off")
 TELEGRAM_TEXT_LIMIT = 3900
 COPY_TEXT_LIMIT = 256
 TRANSCRIBE_TIMEOUT = 180
@@ -300,16 +316,22 @@ class TelegramApi:
         return await asyncio.to_thread(self.request_sync, method, params or {}, timeout)
 
     def _download(self, file_path: str, target: Path, timeout: float) -> None:
+        target.write_bytes(self._fetch(file_path, MAX_VOICE_BYTES, timeout))
+        target.chmod(0o600)
+
+    def _fetch(self, file_path: str, limit: int, timeout: float) -> bytes:
         url = f"{self._base}/file/bot{self._token}/{file_path}"
         try:
             with urllib.request.urlopen(url, timeout=timeout) as response:
-                data = response.read(MAX_VOICE_BYTES + 1)
+                data = response.read(limit + 1)
         except (OSError, urllib.error.HTTPError) as exc:
-            raise TelegramError(f"voice download failed: {exc}") from exc
-        if len(data) > MAX_VOICE_BYTES:
-            raise TelegramError("voice note is too large to transcribe")
-        target.write_bytes(data)
-        target.chmod(0o600)
+            raise TelegramError(f"download failed: {exc}") from exc
+        if len(data) > limit:
+            raise TelegramError("the file is larger than this bot accepts")
+        return data
+
+    async def fetch(self, file_path: str, limit: int, timeout: float = 120) -> bytes:
+        return await asyncio.to_thread(self._fetch, file_path, limit, timeout)
 
     async def download(self, file_path: str, target: Path, timeout: float = 120) -> None:
         await asyncio.to_thread(self._download, file_path, target, timeout)
@@ -323,6 +345,11 @@ class Queued:
     id: str
     text: str
     reply_to: int
+    image: Optional[dict[str, str]] = None
+
+    @property
+    def image_bytes(self) -> int:
+        return len(self.image["data"]) if self.image else 0
 
 
 @dataclass
@@ -452,8 +479,7 @@ class MirrorBot:
         if isinstance(text, str):
             command = mirror_command(text)
             if command:
-                await self.send(self.apply_command(command), reply_to=message_id,
-                                markup=self.control_markup())
+                await self.send(self.apply_command(command), reply_to=message_id)
                 await self.broadcast_state()
                 return
             head = text.strip().split(" ", 1)[0].split("@", 1)[0]
@@ -479,6 +505,18 @@ class MirrorBot:
             self.background.add(task)
             task.add_done_callback(self.background.discard)
             return
+        if message.get("photo") or is_image_document(message.get("document")):
+            if not self.mirror_on:
+                await self.send(MIRROR_OFF_REPLY, reply_to=message_id)
+                return
+            await self.handle_image(message)
+            return
+        if isinstance(message.get("document"), dict):
+            if not self.mirror_on:
+                await self.send(MIRROR_OFF_REPLY, reply_to=message_id)
+                return
+            await self.send(UNSUPPORTED_IMAGE_REPLY, reply_to=message_id)
+            return
         if not self.mirror_on:
             await self.send(MIRROR_OFF_REPLY, reply_to=message_id)
             return
@@ -491,6 +529,10 @@ class MirrorBot:
             self.mirror_on = False
         elif command == "toggle":
             self.mirror_on = not self.mirror_on
+        elif command == "confirmations-on":
+            self.set_confirmations(True)
+        elif command == "confirmations-off":
+            self.set_confirmations(False)
         return self.status_text()
 
     def status_text(self) -> str:
@@ -502,10 +544,6 @@ class MirrorBot:
         if queued:
             status += f" {queued} message(s) waiting."
         return status
-
-    def control_markup(self) -> dict[str, Any]:
-        label = DISABLE_CONFIRMATIONS_LABEL if self.config.confirmations else ENABLE_CONFIRMATIONS_LABEL
-        return {"inline_keyboard": [[{"text": label, "callback_data": CONFIRMATIONS_CALLBACK}]]}
 
     def set_confirmations(self, enabled: bool) -> None:
         self.config.confirmations = enabled
@@ -525,17 +563,24 @@ class MirrorBot:
             "confirmations": self.config.confirmations,
         })
 
-    async def accept_text(self, text: str, reply_to: int) -> None:
-        item = Queued(id=self.next_id(), text=text, reply_to=reply_to)
+    async def accept_text(self, text: str, reply_to: int,
+                          image: Optional[dict[str, str]] = None) -> None:
+        item = Queued(id=self.next_id(), text=text, reply_to=reply_to, image=image)
         self.queue.append(item)
         if not self.connected:
             await self.send(OFFLINE_REPLY, reply_to=reply_to)
         await self.pump()
 
+    def queued_image_bytes(self) -> int:
+        return sum(item.image_bytes for item in (*self.queue, *self.pending.values()))
+
     async def pump(self) -> None:
         while self.queue and self.client is not None:
             item = self.queue.popleft()
-            if not await self.write_frame({"t": "deliver", "id": item.id, "text": item.text}):
+            frame: dict[str, Any] = {"t": "deliver", "id": item.id, "text": item.text}
+            if item.image:
+                frame["image"] = item.image
+            if not await self.write_frame(frame):
                 self.queue.appendleft(item)
                 return
             self.pending[item.id] = item
@@ -611,15 +656,6 @@ class MirrorBot:
     async def handle_callback(self, callback: dict[str, Any]) -> None:
         callback_id = str(callback.get("id"))
         data = str(callback.get("data") or "")
-        if data == CONFIRMATIONS_CALLBACK:
-            await self.answer_callback(callback_id)
-            self.set_confirmations(not self.config.confirmations)
-            card = callback.get("message") or {}
-            message_id = card.get("message_id")
-            if isinstance(message_id, int):
-                await self.edit_card(message_id, self.status_text(), self.control_markup())
-            await self.broadcast_state()
-            return
         parsed = parse_callback(data)
         if parsed is None:
             await self.answer_callback(callback_id, "Unsupported button.")
@@ -677,6 +713,40 @@ class MirrorBot:
         if entry.prompt_id is not None:
             self.prompts.pop(entry.prompt_id, None)
             entry.prompt_id = None
+
+    # --- images ---
+
+    async def handle_image(self, message: dict[str, Any]) -> None:
+        """Send a screenshot to Firstmate exactly as a pasted terminal image."""
+        message_id = int(message["message_id"])
+        caption = message.get("caption")
+        selection = select_image(message)
+        if selection is None:
+            await self.send(UNSUPPORTED_IMAGE_REPLY, reply_to=message_id)
+            return
+        file_id, mime, declared_size = selection
+        if declared_size and declared_size > MAX_IMAGE_BYTES:
+            await self.send(OVERSIZED_IMAGE_REPLY, reply_to=message_id)
+            return
+        if self.queued_image_bytes() >= MAX_QUEUED_IMAGE_BYTES:
+            await self.send(OVERSIZED_IMAGE_REPLY, reply_to=message_id)
+            return
+        try:
+            info = await self.api.call("getFile", {"file_id": file_id})
+            data = await self.api.fetch(str((info or {}).get("file_path", "")),
+                                        MAX_IMAGE_BYTES)
+        except TelegramError as exc:
+            # Never the bytes, the caption, or the identifiers: only the reason.
+            log(f"image download failed: {exc}")
+            await self.send(IMAGE_FAILED_REPLY, reply_to=message_id)
+            return
+        mime = mime or sniff_image_mime(data) or "image/jpeg"
+        if mime not in IMAGE_MIME_TYPES:
+            await self.send(UNSUPPORTED_IMAGE_REPLY, reply_to=message_id)
+            return
+        image = {"data": base64.b64encode(data).decode("ascii"), "mime": mime}
+        await self.accept_text(caption if isinstance(caption, str) else "",
+                               message_id, image=image)
 
     # --- Pi extension socket ---
 
@@ -764,7 +834,7 @@ class MirrorBot:
             return
         if kind == "command":
             command = str(frame.get("command"))
-            if command in MIRROR_COMMANDS or command == "toggle":
+            if command in MIRROR_COMMAND_NAMES or command == "toggle":
                 text = self.apply_command(command)
             else:
                 text = f"Unknown command {command!r}."
@@ -888,6 +958,9 @@ def chunk_text(text: str) -> list[str]:
 # documented tags, so no sanitizer stands between them and the API, and any
 # construct it does not model degrades to its own text.
 
+# A private marker so list() can tell its own items apart from nested content.
+LIST_ITEM_MARK = "\x00"
+
 if mistune is not None:
 
     class TelegramHtmlRenderer(mistune.HTMLRenderer):  # type: ignore[misc]
@@ -925,7 +998,9 @@ if mistune is not None:
             return "\n"
 
         def block_text(self, text: str) -> str:
-            return text
+            # A newline so nested block content starts on its own line rather
+            # than running into the item's own text.
+            return f"{text}\n"
 
         def block_code(self, code: str, info: Optional[str] = None) -> str:
             body = escape(code, quote=False)
@@ -938,10 +1013,26 @@ if mistune is not None:
             return f"<blockquote>{text.strip()}</blockquote>\n"
 
         def list(self, text: str, ordered: bool, **attrs: Any) -> str:
-            return f"{text}\n"
+            # Telegram has no list markup, so the markers are text. They are
+            # applied here because only this call knows whether the list is
+            # numbered and where its numbering starts.
+            number = int(attrs.get("start") or 1)
+            lines: list[str] = []
+            for line in text.split("\n"):
+                if line.startswith(LIST_ITEM_MARK):
+                    body = line[len(LIST_ITEM_MARK):]
+                    lines.append(f"{number}. {body}" if ordered else f"- {body}")
+                    number += 1
+                elif line.strip():
+                    # A nested list or a continuation line, kept under its item.
+                    lines.append(f"  {line}")
+            return "\n".join(lines) + "\n\n"
 
         def list_item(self, text: str) -> str:
-            return f"- {text.strip()}\n"
+            # One line per item keeps adjacent items compact; the marker is
+            # attached by list() above.
+            body = "\n".join(part for part in text.strip().split("\n") if part.strip())
+            return f"{LIST_ITEM_MARK}{body}\n"
 
         def link(self, text: str, url: str, title: Optional[str] = None) -> str:
             return f'<a href="{escape(url, quote=True)}">{text or escape(url, quote=False)}</a>'
@@ -1017,6 +1108,39 @@ def split_markdown(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
     return chunks or [body]
 
 
+def is_image_document(document: Any) -> bool:
+    return isinstance(document, dict) and document.get("mime_type") in IMAGE_MIME_TYPES
+
+
+def select_image(message: dict[str, Any]) -> Optional[tuple[str, Optional[str], int]]:
+    """The best image in a message: (file id, declared mime, declared size)."""
+    photos = message.get("photo")
+    if isinstance(photos, list) and photos:
+        sizes = [p for p in photos if isinstance(p, dict) and p.get("file_id")]
+        if not sizes:
+            return None
+        # Telegram sends every rendition; the captain sent one screenshot, so
+        # take the sharpest one it offers.
+        best = max(sizes, key=lambda p: (int(p.get("width", 0)) * int(p.get("height", 0)),
+                                         int(p.get("file_size", 0))))
+        return str(best["file_id"]), None, int(best.get("file_size", 0))
+    document = message.get("document")
+    if is_image_document(document) and document.get("file_id"):
+        return (str(document["file_id"]), str(document["mime_type"]),
+                int(document.get("file_size", 0)))
+    return None
+
+
+def sniff_image_mime(data: bytes) -> Optional[str]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def peer_description(writer: asyncio.StreamWriter) -> str:
     """Kernel-supplied identity of the connected process, never client-supplied."""
     try:
@@ -1049,7 +1173,6 @@ def mirror_command(text: str) -> Optional[str]:
     if len(parts) != 2 or head != "/telegram" or parts[1] not in MIRROR_COMMANDS:
         return None
     return parts[1]
-
 
 def main_markup(voice_id: int, revision: int) -> dict[str, Any]:
     return {

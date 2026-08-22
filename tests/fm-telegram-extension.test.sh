@@ -245,6 +245,46 @@ await waitFor(
 );
 idle = true;
 
+// 4b. A screenshot arrives as Pi's own image content, with its caption in the
+//     same user message, and is never echoed back into the chat it came from.
+const pixels = Buffer.from("89504e470d0a1a0a0102030405", "hex").toString("base64");
+botWrite({
+  t: "deliver",
+  id: "m4",
+  text: "look at this failure",
+  image: { data: pixels, mime: "image/png" },
+});
+await waitFor(() => submissions.length === 4, "the screenshot submission");
+const shot = submissions[3];
+if (!Array.isArray(shot.content)) {
+  fail(`a screenshot was not sent as image content: ${JSON.stringify(shot)}`);
+}
+if (JSON.stringify(shot.content) !== JSON.stringify([
+  { type: "text", text: "look at this failure" },
+  { type: "image", data: pixels, mimeType: "image/png" },
+])) {
+  fail(`unexpected screenshot content: ${JSON.stringify(shot.content)}`);
+}
+if (shot.options?.deliverAs !== "steer") {
+  fail("a screenshot did not take Pi's ordinary input path");
+}
+await waitFor(
+  () => received.filter((frame) => frame.t === "accepted").length === 4,
+  "the screenshot to be confirmed",
+);
+if (received.some((frame) => frame.t === "terminal" && String(frame.text).includes("failure"))) {
+  fail("a Telegram screenshot was echoed back to Telegram");
+}
+
+// A caption-free screenshot carries only the image.
+botWrite({ t: "deliver", id: "m5", text: "", image: { data: pixels, mime: "image/webp" } });
+await waitFor(() => submissions.length === 5, "the caption-free screenshot");
+if (JSON.stringify(submissions[4].content) !== JSON.stringify([
+  { type: "image", data: pixels, mimeType: "image/webp" },
+])) {
+  fail(`a caption-free screenshot carried extra content: ${JSON.stringify(submissions[4].content)}`);
+}
+
 // 5. /telegram is transport, never conversation text: bare, it toggles.
 const submissionsBeforeCommand = submissions.length;
 onFrame = (frame) => {
