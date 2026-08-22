@@ -370,6 +370,15 @@ class MirrorTestCase(unittest.TestCase):
         (self.firstmate_home / "state" / ".lock").write_text(
             f"{os.getpid()}\n", encoding="utf-8"
         )
+        lock_checker = Path(self.tmp.name) / "session-lock-check"
+        lock_checker.write_text(
+            "#!/bin/sh\n"
+            "[ -f \"$1/.lock\" ] && [ ! -L \"$1/.lock\" ] || exit 1\n"
+            "[ \"$(cat \"$1/.lock\")\" = \"$FM_TEST_PRIMARY_PID\" ] || exit 1\n"
+            "[ \"$2\" = \"$FM_TEST_PRIMARY_PID\" ]\n",
+            encoding="utf-8",
+        )
+        lock_checker.chmod(0o755)
         (self.home / "env").write_text(f"TELEGRAM_BOT_TOKEN={TOKEN}\n", encoding="utf-8")
         transcript_script = Path(self.tmp.name) / "fake-parakeet"
         transcript_script.write_text(
@@ -392,6 +401,9 @@ class MirrorTestCase(unittest.TestCase):
             "FM_TELEGRAM_DIR": str(self.home),
             "FM_HOME": str(self.firstmate_home),
             "FM_TELEGRAM_API_BASE": self.telegram.base,
+            "FM_TELEGRAM_TESTING": "1",
+            "FM_TELEGRAM_SESSION_LOCK_CHECK": str(lock_checker),
+            "FM_TEST_PRIMARY_PID": str(os.getpid()),
             "FM_TEST_TRANSCRIPT": str(self.transcript_file),
         })
         self.environment = environment

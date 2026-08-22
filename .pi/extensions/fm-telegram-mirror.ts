@@ -95,28 +95,21 @@ function firstmateHome(): string {
     resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 }
 
-function parentPid(pid: string): string {
-  const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
-  if (result.status !== 0) return "";
-  return result.stdout.trim();
+function sessionLockChecker(): string {
+  if (process.env.FM_TELEGRAM_TESTING === "1" &&
+      process.env.FM_TELEGRAM_SESSION_LOCK_CHECK) {
+    return process.env.FM_TELEGRAM_SESSION_LOCK_CHECK;
+  }
+  return join(firstmateHome(), "bin", "fm-session-lock-check.sh");
 }
 
 function ownsSessionLock(): boolean {
   const stateDir = process.env.FM_STATE_OVERRIDE || join(firstmateHome(), "state");
-  let lockPid = "";
-  try {
-    lockPid = readFileSync(join(stateDir, ".lock"), "utf8").trim();
-  } catch {
-    return false;
-  }
-  if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return false;
-  let pid = String(process.pid);
-  for (let step = 0; step < 8; step += 1) {
-    if (pid === lockPid) return true;
-    pid = parentPid(pid);
-    if (!pid || pid === "1") break;
-  }
-  return false;
+  const result = spawnSync(sessionLockChecker(), [stateDir, String(process.pid)], {
+    stdio: "ignore",
+    timeout: 2000,
+  });
+  return result.status === 0;
 }
 
 function readDisplayStatus(): boolean {

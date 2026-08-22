@@ -119,7 +119,8 @@ Images travel both ways.
 
 Paste or attach an image in the terminal and it appears in Telegram as real, viewable media rather than a local path: one photo on its own, or an album that keeps the order you sent.
 Pi's own paste writes the image into the temp directory and puts that path in your message, so the mirror recognises exactly that artifact: Pi's own file name in Pi's own temp directory, a regular file this account owns, of an accepted type whose actual bytes match.
-Nothing else is ever uploaded, so typing or quoting any other file path mirrors only the words, and the path itself is kept out of the phone caption because it means nothing there.
+Only a path proven to be a canonical Pi clipboard artifact is removed from the phone caption, including when that proven artifact exceeds a media limit.
+Any arbitrary path or path that fails the identity, ownership, file-type, symlink, image-magic, or existence checks remains ordinary mirrored captain text and is never uploaded.
 Pasting two images at once runs them together with no space between, which is recognised as two pictures while a path glued to anything else stays ordinary text.
 Your terminal text rides along as the caption when it fits, and is sent as its own `You · Terminal` message when it is too long for one.
 An image-only submission still arrives, captioned `You · Terminal`.

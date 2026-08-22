@@ -770,6 +770,7 @@ class MirrorBot:
         finally:
             for process in started:
                 self.transcribers.discard(process)
+        self.active_transcription = False
         if utf16_length(transcript) > TRANSCRIPT_CARD_LIMIT:
             remove_file(audio)
             await self.send(TRANSCRIPT_TOO_LONG_REPLY, reply_to=voice_id)
@@ -1538,16 +1539,12 @@ def peer_credentials(writer: asyncio.StreamWriter) -> Optional[tuple[int, int]]:
     return pid, uid
 
 
-def process_parent(pid: int) -> Optional[int]:
-    try:
-        status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    for line in status.splitlines():
-        if line.startswith("PPid:"):
-            value = line.partition(":")[2].strip()
-            return int(value) if value.isdigit() else None
-    return None
+def session_lock_checker() -> Path:
+    if os.environ.get("FM_TELEGRAM_TESTING") == "1":
+        override = os.environ.get("FM_TELEGRAM_SESSION_LOCK_CHECK")
+        if override:
+            return Path(override)
+    return Path(__file__).with_name("fm-session-lock-check.sh")
 
 
 def peer_owns_session_lock(writer: asyncio.StreamWriter, firstmate_home: Path) -> bool:
@@ -1558,24 +1555,17 @@ def peer_owns_session_lock(writer: asyncio.StreamWriter, firstmate_home: Path) -
     if hasattr(os, "getuid") and peer_uid != os.getuid():
         return False
     try:
-        lock_pid_text = (firstmate_home / "state" / ".lock").read_text(
-            encoding="utf-8"
-        ).strip()
-    except OSError:
+        result = subprocess.run(
+            [str(session_lock_checker()), str(firstmate_home / "state"), str(peer_pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return False
-    if not lock_pid_text.isdigit():
-        return False
-    lock_pid = int(lock_pid_text)
-    if lock_pid <= 1:
-        return False
-    pid: Optional[int] = peer_pid
-    for _step in range(64):
-        if pid == lock_pid:
-            return True
-        if pid is None or pid <= 1:
-            return False
-        pid = process_parent(pid)
-    return False
+    return result.returncode == 0
 
 
 def peer_description(writer: asyncio.StreamWriter) -> str:

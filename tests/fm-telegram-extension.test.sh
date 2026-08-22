@@ -35,6 +35,12 @@ cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$FIXTURE/lib/fm-operation
 ln -s "$PI_PACKAGE_DIR" "$FIXTURE/node_modules/@earendil-works/pi-coding-agent"
 ln -s "$PI_PACKAGE_DIR/node_modules/@earendil-works/pi-tui" "$FIXTURE/node_modules/@earendil-works/pi-tui"
 printf '%s\n' '{"type":"module"}' >"$FIXTURE/package.json"
+cat >"$TMP_ROOT/session-lock-check" <<'SH'
+#!/bin/sh
+[ -f "$1/.lock" ] && [ ! -L "$1/.lock" ] || exit 1
+[ "$(cat "$1/.lock")" = "$2" ]
+SH
+chmod +x "$TMP_ROOT/session-lock-check"
 
 OUT="$TMP_ROOT/node-output"
 if ! (cd "$FIXTURE" && \
@@ -44,6 +50,8 @@ if ! (cd "$FIXTURE" && \
   FM_OPERATIONAL_INPUT_SCRIPT="$ROOT/bin/fm-operational-input.sh" \
   FM_TELEGRAM_DIR="$TMP_ROOT/home" \
   FM_TELEGRAM_MAX_OUTSTANDING_WRITE_BYTES=100000 \
+  FM_TELEGRAM_TESTING=1 \
+  FM_TELEGRAM_SESSION_LOCK_CHECK="$TMP_ROOT/session-lock-check" \
   FM_HOME="$TMP_ROOT/fmhome" \
   WORKER_HOME="$TMP_ROOT/workerhome" \
   node --input-type=module >"$OUT" 2>&1) <<'JS'
