@@ -262,6 +262,14 @@ fm_write_secondmate_meta() {
 
 # --- common assertions ------------------------------------------------------
 
+# fm_test_lock_pid <state-dir>: the session lock's owner pid.
+# bin/fm-session-lock-lib.sh owns the record format: its first line is the pid
+# and later lines bind that pid to its process generation, so a test asserting on
+# ownership reads the pid field rather than the whole record.
+fm_test_lock_pid() {
+  sed -n '1p' "$1/.lock" 2>/dev/null | tr -d '[:space:]'
+}
+
 # assert_contains <haystack> <needle> <msg>
 assert_contains() {
   case "$1" in

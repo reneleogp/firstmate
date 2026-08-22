@@ -194,6 +194,8 @@ fm_pi_extension_version() {
 # fm_pi_extension_loaded <marker> <expected-version> <session-lock>
 # True when <marker> records <expected-version> and names the session process in
 # <session-lock>, i.e. the session holding this home loaded exactly this build.
+# The lock's first line is its pid field; bin/fm-session-lock-lib.sh owns that
+# record format and every ownership verdict drawn from it.
 fm_pi_extension_loaded() {
   local marker=$1 expected_version=$2 lock=$3 marker_version marker_pid lock_pid
   [ -f "$marker" ] && [ -f "$lock" ] && [ -n "$expected_version" ] || return 1

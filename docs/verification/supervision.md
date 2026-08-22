@@ -2,7 +2,7 @@
 
 Audience: maintainer verification.
 
-This record supports current session-start, turn-end, watcher-continuity, and wedge-alarm guarantees.
+This record supports current session-start, turn-end, session-lock identity, watcher-continuity, and wedge-alarm guarantees.
 Operator behavior and active limits remain in the linked current guides.
 Task-specific chronology, temporary paths, run identifiers, and delivery transcripts remain in private reports or PR evidence.
 
@@ -410,6 +410,94 @@ Observed output:
 ```text
 fm-claude-stop-autoarm: ok
 ```
+
+## Session-lock process identity
+
+The per-home session lock binds mutation authority to one live session, so the record has to answer "is the process that published this still running?" rather than "is something with this pid running?".
+A pid alone cannot answer that, and the failure is reachable with ordinary kernel behavior.
+
+The boundary was reproduced end to end on 2026-08-22 on Linux 6.18.33.1-microsoft-standard-WSL2 x86_64 (`CLK_TCK` 100, bash 5.3.9), inside a private PID namespace (`unshare -rpf --mount-proc`) so a genuine pid recycle could be forced through `/proc/sys/kernel/ns_last_pid` instead of simulated.
+A real harness-named process published the lock through `bin/fm-lock.sh`, exited, and the kernel handed its exact pid to another genuine harness-named process, which is the masking condition: same pid, same name, alive.
+
+Observed on the pre-change code, and on the current code, from the same fixture (the machine-specific boot id is redacted as `<uuid>`):
+
+```text
+# before
+A pid=5 comm=pi publish: lock acquired: harness pid 5
+record: [5|]
+live-owner counterfactual: error: another live firstmate session holds the lock (pid 5); operate read-only until resolved
+recycled pid: wanted=5 got=5 comm=pi
+new session: error: another live firstmate session holds the lock (pid 5); operate read-only until resolved
+
+# after
+A pid=5 comm=pi publish: lock acquired: harness pid 5
+record: [5|gen=proc:boot-<uuid>:8211729|]
+live-owner counterfactual: error: another live firstmate session holds the lock (pid 5); operate read-only until resolved
+recycled pid: wanted=5 got=5 comm=pi
+new session: lock acquired: harness pid 8
+```
+
+The consequence being closed is the third line of the "before" block: a session that nobody owns is read as held, so the next real session runs read-only and the turn-end integrations stand down for a session that no longer exists.
+The counterfactual line is the disconfirming control and is identical in both runs: while the publishing process is genuinely alive, a competing session is still refused.
+
+A pre-generation record was checked in the same namespace fixture.
+Its live owner was still honored, its record was upgraded in place on that session's next acquisition, and a recycled pid beyond the one-second timestamp boundary was refused:
+
+```text
+legacy record: [5|]
+new code, live legacy owner, status: lock: held by live harness pid 5
+recycled onto legacy record: pid 5
+new code, recycled pid, status: lock: stale (pid 5 is dead, not a harness, or a different process generation ...)
+upgraded record: [42|gen=proc:boot-<uuid>:8214778|]
+```
+
+Within that one-second window a pre-generation record still reads as compatible, which is the pre-change posture and is why the record is upgraded at the first acquisition rather than left in place.
+
+The portable regression is CI-enforced and covers publication, legitimate ownership, recycled-pid rejection, malformed or missing generation data, stale cleanup, external peer authorization, and both supported generation sources on the host it runs on:
+
+```sh
+bin/fm-test-run.sh tests/fm-session-lock-generation.test.sh
+```
+
+Observed output:
+
+```text
+ok - session-lock generation: publication records the publishing process's kernel generation
+ok - session-lock generation: a dead owner's record is reclaimed and republished
+ok - session-lock generation: a recycled pid never inherits the record, while its true owner keeps it
+ok - session-lock generation: a genuinely live owner still refuses a competing session
+ok - session-lock generation: malformed, mis-keyed, over-long, and symlinked records grant nothing
+ok - session-lock generation: a current-format record that cannot be verified never grants authority
+ok - session-lock generation: a pre-generation record still serves its home and is upgraded on acquisition
+ok - session-lock generation: a legacy record is disproved once its pid belongs to a later process
+ok - session-lock generation: peer authorization takes positive identity evidence, session ownership keeps compatibility
+ok - session-lock generation: both supported generation sources answer on this platform
+FM_TEST_SUMMARY total=1 failed=0 skipped_gate=0 duration_ms=6275
+```
+
+The real-harness guard is opt-in and is the command that refreshes the per-harness table below; run it after any harness upgrade:
+
+```sh
+FM_SESSION_LOCK_GENERATION_LIVE_E2E=1 bin/fm-test-run.sh tests/fm-session-lock-generation-live-e2e.test.sh
+```
+
+Bounded output from the 2026-08-22 run:
+
+```text
+# pi 0.84.2: pid=1687577 generation=proc:boot-<uuid>:8442111
+ok - session-lock identity: pi 0.84.2 publishes a bound record that retires with its process
+# unverified on this machine (not installed): claude codex opencode pi-signed grok kimi cursor
+# checked 1 installed harness(es)
+```
+
+| Harness | Version | Result |
+| --- | --- | --- |
+| pi | 0.84.2 | Bound record published for the live pane process; refused once that exact process exited |
+| claude, codex, opencode, pi-signed, grok, kimi, cursor | - | Not installed on this machine, so unverified here; the guard names each one rather than passing over it |
+
+muse is crew-only and never holds a home's session lock, so it is out of scope for this guard.
+Runtime backends are unaffected: the record is published by the primary session process itself, not by any endpoint, and no backend reads or writes it.
+`bin/fm-session-lock-lib.sh`'s header owns the record format, the two generation sources, and the compatibility contract summarized here.
 
 ## Watcher continuity
 

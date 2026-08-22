@@ -126,10 +126,28 @@ function pidAlive(pid: string): boolean {
   }
 }
 
+// bin/fm-session-lock-lib.sh owns the session-lock record: its first line is
+// the publishing session's pid, and the rest binds that pid to the kernel
+// process generation that published it. This reads the pid field only, and asks
+// the owning script whether the binding still holds rather than re-deriving it
+// here, so a recycled pid - even another genuine Pi process - can never make
+// this session stand down for a session that is already gone.
+function lockGenerationHolds(): boolean {
+  const result = spawnSync(`${fmRoot}/bin/fm-lock.sh`, ["generation-check"], {
+    env: { ...process.env, FM_STATE_OVERRIDE: state },
+    encoding: "utf8",
+  });
+  // Only a verdict the owner actually returned may demote a live recorded owner
+  // to "gone". If the script could not run at all, keep the conservative answer
+  // and stand down, exactly as this extension did before the binding existed.
+  if (result.error || result.status === null) return true;
+  return result.status === 0;
+}
+
 function lockOwnership(): LockOwnership {
   let lockPid = "";
   try {
-    lockPid = readFileSync(`${state}/.lock`, "utf8").trim();
+    lockPid = readFileSync(`${state}/.lock`, "utf8").split("\n")[0].trim();
   } catch {
     return "missing";
   }
@@ -140,7 +158,7 @@ function lockOwnership(): LockOwnership {
     pid = parentPid(pid);
     if (!pid || pid === "1") break;
   }
-  return pidAlive(lockPid) ? "other" : "missing";
+  return pidAlive(lockPid) && lockGenerationHolds() ? "other" : "missing";
 }
 
 function markLoaded(): void {
