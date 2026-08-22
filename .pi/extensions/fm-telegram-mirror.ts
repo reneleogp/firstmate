@@ -150,7 +150,7 @@ const CLIPBOARD_EXTENSIONS = "png|jpg|jpeg|webp";
 const MAX_CLIPBOARD_BYTES = positiveInteger("FM_TELEGRAM_MAX_IMAGE_BYTES", 10 * 1024 * 1024);
 const MAX_CLIPBOARD_TOTAL_BYTES = MAX_CLIPBOARD_BYTES * 3;
 const MAX_CLIPBOARD_IMAGES = 10;
-const MAX_OUTSTANDING_WRITE_BYTES = positiveInteger(
+const MAX_OUTSTANDING_IMAGE_WRITE_BYTES = positiveInteger(
   "FM_TELEGRAM_MAX_OUTSTANDING_WRITE_BYTES",
   Math.ceil(MAX_CLIPBOARD_TOTAL_BYTES / 3) * 4 + 3 * 1024 * 1024,
 );
@@ -308,7 +308,7 @@ export default function (pi: ExtensionAPI) {
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectDelay = RECONNECT_MS;
   let deliveries: Promise<void> = Promise.resolve();
-  let outstandingWriteBytes = 0;
+  let outstandingImageWriteBytes = 0;
   let commandSequence = 0;
   const commandWaiters = new Map<number, (text: string) => void>();
 
@@ -333,17 +333,17 @@ export default function (pi: ExtensionAPI) {
     const target = socket;
     if (!target || target.destroyed) return false;
     const payload = `${JSON.stringify(frame)}\n`;
-    const payloadBytes = Buffer.byteLength(payload);
-    if (payloadBytes > MAX_OUTSTANDING_WRITE_BYTES ||
-        outstandingWriteBytes + payloadBytes > MAX_OUTSTANDING_WRITE_BYTES) return false;
-    outstandingWriteBytes += payloadBytes;
+    const imageBytes = Array.isArray(frame.images) ? Buffer.byteLength(payload) : 0;
+    if (imageBytes > MAX_OUTSTANDING_IMAGE_WRITE_BYTES ||
+        outstandingImageWriteBytes + imageBytes > MAX_OUTSTANDING_IMAGE_WRITE_BYTES) return false;
+    outstandingImageWriteBytes += imageBytes;
     try {
       target.write(payload, () => {
-        if (socket === target) outstandingWriteBytes -= payloadBytes;
+        if (socket === target) outstandingImageWriteBytes -= imageBytes;
       });
       return true;
     } catch {
-      outstandingWriteBytes -= payloadBytes;
+      outstandingImageWriteBytes -= imageBytes;
       return false;
     }
   }
@@ -366,7 +366,7 @@ export default function (pi: ExtensionAPI) {
     const current = socket;
     socket = null;
     buffer = "";
-    outstandingWriteBytes = 0;
+    outstandingImageWriteBytes = 0;
     if (current) {
       current.removeAllListeners();
       current.destroy();

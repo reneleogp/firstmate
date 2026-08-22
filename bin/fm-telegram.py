@@ -124,6 +124,7 @@ SENT_FOOTER = "Sent to Firstmate"
 CANCELLED_FOOTER = "Cancelled"
 EDIT_PROMPT = "Reply to this message with the corrected text."
 TRANSCRIBE_FAILED_REPLY = "Transcription failed. Nothing was sent to Firstmate."
+TRANSCRIPTION_BUSY_REPLY = "Another voice note is already being transcribed. Try again shortly."
 TRANSCRIPT_TOO_LONG_REPLY = (
     "That transcript is over 3,800 characters. Nothing was sent to Firstmate."
 )
@@ -198,6 +199,12 @@ TRANSCRIBE_STOP_GRACE = 2
 
 class TelegramError(RuntimeError):
     """A Telegram API or local configuration failure."""
+
+    def __init__(self, message: str, *, status: Optional[int] = None,
+                 error_type: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.error_type = error_type
 
 
 def log(message: str) -> None:
@@ -340,11 +347,16 @@ class TelegramApi:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:400]
-            raise TelegramError(f"{method} failed with HTTP {exc.code}: {detail}") from exc
+            raise api_rejection(method, exc.code, detail) from exc
         except (OSError, json.JSONDecodeError) as exc:
             raise TelegramError(f"{method} failed: {exc}") from exc
         if not isinstance(payload, dict) or not payload.get("ok"):
-            raise TelegramError(f"{method} rejected: {str(payload)[:400]}")
+            status = payload.get("error_code") if isinstance(payload, dict) else None
+            raise TelegramError(
+                f"{method} rejected: {str(payload)[:400]}",
+                status=status if isinstance(status, int) else None,
+                error_type="api_rejection",
+            )
         return payload.get("result")
 
     async def upload(self, method: str, fields: dict[str, str],
@@ -362,11 +374,16 @@ class TelegramApi:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:400]
-            raise TelegramError(f"{method} failed with HTTP {exc.code}: {detail}") from exc
+            raise api_rejection(method, exc.code, detail) from exc
         except (OSError, json.JSONDecodeError) as exc:
             raise TelegramError(f"{method} failed: {exc}") from exc
         if not isinstance(payload, dict) or not payload.get("ok"):
-            raise TelegramError(f"{method} rejected: {str(payload)[:400]}")
+            status = payload.get("error_code") if isinstance(payload, dict) else None
+            raise TelegramError(
+                f"{method} rejected: {str(payload)[:400]}",
+                status=status if isinstance(status, int) else None,
+                error_type="api_rejection",
+            )
         return payload.get("result")
 
     async def call(self, method: str, params: Optional[dict[str, Any]] = None,
@@ -430,6 +447,7 @@ class MirrorBot:
     client_features: set = field(default_factory=set)
     background: set = field(default_factory=set)
     transcribers: set = field(default_factory=set)
+    active_transcription: bool = False
     _sequence: int = 0
     _stopping: bool = False
 
@@ -608,11 +626,13 @@ class MirrorBot:
             if not self.mirror_on:
                 await self.send(MIRROR_OFF_REPLY, reply_to=message_id)
                 return
-            # Transcription runs beside the poll loop so a long voice note
-            # never stalls ordinary text, commands, or button taps.
+            if self.active_transcription:
+                await self.send(TRANSCRIPTION_BUSY_REPLY, reply_to=message_id)
+                return
+            self.active_transcription = True
             task = asyncio.create_task(self.handle_voice(message))
             self.background.add(task)
-            task.add_done_callback(self.background.discard)
+            task.add_done_callback(self.transcription_finished)
             return
         if message.get("photo") or is_image_document(message.get("document")):
             if not self.mirror_on:
@@ -714,6 +734,10 @@ class MirrorBot:
         await self.send(ACCEPTED_REPLY, reply_to=item.reply_to)
 
     # --- voice ---
+
+    def transcription_finished(self, task: asyncio.Task[Any]) -> None:
+        self.background.discard(task)
+        self.active_transcription = False
 
     async def handle_voice(self, message: dict[str, Any]) -> None:
         voice_id = int(message["message_id"])
@@ -1476,10 +1500,24 @@ def peer_description(writer: asyncio.StreamWriter) -> str:
     return f"pid {pid} ({command}, uid {uid})"
 
 
+def api_rejection(method: str, http_status: int, detail: str) -> TelegramError:
+    status = http_status
+    try:
+        payload = json.loads(detail)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("error_code"), int):
+        status = payload["error_code"]
+    return TelegramError(
+        f"{method} failed with HTTP {http_status}: {detail}",
+        status=status,
+        error_type="api_rejection",
+    )
+
+
 def rejected_formatting(error: TelegramError) -> bool:
-    """True when Telegram refused the markup itself, so nothing was sent."""
-    detail = str(error).lower()
-    return "parse" in detail or "entities" in detail or "tag" in detail
+    """True when Telegram refused the formatted request before sending it."""
+    return error.error_type == "api_rejection" and error.status == 400
 
 
 def mirror_command(text: str) -> Optional[str]:

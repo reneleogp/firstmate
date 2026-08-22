@@ -353,7 +353,9 @@ for (const path of [genuine, genuineJpeg, arbitrary, wrongMagic, oversized, link
 
 // 1d. Image writes stop at a bounded transport backlog and visibly refuse the
 //     image that cannot fit rather than adding it to Node's socket buffer.
-const framesBeforeBackpressure = received.filter((frame) => frame.t === "terminal").length;
+const imageFramesBeforeBackpressure = received.filter(
+  (frame) => frame.t === "terminal" && frame.images,
+).length;
 const queuedPixels = "A".repeat(75000);
 handlers.get("input")({
   text: "first queued image",
@@ -365,18 +367,41 @@ handlers.get("input")({
   source: "interactive",
   images: [{ type: "image", data: queuedPixels, mimeType: "image/png" }],
 }, ctx);
+handlers.get("input")({ text: "required text behind image", source: "interactive" }, ctx);
+handlers.get("message_end")({ message: {
+  role: "assistant",
+  content: [{ type: "text", text: "required reply behind image" }],
+  stopReason: "stop",
+}}, ctx);
+botWrite({ t: "deliver", id: "m-budget", text: "required acceptance behind image" });
 await waitFor(
-  () => received.filter((frame) => frame.t === "terminal").length === framesBeforeBackpressure + 1,
+  () => received.filter((frame) => frame.t === "terminal" && frame.images).length
+    === imageFramesBeforeBackpressure + 1,
   "the bounded image write",
 );
+await waitFor(
+  () => received.some((frame) => frame.t === "terminal" && frame.text === "required text behind image")
+    && received.some((frame) => frame.t === "reply" && frame.text === "required reply behind image")
+    && received.some((frame) => frame.t === "accepted" && frame.id === "m-budget"),
+  "required frames behind the full image budget",
+);
 await new Promise((resolve) => setTimeout(resolve, 200));
-const backpressureFrames = received.filter((frame) => frame.t === "terminal").slice(framesBeforeBackpressure);
+const backpressureFrames = received.filter(
+  (frame) => frame.t === "terminal" && frame.images,
+).slice(imageFramesBeforeBackpressure);
 if (backpressureFrames.length !== 1 || backpressureFrames[0].text !== "first queued image") {
   fail(`the image transport backlog was not bounded: ${JSON.stringify(backpressureFrames.map((frame) => frame.text))}`);
 }
 if (notifications.at(-1)?.message !==
     "Telegram image was not mirrored because its transport queue is full.") {
   fail(`the refused image was not reported visibly: ${JSON.stringify(notifications.at(-1))}`);
+}
+submissions.splice(submissions.findIndex((entry) => entry.content === "required acceptance behind image"), 1);
+for (let index = received.length - 1; index >= 0; index -= 1) {
+  if ((received[index].t === "reply" && received[index].text === "required reply behind image")
+      || (received[index].t === "accepted" && received[index].id === "m-budget")) {
+    received.splice(index, 1);
+  }
 }
 
 // 2. Every completed reply is mirrored exactly once, as Pi finalizes it, while

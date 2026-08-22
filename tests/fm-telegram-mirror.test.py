@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -72,6 +73,7 @@ class FakeTelegram:
         self.reject_uploads = False
         # Telegram refuses markup it cannot parse; the bot must recover.
         self.reject_parse_mode = False
+        self.format_rejection = "can't parse entities: unsupported start tag"
         self.next_message_id = 1000
         self.next_update_id = 1
         self.files: dict[str, bytes] = {}
@@ -97,7 +99,11 @@ class FakeTelegram:
                     pass
 
             def _error(self, status: int, detail: str) -> None:
-                body = json.dumps({"ok": False, "description": f"Bad Request: {detail}"}).encode()
+                body = json.dumps({
+                    "ok": False,
+                    "error_code": status,
+                    "description": f"Bad Request: {detail}",
+                }).encode()
                 try:
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
@@ -176,7 +182,7 @@ class FakeTelegram:
             return []
         if method == "sendMessage":
             if self.reject_parse_mode and "parse_mode" in params:
-                raise ParseModeRejected("can't parse entities: unsupported start tag")
+                raise ParseModeRejected(self.format_rejection)
             with self.lock:
                 self.next_message_id += 1
                 message = dict(params)
@@ -550,16 +556,61 @@ class MirrorTestCase(unittest.TestCase):
         elapsed = time.time() - started
         self.assertLess(elapsed, 5, f"the stop took {elapsed:.1f}s while polling")
 
+    def test_only_one_voice_note_transcribes_at_a_time(self) -> None:
+        gate = Path(self.tmp.name) / "transcription-gate"
+        starts = Path(self.tmp.name) / "transcription-starts"
+        slow = Path(self.tmp.name) / "gated-parakeet"
+        slow.write_text(
+            "#!/bin/sh\n"
+            f"printf 'start\\n' >> {shlex.quote(str(starts))}\n"
+            f"while [ ! -e {shlex.quote(str(gate))} ]; do sleep 0.05; done\n"
+            "printf 'finished transcript\\n'\n",
+            encoding="utf-8",
+        )
+        slow.chmod(0o755)
+        config = json.loads((self.home / "config.json").read_text())
+        config["transcribe_command"] = str(slow)
+        (self.home / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        self.stop_bot()
+        self.start_bot()
+
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.telegram.push_voice(450)
+        self.telegram.wait_sent(
+            lambda m: m.get("text") == "Transcribing…"
+            and m.get("reply_parameters", {}).get("message_id") == 450
+        )
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline and not starts.exists():
+            time.sleep(0.05)
+        self.assertTrue(starts.exists(), "the first transcription never started")
+        self.telegram.push_voice(451)
+        refused = self.telegram.wait_sent(
+            lambda m: m.get("reply_parameters", {}).get("message_id") == 451
+        )
+        self.assertEqual(
+            refused["text"],
+            "Another voice note is already being transcribed. Try again shortly.",
+        )
+        self.assertEqual(starts.read_text().splitlines(), ["start"])
+        gate.touch()
+        self.telegram.wait_sent(
+            lambda m: m.get("text") == "finished transcript" and m.get("reply_markup")
+        )
+
     def test_abandoned_transcripts_do_not_accumulate(self) -> None:
         pi = self.connect_pi()
         self.enable_mirror(pi)
         # Cards nobody taps must not retain their text and audio forever.
         for index in range(40):
-            self.telegram.push_voice(500 + index)
-        self.telegram.wait_sent(
-            lambda m: m.get("reply_parameters", {}).get("message_id") == 539
-            and m.get("reply_markup") is not None
-        )
+            message_id = 500 + index
+            self.telegram.push_voice(message_id)
+            self.telegram.wait_sent(
+                lambda m, expected=message_id:
+                m.get("reply_parameters", {}).get("message_id") == expected
+                and m.get("reply_markup") is not None
+            )
         deadline = time.time() + DEADLINE
         while time.time() < deadline:
             if len(list((self.home / "audio").glob("*.ogg"))) <= 32:
@@ -697,6 +748,7 @@ class MirrorTestCase(unittest.TestCase):
 
     def test_rejected_formatting_falls_back_to_plain_text_once(self) -> None:
         self.telegram.reject_parse_mode = True
+        self.telegram.format_rejection = "wrong HTTP URL specified"
         pi = self.connect_pi()
         self.enable_mirror(pi)
         pi.send({"t": "reply", "text": "**bold** and `code`"})
