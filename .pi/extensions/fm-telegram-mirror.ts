@@ -21,10 +21,10 @@ import { spawnSync } from "node:child_process";
 import {
   closeSync,
   constants as fsConstants,
-  existsSync,
   fchmodSync,
   fstatSync,
   ftruncateSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -126,7 +126,17 @@ function writeDisplayStatus(shown: boolean): void {
   let descriptor: number | undefined;
   try {
     const home = botHome();
-    if (!existsSync(home)) mkdirSync(home, { recursive: true, mode: 0o700 });
+    try {
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw error;
+    }
+    const homeDetails = lstatSync(home);
+    if (!homeDetails.isDirectory()) throw new Error(`${home} is not a real directory`);
+    if (typeof process.getuid === "function" && homeDetails.uid !== process.getuid()) {
+      throw new Error(`${home} belongs to another account`);
+    }
     const target = join(home, DISPLAY_SETTING_FILE);
     descriptor = openSync(
       target,

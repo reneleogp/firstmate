@@ -714,6 +714,27 @@ if (!lstatSync(displayPreference).isSymbolicLink()) {
 if (!persistenceErrors.some((message) => message.includes("could not persist"))) {
   fail(`the refused display preference write was not reported: ${JSON.stringify(persistenceErrors)}`);
 }
+
+const linkedHomeTarget = join(dirname(home), "linked-private-target");
+const linkedHome = join(dirname(home), "linked-private-home");
+mkdirSync(linkedHomeTarget, { mode: 0o700 });
+writeFileSync(join(linkedHomeTarget, "pi-display-status"), "on\n");
+symlinkSync(linkedHomeTarget, linkedHome);
+process.env.FM_TELEGRAM_DIR = linkedHome;
+persistenceErrors.length = 0;
+console.error = (message) => persistenceErrors.push(String(message));
+await settingsDefinition.handler("", ctx);
+console.error = originalConsoleError;
+process.env.FM_TELEGRAM_DIR = home;
+if (readFileSync(join(linkedHomeTarget, "pi-display-status"), "utf8") !== "on\n") {
+  fail("the display preference write traversed a symlinked private home");
+}
+if (!lstatSync(linkedHome).isSymbolicLink()) {
+  fail("the refused symlinked private home was replaced");
+}
+if (!persistenceErrors.some((message) => message.includes("could not persist"))) {
+  fail(`the symlinked private home refusal was not reported: ${JSON.stringify(persistenceErrors)}`);
+}
 ctx.mode = "print";
 
 // 7. Shutdown releases the connection and stops reconnecting, and a later

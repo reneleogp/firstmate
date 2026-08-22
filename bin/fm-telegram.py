@@ -2064,6 +2064,57 @@ def process_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def process_identity(pid: Optional[int]) -> Optional[tuple[int, int, int]]:
+    if pid is None or pid <= 0:
+        return None
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+
+            class ProcBSDInfo(ctypes.Structure):
+                _fields_ = [
+                    ("pbi_flags", ctypes.c_uint32),
+                    ("pbi_status", ctypes.c_uint32),
+                    ("pbi_xstatus", ctypes.c_uint32),
+                    ("pbi_pid", ctypes.c_uint32),
+                    ("pbi_ppid", ctypes.c_uint32),
+                    ("pbi_uid", ctypes.c_uint32),
+                    ("pbi_gid", ctypes.c_uint32),
+                    ("pbi_ruid", ctypes.c_uint32),
+                    ("pbi_rgid", ctypes.c_uint32),
+                    ("pbi_svuid", ctypes.c_uint32),
+                    ("pbi_svgid", ctypes.c_uint32),
+                    ("rfu_1", ctypes.c_uint32),
+                    ("pbi_comm", ctypes.c_char * 16),
+                    ("pbi_name", ctypes.c_char * 32),
+                    ("pbi_nfiles", ctypes.c_uint32),
+                    ("pbi_pgid", ctypes.c_uint32),
+                    ("pbi_pjobc", ctypes.c_uint32),
+                    ("e_tdev", ctypes.c_uint32),
+                    ("e_tpgid", ctypes.c_uint32),
+                    ("pbi_nice", ctypes.c_int32),
+                    ("pbi_start_tvsec", ctypes.c_uint64),
+                    ("pbi_start_tvusec", ctypes.c_uint64),
+                ]
+
+            details = ProcBSDInfo()
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            size = ctypes.sizeof(details)
+            if libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(details), size) != size:
+                return None
+            if details.pbi_pid != pid:
+                return None
+            return pid, int(details.pbi_start_tvsec), int(details.pbi_start_tvusec)
+        except (AttributeError, OSError, ValueError):
+            return None
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = stat_text.rsplit(")", 1)[1].split()
+        return pid, int(fields[19]), 0
+    except (IndexError, OSError, ValueError):
+        return None
+
+
 class ServiceManager:
     """One home's per-user service, however this platform runs one."""
 
@@ -2431,22 +2482,29 @@ class LaunchdService(ServiceManager):
         """
         self.require_own_job(job, action)
         pid = job.pid
+        identity = process_identity(pid)
+
+        def captured_process_alive() -> bool:
+            if identity is None:
+                return process_alive(pid)
+            return process_identity(pid) == identity
+
         result = self.launchctl("bootout", self.target)
         if result.returncode not in (0, LAUNCHCTL_IN_PROGRESS, LAUNCHCTL_NO_SUCH_PROCESS) \
                 and self.job().loaded:
             raise TelegramError(f"could not stop {LAUNCHD_LABEL}: {result.stdout.strip()}")
         deadline = time.monotonic() + self.stop_timeout
         while time.monotonic() < deadline:
-            if not self.job().loaded and not process_alive(pid):
+            if not self.job().loaded and not captured_process_alive():
                 return
             time.sleep(LAUNCHD_POLL_SECONDS)
-        if process_alive(pid):
+        if identity is not None and process_identity(pid) == identity:
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
             kill_deadline = time.monotonic() + LAUNCHD_KILL_TIMEOUT
-            while time.monotonic() < kill_deadline and process_alive(pid):
+            while time.monotonic() < kill_deadline and captured_process_alive():
                 time.sleep(LAUNCHD_POLL_SECONDS)
-        if self.job().loaded or process_alive(pid):
+        if self.job().loaded or captured_process_alive():
             raise TelegramError(
                 f"{LAUNCHD_LABEL} did not stop within {int(self.stop_timeout)}s"
             )

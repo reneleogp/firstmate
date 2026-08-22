@@ -428,6 +428,42 @@ test_a_failed_install_restores_a_previous_disable() {
 
 # --- stopping ---------------------------------------------------------------
 
+test_stop_does_not_signal_a_reused_pid() {
+  python3 - "$BOT" <<'PY' || fail "stop signaled a process that reused the service pid"
+import importlib.util
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_telegram", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+identities = iter([(8123, 10, 0), (8123, 20, 0)])
+signals = []
+module.process_identity = lambda _pid: next(identities)
+module.os.kill = lambda pid, sent: signals.append((pid, sent))
+
+class ReusedPidStop(module.LaunchdService):
+    target = "gui/501/com.firstmate.telegram"
+    stop_timeout = 0.1
+
+    def require_own_job(self, _job, _action):
+        return None
+
+    def launchctl(self, *_arguments):
+        return subprocess.CompletedProcess([], 0, "")
+
+    def job(self):
+        return module.LaunchdJob(loaded=False)
+
+subject = object.__new__(ReusedPidStop)
+subject.stop_job(module.LaunchdJob(loaded=True, pid=8123), "stopped")
+assert signals == [], f"the replacement process was signaled: {signals}"
+PY
+  pass "telegram macOS: stop treats a reused pid as the departed service generation"
+}
+
 test_stop_escalates_past_a_service_that_ignores_it() {
   local out pid
   new_case
@@ -705,6 +741,7 @@ test_a_failed_update_restores_the_previous_definition_and_child
 test_a_failed_update_restores_a_keepalive_job_between_children
 test_an_incomplete_update_rollback_is_reported
 test_a_failed_install_restores_a_previous_disable
+test_stop_does_not_signal_a_reused_pid
 test_stop_escalates_past_a_service_that_ignores_it
 test_stop_leaves_the_installation_in_place
 test_disable_is_recorded_even_when_nothing_is_running
