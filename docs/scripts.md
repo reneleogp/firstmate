@@ -122,4 +122,4 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-public-followup-lib.sh` | Shared relay-activation gate, O(1) presence checks, and private transport paths for promised public replies |
 | `fm-public-followup.sh`  | Reconcile typed terminal work results into a public commitment and deliver its final reply once |
 | `fm-public-followup-emit.sh` | Report one typed terminal work result into the home that owes the public reply    |
-| `fm-telegram.py`         | Run, pair, and service the WSL Telegram terminal mirror bot beside one Pi session ([telegram.md](telegram.md)) |
+| `fm-telegram.py`         | Run, pair, and service the WSL and macOS Telegram terminal mirror bot beside one Pi session ([telegram.md](telegram.md)) |

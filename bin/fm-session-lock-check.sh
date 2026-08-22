@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Verify that a process belongs to the live Pi session holding a home's session lock.
 # Usage: fm-session-lock-check.sh <state-dir> <peer-pid>
+#
+# Environment:
+#   FM_TELEGRAM_PLATFORM   linux or macos, overriding the uname verdict
+#   FM_TELEGRAM_PROC_ROOT  /proc root to read (Linux only)
 set -u
 
 if [ "$#" -ne 2 ]; then
@@ -24,22 +28,70 @@ case "$(basename -- "$lock_comm")" in
   *) exit 1 ;;
 esac
 
+# A lock names a pid, and a pid is reused. Refusing a lock older than the
+# process that claims it is what keeps a recycled pid from inheriting an
+# earlier session's authority. Both platforms answer the same question - did
+# this process start at or before the lock was written - from whatever identity
+# their kernel exposes: /proc on Linux, elapsed process time on macOS, which has
+# no /proc at all.
+#
 # Linux exposes process starts in clock ticks from boot while lock mtimes have
-# one-second portable precision. One second admits the precision boundary only.
+# one-second portable precision, and macOS reports elapsed time floored to whole
+# seconds. One second admits either precision boundary and nothing more.
 LOCK_TIME_TOLERANCE_SECONDS=1
-PROC_ROOT=${FM_TELEGRAM_PROC_ROOT:-/proc}
-proc_stat=$(cat "$PROC_ROOT/$lock_pid/stat" 2>/dev/null) || exit 1
-proc_fields=${proc_stat##*) }
-read -r -a proc_field_array <<< "$proc_fields"
-[ "${#proc_field_array[@]}" -ge 20 ] || exit 1
-start_ticks=${proc_field_array[19]}
-boot_time=$(awk '$1 == "btime" && $2 ~ /^[0-9]+$/ { print $2; found=1; exit } END { if (!found) exit 1 }' "$PROC_ROOT/stat" 2>/dev/null) || exit 1
-clock_ticks=$(getconf CLK_TCK 2>/dev/null) || exit 1
-lock_time=$(stat -c %Y -- "$lock_path" 2>/dev/null) || exit 1
-case "$start_ticks:$boot_time:$clock_ticks:$lock_time" in
-  *[!0-9:]*) exit 1 ;;
+
+platform=${FM_TELEGRAM_PLATFORM:-}
+if [ -z "$platform" ]; then
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) platform=macos ;;
+    *) platform=linux ;;
+  esac
+fi
+
+case "$platform" in
+  macos)
+    elapsed=$(ps -o etime= -p "$lock_pid" 2>/dev/null) || exit 1
+    now=$(date +%s) || exit 1
+    # date -r <file> reports that file's modification time on both BSD and GNU,
+    # so the macOS branch needs no `stat` dialect and stays runnable, against
+    # real processes and real files, on the Linux hosts that run this suite.
+    lock_time=$(date -r "$lock_path" +%s 2>/dev/null) || exit 1
+    case "$now:$lock_time" in
+      *[!0-9:]*) exit 1 ;;
+    esac
+    start_time=$(awk -v elapsed="$elapsed" -v now="$now" '
+      BEGIN {
+        gsub(/[[:space:]]/, "", elapsed)
+        if (elapsed !~ /^([0-9]+-)?([0-9]+:)?[0-9]+:[0-9]+$/) exit 1
+        days = 0
+        rest = elapsed
+        if (split(elapsed, parts, "-") == 2) { days = parts[1]; rest = parts[2] }
+        count = split(rest, fields, ":")
+        if (count == 3) seconds = fields[1] * 3600 + fields[2] * 60 + fields[3]
+        else if (count == 2) seconds = fields[1] * 60 + fields[2]
+        else exit 1
+        print now - (days * 86400 + seconds)
+      }') || exit 1
+    ;;
+  *)
+    PROC_ROOT=${FM_TELEGRAM_PROC_ROOT:-/proc}
+    proc_stat=$(cat "$PROC_ROOT/$lock_pid/stat" 2>/dev/null) || exit 1
+    proc_fields=${proc_stat##*) }
+    read -r -a proc_field_array <<< "$proc_fields"
+    [ "${#proc_field_array[@]}" -ge 20 ] || exit 1
+    start_ticks=${proc_field_array[19]}
+    boot_time=$(awk '$1 == "btime" && $2 ~ /^[0-9]+$/ { print $2; found=1; exit } END { if (!found) exit 1 }' "$PROC_ROOT/stat" 2>/dev/null) || exit 1
+    clock_ticks=$(getconf CLK_TCK 2>/dev/null) || exit 1
+    lock_time=$(stat -c %Y -- "$lock_path" 2>/dev/null) || exit 1
+    case "$start_ticks:$boot_time:$clock_ticks:$lock_time" in
+      *[!0-9:]*) exit 1 ;;
+    esac
+    [ "$clock_ticks" -gt 0 ] 2>/dev/null || exit 1
+    start_time=$(awk -v boot="$boot_time" -v ticks="$start_ticks" -v hz="$clock_ticks" \
+      'BEGIN { print boot + (ticks / hz) }') || exit 1
+    ;;
 esac
-[ "$clock_ticks" -gt 0 ] 2>/dev/null || exit 1
-awk -v boot="$boot_time" -v ticks="$start_ticks" -v hz="$clock_ticks" \
-  -v lock="$lock_time" -v tolerance="$LOCK_TIME_TOLERANCE_SECONDS" \
-  'BEGIN { exit !((boot + (ticks / hz)) <= (lock + tolerance)) }'
+
+[ -n "$start_time" ] || exit 1
+awk -v start="$start_time" -v lock="$lock_time" -v tolerance="$LOCK_TIME_TOLERANCE_SECONDS" \
+  'BEGIN { exit !(start <= (lock + tolerance)) }'

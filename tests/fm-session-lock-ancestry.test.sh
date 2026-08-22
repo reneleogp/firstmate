@@ -269,6 +269,50 @@ test_telegram_peer_authentication_binds_lock_to_process_start() {
   pass "telegram session-lock: authentication binds a lock to its Pi process generation"
 }
 
+test_macos_peer_authentication_binds_lock_to_process_start() {
+  local dir pi_bin pi_pid checker lock_path
+  dir="$TMP_ROOT/telegram-macos-generation"
+  checker="$ROOT/bin/fm-session-lock-check.sh"
+  mkdir -p "$dir/state"
+  lock_path="$dir/state/.lock"
+  pi_bin="$dir/pi"
+  cp /bin/bash "$pi_bin"
+  chmod +x "$pi_bin"
+  "$pi_bin" -c 'sleep 30; :' &
+  pi_pid=$!
+  printf '%s\n' "$pi_pid" >"$lock_path"
+
+  # macOS has no /proc, so that branch reads elapsed process time instead. Its
+  # arithmetic and both refusals are exercised here against a real process and
+  # a real lock file, with only the platform verdict forced.
+  FM_TELEGRAM_PLATFORM=macos "$checker" "$dir/state" "$pi_pid" \
+    || { kill "$pi_pid" 2>/dev/null || true; wait "$pi_pid" 2>/dev/null || true; fail "macos: the genuine Pi lock owner was refused"; }
+
+  # A lock written before this process existed is a recycled pid inheriting an
+  # earlier session's authority, whatever the platform.
+  touch -d '@1000' "$lock_path"
+  if FM_TELEGRAM_PLATFORM=macos "$checker" "$dir/state" "$pi_pid"; then
+    kill "$pi_pid" 2>/dev/null || true
+    wait "$pi_pid" 2>/dev/null || true
+    fail "macos: a same-family Pi process started after the stale lock authenticated"
+  fi
+
+  # The Linux-only /proc source must not decide anything on that branch.
+  touch "$lock_path"
+  FM_TELEGRAM_PLATFORM=macos FM_TELEGRAM_PROC_ROOT="$dir/no-such-proc" \
+    "$checker" "$dir/state" "$pi_pid" \
+    || { kill "$pi_pid" 2>/dev/null || true; wait "$pi_pid" 2>/dev/null || true; fail "macos: authentication still depended on /proc"; }
+
+  kill "$pi_pid" 2>/dev/null || true
+  wait "$pi_pid" 2>/dev/null || true
+
+  # A dead pid has no elapsed time to read, so the macOS branch must fail closed.
+  if FM_TELEGRAM_PLATFORM=macos "$checker" "$dir/state" "$pi_pid"; then
+    fail "macos: a dead lock owner authenticated"
+  fi
+  pass "telegram session-lock: the macOS branch binds a lock to its Pi process generation without /proc"
+}
+
 test_peer_authentication_rejects_stale_and_invalid_locks() {
   local dir fakebin
   dir="$TMP_ROOT/peer-auth"
@@ -459,6 +503,7 @@ test_ordinary_paths_are_never_harness_processes
 test_harness_beyond_a_gap_never_owns_the_lock
 test_competing_version_named_session_is_seen_as_live
 test_telegram_peer_authentication_binds_lock_to_process_start
+test_macos_peer_authentication_binds_lock_to_process_start
 test_peer_authentication_rejects_stale_and_invalid_locks
 test_e2e_version_named_session_claims_the_home
 test_e2e_daemon_parented_session_claims_the_home

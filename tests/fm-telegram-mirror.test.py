@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Focused acceptance tests for bin/fm-telegram.py, the WSL Telegram mirror bot.
+"""Focused acceptance tests for bin/fm-telegram.py, the Telegram mirror bot.
 
 Each test drives the real bot process end to end: a fake Telegram Bot API over
 loopback HTTP, a fake Pi extension over the bot's own Unix socket, and a fake
 local Parakeet command. Nothing here inspects the bot's source.
+
+The macOS service slice has its own runner, tests/fm-telegram-macos-service.test.sh.
 """
 
 from __future__ import annotations
@@ -1734,6 +1736,7 @@ class ServiceUnitTestCase(unittest.TestCase):
                 "FM_TELEGRAM_DIR": tmp,
                 "FM_HOME": firstmate_home,
                 "TELEGRAM_BOT_TOKEN": TOKEN,
+                "FM_TELEGRAM_ASSUME_PLATFORM": "wsl",
             })
             unit = subprocess.run(
                 [sys.executable, str(BOT), "service-unit"], env=environment,
@@ -1748,11 +1751,14 @@ class ServiceUnitTestCase(unittest.TestCase):
         self.assertIn("TimeoutStopSec=20", unit)
         self.assertNotIn(TOKEN, unit)
 
-    def test_service_install_refuses_outside_wsl(self) -> None:
+    def test_service_install_refuses_on_an_unsupported_host(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             environment = dict(os.environ)
             environment.update({"FM_TELEGRAM_DIR": tmp, "TELEGRAM_BOT_TOKEN": TOKEN})
             environment.pop("WSL_DISTRO_NAME", None)
+            # Decided here rather than by the host running the suite, so this
+            # refusal is the same fact on WSL, macOS, and plain Linux.
+            environment["FM_TELEGRAM_ASSUME_PLATFORM"] = "none"
             environment["FM_TELEGRAM_ASSUME_WSL"] = "0"
             environment["HOME"] = tmp
             result = subprocess.run(
@@ -1760,7 +1766,7 @@ class ServiceUnitTestCase(unittest.TestCase):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
             )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("WSL only", result.stderr)
+        self.assertIn("WSL and macOS only", result.stderr)
 
 
 if __name__ == "__main__":
