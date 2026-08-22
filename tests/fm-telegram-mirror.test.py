@@ -419,10 +419,16 @@ class MirrorTestCase(unittest.TestCase):
         )
         self.addCleanup(self.stop_bot)
         deadline = time.time() + DEADLINE
-        while not self.socket_path.exists() and time.time() < deadline:
+        # The socket FILE appears at bind(), before listen(), so its existence
+        # alone lets a connection race in and be refused. The bot publishes its
+        # readiness marker only once the server is accepting, so that is what
+        # says it is up.
+        marker = self.home / "service-ready.json"
+        while not marker.exists() and time.time() < deadline:
             if self.bot.poll() is not None:
                 raise AssertionError(f"bot exited: {self.bot.communicate()[1]}")
             time.sleep(0.02)
+        self.assertTrue(marker.exists(), "bot never reported itself ready")
         self.assertTrue(self.socket_path.exists(), "bot never opened its socket")
 
     def stop_bot(self) -> None:
