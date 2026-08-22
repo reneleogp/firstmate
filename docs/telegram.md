@@ -118,6 +118,8 @@ Messages still reach Firstmate exactly as before, and an accepted message still 
 Images travel both ways.
 
 Paste or attach an image in the terminal and it appears in Telegram as real, viewable media rather than a local path: one photo on its own, or an album that keeps the order you sent.
+Pi's own paste writes the image into the temp directory and puts that path in your message, so the mirror recognises exactly that artifact: Pi's own file name in Pi's own temp directory, a regular file this account owns, of an accepted type whose actual bytes match.
+Nothing else is ever uploaded, so typing or quoting any other file path mirrors only the words, and the path itself is kept out of the phone caption because it means nothing there.
 Your terminal text rides along as the caption when it fits, and is sent as its own `You · Terminal` message when it is too long for one.
 An image-only submission still arrives, captioned `You · Terminal`.
 Images that are the wrong type or too large are skipped with a short note saying how many, and if Telegram rejects an upload you are told plainly; a failed album is never re-sent, so nothing arrives twice.

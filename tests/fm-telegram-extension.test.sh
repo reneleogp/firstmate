@@ -47,7 +47,8 @@ if ! (cd "$FIXTURE" && \
   WORKER_HOME="$TMP_ROOT/workerhome" \
   node --input-type=module >"$OUT" 2>&1) <<'JS'
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -194,6 +195,92 @@ if (JSON.stringify(imageFrames[0]) !== JSON.stringify({
 }
 if (imageFrames[1].text !== "" || imageFrames[1].images.length !== 1) {
   fail(`an image-only submission was not mirrored intact: ${JSON.stringify(imageFrames[1])}`);
+}
+
+// 1c. A pasted clipboard image is the live case: Pi writes it into the temp
+//     directory and inserts the path as ordinary text, with no image event at
+//     all, so the artifact itself is the only signal. Recognition must be
+//     narrow enough that naming any other file uploads nothing.
+const clipboardDir = tmpdir();
+const uuid = "a864c680-178e-4995-86d9-48d62744aa3e";
+const pngBytes = Buffer.from("89504e470d0a1a0a" + "00".repeat(24), "hex");
+const jpegBytes = Buffer.from("ffd8ff" + "11".repeat(24), "hex");
+const genuine = join(clipboardDir, `pi-clipboard-${uuid}.png`);
+const genuineJpeg = join(clipboardDir, `pi-clipboard-b1c2d3e4-1111-2222-3333-444455556666.jpg`);
+writeFileSync(genuine, pngBytes);
+writeFileSync(genuineJpeg, jpegBytes);
+
+// Negatives, each a file that really exists and is really named plausibly.
+const arbitrary = join(clipboardDir, "fm-telegram-secret.png");
+writeFileSync(arbitrary, pngBytes);
+const wrongMagic = join(clipboardDir, `pi-clipboard-99999999-1111-2222-3333-444455556666.png`);
+writeFileSync(wrongMagic, Buffer.from("not an image at all"));
+const oversized = join(clipboardDir, `pi-clipboard-88888888-1111-2222-3333-444455556666.png`);
+writeFileSync(oversized, Buffer.concat([pngBytes, Buffer.alloc(11 * 1024 * 1024)]));
+const linkTarget = join(clipboardDir, "fm-telegram-link-target.png");
+writeFileSync(linkTarget, pngBytes);
+const symlinked = join(clipboardDir, `pi-clipboard-77777777-1111-2222-3333-444455556666.png`);
+try { unlinkSync(symlinked); } catch {}
+symlinkSync(linkTarget, symlinked);
+const missing = join(clipboardDir, `pi-clipboard-66666666-1111-2222-3333-444455556666.png`);
+try { unlinkSync(missing); } catch {}
+
+const framesBeforePaste = received.filter((frame) => frame.t === "terminal").length;
+// The captain's exact submission: the clipboard path followed by their words.
+handlers.get("input")({ text: `${genuine} lets see here`, source: "interactive" }, ctx);
+await waitFor(
+  () => received.filter((frame) => frame.t === "terminal").length === framesBeforePaste + 1,
+  "the pasted clipboard image",
+);
+const pasted = received.filter((frame) => frame.t === "terminal").at(-1);
+if (!pasted.images || pasted.images.length !== 1) {
+  fail(`a pasted clipboard image was not mirrored: ${JSON.stringify(pasted)}`);
+}
+if (pasted.images[0].mime !== "image/png"
+    || pasted.images[0].data !== pngBytes.toString("base64")) {
+  fail(`the mirrored bytes were not the pasted image: ${JSON.stringify(pasted.images[0]).slice(0, 120)}`);
+}
+// The phone gets the captain's words, never Pi's local plumbing.
+if (pasted.text !== "lets see here") {
+  fail(`the caption kept the local path or lost the text: ${JSON.stringify(pasted.text)}`);
+}
+
+// Two pastes in one submission keep their order.
+handlers.get("input")({ text: `${genuine} and ${genuineJpeg}`, source: "interactive" }, ctx);
+await waitFor(
+  () => received.filter((frame) => frame.t === "terminal").length === framesBeforePaste + 2,
+  "the two-image paste",
+);
+const twoShots = received.filter((frame) => frame.t === "terminal").at(-1);
+if (JSON.stringify(twoShots.images?.map((image) => image.mime)) !==
+    JSON.stringify(["image/png", "image/jpeg"])) {
+  fail(`two pasted images lost their order: ${JSON.stringify(twoShots.images?.length)}`);
+}
+if (twoShots.text !== "and") {
+  fail(`unexpected caption for a two-image paste: ${JSON.stringify(twoShots.text)}`);
+}
+
+// Nothing else may ever be uploaded, however it is named or linked.
+const framesBeforeNegatives = received.filter((frame) => frame.t === "terminal").length;
+for (const probe of [arbitrary, wrongMagic, oversized, symlinked, missing,
+                     "/etc/passwd", join(clipboardDir, "pi-clipboard-not-a-uuid.png"),
+                     `${genuine}.txt`]) {
+  handlers.get("input")({ text: `look at ${probe}`, source: "interactive" }, ctx);
+}
+handlers.get("input")({ text: `${operational} ${genuine}`, source: "interactive" }, ctx);
+await new Promise((resolve) => setTimeout(resolve, 400));
+const negatives = received.filter((frame) => frame.t === "terminal").slice(framesBeforeNegatives);
+for (const frame of negatives) {
+  if (frame.images) {
+    fail(`a file that is not a genuine clipboard paste was uploaded: ${JSON.stringify(frame.text)}`);
+  }
+}
+if (negatives.length !== 8) {
+  fail(`operational input was mirrored or a probe was dropped: ${negatives.length}`);
+}
+
+for (const path of [genuine, genuineJpeg, arbitrary, wrongMagic, oversized, linkTarget, symlinked]) {
+  try { unlinkSync(path); } catch {}
 }
 
 // 2. Every completed reply is mirrored exactly once, as Pi finalizes it, while

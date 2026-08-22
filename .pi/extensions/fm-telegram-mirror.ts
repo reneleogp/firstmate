@@ -18,10 +18,10 @@
 // extension is the client, because the bot outlives every Pi session. The wire
 // protocol is stated once in that script's header.
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getSettingsListTheme, type ExtensionAPI, type ExtensionContext }
   from "@earendil-works/pi-coding-agent";
@@ -133,6 +133,71 @@ function asQueuedImage(value: unknown): QueuedImage | undefined {
   const candidate = value as { data?: unknown; mime?: unknown };
   if (typeof candidate.data !== "string" || typeof candidate.mime !== "string") return undefined;
   return { data: candidate.data, mime: candidate.mime };
+}
+
+// Pi's clipboard paste writes the image into the system temp directory as
+// pi-clipboard-<uuid>.<ext> and inserts that path into the editor as ordinary
+// text (interactive-mode's handleClipboardPaste in Pi 0.84.2). There is no
+// image event to subscribe to, so a pasted screenshot can only be recognised by
+// that artifact. Recognition is deliberately narrow: exactly Pi's own file name
+// in Pi's own temp directory, a real file this account owns, and bytes whose
+// magic matches the extension. A path merely typed into the terminal never
+// qualifies, so naming a file cannot make the mirror upload it.
+const CLIPBOARD_NAME =
+  /^pi-clipboard-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(png|jpg|jpeg|webp)$/;
+const MAX_CLIPBOARD_BYTES = positiveInteger("FM_TELEGRAM_MAX_IMAGE_BYTES", 10 * 1024 * 1024);
+const MAX_CLIPBOARD_TOTAL_BYTES = MAX_CLIPBOARD_BYTES * 3;
+const MAX_CLIPBOARD_IMAGES = 10;
+
+function imageMimeFromMagic(bytes: Buffer): string | undefined {
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (bytes.length >= 12 && bytes.subarray(0, 4).toString("latin1") === "RIFF" &&
+      bytes.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
+  return undefined;
+}
+
+function clipboardMime(name: string): string | undefined {
+  if (name.endsWith(".png")) return "image/png";
+  if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
+  if (name.endsWith(".webp")) return "image/webp";
+  return undefined;
+}
+
+type ClipboardPaste = { token: string; image: QueuedImage };
+
+function clipboardPastes(text: string): ClipboardPaste[] {
+  const directory = tmpdir();
+  const found: ClipboardPaste[] = [];
+  let total = 0;
+  for (const token of text.split(/\s+/)) {
+    if (found.length >= MAX_CLIPBOARD_IMAGES) break;
+    if (dirname(token) !== directory) continue;
+    const name = basename(token);
+    if (!CLIPBOARD_NAME.test(name)) continue;
+    const declared = clipboardMime(name);
+    if (!declared) continue;
+    try {
+      // lstat, so a symlink pointing somewhere else is refused rather than
+      // followed, and only this account's own regular file is read.
+      const info = lstatSync(token);
+      if (!info.isFile() || info.isSymbolicLink()) continue;
+      if (info.size <= 0 || info.size > MAX_CLIPBOARD_BYTES) continue;
+      if (typeof process.getuid === "function" && info.uid !== process.getuid()) continue;
+      if (total + info.size > MAX_CLIPBOARD_TOTAL_BYTES) continue;
+      const bytes = readFileSync(token);
+      // The bytes decide, not the name: a renamed file is not an image.
+      if (imageMimeFromMagic(bytes) !== declared) continue;
+      total += info.size;
+      found.push({ token, image: { data: bytes.toString("base64"), mime: declared } });
+    } catch {
+      continue;
+    }
+  }
+  return found;
 }
 
 // Pi hands attached images to the input event as its own image content; the
@@ -386,11 +451,20 @@ export default function (pi: ExtensionAPI) {
   pi.on?.("input", (event) => {
     if (event.source !== "interactive") return;
     const text = typeof event.text === "string" ? event.text : "";
-    const images = terminalImages(event.images);
-    // An image-only submission has no text but is still a real submission.
-    if (!text.trim() && images.length === 0) return;
     if (text.trim() && classifyFirstmateOperationalText(text) !== undefined) return;
-    write(images.length > 0 ? { t: "terminal", text, images } : { t: "terminal", text });
+    const pastes = clipboardPastes(text);
+    const images = [...terminalImages(event.images), ...pastes.map((paste) => paste.image)];
+    // The local path is Pi's own plumbing and means nothing on a phone, so the
+    // caption keeps only what the captain actually wrote around it. Firstmate
+    // still receives the submission exactly as typed.
+    let caption = text;
+    for (const paste of pastes) caption = caption.split(paste.token).join(" ");
+    caption = caption.replace(/\s+/g, " ").trim();
+    // An image-only submission has no text but is still a real submission.
+    if (!caption && images.length === 0) return;
+    write(images.length > 0
+      ? { t: "terminal", text: caption, images }
+      : { t: "terminal", text });
   });
 
   // Every completed reply is mirrored as Pi finalizes it, exactly once.
