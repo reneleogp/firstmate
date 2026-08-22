@@ -555,7 +555,7 @@ SH
 
   FM_HOME="$home" PATH="$fakebin:$BASE_PATH" "$ROOT/bin/fm-lock.sh" \
     || fail "fm-lock did not acquire from Kimi ancestry"
-  case "$(cat "$home/state/.lock")" in
+  case "$(fm_test_lock_pid "$home/state")" in
     ''|*[!0-9]*) fail "fm-lock did not record the Kimi harness ancestor" ;;
   esac
   printf '%s\n' "$$" > "$home/state/.lock"
