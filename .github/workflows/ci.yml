@@ -129,9 +129,9 @@ jobs:
   tests-portable-serial:
     name: Behavior portable serial ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    # Current portable-serial shards can take about 15 min of script time as
-    # duration hints age. This cap leaves setup and runner-variance headroom
-    # while remaining a hang tripwire rather than a healthy expected duration.
+    # Current balance hints put each shard at about 11 min of serial work.
+    # The cap preserves more than 2x hang-tripwire margin for runner and timing
+    # variance instead of cancelling a healthy shard near the old 15 min bound.
     timeout-minutes: 25
     strategy:
       # Every shard reports so one failure never hides another shard's result.
