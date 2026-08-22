@@ -270,11 +270,19 @@ test_telegram_peer_authentication_binds_lock_to_process_start() {
 }
 
 test_macos_peer_authentication_binds_lock_to_process_start() {
-  local dir pi_bin pi_pid checker lock_path
+  local dir fakebin pi_bin pi_pid checker lock_path
   dir="$TMP_ROOT/telegram-macos-generation"
   checker="$ROOT/bin/fm-session-lock-check.sh"
-  mkdir -p "$dir/state"
+  fakebin="$dir/fakebin"
+  mkdir -p "$dir/state" "$fakebin"
   lock_path="$dir/state/.lock"
+  cat >"$fakebin/stat" <<'SH'
+#!/usr/bin/env bash
+# Semantic stand-in for macOS stat; this Linux host cannot execute BSD stat.
+[ "$#" -eq 3 ] && [ "$1" = -f ] && [ "$2" = %m ] || exit 64
+exec /usr/bin/stat -c %Y "$3"
+SH
+  chmod +x "$fakebin/stat"
   pi_bin="$dir/pi"
   cp /bin/bash "$pi_bin"
   chmod +x "$pi_bin"
@@ -284,14 +292,15 @@ test_macos_peer_authentication_binds_lock_to_process_start() {
 
   # macOS has no /proc, so that branch reads elapsed process time instead. Its
   # arithmetic and both refusals are exercised here against a real process and
-  # a real lock file, with only the platform verdict forced.
-  FM_TELEGRAM_PLATFORM=macos "$checker" "$dir/state" "$pi_pid" \
+  # lock file; only the platform verdict and BSD stat's mtime semantics are
+  # stood in on this Linux host.
+  PATH="$fakebin:$PATH" FM_TELEGRAM_PLATFORM=macos "$checker" "$dir/state" "$pi_pid" \
     || { kill "$pi_pid" 2>/dev/null || true; wait "$pi_pid" 2>/dev/null || true; fail "macos: the genuine Pi lock owner was refused"; }
 
   # A lock written before this process existed is a recycled pid inheriting an
   # earlier session's authority, whatever the platform.
   touch -d '@1000' "$lock_path"
-  if FM_TELEGRAM_PLATFORM=macos "$checker" "$dir/state" "$pi_pid"; then
+  if PATH="$fakebin:$PATH" FM_TELEGRAM_PLATFORM=macos "$checker" "$dir/state" "$pi_pid"; then
     kill "$pi_pid" 2>/dev/null || true
     wait "$pi_pid" 2>/dev/null || true
     fail "macos: a same-family Pi process started after the stale lock authenticated"
@@ -299,7 +308,7 @@ test_macos_peer_authentication_binds_lock_to_process_start() {
 
   # The Linux-only /proc source must not decide anything on that branch.
   touch "$lock_path"
-  FM_TELEGRAM_PLATFORM=macos FM_TELEGRAM_PROC_ROOT="$dir/no-such-proc" \
+  PATH="$fakebin:$PATH" FM_TELEGRAM_PLATFORM=macos FM_TELEGRAM_PROC_ROOT="$dir/no-such-proc" \
     "$checker" "$dir/state" "$pi_pid" \
     || { kill "$pi_pid" 2>/dev/null || true; wait "$pi_pid" 2>/dev/null || true; fail "macos: authentication still depended on /proc"; }
 
@@ -307,7 +316,7 @@ test_macos_peer_authentication_binds_lock_to_process_start() {
   wait "$pi_pid" 2>/dev/null || true
 
   # A dead pid has no elapsed time to read, so the macOS branch must fail closed.
-  if FM_TELEGRAM_PLATFORM=macos "$checker" "$dir/state" "$pi_pid"; then
+  if PATH="$fakebin:$PATH" FM_TELEGRAM_PLATFORM=macos "$checker" "$dir/state" "$pi_pid"; then
     fail "macos: a dead lock owner authenticated"
   fi
   pass "telegram session-lock: the macOS branch binds a lock to its Pi process generation without /proc"

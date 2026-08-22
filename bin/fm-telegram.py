@@ -2483,11 +2483,14 @@ class LaunchdService(ServiceManager):
         self.require_own_job(job, action)
         pid = job.pid
         identity = process_identity(pid)
+        if identity is not None:
+            associated_job = self.job()
+            if not associated_job.loaded or associated_job.pid != pid \
+                    or process_identity(pid) != identity:
+                identity = None
 
         def captured_process_alive() -> bool:
-            if identity is None:
-                return process_alive(pid)
-            return process_identity(pid) == identity
+            return identity is not None and process_identity(pid) == identity
 
         result = self.launchctl("bootout", self.target)
         if result.returncode not in (0, LAUNCHCTL_IN_PROGRESS, LAUNCHCTL_NO_SUCH_PROCESS) \
@@ -2797,7 +2800,10 @@ def status(home: Path) -> int:
 
 def transcribe_note(command: str) -> str:
     """Say plainly when the configured command is not reachable from here."""
-    parts = shlex.split(command)
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return " (invalid syntax)"
     if not parts:
         return " (empty)"
     program = parts[0]

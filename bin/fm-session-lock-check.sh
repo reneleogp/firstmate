@@ -52,10 +52,7 @@ case "$platform" in
   macos)
     elapsed=$(ps -o etime= -p "$lock_pid" 2>/dev/null) || exit 1
     now=$(date +%s) || exit 1
-    # date -r <file> reports that file's modification time on both BSD and GNU,
-    # so the macOS branch needs no `stat` dialect and stays runnable, against
-    # real processes and real files, on the Linux hosts that run this suite.
-    lock_time=$(date -r "$lock_path" +%s 2>/dev/null) || exit 1
+    lock_time=$(stat -f %m "$lock_path" 2>/dev/null) || exit 1
     case "$now:$lock_time" in
       *[!0-9:]*) exit 1 ;;
     esac

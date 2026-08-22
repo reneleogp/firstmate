@@ -276,7 +276,7 @@ Until the checklist below has been run on your Mac, treat macOS support as imple
 
 - Real `launchctl`: whether `bootstrap`, `bootout`, `enable`, `disable`, `print`, and `print-disabled` behave in your login session as modelled, including the exit codes and the `gui/<uid>` domain.
 - Real `plutil`: whether it accepts the generated LaunchAgent.
-- macOS peer identity: whether the bot can read the connected Pi session's account and process from the socket, which uses macOS's own local-peer options rather than the Linux ones.
+- macOS peer identity: whether the bot can read the connected Pi session's account and process from the socket, which uses macOS's own local-peer options and BSD `stat` for the session-lock mtime rather than the Linux sources.
 - Real Apple Silicon Parakeet: whether your configured command transcribes a voice note under the LaunchAgent's own environment.
 
 A GitHub macOS runner cannot stand in for this, because it has no logged-in GUI session for the LaunchAgent to load into.
@@ -288,7 +288,7 @@ Each step is one command and one thing to look for.
 1. `bin/fm-telegram.py install-service` then `bin/fm-telegram.py status` - it reports the definition as `owned`, enabled, and running with a pid.
 2. `launchctl print gui/$(id -u)/com.firstmate.telegram` - one job, one pid, loaded from the file `status` named.
 3. `plutil -lint ~/Library/LaunchAgents/com.firstmate.telegram.plist` - it reports OK, and `grep` finds neither your token nor your paired ids in that file.
-4. Start Pi in your Firstmate home, then `/telegram` in the terminal - the footer stops saying `unavailable` and the bot answers, which is the peer identity working.
+4. Start Pi in your Firstmate home, then `/telegram` in the terminal - the footer stops saying `unavailable` and the bot answers, which verifies macOS peer identity and the BSD session-lock mtime read together.
 5. Send `/telegram_on` from your phone, type a message in the terminal, and send one from Telegram - both directions arrive, and the Telegram one is confirmed.
 6. Send a screenshot from Telegram and paste one into the terminal - each arrives as a real image at the other end.
 7. Send a voice note and tap `Send to Firstmate` - it transcribes with your local command, and `~/.firstmate-telegram/audio/` is empty afterwards.

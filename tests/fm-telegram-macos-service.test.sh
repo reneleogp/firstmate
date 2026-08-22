@@ -439,9 +439,8 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
-identities = iter([(8123, 10, 0), (8123, 20, 0)])
 signals = []
-module.process_identity = lambda _pid: next(identities)
+module.process_identity = lambda _pid: (8123, 20, 0)
 module.os.kill = lambda pid, sent: signals.append((pid, sent))
 
 class ReusedPidStop(module.LaunchdService):
@@ -674,6 +673,29 @@ test_status_reports_the_installation_without_a_secret() {
   pass "telegram macOS: status reports ownership, login state, and the running service"
 }
 
+test_status_reports_a_malformed_transcribe_command_and_service_state() {
+  local out
+  new_case
+  out=$(service install-service) || fail "install-service failed: $out"
+  cat >"$CASE_HOME/config.json" <<'JSON'
+{
+  "chat_id": 9797,
+  "transcribe_command": "'unterminated",
+  "user_id": 4242
+}
+JSON
+  out=$(service status) || fail "status failed for malformed transcribe command: $out"
+  case "$out" in
+    *"transcribe command: 'unterminated (invalid syntax)"*) : ;;
+    *) fail "status did not annotate the malformed transcribe command: $out" ;;
+  esac
+  case "$out" in
+    *"service: running (pid"*) : ;;
+    *) fail "status omitted service state after a malformed transcribe command: $out" ;;
+  esac
+  pass "telegram macOS: malformed transcription syntax does not hide service status"
+}
+
 # --- peer identity ----------------------------------------------------------
 
 test_macos_peer_credentials_are_decoded_from_the_kernel_struct() {
@@ -752,5 +774,6 @@ test_no_command_acts_on_a_job_it_cannot_prove_is_its_own
 test_cleanup_removes_its_own_installation
 test_a_rejected_definition_is_never_published
 test_status_reports_the_installation_without_a_secret
+test_status_reports_a_malformed_transcribe_command_and_service_state
 test_macos_peer_credentials_are_decoded_from_the_kernel_struct
 test_readiness_outlasts_the_bot_s_own_network_waits
