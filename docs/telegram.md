@@ -197,7 +197,8 @@ Threading is presentation only and never changes what Firstmate sees or how Pi p
 3. That same `Transcribing…` message becomes the transcript card in place, with `Send to Firstmate`, `Edit`, and `Cancel`.
 4. Nothing reaches Pi until you tap `Send to Firstmate`.
 
-A voice note never occupies more than one bot message: the `Transcribing…` placeholder is edited into whatever ends the note, whether that is the transcript card, a transcription failure, or an over-length refusal, so no stale `Transcribing…` is ever left beside a separate result.
+A voice note normally occupies one bot message: the `Transcribing…` placeholder is edited into whatever ends the note, whether that is the transcript card, a transcription failure, or an over-length refusal.
+If sending the placeholder or editing it in place fails, the result is sent as a separate message instead so the transcript or terminal outcome is not lost.
 
 `Edit` replaces the buttons with `Copy text` and `Back` and opens a reply prompt bound to that transcript.
 Copy the text, paste it into the reply, correct it, and send: the original transcript message updates and the main buttons return, as often as you like.

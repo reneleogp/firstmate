@@ -131,6 +131,7 @@ TRANSCRIPT_TOO_LONG_REPLY = (
     "That transcript is over 3,800 characters. Nothing was sent to Firstmate."
 )
 TRANSCRIPT_EDIT_TOO_LONG_REPLY = "Transcript edits must be 3,800 characters or fewer."
+STALE_TRANSCRIPT_REPLY = "This transcript is no longer active."
 UNSUPPORTED_REPLY = "Only text, voice notes, and images are mirrored."
 UNSUPPORTED_IMAGE_REPLY = "That file type is not supported. Send a PNG, JPEG, or WebP image."
 OVERSIZED_IMAGE_REPLY = "That image is too large to send to Firstmate."
@@ -800,7 +801,7 @@ class MirrorBot:
         self.voices[voice_id] = Voice(
             voice_id=voice_id, card_id=card_id, text=transcript, audio=audio
         )
-        self.retire_stale_voices()
+        await self.retire_stale_voices()
 
     async def retire_placeholder(self, card_id: Optional[int], voice_id: int,
                                  text: str) -> None:
@@ -823,13 +824,16 @@ class MirrorBot:
             end_process_group(process)
         self.transcribers.clear()
 
-    def retire_stale_voices(self) -> None:
+    async def retire_stale_voices(self) -> None:
         """Keep the newest transcripts only; an untouched card is not durable."""
         while len(self.voices) > MAX_PENDING_VOICES:
             oldest = min(self.voices)
             entry = self.voices.pop(oldest)
             self.clear_prompt(entry)
             remove_file(entry.audio)
+            await self.retire_placeholder(
+                entry.card_id, entry.voice_id, STALE_TRANSCRIPT_REPLY,
+            )
 
     async def handle_callback(self, callback: dict[str, Any]) -> None:
         callback_id = str(callback.get("id"))
@@ -841,7 +845,7 @@ class MirrorBot:
         voice_id, revision, action = parsed
         entry = self.voices.get(voice_id)
         if entry is None:
-            await self.answer_callback(callback_id, "This transcript is no longer active.")
+            await self.answer_callback(callback_id, STALE_TRANSCRIPT_REPLY)
             return
         if revision != entry.revision:
             await self.answer_callback(callback_id, "This transcript has already moved on.")
@@ -892,7 +896,9 @@ class MirrorBot:
         self.voices.pop(entry.voice_id, None)
         remove_file(entry.audio)
         entry.audio = None
-        await self.edit_card(entry.card_id, f"{entry.text}\n\n{footer}", None)
+        await self.retire_placeholder(
+            entry.card_id, entry.voice_id, f"{entry.text}\n\n{footer}",
+        )
 
     def clear_prompt(self, entry: Voice) -> None:
         if entry.prompt_id is not None:

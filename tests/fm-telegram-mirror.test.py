@@ -74,6 +74,7 @@ class FakeTelegram:
         # Telegram refuses markup it cannot parse; the bot must recover.
         self.reject_parse_mode = False
         self.format_rejection = "can't parse entities: unsupported start tag"
+        self.reject_next_edit = False
         self.next_message_id = 1000
         self.next_update_id = 1
         self.files: dict[str, bytes] = {}
@@ -191,6 +192,9 @@ class FakeTelegram:
                 return message
         if method == "editMessageText":
             with self.lock:
+                if self.reject_next_edit:
+                    self.reject_next_edit = False
+                    raise ParseModeRejected("message can't be edited")
                 self.edits.append(dict(params))
                 return dict(params)
         if method == "answerCallbackQuery":
@@ -644,10 +648,13 @@ class MirrorTestCase(unittest.TestCase):
         pi = self.connect_pi()
         self.enable_mirror(pi)
         # Cards nobody taps must not retain their text and audio forever.
+        oldest_placeholder = 0
         for index in range(40):
             message_id = 500 + index
             self.telegram.push_voice(message_id)
             placeholder = self.placeholder_id_for(message_id)
+            if index == 0:
+                oldest_placeholder = placeholder
             self.telegram.wait_edit(
                 lambda e, expected=placeholder:
                 int(e.get("message_id", 0)) == expected
@@ -662,6 +669,11 @@ class MirrorTestCase(unittest.TestCase):
         self.assertLessEqual(len(retained), 32, f"retained {len(retained)} voice files")
         self.assertIn("539", retained, "the newest transcript was dropped instead of the oldest")
         self.assertNotIn("500", retained, "the oldest transcript was never retired")
+        retired = self.telegram.wait_edit(
+            lambda e: int(e.get("message_id", 0)) == oldest_placeholder
+            and e.get("text") == "This transcript is no longer active."
+        )
+        self.assertEqual(retired["reply_markup"], {"inline_keyboard": []})
 
     def test_replies_are_formatted_as_telegram_html(self) -> None:
         pi = self.connect_pi()
@@ -1742,6 +1754,20 @@ class MirrorTestCase(unittest.TestCase):
         self.assertEqual(self.voice_messages(81), ["Transcribing…"])
         self.assertFalse((self.home / "audio" / "81.ogg").exists())
         pi.expect_nothing()
+
+    def test_a_failed_terminal_edit_falls_back_to_a_plain_message(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.telegram.push_voice(82)
+        card_id = self.card_id_for("please rebase the branch")
+        self.telegram.reject_next_edit = True
+        self.telegram.push_callback("v:82:1:send", card_id, "cb-rejected-terminal-edit")
+        fallback = self.telegram.wait_sent(
+            lambda m: m.get("text") == "please rebase the branch\n\nSent to Firstmate"
+            and m.get("reply_parameters", {}).get("message_id") == 82
+        )
+        self.assertNotIn("reply_markup", fallback)
+        self.assertEqual(pi.read()["text"], "please rebase the branch")
 
     def test_a_voice_note_uses_one_message_from_placeholder_to_card(self) -> None:
         pi = self.connect_pi()
