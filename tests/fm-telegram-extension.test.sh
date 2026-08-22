@@ -43,6 +43,7 @@ if ! (cd "$FIXTURE" && \
   OPERATIONAL_INPUT="$ROOT/bin/fm-operational-input.sh" \
   FM_OPERATIONAL_INPUT_SCRIPT="$ROOT/bin/fm-operational-input.sh" \
   FM_TELEGRAM_DIR="$TMP_ROOT/home" \
+  FM_TELEGRAM_MAX_OUTSTANDING_WRITE_BYTES=100000 \
   FM_HOME="$TMP_ROOT/fmhome" \
   WORKER_HOME="$TMP_ROOT/workerhome" \
   node --input-type=module >"$OUT" 2>&1) <<'JS'
@@ -295,6 +296,17 @@ if (wrapped.text !== "look at these two") {
   fail(`surrounding text was not preserved cleanly: ${JSON.stringify(wrapped.text)}`);
 }
 
+// Removing an artifact does not normalize the captain's unrelated whitespace.
+handlers.get("input")({ text: `  lead\t${genuine} \t tail  `, source: "interactive" }, ctx);
+await waitFor(
+  () => received.filter((frame) => frame.t === "terminal").length === framesBeforeAdjacent + 3,
+  "the whitespace-preserving paste",
+);
+const spaced = received.filter((frame) => frame.t === "terminal").at(-1);
+if (spaced.text !== "  lead\t\t tail  ") {
+  fail(`clipboard cleanup altered unrelated whitespace: ${JSON.stringify(spaced.text)}`);
+}
+
 // A genuine artifact glued to an invalid suffix is prose, not an artifact, and
 // must not be split at the extension to smuggle the file out.
 const framesBeforeAmbiguous = received.filter((frame) => frame.t === "terminal").length;
@@ -337,6 +349,34 @@ if (negatives.length !== 8) {
 
 for (const path of [genuine, genuineJpeg, arbitrary, wrongMagic, oversized, linkTarget, symlinked]) {
   try { unlinkSync(path); } catch {}
+}
+
+// 1d. Image writes stop at a bounded transport backlog and visibly refuse the
+//     image that cannot fit rather than adding it to Node's socket buffer.
+const framesBeforeBackpressure = received.filter((frame) => frame.t === "terminal").length;
+const queuedPixels = "A".repeat(75000);
+handlers.get("input")({
+  text: "first queued image",
+  source: "interactive",
+  images: [{ type: "image", data: queuedPixels, mimeType: "image/png" }],
+}, ctx);
+handlers.get("input")({
+  text: "refused queued image",
+  source: "interactive",
+  images: [{ type: "image", data: queuedPixels, mimeType: "image/png" }],
+}, ctx);
+await waitFor(
+  () => received.filter((frame) => frame.t === "terminal").length === framesBeforeBackpressure + 1,
+  "the bounded image write",
+);
+await new Promise((resolve) => setTimeout(resolve, 200));
+const backpressureFrames = received.filter((frame) => frame.t === "terminal").slice(framesBeforeBackpressure);
+if (backpressureFrames.length !== 1 || backpressureFrames[0].text !== "first queued image") {
+  fail(`the image transport backlog was not bounded: ${JSON.stringify(backpressureFrames.map((frame) => frame.text))}`);
+}
+if (notifications.at(-1)?.message !==
+    "Telegram image was not mirrored because its transport queue is full.") {
+  fail(`the refused image was not reported visibly: ${JSON.stringify(notifications.at(-1))}`);
 }
 
 // 2. Every completed reply is mirrored exactly once, as Pi finalizes it, while

@@ -150,6 +150,10 @@ const CLIPBOARD_EXTENSIONS = "png|jpg|jpeg|webp";
 const MAX_CLIPBOARD_BYTES = positiveInteger("FM_TELEGRAM_MAX_IMAGE_BYTES", 10 * 1024 * 1024);
 const MAX_CLIPBOARD_TOTAL_BYTES = MAX_CLIPBOARD_BYTES * 3;
 const MAX_CLIPBOARD_IMAGES = 10;
+const MAX_OUTSTANDING_WRITE_BYTES = positiveInteger(
+  "FM_TELEGRAM_MAX_OUTSTANDING_WRITE_BYTES",
+  Math.ceil(MAX_CLIPBOARD_TOTAL_BYTES / 3) * 4 + 3 * 1024 * 1024,
+);
 
 function imageMimeFromMagic(bytes: Buffer): string | undefined {
   if (bytes.length >= 8 && bytes.subarray(0, 8).equals(
@@ -209,13 +213,17 @@ function clipboardScan(text: string): ClipboardScan {
     }
     index = end;
   }
-  let caption = text;
   // Only proven artifacts leave the caption; anything that failed a check is
   // ordinary text the captain wrote and stays exactly as written.
-  for (const [start, end] of [...accepted].reverse()) {
-    caption = `${caption.slice(0, start)} ${caption.slice(end)}`;
+  const removed = accepted.map(([start, end]): [number, number] => {
+    if (/[ \t]/.test(text[end] ?? "")) return [start, end + 1];
+    if (end === text.length && /[ \t]/.test(text[start - 1] ?? "")) return [start - 1, end];
+    return [start, end];
+  });
+  let caption = text;
+  for (const [start, end] of [...removed].reverse()) {
+    caption = `${caption.slice(0, start)}${caption.slice(end)}`;
   }
-  if (accepted.length > 0) caption = caption.replace(/[ \t]+/g, " ").trim();
   return { images, caption };
 }
 
@@ -300,6 +308,7 @@ export default function (pi: ExtensionAPI) {
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectDelay = RECONNECT_MS;
   let deliveries: Promise<void> = Promise.resolve();
+  let outstandingWriteBytes = 0;
   let commandSequence = 0;
   const commandWaiters = new Map<number, (text: string) => void>();
 
@@ -321,11 +330,20 @@ export default function (pi: ExtensionAPI) {
   }
 
   function write(frame: Record<string, unknown>): boolean {
-    if (!socket || socket.destroyed) return false;
+    const target = socket;
+    if (!target || target.destroyed) return false;
+    const payload = `${JSON.stringify(frame)}\n`;
+    const payloadBytes = Buffer.byteLength(payload);
+    if (payloadBytes > MAX_OUTSTANDING_WRITE_BYTES ||
+        outstandingWriteBytes + payloadBytes > MAX_OUTSTANDING_WRITE_BYTES) return false;
+    outstandingWriteBytes += payloadBytes;
     try {
-      socket.write(`${JSON.stringify(frame)}\n`);
+      target.write(payload, () => {
+        if (socket === target) outstandingWriteBytes -= payloadBytes;
+      });
       return true;
     } catch {
+      outstandingWriteBytes -= payloadBytes;
       return false;
     }
   }
@@ -348,6 +366,7 @@ export default function (pi: ExtensionAPI) {
     const current = socket;
     socket = null;
     buffer = "";
+    outstandingWriteBytes = 0;
     if (current) {
       current.removeAllListeners();
       current.destroy();
@@ -499,9 +518,12 @@ export default function (pi: ExtensionAPI) {
     const caption = pasted.images.length > 0 ? pasted.caption : text;
     // An image-only submission has no text but is still a real submission.
     if (!caption.trim() && images.length === 0) return;
-    write(images.length > 0
+    const written = write(images.length > 0
       ? { t: "terminal", text: caption, images }
       : { t: "terminal", text });
+    if (!written && images.length > 0) {
+      activeCtx?.ui.notify("Telegram image was not mirrored because its transport queue is full.", "warning");
+    }
   });
 
   // Every completed reply is mirrored as Pi finalizes it, exactly once.
