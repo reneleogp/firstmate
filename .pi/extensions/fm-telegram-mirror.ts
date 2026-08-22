@@ -6,7 +6,7 @@
 //
 //   - reports ordinary terminal submissions so the bot can mirror them,
 //   - reports Firstmate's final visible reply after each completed run,
-//   - submits queued Telegram text through Pi's normal user input, and
+//   - submits queued Telegram text and images through Pi's normal user input, and
 //   - confirms to the bot when Pi accepted each Telegram message.
 //
 // Telegram text reaches Firstmate exactly as terminal text: no origin marker,

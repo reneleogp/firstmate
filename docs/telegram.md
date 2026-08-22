@@ -77,8 +77,9 @@ In Telegram, these switch it and are never sent to Firstmate as conversation tex
 - `/telegram off` - stop new mirroring.
 - `/telegram status` - report mirroring, whether Firstmate is connected, and whether confirmations are on.
 
-Telegram's own command menu cannot contain a space, so the same commands are published to the paired chat as `/telegram_on`, `/telegram_off`, `/telegram_status`, `/telegram_confirmations_on`, and `/telegram_confirmations_off`.
-Both spellings do the same thing; the menu aliases exist so the commands are visible and tappable in Telegram.
+Telegram's own command menu cannot contain a space, so `/telegram on`, `/telegram off`, and `/telegram status` are also published as `/telegram_on`, `/telegram_off`, and `/telegram_status`.
+The menu also publishes `/telegram_confirmations_on` and `/telegram_confirmations_off`.
+The aliases exist so every Telegram command is visible and tappable.
 
 While mirror mode is off, an ordinary message is answered with `Telegram mirror is off. Send /telegram_on to enable it.`, naming a command you can tap straight from the menu.
 
@@ -121,6 +122,7 @@ Paste or attach an image in the terminal and it appears in Telegram as real, vie
 Pi's own paste writes the image into the temp directory and puts that path in your message, so the mirror recognises exactly that artifact: Pi's own file name in Pi's own temp directory, a regular file this account owns, of an accepted type whose actual bytes match.
 Only a path proven to be a canonical Pi clipboard artifact is removed from the phone caption, including when that proven artifact exceeds a media limit.
 Any arbitrary path or path that fails the identity, ownership, file-type, symlink, image-magic, or existence checks remains ordinary mirrored captain text and is never uploaded.
+The mirror only reads proven clipboard artifacts and never deletes them; Pi continues to own their cleanup.
 Pasting two images at once runs them together with no space between, which is recognised as two pictures while a path glued to anything else stays ordinary text.
 Your terminal text rides along as the caption when it fits, and is sent as its own `You · Terminal` message when it is too long for one.
 An image-only submission still arrives, captioned `You · Terminal`.
@@ -186,8 +188,7 @@ Every status the bot itself produces replies to the exact Telegram message it de
 
 Firstmate's own replies are always sent as ordinary unthreaded messages.
 Pi batches back-to-back submissions into one run, so a reply belongs to no single source message, and threading it would attach answers to the wrong one.
-This supersedes the original design note that a Telegram-originated message should receive its reply threaded; the captain approved always-unthreaded replies after live testing.
-Threading is presentation only either way, and never changes what Firstmate sees or how Pi processes input.
+Threading is presentation only and never changes what Firstmate sees or how Pi processes input.
 
 ## Voice notes
 
@@ -222,8 +223,7 @@ Every button action is bound to the current transcript revision, so a stale or r
 - Transport statuses stay attached to the exact message they describe, while Firstmate's replies are never threaded (see Reply threading).
 - The service unit holds no token and no message content; the token stays in `~/.firstmate-telegram/env` and pairing stays in `config.json`.
 - Temporary voice audio is owner-only and is deleted after send, cancel, failure, and at bot start and stop; images are never written to disk at all.
-- Transcription memory belongs to the local speech model, not the bot: the bot stays around 34 MB while a transcription child can hold well over a gigabyte for its model.
-  A service memory figure covers the whole service, children included, and its peak stays at that high-water mark for the rest of the run even after the child exits.
+- Transcription memory belongs to the local speech model rather than the bot process, and the service's memory accounting includes the transcriber and its children.
 - `FM_TELEGRAM_DIR` moves the private directory; `bin/fm-telegram.py --help` owns the remaining flags and environment.
 
 The wire protocol between the bot and the Pi extension is stated once in `bin/fm-telegram.py`'s header.

@@ -130,7 +130,8 @@ start_pi() {
   mkdir -p "$FM_LAB_HOME/state"
   tmux -L "$SOCKET" new-session -d -s "$SESSION" -x 200 -y 50 -c "$WORK" \
     "printf '%s\n' \$\$ >'$FM_LAB_HOME/state/.lock'; \
-     FM_HOME='$FM_LAB_HOME' FM_TELEGRAM_DIR='$HOME_DIR' FAKE_MODEL_PORT='$PORT' \
+     FM_HOME='$ROOT' FM_STATE_OVERRIDE='$FM_LAB_HOME/state' \
+     FM_TELEGRAM_DIR='$HOME_DIR' FAKE_MODEL_PORT='$PORT' \
      exec pi --no-session --no-context-files --no-extensions --no-skills --no-tools \
      -e '$FIXTURES/fake-provider.ts' -e '$EXT' --model fakelab/slow-fake"
   local i=0

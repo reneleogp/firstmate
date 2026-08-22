@@ -25,14 +25,16 @@ overridden by FM_TELEGRAM_DIR):
 Wire protocol (newline-delimited JSON, both directions):
 
   extension -> bot  {"t":"hello","features":["image"]}
-                    {"t":"terminal","text":...}     terminal submission
+                    {"t":"terminal","text":...,"images":[...]} terminal submission
                     {"t":"reply","text":...}        final visible Firstmate text
                     {"t":"command","id":N,"command":"toggle"|"on"|"off"|"status"}
-                    {"t":"set","id":N,"setting":"confirmations","value":bool}
+                    {"t":"set","setting":"confirmations","value":bool}
                     {"t":"accepted","id":"..."}     Pi accepted that message
   bot -> extension  {"t":"deliver","id":"...","text":...,"image":{...}}
-                    {"t":"command_result","id":N,"text":...}
+                    {"t":"command_result","id":N|null,"text":...}
                     {"t":"state","mirror":bool,"confirmations":bool}
+
+The terminal frame's images and the delivery frame's image are optional.
 
 The hello frame's features decide what the bot may send. A bridge older than
 this bot does not announce "image", and an image sent to it would be silently
