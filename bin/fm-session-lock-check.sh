@@ -56,7 +56,8 @@ case "$platform" in
     case "$now:$lock_time" in
       *[!0-9:]*) exit 1 ;;
     esac
-    start_time=$(awk -v elapsed="$elapsed" -v now="$now" '
+    awk -v elapsed="$elapsed" -v now="$now" -v lock="$lock_time" \
+      -v tolerance="$LOCK_TIME_TOLERANCE_SECONDS" '
       BEGIN {
         gsub(/[[:space:]]/, "", elapsed)
         if (elapsed !~ /^([0-9]+-)?([0-9]+:)?[0-9]+:[0-9]+$/) exit 1
@@ -67,8 +68,8 @@ case "$platform" in
         if (count == 3) seconds = fields[1] * 3600 + fields[2] * 60 + fields[3]
         else if (count == 2) seconds = fields[1] * 60 + fields[2]
         else exit 1
-        print now - (days * 86400 + seconds)
-      }') || exit 1
+        exit !((now - (days * 86400 + seconds)) <= (lock + tolerance))
+      }' || exit 1
     ;;
   *)
     PROC_ROOT=${FM_TELEGRAM_PROC_ROOT:-/proc}
@@ -84,11 +85,8 @@ case "$platform" in
       *[!0-9:]*) exit 1 ;;
     esac
     [ "$clock_ticks" -gt 0 ] 2>/dev/null || exit 1
-    start_time=$(awk -v boot="$boot_time" -v ticks="$start_ticks" -v hz="$clock_ticks" \
-      'BEGIN { print boot + (ticks / hz) }') || exit 1
+    awk -v boot="$boot_time" -v ticks="$start_ticks" -v hz="$clock_ticks" \
+      -v lock="$lock_time" -v tolerance="$LOCK_TIME_TOLERANCE_SECONDS" \
+      'BEGIN { exit !((boot + (ticks / hz)) <= (lock + tolerance)) }' || exit 1
     ;;
 esac
-
-[ -n "$start_time" ] || exit 1
-awk -v start="$start_time" -v lock="$lock_time" -v tolerance="$LOCK_TIME_TOLERANCE_SECONDS" \
-  'BEGIN { exit !(start <= (lock + tolerance)) }'

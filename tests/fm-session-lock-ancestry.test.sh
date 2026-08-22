@@ -233,21 +233,21 @@ test_telegram_peer_authentication_binds_lock_to_process_start() {
   pi_pid=$!
   printf '%s\n' "$pi_pid" >"$dir/state/.lock"
   mkdir -p "$proc_root/$pi_pid"
-  printf 'btime 1000\n' >"$proc_root/stat"
+  printf 'btime 1787425318\n' >"$proc_root/stat"
   printf '%s (pi) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1000\n' "$pi_pid" >"$proc_root/$pi_pid/stat"
 
-  touch -d '@1008' "$dir/state/.lock"
+  touch -d '@1787425326' "$dir/state/.lock"
   if FM_TELEGRAM_PROC_ROOT="$proc_root" "$checker" "$dir/state" "$pi_pid"; then
     kill "$pi_pid" 2>/dev/null || true
     wait "$pi_pid" 2>/dev/null || true
     fail "a same-family Pi process started after the stale lock authenticated"
   fi
 
-  touch -d '@1009' "$dir/state/.lock"
+  touch -d '@1787425327' "$dir/state/.lock"
   FM_TELEGRAM_PROC_ROOT="$proc_root" "$checker" "$dir/state" "$pi_pid" \
     || { kill "$pi_pid" 2>/dev/null || true; wait "$pi_pid" 2>/dev/null || true; fail "the timestamp precision boundary was refused"; }
 
-  touch -d '@1010' "$dir/state/.lock"
+  touch -d '@1787425328' "$dir/state/.lock"
   FM_TELEGRAM_PROC_ROOT="$proc_root" "$checker" "$dir/state" "$pi_pid" \
     || { kill "$pi_pid" 2>/dev/null || true; wait "$pi_pid" 2>/dev/null || true; fail "the genuine Pi lock owner was refused"; }
 

@@ -12,6 +12,8 @@ else:
   bootout <target>            asks the job to stop and returns EINPROGRESS
                               while its process is still alive, the way launchd
                               tears a job down asynchronously
+  kill SIGKILL <target>       signals the process currently owned by the loaded
+                              service target
   print <target>              the loaded job's path, state, pid, and last exit
                               code, or "could not find" when it is not loaded
   print-disabled <domain>     the persistent per-label disable records
@@ -209,6 +211,22 @@ def command_bootout(arguments: list[str], state: dict[str, Any]) -> int:
     return 0
 
 
+def command_kill(arguments: list[str], state: dict[str, Any]) -> int:
+    if len(arguments) != 2 or arguments[0] != "SIGKILL":
+        return 2
+    job = state["jobs"].get(label_of(arguments[1]))
+    if job is None:
+        return EX_NO_SUCH_PROCESS
+    pid = job.get("pid")
+    if not alive(pid):
+        return EX_NO_SUCH_PROCESS
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        return EX_NO_SUCH_PROCESS
+    return 0
+
+
 def command_print(arguments: list[str], state: dict[str, Any]) -> int:
     label = label_of(arguments[0]) if arguments else ""
     job = state["jobs"].get(label)
@@ -253,6 +271,7 @@ def main(argv: list[str]) -> int:
     handlers = {
         "bootstrap": command_bootstrap,
         "bootout": command_bootout,
+        "kill": command_kill,
         "print": command_print,
         "print-disabled": command_print_disabled,
         "enable": command_enable,

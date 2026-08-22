@@ -463,6 +463,49 @@ PY
   pass "telegram macOS: stop treats a reused pid as the departed service generation"
 }
 
+test_stop_refuses_to_signal_a_lingering_unowned_process() {
+  python3 - "$BOT" <<'PY' || fail "stop did not fail closed for an unowned lingering process"
+import importlib.util
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_telegram", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+identity = (8123, 20, 0)
+module.process_identity = lambda _pid: identity
+calls = []
+
+class LingeringStop(module.LaunchdService):
+    target = "gui/501/com.firstmate.telegram"
+    stop_timeout = 0.01
+
+    def require_own_job(self, _job, _action):
+        return None
+
+    def launchctl(self, *arguments):
+        calls.append(arguments)
+        return subprocess.CompletedProcess([], 0, "")
+
+    def job(self):
+        if not calls:
+            return module.LaunchdJob(loaded=True, pid=8123)
+        return module.LaunchdJob(loaded=False)
+
+subject = object.__new__(LingeringStop)
+try:
+    subject.stop_job(module.LaunchdJob(loaded=True, pid=8123), "stopped")
+except module.TelegramError:
+    pass
+else:
+    raise AssertionError("the lingering process was reported stopped")
+assert not any(call and call[0] == "kill" for call in calls), calls
+PY
+  pass "telegram macOS: stop reports an unowned lingering process without signalling it"
+}
+
 test_stop_escalates_past_a_service_that_ignores_it() {
   local out pid
   new_case
@@ -542,6 +585,32 @@ PLIST
   [ "$before" = "$(cat "$PLIST")" ] || fail "a foreign LaunchAgent was rewritten"
   job_loaded && fail "a foreign LaunchAgent was loaded"
   pass "telegram macOS: an installation serving another home is reported, never replaced or removed"
+}
+
+test_a_foreign_program_at_the_owned_path_is_never_touched() {
+  local out before
+  new_case
+  python3 - "$PLIST" "$LABEL" "$CASE_HOME" <<'PY'
+import plistlib
+import sys
+
+path, label, home = sys.argv[1:]
+with open(path, "wb") as handle:
+    plistlib.dump({
+        "Label": label,
+        "ProgramArguments": ["/bin/echo", "run"],
+        "EnvironmentVariables": {"FM_TELEGRAM_DIR": home},
+    }, handle)
+PY
+  before=$(cat "$PLIST")
+  for command in install-service restart-service stop-service disable-service uninstall-service; do
+    if out=$(service "$command"); then
+      fail "$command trusted a foreign program ending in run: $out"
+    fi
+  done
+  [ "$before" = "$(cat "$PLIST")" ] || fail "a foreign program definition was rewritten"
+  job_loaded && fail "a foreign program definition was loaded"
+  pass "telegram macOS: ownership requires the generated interpreter and bot script arguments"
 }
 
 test_a_job_loaded_from_another_definition_is_never_stopped() {
@@ -764,11 +833,13 @@ test_a_failed_update_restores_a_keepalive_job_between_children
 test_an_incomplete_update_rollback_is_reported
 test_a_failed_install_restores_a_previous_disable
 test_stop_does_not_signal_a_reused_pid
+test_stop_refuses_to_signal_a_lingering_unowned_process
 test_stop_escalates_past_a_service_that_ignores_it
 test_stop_leaves_the_installation_in_place
 test_disable_is_recorded_even_when_nothing_is_running
 test_install_lifts_its_own_disable
 test_a_foreign_definition_is_never_touched
+test_a_foreign_program_at_the_owned_path_is_never_touched
 test_a_job_loaded_from_another_definition_is_never_stopped
 test_no_command_acts_on_a_job_it_cannot_prove_is_its_own
 test_cleanup_removes_its_own_installation

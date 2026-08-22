@@ -2362,6 +2362,26 @@ class LaunchdService(ServiceManager):
             return shlex.split(override)
         return [sys.executable, str(bot_script()), "run"]
 
+    def owns_program_arguments(self, arguments: Any) -> bool:
+        if not isinstance(arguments, list) or len(arguments) != 3 \
+                or not all(isinstance(value, str) for value in arguments) \
+                or arguments[2] != "run":
+            return False
+        if Path(arguments[0]).resolve() != Path(sys.executable).resolve():
+            return False
+        allowed_scripts = {bot_script()}
+        override = testing_override("FM_TELEGRAM_SERVICE_PROGRAM")
+        if override:
+            try:
+                override_arguments = shlex.split(override)
+            except ValueError:
+                return False
+            if len(override_arguments) == 3 \
+                    and Path(override_arguments[0]).resolve() == Path(sys.executable).resolve() \
+                    and override_arguments[2] == "run":
+                allowed_scripts.add(Path(override_arguments[1]).resolve())
+        return Path(arguments[1]).resolve() in allowed_scripts
+
     def plist_data(self, launch_id: str) -> dict[str, Any]:
         """Local paths and one launch generation. Never a secret.
 
@@ -2413,7 +2433,7 @@ class LaunchdService(ServiceManager):
         if environment.get("FM_TELEGRAM_DIR") != str(self.home):
             return "foreign"
         arguments = data.get("ProgramArguments")
-        if not isinstance(arguments, list) or not arguments or arguments[-1] != "run":
+        if not self.owns_program_arguments(arguments):
             return "foreign"
         return "owned"
 
@@ -2477,8 +2497,7 @@ class LaunchdService(ServiceManager):
 
         launchd sends its own SIGTERM and then SIGKILL after ExitTimeOut. A
         transcription or a Telegram poll can outlast a single check, so the wait
-        is a bounded poll of both the job and the process it left behind, and a
-        process that survives the whole bound is ended here.
+        is a bounded poll of both the job and the process it left behind.
         """
         self.require_own_job(job, action)
         pid = job.pid
@@ -2501,11 +2520,19 @@ class LaunchdService(ServiceManager):
             if not self.job().loaded and not captured_process_alive():
                 return
             time.sleep(LAUNCHD_POLL_SECONDS)
-        if identity is not None and process_identity(pid) == identity:
-            with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGKILL)
+        current_job = self.job()
+        if current_job.loaded and current_job.pid == pid \
+                and identity is not None and process_identity(pid) == identity:
+            self.require_own_job(current_job, action)
+            result = self.launchctl("kill", "SIGKILL", self.target)
+            if result.returncode != 0 and self.job().loaded:
+                raise TelegramError(
+                    f"could not escalate the stop of {LAUNCHD_LABEL}: "
+                    f"{result.stdout.strip()}"
+                )
             kill_deadline = time.monotonic() + LAUNCHD_KILL_TIMEOUT
-            while time.monotonic() < kill_deadline and captured_process_alive():
+            while time.monotonic() < kill_deadline \
+                    and (self.job().loaded or captured_process_alive()):
                 time.sleep(LAUNCHD_POLL_SECONDS)
         if self.job().loaded or captured_process_alive():
             raise TelegramError(
