@@ -11,13 +11,23 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-guard-stale-banner)
+PI_PROCESS="$TMP_ROOT/pi"
+cp /bin/bash "$PI_PROCESS"
+chmod +x "$PI_PROCESS"
+PI_SESSION_PID=
+
+start_pi_session_process() {
+  "$PI_PROCESS" -c 'sleep 60; :' >/dev/null 2>&1 &
+  PI_SESSION_PID=$!
+}
 
 make_guard_case() {
   local name=$1 dir home root
   dir="$TMP_ROOT/$name"
   home="$dir/home"
   root="$dir/root"
-  mkdir -p "$home/state" "$home/config" "$root"
+  mkdir -p "$home/state" "$home/config" "$root/bin"
+  cp "$ROOT/bin/fm-lock.sh" "$ROOT/bin/fm-session-lock-lib.sh" "$root/bin/"
   fm_write_meta "$home/state/task.meta" "window=firstmate:fm-task" "kind=ship"
   printf '%s\n' "$dir"
 }
@@ -97,7 +107,7 @@ run_guard_case_extension() {
 #   drift        "" | watch | turnend - write a marker whose version is not the
 #                current build, i.e. the session loaded an older extension
 record_pi_extension_session() {
-  local dir=$1 session_pid=${2:-} omit=${3:-} drift=${4:-} home root pair source marker version
+  local dir=$1 session_pid=${2:-} omit=${3:-} drift=${4:-} home root pair source marker version record
   home=$(case_home "$dir")
   root=$(case_root "$dir")
   mkdir -p "$root/.pi/extensions"
@@ -116,7 +126,12 @@ record_pi_extension_session() {
     fi
     printf '%s\n%s\n' "$version" "$session_pid" > "$home/state/$marker"
   done
-  [ -n "$session_pid" ] && printf '%s\n' "$session_pid" > "$home/state/.lock"
+  if [ -n "$session_pid" ]; then
+    record=$(bash -c '. "$1"; fm_session_lock_record "$2"' _ \
+      "$ROOT/bin/fm-session-lock-lib.sh" "$session_pid") || true
+    [ -n "$record" ] || record=$session_pid
+    printf '%s\n' "$record" > "$home/state/.lock"
+  fi
   return 0
 }
 
@@ -427,8 +442,8 @@ test_extension_handoff_with_live_session_is_healthy() {
   local dir home out pid
   dir=$(make_guard_case extension-handoff)
   home=$(case_home "$dir")
-  sleep 60 &
-  pid=$!
+  start_pi_session_process
+  pid=$PI_SESSION_PID
   record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
   touch "$home/state/.last-watcher-beat"
   out=$(run_guard_case_extension "$dir")
@@ -447,8 +462,8 @@ test_extension_handoff_with_empty_lock_is_healthy() {
   local dir home out pid
   dir=$(make_guard_case extension-empty-lock)
   home=$(case_home "$dir")
-  sleep 60 &
-  pid=$!
+  start_pi_session_process
+  pid=$PI_SESSION_PID
   record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
   mkdir -p "$home/state/.watch.lock"
   touch "$home/state/.last-watcher-beat"
@@ -469,8 +484,8 @@ test_extension_held_unhealthy_locks_stay_alarm() {
   for case_name in dead-pid malformed-pid wrong-home wrong-path identity-mismatch; do
     dir=$(make_guard_case "extension-held-$case_name")
     home=$(case_home "$dir")
-    sleep 60 &
-    session_pid=$!
+    start_pi_session_process
+    session_pid=$PI_SESSION_PID
     record_pi_extension_session "$dir" "$session_pid" \
       || fail "could not record the Pi extension session for $case_name"
     holder_pid=
@@ -545,8 +560,8 @@ test_extension_ownership_needs_every_signal() {
     case_name=${spec%%:*}
     dir=$(make_guard_case "extension-$case_name")
     home=$(case_home "$dir")
-    sleep 60 &
-    pid=$!
+    start_pi_session_process
+    pid=$PI_SESSION_PID
     if [ "$(printf '%s' "$spec" | cut -d: -f2)" = dead ]; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -572,8 +587,8 @@ test_extension_stale_beacon_alarms_despite_live_session() {
   local dir home out pid
   dir=$(make_guard_case extension-stale-beacon)
   home=$(case_home "$dir")
-  sleep 60 &
-  pid=$!
+  start_pi_session_process
+  pid=$PI_SESSION_PID
   record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
   out=$(FM_ROOT_OVERRIDE="$(case_root "$dir")" \
     FM_HOME="$home" \
@@ -595,8 +610,8 @@ test_extension_handoff_keeps_queued_wake_warning() {
   local dir home out pid
   dir=$(make_guard_case extension-queued-wake)
   home=$(case_home "$dir")
-  sleep 60 &
-  pid=$!
+  start_pi_session_process
+  pid=$PI_SESSION_PID
   record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
   touch "$home/state/.last-watcher-beat"
   printf '%s\n' "1700000000	1	signal	task	signal: crewmate needs a decision" > "$home/state/.wake-queue"
@@ -617,8 +632,8 @@ test_persistent_model_ignores_pi_extension_evidence() {
   local dir home out pid
   dir=$(make_guard_case persistent-ignores-pi-evidence)
   home=$(case_home "$dir")
-  sleep 60 &
-  pid=$!
+  start_pi_session_process
+  pid=$PI_SESSION_PID
   record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
   touch "$home/state/.last-watcher-beat"
   out=$(run_guard_case "$dir")
@@ -662,8 +677,8 @@ test_pi_harness_routes_itself_to_the_extension_model() {
     [ "$harness" = pi ] || pi_env+=(FM_PI_HARNESS=pi-signed)
     dir=$(make_guard_case "harness-routing-$harness")
     home=$(case_home "$dir")
-    sleep 60 &
-    pid=$!
+    start_pi_session_process
+    pid=$PI_SESSION_PID
     record_pi_extension_session "$dir" "$pid" || fail "could not record the Pi extension session"
     touch "$home/state/.last-watcher-beat"
     out=$(env -u CLAUDECODE -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GROK_AGENT -u FM_SUPERVISION_MODEL \
