@@ -453,13 +453,13 @@ upgraded record: [42|gen=proc:boot-<uuid>:8214778|]
 
 Within that one-second window a pre-generation record still reads as compatible, which is the pre-change posture and is why the record is upgraded at the first acquisition rather than left in place.
 
-The portable regression is CI-enforced and covers publication, legitimate ownership, recycled-pid rejection, malformed or missing generation data, stale cleanup, external peer authorization, positive high-resolution generation evidence, and fail-closed handling of insufficient-resolution fallbacks:
+The portable regression is CI-enforced and covers publication, legitimate ownership, recycled-pid rejection, malformed or missing generation data, stale cleanup, external peer authorization, both supported generation sources, and the explicit legacy fallback when neither source exists:
 
 ```sh
 bin/fm-test-run.sh tests/fm-session-lock-generation.test.sh
 ```
 
-Observed output:
+The suite's current case labels are:
 
 ```text
 ok - session-lock generation: publication records the publishing process's kernel generation
@@ -471,8 +471,8 @@ ok - session-lock generation: a current-format record that cannot be verified ne
 ok - session-lock generation: a pre-generation record still serves its home and is upgraded on acquisition
 ok - session-lock generation: a legacy record is disproved once its pid belongs to a later process
 ok - session-lock generation: peer authorization takes positive identity evidence, session ownership keeps compatibility
-ok - session-lock generation: supported positive sources bind, insufficient-resolution fallback fails closed
-FM_TEST_SUMMARY total=1 failed=0 skipped_gate=0 duration_ms=3673
+ok - session-lock generation: a host with neither source gets a plainly announced legacy lock
+ok - session-lock generation: procfs and portable ps sources bind, while a host with neither falls back
 ```
 
 The real-harness guard is opt-in and is the command that refreshes the per-harness table below; run it after any harness upgrade:
@@ -497,7 +497,7 @@ ok - session-lock identity: pi 0.84.2 publishes a bound record that retires with
 
 muse is crew-only and never holds a home's session lock, so it is out of scope for this guard.
 Runtime backends are unaffected: the record is published by the primary session process itself, not by any endpoint, and no backend reads or writes it.
-`bin/fm-session-lock-lib.sh`'s header owns the record format, positive generation evidence, fail-closed fallback, and the compatibility contract summarized here.
+`bin/fm-session-lock-lib.sh`'s header owns the record format, positive generation evidence, explicit legacy fallback, and compatibility contract summarized here.
 
 ## Watcher continuity
 

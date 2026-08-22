@@ -3,9 +3,11 @@
 # Publishes the harness (agent) process found by walking the shell's ancestry,
 # which lives as long as the firstmate session - unlike the transient subshell
 # PID of any one tool call, which is dead moments after it is written - together
-# with that process's kernel generation identity, so a recycled pid can never
-# inherit the record. bin/fm-session-lock-lib.sh owns the record format, the
-# generation identity, and every verdict this script prints.
+# with that process's kernel generation identity when the host exposes one, so a
+# recycled pid cannot inherit a generation-bound record. Hosts without either
+# supported source use the explicitly announced legacy binding.
+# bin/fm-session-lock-lib.sh owns the record format, generation identity, legacy
+# compatibility path, and every verdict this script prints.
 # Usage: fm-lock.sh                   acquire; exit 1 unless ownership is verified
 #        fm-lock.sh status            print holder and liveness; always exits 0
 #        fm-lock.sh generation-check  exit 0 only while the record's identity

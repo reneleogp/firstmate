@@ -24,7 +24,22 @@ install_pi_watch_extension_fixture() {
   cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$repo/.pi/extensions/lib/fm-operational-input.ts"
   mkdir -p "$repo/bin"
   cp "$ROOT/bin/fm-operational-input.sh" "$repo/bin/fm-operational-input.sh"
-  chmod +x "$repo/bin/fm-operational-input.sh"
+  cat > "$repo/bin/fm-lock.sh" <<'SH'
+#!/usr/bin/env bash
+# Test double for the authoritative lock owner's public ownership interface.
+[ "${1:-}" = ownership ] || exit 2
+lock=${FM_STATE_OVERRIDE:?}/.lock
+[ -f "$lock" ] || { printf 'missing\n'; exit 0; }
+IFS= read -r lock_pid < "$lock" || { printf 'other\n'; exit 0; }
+if [ "$lock_pid" = "${2:-}" ]; then
+  printf 'owned\n'
+elif kill -0 "$lock_pid" 2>/dev/null; then
+  printf 'other\n'
+else
+  printf 'missing\n'
+fi
+SH
+  chmod +x "$repo/bin/fm-operational-input.sh" "$repo/bin/fm-lock.sh"
   cat > "$repo/node_modules/@earendil-works/pi-coding-agent/package.json" <<'JSON'
 {"name":"@earendil-works/pi-coding-agent","type":"module","exports":"./index.js"}
 JSON

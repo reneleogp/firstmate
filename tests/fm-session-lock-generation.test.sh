@@ -388,20 +388,45 @@ SH
   # A legacy record no evidence can decide authorizes nothing outside the
   # session, even though the same record still serves that session itself.
   printf '%s\n' "$pid" > "$state/.lock"
-  FM_SESSION_LOCK_PROC_ROOT="$home/emptyproc" lib_eval "fm_session_lock_generation_verdict '$state'" \
+  FM_SESSION_LOCK_PROC_ROOT="$home/emptyproc" FM_SESSION_LOCK_PS_COMMAND=false \
+    lib_eval "fm_session_lock_generation_verdict '$state'" \
     | grep -qx unbound || fail "a legacy record with no start-time evidence did not read as unbound"
-  if FM_SESSION_LOCK_PROC_ROOT="$home/emptyproc" "$CHECK_SH" "$state" "$pid"; then
+  if FM_SESSION_LOCK_PROC_ROOT="$home/emptyproc" FM_SESSION_LOCK_PS_COMMAND=false \
+    "$CHECK_SH" "$state" "$pid"; then
     fail "an undecidable legacy record authorized a peer"
   fi
-  FM_SESSION_LOCK_PROC_ROOT="$home/emptyproc" lib_eval "fm_session_lock_owned_by_pid '$state' '$pid'" \
+  FM_SESSION_LOCK_PROC_ROOT="$home/emptyproc" FM_SESSION_LOCK_PS_COMMAND=false \
+    lib_eval "fm_session_lock_owned_by_pid '$state' '$pid'" \
     || fail "an undecidable legacy record stopped serving its own session"
   pass "session-lock generation: peer authorization takes positive identity evidence, session ownership keeps compatibility"
 }
 
 # --- supported-platform behavior ---------------------------------------------
 
+test_publication_without_generation_sources_is_explicitly_legacy() {
+  local home state out record
+  home="$TMP_ROOT/no-generation-sources"
+  state="$home/state"
+  mkdir -p "$state" "$home/empty-proc"
+
+  out=$(FM_SESSION_LOCK_PROC_ROOT="$home/empty-proc" FM_SESSION_LOCK_PS_COMMAND=false \
+    "$HARNESS_BIN" -c "FM_HOME='$home' '$LOCK_SH' 2>&1; :")
+  assert_contains "$out" "lock acquired: harness pid" \
+    "a host exposing neither generation source was refused a session lock: $out"
+  assert_contains "$out" "only the legacy pid binding" \
+    "legacy-only publication did not plainly explain its weaker binding: $out"
+  record=$(cat "$state/.lock")
+  case "$record" in
+    *$'\n'*) fail "legacy-only publication unexpectedly wrote a multi-line record: $record" ;;
+  esac
+  case "$record" in
+    ''|*[!0-9]*) fail "legacy-only publication did not persist the harness pid: $record" ;;
+  esac
+  pass "session-lock generation: a host with neither source gets a plainly announced legacy lock"
+}
+
 test_process_generation_sources_on_this_platform() {
-  local first second other_pid other empty_root dead
+  local first second other_pid other empty_root fallback fallback_second dead
   first=$(generation_of "$$") || fail "no process generation source is available on this platform"
   second=$(generation_of "$$")
   [ "$first" = "$second" ] || fail "the same process reported two different generations: '$first' then '$second'"
@@ -421,13 +446,27 @@ test_process_generation_sources_on_this_platform() {
     esac
   fi
 
-  # ps lstart has only one-second precision. Without procfs or another positive
-  # high-resolution source, generation-bound authority must fail closed rather
-  # than let a same-second recycled pid inherit the token.
+  # With procfs unavailable, the portable macOS/BSD ps lstart source still
+  # publishes a stable, self-contained generation token and start-time value.
   empty_root="$TMP_ROOT/empty-proc"
   mkdir -p "$empty_root"
-  if FM_SESSION_LOCK_PROC_ROOT="$empty_root" generation_of "$$" >/dev/null; then
-    fail "a host with only insufficient-resolution process-start evidence issued a generation token"
+  fallback=$(FM_SESSION_LOCK_PROC_ROOT="$empty_root" generation_of "$$") \
+    || fail "the portable ps lstart generation source was unavailable"
+  fallback_second=$(FM_SESSION_LOCK_PROC_ROOT="$empty_root" generation_of "$$")
+  [ "$fallback" = "$fallback_second" ] \
+    || fail "ps lstart reported two generations for one process: '$fallback' then '$fallback_second'"
+  case "$fallback" in
+    ps:*) : ;;
+    *) fail "the no-procfs fallback did not identify itself as ps lstart: '$fallback'" ;;
+  esac
+  FM_SESSION_LOCK_PROC_ROOT="$empty_root" lib_eval "fm_process_start_epoch '$$'" >/dev/null \
+    || fail "ps lstart could not support legacy lock-mtime disproof"
+
+  # A host exposing neither source gets no generation token and therefore takes
+  # the explicit legacy publication path.
+  if FM_SESSION_LOCK_PROC_ROOT="$empty_root" FM_SESSION_LOCK_PS_COMMAND=false \
+    generation_of "$$" >/dev/null; then
+    fail "a host exposing neither supported process-generation source issued a token"
   fi
 
   # A dead pid has no generation at all, so a record naming one can never verify.
@@ -437,7 +476,7 @@ test_process_generation_sources_on_this_platform() {
   if generation_of "$dead" >/dev/null; then
     fail "a dead pid still reported a process generation"
   fi
-  pass "session-lock generation: supported positive sources bind, insufficient-resolution fallback fails closed"
+  pass "session-lock generation: procfs and portable ps sources bind, while a host with neither falls back"
 }
 
 test_publication_binds_the_record_to_the_publishing_generation
@@ -449,4 +488,5 @@ test_unverifiable_current_record_is_never_treated_as_bound
 test_legacy_record_keeps_serving_its_own_session_and_is_upgraded
 test_legacy_record_is_rejected_once_the_process_postdates_it
 test_peer_authorization_requires_positive_identity_evidence
+test_publication_without_generation_sources_is_explicitly_legacy
 test_process_generation_sources_on_this_platform
