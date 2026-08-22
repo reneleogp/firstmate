@@ -124,6 +124,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import errno
 import json
 import os
 import plistlib
@@ -132,6 +133,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -329,13 +331,34 @@ def service_log(home: Path) -> Path:
     return home / "service.log"
 
 
+def require_private_descriptor(descriptor: int, target: Path) -> None:
+    details = os.fstat(descriptor)
+    if not stat.S_ISREG(details.st_mode):
+        raise OSError(errno.EINVAL, "private target is not a regular file", target)
+    if hasattr(os, "getuid") and details.st_uid != os.getuid():
+        raise OSError(errno.EPERM, "private target belongs to another account", target)
+    os.fchmod(descriptor, 0o600)
+
+
 def write_private_bytes(target: Path, payload: bytes) -> None:
     """Write owner-only, never through a symlink someone else left in place."""
     descriptor = os.open(
-        target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        target, os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600
     )
     with os.fdopen(descriptor, "wb") as handle:
+        require_private_descriptor(handle.fileno(), target)
+        handle.truncate(0)
         handle.write(payload)
+
+
+def prepare_private_file(target: Path) -> None:
+    """Create an owner-only append target without following a symlink."""
+    descriptor = os.open(
+        target, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | os.O_NOFOLLOW,
+        0o600,
+    )
+    with os.fdopen(descriptor, "ab") as handle:
+        require_private_descriptor(handle.fileno(), target)
 
 
 def publish_ready_marker(home: Path) -> None:
@@ -380,8 +403,11 @@ def read_config(home: Path) -> dict[str, Any]:
 def write_config(home: Path, data: dict[str, Any]) -> None:
     private_dir(home)
     target = config_file(home)
-    target.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    target.chmod(0o600)
+    payload = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    try:
+        write_private_bytes(target, payload)
+    except OSError as exc:
+        raise TelegramError(f"could not write {target}: {exc}") from exc
 
 
 @dataclass
@@ -2441,25 +2467,68 @@ class LaunchdService(ServiceManager):
         # start a second one and let the first one's marker answer for it.
         self.wait_ready(launch_id)
 
-    def roll_back(self, previous: Optional[bytes], was_disabled: Optional[bool]) -> None:
-        """Leave a failed install exactly as enabled as it was before it ran."""
-        with contextlib.suppress(TelegramError):
-            job = self.job()
-            if job.loaded and (not job.path or Path(job.path) == self.plist):
+    def roll_back(
+        self, previous: Optional[bytes], previous_job: LaunchdJob, was_disabled: bool
+    ) -> list[str]:
+        """Restore the definition, loaded job, and disable record from before launch."""
+        failures: list[str] = []
+        job = self.job()
+        if job.loaded and (not job.path or Path(job.path) == self.plist):
+            try:
                 self.stop_job(job, "rolled back")
-        with contextlib.suppress(TelegramError, OSError):
+            except TelegramError as exc:
+                failures.append(str(exc))
+        try:
             if previous is None:
-                # A fresh install that failed must leave nothing behind that
-                # launchd would start at the next login.
                 remove_file(self.plist)
             else:
                 self.publish(previous)
-        if was_disabled:
-            self.launchctl("disable", self.target)
+        except (TelegramError, OSError) as exc:
+            failures.append(str(exc))
+
+        if previous_job.loaded and previous is not None and not failures:
+            try:
+                if was_disabled:
+                    self.checked("enable", self.target)
+                if previous_job.pid is None:
+                    dormant = plistlib.loads(previous)
+                    dormant["RunAtLoad"] = False
+                    dormant["KeepAlive"] = False
+                    self.publish(plistlib.dumps(dormant))
+                    self.checked("bootstrap", self.domain, str(self.plist))
+                    self.publish(previous)
+                else:
+                    remove_file(ready_marker(self.home))
+                    self.checked("bootstrap", self.domain, str(self.plist))
+                    environment = plistlib.loads(previous).get("EnvironmentVariables", {})
+                    launch_id = environment.get("FM_TELEGRAM_LAUNCH_ID")
+                    if not isinstance(launch_id, str):
+                        raise TelegramError("the previous LaunchAgent has no launch generation")
+                    self.wait_ready(launch_id)
+            except (TelegramError, OSError, ValueError, ExpatError) as exc:
+                failures.append(str(exc))
+
+        try:
+            self.checked("disable" if was_disabled else "enable", self.target)
+            restored_disabled = self.disabled()
+            if restored_disabled is None or restored_disabled != was_disabled:
+                raise TelegramError("launchd did not restore the previous disable state")
+        except TelegramError as exc:
+            failures.append(str(exc))
+        return failures
 
     def relaunch(self, action: str) -> None:
         previous = self.plist.read_bytes() if self.plist.exists() else None
+        previous_job = self.job()
         was_disabled = self.disabled()
+        if was_disabled is None:
+            raise TelegramError("could not determine the existing launchd disable state")
+        try:
+            prepare_private_file(service_log(self.home))
+        except OSError as exc:
+            raise TelegramError(
+                f"could not prepare {service_log(self.home)} without following a symlink: {exc}"
+            ) from exc
         # A fresh generation every time, so readiness can never be satisfied by
         # the child being replaced.
         launch_id = secrets.token_hex(16)
@@ -2467,7 +2536,10 @@ class LaunchdService(ServiceManager):
         try:
             self.launch(launch_id)
         except TelegramError as error:
-            self.roll_back(previous, was_disabled)
+            failures = self.roll_back(previous, previous_job, was_disabled)
+            if failures:
+                detail = "; ".join(failures)
+                raise TelegramError(f"{error}; rollback was incomplete: {detail}") from error
             raise TelegramError(f"{error}; the previous state was restored") from error
         print(f"{action} {LAUNCHD_LABEL} ({self.plist})")
 

@@ -201,6 +201,23 @@ test_the_published_definition_carries_no_secret() {
   pass "telegram macOS: the published LaunchAgent starts at login and carries only local paths"
 }
 
+test_install_refuses_a_service_log_symlink() {
+  local out victim
+  new_case
+  victim="$CASE_DIR/victim.log"
+  printf 'do not overwrite\n' >"$victim"
+  ln -s "$victim" "$CASE_HOME/service.log"
+  if out=$(service install-service); then
+    fail "install followed a service-log symlink: $out"
+  fi
+  [ "$(cat "$victim")" = "do not overwrite" ] \
+    || fail "install wrote through the service-log symlink"
+  [ -L "$CASE_HOME/service.log" ] || fail "install replaced the refusing symlink"
+  assert_absent "$PLIST" "a service-log refusal still published a LaunchAgent"
+  job_loaded && fail "a service-log refusal still started a job"
+  pass "telegram macOS: install refuses a service-log symlink before publication"
+}
+
 test_update_relaunches_once_and_ignores_the_previous_marker() {
   local out first second before
   new_case
@@ -250,18 +267,50 @@ test_a_failed_install_leaves_nothing_that_starts_at_login() {
   pass "telegram macOS: a failed install rolls back and leaves nothing to start at login"
 }
 
-test_a_failed_update_restores_the_previous_definition() {
-  local out before after
+test_a_failed_update_restores_the_previous_definition_and_child() {
+  local out before after previous_pid restored_pid
   new_case
   out=$(service install-service) || fail "first install failed: $out"
   before=$(cat "$PLIST")
+  previous_pid=$(running_pid)
   if out=$(service install-service fail); then
     fail "an update to a broken service reported success: $out"
   fi
   after=$(cat "$PLIST")
   [ "$before" = "$after" ] \
     || fail "a failed update left a different LaunchAgent published"
-  pass "telegram macOS: a failed update restores the definition that was working"
+  job_loaded || fail "a failed update left the previously loaded service down"
+  restored_pid=$(running_pid)
+  [ "$restored_pid" != 0 ] && [ "$restored_pid" != "$previous_pid" ] \
+    || fail "a failed update did not restart exactly one replacement for the prior child"
+  [ "$(launch_count)" = 3 ] \
+    || fail "a failed update launched $(launch_count) children instead of old, failed, restored"
+  case "$out" in
+    *"the previous state was restored"*) : ;;
+    *) fail "a complete rollback was not reported as restored: $out" ;;
+  esac
+  pass "telegram macOS: a failed update restores its definition and one running child"
+}
+
+test_an_incomplete_update_rollback_is_reported() {
+  local out
+  new_case
+  out=$(service install-service) || fail "first install failed: $out"
+  if out=$(FM_FAKE_LAUNCHD_FAIL_BOOTSTRAP_CALL=3 service install-service fail); then
+    fail "an update with a failed rollback reported success: $out"
+  fi
+  case "$out" in
+    *"rollback was incomplete"*) : ;;
+    *) fail "an incomplete rollback claimed the previous state was restored: $out" ;;
+  esac
+  case "$out" in
+    *"the previous state was restored"*)
+      fail "an incomplete rollback claimed success: $out"
+      ;;
+    *) : ;;
+  esac
+  job_loaded && fail "the failed rollback unexpectedly left a loaded prior service"
+  pass "telegram macOS: an incomplete rollback is surfaced instead of claiming restoration"
 }
 
 test_a_failed_install_restores_a_previous_disable() {
@@ -547,10 +596,12 @@ PY
 
 test_install_starts_one_service_and_waits_for_that_child
 test_the_published_definition_carries_no_secret
+test_install_refuses_a_service_log_symlink
 test_update_relaunches_once_and_ignores_the_previous_marker
 test_a_stale_marker_never_reports_a_new_launch_ready
 test_a_failed_install_leaves_nothing_that_starts_at_login
-test_a_failed_update_restores_the_previous_definition
+test_a_failed_update_restores_the_previous_definition_and_child
+test_an_incomplete_update_rollback_is_reported
 test_a_failed_install_restores_a_previous_disable
 test_stop_escalates_past_a_service_that_ignores_it
 test_stop_leaves_the_installation_in_place

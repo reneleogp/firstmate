@@ -1422,6 +1422,19 @@ class MirrorTestCase(unittest.TestCase):
         )
         self.assertIn("Confirmations are on.", after_pi["text"])
 
+    def test_confirmation_write_refuses_a_config_symlink(self) -> None:
+        pi = self.connect_pi()
+        victim = Path(self.tmp.name) / "victim.json"
+        original = b'{"owner": "someone else"}\n'
+        victim.write_bytes(original)
+        (self.home / "config.json").unlink()
+        (self.home / "config.json").symlink_to(victim)
+
+        pi.send({"t": "set", "id": 41, "setting": "confirmations", "value": False})
+        self.assertIn("Confirmations are off", pi.read()["text"])
+        self.assertEqual(victim.read_bytes(), original)
+        self.assertTrue((self.home / "config.json").is_symlink())
+
     def test_telegram_text_reaches_pi_unchanged_and_is_confirmed(self) -> None:
         pi = self.connect_pi()
         self.enable_mirror(pi)

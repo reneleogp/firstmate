@@ -158,6 +158,11 @@ def launch(job_plist: dict[str, Any], path: str, state: dict[str, Any]) -> int:
 def command_bootstrap(arguments: list[str], state: dict[str, Any]) -> int:
     if len(arguments) < 2:
         return 2
+    state["bootstrap_calls"] = int(state.get("bootstrap_calls", 0)) + 1
+    fail_call = os.environ.get("FM_FAKE_LAUNCHD_FAIL_BOOTSTRAP_CALL")
+    if fail_call and state["bootstrap_calls"] == int(fail_call):
+        print("Bootstrap failed: injected failure", file=sys.stderr)
+        return 1
     path = arguments[1]
     try:
         data = plistlib.loads(Path(path).read_bytes())
