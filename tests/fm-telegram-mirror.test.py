@@ -32,6 +32,27 @@ VOICE_BYTES = b"OggS-fake-voice"
 DEADLINE = 10.0
 
 
+def parse_multipart(body: bytes, boundary: str) -> tuple[dict[str, str],
+                                                         list[tuple[str, str, bytes]]]:
+    """Minimal reader for exactly the shape the bot uploads."""
+    fields: dict[str, str] = {}
+    files: list[tuple[str, str, bytes]] = []
+    marker = f"--{boundary}".encode()
+    for section in body.split(marker):
+        if not section.strip() or section.startswith(b"--"):
+            continue
+        head, _, payload = section.partition(b"\r\n\r\n")
+        headers = head.decode("utf-8", "replace")
+        name = headers.split('name="', 1)[1].split('"', 1)[0]
+        payload = payload[:-2] if payload.endswith(b"\r\n") else payload
+        if 'filename="' in headers:
+            filename = headers.split('filename="', 1)[1].split('"', 1)[0]
+            files.append((name, filename, payload))
+        else:
+            fields[name] = payload.decode("utf-8", "replace")
+    return fields, files
+
+
 class ParseModeRejected(Exception):
     """The fake API's stand-in for Telegram's 400 on unparsable markup."""
 
@@ -46,6 +67,9 @@ class FakeTelegram:
         self.edits: list[dict[str, Any]] = []
         self.callback_answers: list[dict[str, Any]] = []
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        # Uploads the bot made: (method, fields, [(field, filename, bytes)]).
+        self.uploads: list[tuple[str, dict[str, str], list[tuple[str, str, bytes]]]] = []
+        self.reject_uploads = False
         # Telegram refuses markup it cannot parse; the bot must recover.
         self.reject_parse_mode = False
         self.next_message_id = 1000
@@ -97,8 +121,20 @@ class FakeTelegram:
 
             def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
                 length = int(self.headers.get("Content-Length") or 0)
-                params = json.loads(self.rfile.read(length) or b"{}")
+                raw = self.rfile.read(length)
                 method = self.path.rsplit("/", 1)[-1]
+                content_type = self.headers.get("Content-Type") or ""
+                if content_type.startswith("multipart/form-data"):
+                    boundary = content_type.split("boundary=", 1)[1].strip()
+                    fields, files = parse_multipart(raw, boundary)
+                    with harness.lock:
+                        harness.uploads.append((method, fields, files))
+                    if harness.reject_uploads:
+                        self._error(400, "IMAGE_PROCESS_FAILED")
+                        return
+                    self._json({"message_id": 4242})
+                    return
+                params = json.loads(raw or b"{}")
                 try:
                     self._json(harness.dispatch(method, params))
                 except ParseModeRejected as exc:
@@ -910,6 +946,97 @@ class MirrorTestCase(unittest.TestCase):
                 frame.get("t"), "deliver",
                 f"an image was handed to a session that cannot render one: {frame}",
             )
+
+    def test_a_terminal_image_is_mirrored_as_real_media(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        # Text plus one image: one submission, one album entry, the terminal
+        # text as its caption.
+        pi.send({"t": "terminal", "text": "what do you make of this",
+                 "images": [{"data": base64.b64encode(self.PNG).decode(), "mime": "image/png"}]})
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline and not self.telegram.uploads:
+            time.sleep(0.05)
+        self.assertTrue(self.telegram.uploads, "the terminal image was never uploaded")
+        method, fields, files = self.telegram.uploads[0]
+        self.assertEqual(method, "sendPhoto")
+        self.assertEqual(fields["caption"], "You · Terminal\nwhat do you make of this")
+        self.assertEqual(len(files), 1)
+        # Real bytes, not a path and not base64 text.
+        self.assertEqual(files[0][2], self.PNG)
+        self.assertNotIn("/tmp/", json.dumps(fields))
+
+    def test_a_terminal_image_without_text_still_reaches_telegram(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        pi.send({"t": "terminal", "text": "",
+                 "images": [{"data": base64.b64encode(self.PNG).decode(), "mime": "image/png"}]})
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline and not self.telegram.uploads:
+            time.sleep(0.05)
+        self.assertTrue(self.telegram.uploads, "an image-only submission was dropped")
+        _method, fields, files = self.telegram.uploads[0]
+        self.assertEqual(fields["caption"], "You · Terminal")
+        self.assertEqual(files[0][2], self.PNG)
+
+    def test_several_terminal_images_keep_their_order_in_one_album(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        blobs = [self.PNG + bytes([index]) for index in range(3)]
+        pi.send({"t": "terminal", "text": "three shots", "images": [
+            {"data": base64.b64encode(blob).decode(), "mime": "image/png"} for blob in blobs
+        ]})
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline and not self.telegram.uploads:
+            time.sleep(0.05)
+        self.assertTrue(self.telegram.uploads, "the album was never uploaded")
+        method, fields, files = self.telegram.uploads[0]
+        self.assertEqual(method, "sendMediaGroup")
+        media = json.loads(fields["media"])
+        self.assertEqual([entry["media"] for entry in media],
+                         [f"attach://{name}" for name, _filename, _blob in files])
+        self.assertEqual([blob for _name, _filename, blob in files], blobs)
+        self.assertEqual(media[0]["caption"], "You · Terminal\nthree shots")
+        self.assertNotIn("caption", media[1])
+
+    def test_terminal_images_respect_the_size_and_type_bounds(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        pi.send({"t": "terminal", "text": "mixed bag", "images": [
+            {"data": base64.b64encode(self.PNG).decode(), "mime": "image/png"},
+            {"data": base64.b64encode(b"not an image at all").decode(), "mime": "image/png"},
+            {"data": base64.b64encode(self.PNG).decode(), "mime": "application/zip"},
+            {"data": base64.b64encode(b"\\x89PNG\\r\\n\\x1a\\n" + b"x" * (11 * 1024 * 1024)).decode(),
+             "mime": "image/png"},
+        ]})
+        deadline = time.time() + DEADLINE
+        while time.time() < deadline and not self.telegram.uploads:
+            time.sleep(0.05)
+        self.assertTrue(self.telegram.uploads)
+        _method, _fields, files = self.telegram.uploads[0]
+        self.assertEqual([blob for _n, _f, blob in files], [self.PNG])
+        refusal = self.telegram.wait_sent(lambda m: "were not mirrored" in str(m.get("text")))
+        self.assertIn("3 image(s)", refusal["text"])
+
+    def test_a_rejected_terminal_image_reports_without_duplicating(self) -> None:
+        pi = self.connect_pi()
+        self.enable_mirror(pi)
+        self.telegram.reject_uploads = True
+        pi.send({"t": "terminal", "text": "this one fails",
+                 "images": [{"data": base64.b64encode(self.PNG).decode(), "mime": "image/png"}]})
+        failure = self.telegram.wait_sent(lambda m: "could not be" in str(m.get("text")))
+        self.assertIn("1 image(s) could not be sent", failure["text"])
+        time.sleep(0.8)
+        # One attempt only: a failed album is never re-sent.
+        self.assertEqual(len(self.telegram.uploads), 1)
+
+    def test_terminal_images_are_not_mirrored_while_the_mirror_is_off(self) -> None:
+        pi = self.connect_pi()
+        pi.send({"t": "terminal", "text": "while off",
+                 "images": [{"data": base64.b64encode(self.PNG).decode(), "mime": "image/png"}]})
+        time.sleep(0.8)
+        self.assertEqual(self.telegram.uploads, [])
+        self.assertEqual(self.telegram.sent_texts(), [])
 
     def test_menu_aliases_are_published_and_switch_the_mirror(self) -> None:
         pi = self.connect_pi()

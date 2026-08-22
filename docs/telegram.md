@@ -115,6 +115,13 @@ Messages still reach Firstmate exactly as before, and an accepted message still 
 
 ## Screenshots and images
 
+Images travel both ways.
+
+Paste or attach an image in the terminal and it appears in Telegram as real, viewable media rather than a local path: one photo on its own, or an album that keeps the order you sent.
+Your terminal text rides along as the caption when it fits, and is sent as its own `You · Terminal` message when it is too long for one.
+An image-only submission still arrives, captioned `You · Terminal`.
+Images that are the wrong type or too large are skipped with a short note saying how many, and if Telegram rejects an upload you are told plainly; a failed album is never re-sent, so nothing arrives twice.
+
 Send a screenshot from the paired chat and Firstmate receives it exactly as an image pasted into the terminal, with nothing saying it came from Telegram.
 A caption travels with it as the text of the same message.
 Because the terminal shows no preview of an attached image, the message also carries a plain `[Image attached]` line so you can see one arrived; with a caption it reads as the caption followed by that line, and without one it is that line alone.
@@ -134,7 +141,7 @@ While mirror mode is off, an ordinary Telegram message is answered with `Telegra
 
 While mirror mode is on:
 
-- each ordinary submission typed in the Pi terminal appears in Telegram as a `You · Terminal` message,
+- each ordinary submission typed in the Pi terminal appears in Telegram as a `You · Terminal` message, images included,
 - every completed reply appears as Firstmate finishes it, and
 - gray thinking, tool calls, tool results, shell output, and system, developer, extension, or operational messages never appear.
 

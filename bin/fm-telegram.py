@@ -84,9 +84,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import binascii
 import contextlib
 import json
 import os
+import secrets
 import shlex
 import signal
 import socket
@@ -164,6 +166,13 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 # Queued images live in memory only, like every other queued message, so the
 # total is bounded rather than growing while Firstmate is away.
 MAX_QUEUED_IMAGE_BYTES = 32 * 1024 * 1024
+# Outbound: Telegram's own album and caption limits.
+MAX_MEDIA_GROUP = 10
+TELEGRAM_CAPTION_LIMIT = 1024
+# One frame can carry a screenshot, which is far past asyncio's default 64 KiB
+# line limit; without this the reader would fail and drop the session the first
+# time an image was mirrored from the terminal.
+MAX_FRAME_BYTES = MAX_QUEUED_IMAGE_BYTES + 2 * 1024 * 1024
 # Delivery confirmations are switched by their own Telegram commands and by Pi's
 # settings; both write the one persistent setting the bot owns.
 MIRROR_COMMAND_NAMES = ("on", "off", "status", "confirmations-on", "confirmations-off")
@@ -301,6 +310,42 @@ class TelegramApi:
         self._base = base.rstrip("/")
         self._token = token
 
+    def _multipart_sync(self, method: str, fields: dict[str, str],
+                        files: list[tuple[str, str, bytes]], timeout: float) -> Any:
+        """Upload real media: the Bot API takes bytes only as multipart."""
+        boundary = f"----fm{secrets.token_hex(16)}"
+        body = bytearray()
+        for name, value in fields.items():
+            body += f"--{boundary}\r\n".encode()
+            body += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+            body += value.encode("utf-8") + b"\r\n"
+        for name, filename, blob in files:
+            body += f"--{boundary}\r\n".encode()
+            body += (f'Content-Disposition: form-data; name="{name}"; '
+                     f'filename="{filename}"\r\n').encode()
+            body += b"Content-Type: application/octet-stream\r\n\r\n"
+            body += blob + b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        request = urllib.request.Request(
+            f"{self._base}/bot{self._token}/{method}", data=bytes(body),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:400]
+            raise TelegramError(f"{method} failed with HTTP {exc.code}: {detail}") from exc
+        except (OSError, json.JSONDecodeError) as exc:
+            raise TelegramError(f"{method} failed: {exc}") from exc
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            raise TelegramError(f"{method} rejected: {str(payload)[:400]}")
+        return payload.get("result")
+
+    async def upload(self, method: str, fields: dict[str, str],
+                     files: list[tuple[str, str, bytes]], timeout: float = 120) -> Any:
+        return await asyncio.to_thread(self._multipart_sync, method, fields, files, timeout)
+
     def request_sync(self, method: str, params: dict[str, Any], timeout: float = 30) -> Any:
         url = f"{self._base}/bot{self._token}/{method}"
         body = json.dumps(params).encode("utf-8")
@@ -395,6 +440,59 @@ class MirrorBot:
     def next_id(self) -> str:
         self._sequence += 1
         return f"m{self._sequence}"
+
+    async def mirror_terminal(self, text: str, images: Any = None) -> None:
+        """Show a terminal submission in Telegram, images included."""
+        accepted, refused = accept_outbound_images(images)
+        label = f"{TERMINAL_LABEL}\n{text}" if text.strip() else TERMINAL_LABEL
+        if not accepted:
+            await self.send(label)
+        else:
+            # A caption rides along when Telegram allows its length; a longer
+            # submission is its own message so nothing is truncated away.
+            caption = label if len(label) <= TELEGRAM_CAPTION_LIMIT else ""
+            if not caption:
+                await self.send(label)
+            await self.send_photos(accepted, caption)
+        if refused:
+            await self.send(f"{TERMINAL_LABEL}\n{refused} image(s) were too large or "
+                            "an unsupported type and were not mirrored.")
+
+    async def send_photos(self, images: list[tuple[bytes, str]], caption: str) -> None:
+        """One album per batch: a group succeeds or fails whole, never twice."""
+        for start in range(0, len(images), MAX_MEDIA_GROUP):
+            batch = images[start:start + MAX_MEDIA_GROUP]
+            batch_caption = caption if start == 0 else ""
+            try:
+                if len(batch) == 1:
+                    fields = {"chat_id": str(self.config.chat_id)}
+                    if batch_caption:
+                        fields["caption"] = batch_caption
+                    await self.api.upload(
+                        "sendPhoto", fields,
+                        [("photo", f"terminal{extension_for(batch[0][1])}", batch[0][0])],
+                    )
+                    continue
+                media = []
+                files = []
+                for index, (blob, mime) in enumerate(batch):
+                    name = f"file{index}"
+                    entry: dict[str, Any] = {"type": "photo", "media": f"attach://{name}"}
+                    if index == 0 and batch_caption:
+                        entry["caption"] = batch_caption
+                    media.append(entry)
+                    files.append((name, f"terminal{index}{extension_for(mime)}", blob))
+                await self.api.upload(
+                    "sendMediaGroup",
+                    {"chat_id": str(self.config.chat_id), "media": json.dumps(media)},
+                    files,
+                )
+            except TelegramError as exc:
+                # Never the bytes or the submission: only what failed.
+                log(f"could not mirror terminal images: {exc}")
+                await self.send(f"{TERMINAL_LABEL}\n{len(batch)} image(s) could not be "
+                                "sent to Telegram.")
+                return
 
     async def send(self, text: str, reply_to: Optional[int] = None,
                    markup: Optional[dict[str, Any]] = None,
@@ -823,7 +921,13 @@ class MirrorBot:
         # The queue drains once hello names what this session can render.
         try:
             while True:
-                line = await reader.readline()
+                try:
+                    line = await reader.readline()
+                except (ValueError, asyncio.LimitOverrunError):
+                    # A frame past the bound is refused without tearing the
+                    # session down for every later message.
+                    log("ignored an oversized frame from the Firstmate session")
+                    continue
                 if not line:
                     break
                 try:
@@ -854,7 +958,7 @@ class MirrorBot:
             return
         if kind == "terminal":
             if self.mirror_on and isinstance(frame.get("text"), str):
-                await self.send(f"{TERMINAL_LABEL}\n{frame['text']}")
+                await self.mirror_terminal(frame["text"], frame.get("images"))
             return
         if kind == "reply":
             # Never threaded. Pi batches back-to-back submissions into one run,
@@ -928,7 +1032,8 @@ class MirrorBot:
         private_dir(self.config.home)
         clear_audio(self.config.home)
         remove_file(path)
-        server = await asyncio.start_unix_server(self.handle_client, path=str(path))
+        server = await asyncio.start_unix_server(self.handle_client, path=str(path),
+                                                 limit=MAX_FRAME_BYTES)
         os.chmod(path, 0o600)
         log(f"listening on {path}")
         loop = asyncio.get_running_loop()
@@ -1172,6 +1277,46 @@ def sniff_image_mime(data: bytes) -> Optional[str]:
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
     return None
+
+
+def extension_for(mime: str) -> str:
+    return {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mime, ".png")
+
+
+def accept_outbound_images(images: Any) -> tuple[list[tuple[bytes, str]], int]:
+    """Terminal images fit to mirror, plus how many were refused.
+
+    The same type and size rules as inbound images, applied before anything is
+    uploaded, with an aggregate bound so one submission cannot hold the mirror.
+    """
+    if not isinstance(images, list):
+        return [], 0
+    accepted: list[tuple[bytes, str]] = []
+    refused = 0
+    total = 0
+    for entry in images:
+        if not isinstance(entry, dict):
+            refused += 1
+            continue
+        mime = entry.get("mime")
+        raw = entry.get("data")
+        if mime not in IMAGE_MIME_TYPES or not isinstance(raw, str):
+            refused += 1
+            continue
+        try:
+            blob = base64.b64decode(raw, validate=True)
+        except (ValueError, binascii.Error):
+            refused += 1
+            continue
+        if not blob or len(blob) > MAX_IMAGE_BYTES or sniff_image_mime(blob) != mime:
+            refused += 1
+            continue
+        if total + len(blob) > MAX_QUEUED_IMAGE_BYTES:
+            refused += 1
+            continue
+        total += len(blob)
+        accepted.append((blob, mime))
+    return accepted, refused
 
 
 def peer_description(writer: asyncio.StreamWriter) -> str:

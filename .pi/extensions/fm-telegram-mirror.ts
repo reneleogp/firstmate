@@ -135,6 +135,21 @@ function asQueuedImage(value: unknown): QueuedImage | undefined {
   return { data: candidate.data, mime: candidate.mime };
 }
 
+// Pi hands attached images to the input event as its own image content; the
+// bot receives the bytes so Telegram can show real media rather than a local
+// path the captain's phone cannot open.
+function terminalImages(images: unknown): QueuedImage[] {
+  if (!Array.isArray(images)) return [];
+  const mirrored: QueuedImage[] = [];
+  for (const entry of images) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const candidate = entry as { data?: unknown; mimeType?: unknown };
+    if (typeof candidate.data !== "string" || typeof candidate.mimeType !== "string") continue;
+    mirrored.push({ data: candidate.data, mime: candidate.mimeType });
+  }
+  return mirrored;
+}
+
 function assistantText(message: unknown): string {
   const content = (message as { role?: string; content?: unknown } | undefined)?.content;
   if (!Array.isArray(content)) return "";
@@ -364,15 +379,18 @@ export default function (pi: ExtensionAPI) {
     activeCtx = null;
   });
 
-  // Ordinary captain submissions typed in the terminal. Telegram-originated
-  // text arrives as source "extension" and is already visible in Telegram, so
-  // it is never echoed back, and Firstmate's own operational input is never
-  // mirrored at all.
+  // Ordinary captain submissions typed in the terminal, images included.
+  // Telegram-originated text and screenshots arrive as source "extension" and
+  // are already visible in Telegram, so they are never echoed back, and
+  // Firstmate's own operational input is never mirrored at all.
   pi.on?.("input", (event) => {
     if (event.source !== "interactive") return;
-    if (typeof event.text !== "string" || !event.text.trim()) return;
-    if (classifyFirstmateOperationalText(event.text) !== undefined) return;
-    write({ t: "terminal", text: event.text });
+    const text = typeof event.text === "string" ? event.text : "";
+    const images = terminalImages(event.images);
+    // An image-only submission has no text but is still a real submission.
+    if (!text.trim() && images.length === 0) return;
+    if (text.trim() && classifyFirstmateOperationalText(text) !== undefined) return;
+    write(images.length > 0 ? { t: "terminal", text, images } : { t: "terminal", text });
   });
 
   // Every completed reply is mirrored as Pi finalizes it, exactly once.

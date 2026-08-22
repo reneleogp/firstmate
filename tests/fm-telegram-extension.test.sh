@@ -160,6 +160,42 @@ if (terminalFrames.length !== 1 || terminalFrames[0].text !== "check the failing
   fail(`unexpected terminal mirroring: ${JSON.stringify(terminalFrames)}`);
 }
 
+// 1b. A pasted screenshot is part of the submission: the bot receives the bytes
+//     so Telegram can show real media, and the images keep their order. A
+//     Telegram-origin screenshot still never echoes back.
+const shotA = "iVBORw0KA";
+const shotB = "iVBORw0KB";
+handlers.get("input")({
+  text: "what do you make of these",
+  source: "interactive",
+  images: [
+    { type: "image", data: shotA, mimeType: "image/png" },
+    { type: "image", data: shotB, mimeType: "image/webp" },
+  ],
+}, ctx);
+handlers.get("input")({ text: "", source: "interactive", images: [{ type: "image", data: shotA, mimeType: "image/png" }] }, ctx);
+handlers.get("input")({ text: "", source: "extension", images: [{ type: "image", data: shotB, mimeType: "image/png" }] }, ctx);
+handlers.get("input")({ text: operational, source: "interactive", images: [{ type: "image", data: shotA, mimeType: "image/png" }] }, ctx);
+await waitFor(
+  () => received.filter((frame) => frame.t === "terminal" && frame.images).length === 2,
+  "the terminal image frames",
+);
+await new Promise((resolve) => setTimeout(resolve, 200));
+const imageFrames = received.filter((frame) => frame.t === "terminal" && frame.images);
+if (imageFrames.length !== 2) {
+  fail(`unexpected terminal image mirroring: ${JSON.stringify(imageFrames)}`);
+}
+if (JSON.stringify(imageFrames[0]) !== JSON.stringify({
+  t: "terminal",
+  text: "what do you make of these",
+  images: [{ data: shotA, mime: "image/png" }, { data: shotB, mime: "image/webp" }],
+})) {
+  fail(`text plus images was not preserved in order: ${JSON.stringify(imageFrames[0])}`);
+}
+if (imageFrames[1].text !== "" || imageFrames[1].images.length !== 1) {
+  fail(`an image-only submission was not mirrored intact: ${JSON.stringify(imageFrames[1])}`);
+}
+
 // 2. Every completed reply is mirrored exactly once, as Pi finalizes it, while
 //    thinking, tool narration, and tool results are never mirrored. The five
 //    queued messages below are one continuous run with a single settle: the
