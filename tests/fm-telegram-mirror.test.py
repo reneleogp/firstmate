@@ -365,6 +365,11 @@ class MirrorTestCase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name) / "home"
         self.home.mkdir(parents=True)
+        self.firstmate_home = Path(self.tmp.name) / "firstmate"
+        (self.firstmate_home / "state").mkdir(parents=True)
+        (self.firstmate_home / "state" / ".lock").write_text(
+            f"{os.getpid()}\n", encoding="utf-8"
+        )
         (self.home / "env").write_text(f"TELEGRAM_BOT_TOKEN={TOKEN}\n", encoding="utf-8")
         transcript_script = Path(self.tmp.name) / "fake-parakeet"
         transcript_script.write_text(
@@ -385,6 +390,7 @@ class MirrorTestCase(unittest.TestCase):
         environment = dict(os.environ)
         environment.update({
             "FM_TELEGRAM_DIR": str(self.home),
+            "FM_HOME": str(self.firstmate_home),
             "FM_TELEGRAM_API_BASE": self.telegram.base,
             "FM_TEST_TRANSCRIPT": str(self.transcript_file),
         })
@@ -799,6 +805,29 @@ class MirrorTestCase(unittest.TestCase):
         sent = self.telegram.wait_sent(lambda m: "bold" in str(m.get("text")))
         self.assertEqual(sent["text"], "**bold** stays literal")
         self.assertNotIn("parse_mode", sent)
+
+    def test_an_unverified_first_client_is_refused(self) -> None:
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: sleeper.poll() is None and sleeper.kill())
+        lock = self.firstmate_home / "state" / ".lock"
+        lock.write_text(f"{sleeper.pid}\n", encoding="utf-8")
+
+        intruder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        intruder.settimeout(2)
+        intruder.connect(str(self.socket_path))
+        self.addCleanup(intruder.close)
+        intruder.sendall(b'{"t":"command","id":91,"command":"on"}\n')
+        try:
+            self.assertEqual(intruder.recv(65536), b"")
+        except (ConnectionResetError, OSError):
+            pass
+
+        lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        sleeper.kill()
+        sleeper.wait(timeout=2)
+        primary = self.connect_pi()
+        primary.send({"t": "command", "id": 92, "command": "status"})
+        self.assertIn("Firstmate is connected", primary.read()["text"])
 
     def test_a_second_session_cannot_take_over_or_leak_into_the_chat(self) -> None:
         primary = self.connect_pi()
@@ -1688,7 +1717,12 @@ class ServiceUnitTestCase(unittest.TestCase):
     def test_unit_starts_the_bot_and_carries_no_secret(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             environment = dict(os.environ)
-            environment.update({"FM_TELEGRAM_DIR": tmp, "TELEGRAM_BOT_TOKEN": TOKEN})
+            firstmate_home = str(Path(tmp) / "firstmate")
+            environment.update({
+                "FM_TELEGRAM_DIR": tmp,
+                "FM_HOME": firstmate_home,
+                "TELEGRAM_BOT_TOKEN": TOKEN,
+            })
             unit = subprocess.run(
                 [sys.executable, str(BOT), "service-unit"], env=environment,
                 stdout=subprocess.PIPE, text=True, check=True,
@@ -1696,6 +1730,7 @@ class ServiceUnitTestCase(unittest.TestCase):
         self.assertIn("WantedBy=default.target", unit)
         self.assertIn(f"{BOT} run", unit)
         self.assertIn(f"Environment=FM_TELEGRAM_DIR={tmp}", unit)
+        self.assertIn(f"Environment=FM_HOME={firstmate_home}", unit)
         # The bot's own stop is bounded; the unit must not fall back to the 90s
         # default that killed it in the field.
         self.assertIn("TimeoutStopSec=20", unit)

@@ -279,6 +279,7 @@ def write_config(home: Path, data: dict[str, Any]) -> None:
 @dataclass
 class Config:
     home: Path
+    firstmate_home: Path
     token: str
     user_id: int
     chat_id: int
@@ -303,8 +304,12 @@ def load_config(home: Path) -> Config:
     command = data.get("transcribe_command") or DEFAULT_TRANSCRIBE_COMMAND
     api_base = os.environ.get("FM_TELEGRAM_API_BASE") or data.get("api_base") or DEFAULT_API_BASE
     confirmations = data.get("confirmations")
+    firstmate_home = Path(
+        os.environ.get("FM_HOME") or Path(__file__).resolve().parents[1]
+    ).resolve()
     return Config(
         home=home,
+        firstmate_home=firstmate_home,
         token=token,
         user_id=user_id,
         chat_id=chat_id,
@@ -948,6 +953,11 @@ class MirrorBot:
 
     async def handle_client(self, reader: asyncio.StreamReader,
                             writer: asyncio.StreamWriter) -> None:
+        if not peer_owns_session_lock(writer, self.config.firstmate_home):
+            log(f"refused an unverified Pi connection from {peer_description(writer)}")
+            with contextlib.suppress(OSError):
+                writer.close()
+            return
         # One mirrored session, first come, never displaced. A crewmate or scout
         # that reached this socket must not be able to take the captain's chat
         # away from the live Firstmate session, so a second connection is
@@ -1516,15 +1526,64 @@ def accept_outbound_images(images: Any) -> tuple[list[tuple[bytes, str]], int]:
     return accepted, refused
 
 
-def peer_description(writer: asyncio.StreamWriter) -> str:
-    """Kernel-supplied identity of the connected process, never client-supplied."""
+def peer_credentials(writer: asyncio.StreamWriter) -> Optional[tuple[int, int]]:
+    """Linux kernel identity for this Unix-socket peer."""
     try:
         sock = writer.get_extra_info("socket")
         credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
                                       struct.calcsize("3i"))
         pid, uid, _gid = struct.unpack("3i", credentials)
     except (OSError, AttributeError, struct.error):
+        return None
+    return pid, uid
+
+
+def process_parent(pid: int) -> Optional[int]:
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in status.splitlines():
+        if line.startswith("PPid:"):
+            value = line.partition(":")[2].strip()
+            return int(value) if value.isdigit() else None
+    return None
+
+
+def peer_owns_session_lock(writer: asyncio.StreamWriter, firstmate_home: Path) -> bool:
+    credentials = peer_credentials(writer)
+    if credentials is None:
+        return False
+    peer_pid, peer_uid = credentials
+    if hasattr(os, "getuid") and peer_uid != os.getuid():
+        return False
+    try:
+        lock_pid_text = (firstmate_home / "state" / ".lock").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        return False
+    if not lock_pid_text.isdigit():
+        return False
+    lock_pid = int(lock_pid_text)
+    if lock_pid <= 1:
+        return False
+    pid: Optional[int] = peer_pid
+    for _step in range(64):
+        if pid == lock_pid:
+            return True
+        if pid is None or pid <= 1:
+            return False
+        pid = process_parent(pid)
+    return False
+
+
+def peer_description(writer: asyncio.StreamWriter) -> str:
+    """Kernel-supplied identity of the connected process, never client-supplied."""
+    credentials = peer_credentials(writer)
+    if credentials is None:
         return "an unidentified process"
+    pid, uid = credentials
     try:
         command = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
     except OSError:
@@ -1708,6 +1767,9 @@ def unit_path() -> Path:
 
 def unit_text(home: Path) -> str:
     script = Path(__file__).resolve()
+    firstmate_home = Path(
+        os.environ.get("FM_HOME") or Path(__file__).resolve().parents[1]
+    ).resolve()
     return (
         "[Unit]\n"
         "Description=Firstmate Telegram terminal mirror\n"
@@ -1716,6 +1778,7 @@ def unit_text(home: Path) -> str:
         "[Service]\n"
         "Type=simple\n"
         f"Environment=FM_TELEGRAM_DIR={shlex.quote(str(home))}\n"
+        f"Environment=FM_HOME={shlex.quote(str(firstmate_home))}\n"
         f"ExecStart={sys.executable} {shlex.quote(str(script))} run\n"
         "Restart=always\n"
         "RestartSec=5\n"

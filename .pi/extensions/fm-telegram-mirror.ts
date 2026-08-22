@@ -20,8 +20,9 @@
 import { spawnSync } from "node:child_process";
 import {
   closeSync,
+  constants as fsConstants,
   existsSync,
-  lstatSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -252,30 +253,36 @@ function readClipboardArtifact(
 ): ClipboardArtifact {
   const declared = clipboardMime(basename(token));
   if (!declared) return { kind: "invalid" };
+  let descriptor: number | undefined;
   try {
-    // lstat, so a symlink pointing somewhere else is refused rather than
-    // followed, and only this account's own regular file is read.
-    const info = lstatSync(token);
-    if (!info.isFile() || info.isSymbolicLink() || info.size <= 0) return { kind: "invalid" };
+    descriptor = openSync(token, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const info = fstatSync(descriptor);
+    if (!info.isFile() || info.size <= 0) return { kind: "invalid" };
     if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
       return { kind: "invalid" };
     }
-    const descriptor = openSync(token, "r");
-    const header = Buffer.alloc(Math.min(info.size, 12));
-    try {
-      readSync(descriptor, header, 0, header.length, 0);
-    } finally {
-      closeSync(descriptor);
+    const parts: Buffer[] = [];
+    let length = 0;
+    while (length <= MAX_CLIPBOARD_BYTES) {
+      const part = Buffer.alloc(Math.min(64 * 1024, MAX_CLIPBOARD_BYTES + 1 - length));
+      const count = readSync(descriptor, part, 0, part.length, null);
+      if (count === 0) break;
+      parts.push(part.subarray(0, count));
+      length += count;
     }
-    // The bytes decide, not the name: a renamed file is not an image.
-    if (imageMimeFromMagic(header) !== declared) return { kind: "invalid" };
-    if (info.size > MAX_CLIPBOARD_BYTES || imageCount >= MAX_CLIPBOARD_IMAGES ||
-        alreadyTaken + info.size > MAX_CLIPBOARD_TOTAL_BYTES) return { kind: "refused" };
-    const bytes = readFileSync(token);
+    const bytes = Buffer.concat(parts, length);
     if (imageMimeFromMagic(bytes) !== declared) return { kind: "invalid" };
+    if (bytes.length > MAX_CLIPBOARD_BYTES || imageCount >= MAX_CLIPBOARD_IMAGES ||
+        alreadyTaken + bytes.length > MAX_CLIPBOARD_TOTAL_BYTES) return { kind: "refused" };
     return { kind: "accepted", image: { data: bytes.toString("base64"), mime: declared } };
   } catch {
     return { kind: "invalid" };
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        closeSync(descriptor);
+      } catch {}
+    }
   }
 }
 

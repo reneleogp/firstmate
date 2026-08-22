@@ -47,7 +47,7 @@ if ! (cd "$FIXTURE" && \
   FM_HOME="$TMP_ROOT/fmhome" \
   WORKER_HOME="$TMP_ROOT/workerhome" \
   node --input-type=module >"$OUT" 2>&1) <<'JS'
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
@@ -369,7 +369,46 @@ if (countLimited.text.includes("pi-clipboard-") ||
   fail(`the clipboard image-count refusal was not reported safely: ${JSON.stringify(notifications.slice(noticesBeforeImageCountLimit))}`);
 }
 
-for (const path of [genuine, genuineJpeg, arbitrary, wrongMagic, oversized, linkTarget, symlinked]) {
+const raced = join(clipboardDir, `pi-clipboard-55555555-1111-2222-3333-444455556666.png`);
+const racedStage = `${raced}.stage`;
+const racedSecret = join(clipboardDir, "fm-telegram-race-secret.png");
+const racedSafeBytes = Buffer.from("89504e470d0a1a0a" + "22".repeat(24), "hex");
+const racedSecretBytes = Buffer.from("89504e470d0a1a0a" + "ee".repeat(24), "hex");
+writeFileSync(raced, racedSafeBytes);
+writeFileSync(racedSecret, racedSecretBytes);
+const raceScript = join(process.env.FM_TELEGRAM_DIR, "clipboard-racer.mjs");
+writeFileSync(raceScript, `
+  import { renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+  const [target, stage, secret, safe] = process.argv.slice(2);
+  const bytes = Buffer.from(safe, "base64");
+  for (;;) {
+    try { unlinkSync(stage); } catch {}
+    try { symlinkSync(secret, stage); renameSync(stage, target); } catch {}
+    try { unlinkSync(stage); } catch {}
+    try { writeFileSync(stage, bytes); renameSync(stage, target); } catch {}
+  }
+`);
+const racer = spawn(process.execPath, [raceScript, raced, racedStage, racedSecret,
+  racedSafeBytes.toString("base64")], { stdio: "ignore" });
+await new Promise((resolve) => setTimeout(resolve, 50));
+const framesBeforeRace = received.filter((frame) => frame.t === "terminal").length;
+for (let attempt = 0; attempt < 1500; attempt += 1) {
+  handlers.get("input")({ text: raced, source: "interactive" }, ctx);
+}
+await waitFor(
+  () => received.filter((frame) => frame.t === "terminal").length === framesBeforeRace + 1500,
+  "the clipboard replacement race probes",
+);
+racer.kill("SIGKILL");
+const raceFrames = received.filter((frame) => frame.t === "terminal").slice(framesBeforeRace);
+if (raceFrames.some((frame) => frame.images?.some(
+  (image) => image.data === racedSecretBytes.toString("base64"),
+))) {
+  fail("a clipboard pathname replacement leaked the symlink target bytes");
+}
+
+for (const path of [genuine, genuineJpeg, arbitrary, wrongMagic, oversized, linkTarget, symlinked,
+                    raced, racedStage, racedSecret, raceScript]) {
   try { unlinkSync(path); } catch {}
 }
 
