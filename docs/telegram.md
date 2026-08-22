@@ -1,8 +1,11 @@
-# Telegram terminal mirror (WSL)
+# Telegram terminal mirror
 
 The Telegram mirror puts the one Firstmate terminal conversation on your phone, in both directions.
-It is a private Python bot (`bin/fm-telegram.py`) running as a WSL user service beside one Pi extension (`.pi/extensions/fm-telegram-mirror.ts`).
-It is WSL only and has no macOS service.
+It is a private Python bot (`bin/fm-telegram.py`) running as a per-user service beside one Pi extension (`.pi/extensions/fm-telegram-mirror.ts`).
+It runs on WSL as a systemd user unit and on macOS as a LaunchAgent, and nowhere else.
+
+Everything you can see and do is the same on both: mirror mode, the commands, the terminal footer and settings, voice notes, screenshots, formatting, and every limit below.
+Only the service manager differs, so this page splits only where the setup commands genuinely differ.
 
 Telegram text reaches Firstmate exactly as terminal text: no origin marker, no hidden provenance, and no Telegram-specific instruction.
 Telegram input therefore carries the same authority as anything typed in the terminal, so pair only your own account.
@@ -11,7 +14,7 @@ The bot never starts Firstmate, never creates a second session, and contains no 
 ## Setup
 
 1. Create a bot with Telegram's `@BotFather` and copy its token.
-2. Store the token privately (this file is never read by the service unit):
+2. Store the token privately (this file is never read by the service):
 
    ```sh
    mkdir -p ~/.firstmate-telegram && chmod 700 ~/.firstmate-telegram
@@ -28,30 +31,63 @@ The bot never starts Firstmate, never creates a second session, and contains no 
    The pairing identifiers land in `~/.firstmate-telegram/config.json`.
    Messages from any other account or chat are ignored without downloading attachments or forwarding content.
 
-4. Optional: set the local Parakeet command for voice notes in that same file, as `transcribe_command`.
+4. Set the local Parakeet command for voice notes in that same file, as `transcribe_command`.
    It defaults to `parakeet-tdt-0.6b-v3`, and the audio path replaces `{audio}` or is appended.
+   A service manager's `PATH` is not your login shell's, so give it as an absolute path whenever the command lives outside `/usr/bin` and `/bin`.
+   On Apple Silicon that is the normal case, because a local Parakeet installed by Homebrew or `pip --user` sits under `/opt/homebrew/bin` or `~/.local/bin`:
+
+   ```json
+   { "transcribe_command": "/opt/homebrew/bin/parakeet-mlx {audio}" }
+   ```
+
+   `bin/fm-telegram.py status` prints that command and says plainly when it cannot be found.
    Transcription is local Parakeet only; there is no Whisper fallback or retry button.
 
-5. Install the Markdown parser used to format Firstmate's replies:
+5. Install the Markdown parser used to format Firstmate's replies, into the same Python that will run the bot:
 
    ```sh
-   sudo apt install python3-mistune
+   sudo apt install python3-mistune       # WSL
+   python3 -m pip install --user mistune  # macOS
    ```
 
    Without it the mirror still works and simply sends every reply as plain text.
 
-6. Install the WSL user service so the bot starts whenever WSL starts:
+6. Install the user service so the bot starts whenever you log in:
 
    ```sh
-   bin/fm-telegram.py install-service   # writes ~/.config/systemd/user/firstmate-telegram.service
+   bin/fm-telegram.py install-service
    bin/fm-telegram.py status
    ```
 
+   On WSL that writes `~/.config/systemd/user/firstmate-telegram.service`.
    Run `loginctl enable-linger "$USER"` if you want the service to survive after your last WSL shell closes.
-   `bin/fm-telegram.py service-unit` prints the unit without installing it, and `uninstall-service` removes it.
+
+   On macOS it writes `~/Library/LaunchAgents/com.firstmate.telegram.plist` and loads it, so the bot starts at every login.
+   Run `install-service` with the same `python3` you installed `mistune` into, because that interpreter is the one recorded in the LaunchAgent.
 
 The Pi half loads automatically with the other tracked Firstmate extensions in `.pi/extensions/` when Pi runs in a trusted Firstmate home.
 It connects to the bot when a Pi session starts and retries on a widening delay while the bot is absent, so a home without the bot pays nothing but an occasional failed connection.
+
+## Running the service
+
+The same commands drive the service on both platforms:
+
+| Command | What it does |
+| --- | --- |
+| `install-service` | Install or update the service, start it, and wait until that new process is actually serving |
+| `restart-service` | Republish the definition and relaunch it, again waiting for the new process |
+| `stop-service` | Stop it within a bounded time, leaving it installed |
+| `disable-service` | Stop it and keep it from starting at the next login |
+| `uninstall-service` | Stop and remove it |
+| `service-unit` | Print the service definition without installing anything |
+| `status` | Print pairing, transcription command, socket, and service state |
+
+Each of those owns exactly one installation: the one whose definition names your private directory.
+A definition that names another directory, and a running job that macOS loaded from another file or whose file has since been deleted, are reported with the command that inspects them and are otherwise left exactly as they are.
+If an install fails, the previous definition and its login state are put back, so a failed install never leaves something new starting at your next login.
+
+On macOS the service's own output goes to `~/.firstmate-telegram/service.log`, which is where `install-service` points you when a start fails.
+That file carries the same transport diagnostics the bot prints, and never a token, a paired identifier, or message content.
 
 ## Only your own session is mirrored
 
@@ -108,7 +144,7 @@ While the bot is unavailable it reads `unavailable` and cannot be changed there,
 In Telegram, use `/telegram_confirmations_on` and `/telegram_confirmations_off` from the command menu.
 In the terminal, use the second toggle in `/telegram-settings`.
 
-The current state is part of the status line, and the choice is stored in `~/.firstmate-telegram/config.json` as `confirmations`, so it survives a bot or WSL restart.
+The current state is part of the status line, and the choice is stored in `~/.firstmate-telegram/config.json` as `confirmations`, so it survives a bot or machine restart.
 Because the bot owns the setting and publishes every change, the two surfaces cannot drift apart.
 
 Turning it off hides only the receipt.
@@ -166,7 +202,7 @@ That receipt can be switched off (see Delivery confirmations).
 If Firstmate is not running, the reply is `Firstmate is not running. Your message is queued until it starts.` and the text waits in memory until the one Pi session connects.
 
 **There is no durable queue, expiry system, replay journal, or retention subsystem.**
-A queued message that has not reached Pi is lost if the bot restarts or WSL stops.
+A queued message that has not reached Pi is lost if the bot restarts or your machine stops.
 If Pi disappears between accepting a message and confirming it, that one message is sent again when the session returns.
 Both are deliberate limitations of this version rather than bugs.
 
@@ -218,21 +254,56 @@ Every button action is bound to the current transcript revision, so a stale or r
 - Only the paired chat can send images, and the primary-session rule covers them: a worker session can neither receive nor deliver one.
 - The bot owns mirror mode and delivery confirmations for both surfaces; the terminal only shows and changes what the bot publishes.
 - Stopping or restarting the service is bounded: a running transcription and everything it started are ended, the connected terminal session is released, and the bot exits rather than waiting on work it cannot interrupt.
-  The installed unit sets `TimeoutStopSec=20` to match.
+  The installed service gives it a matching grace, and a stop that the service still ignores is escalated rather than reported as done.
+- Starting the service is bounded the other way: `install-service` and `restart-service` wait for the process they just started to be serving, for longer than any wait the bot itself can take on the network, and never accept a leftover signal from the process being replaced.
+- On macOS exactly one process runs the service; the install starts it once and never starts a second alongside it.
 - At most 32 untouched voice transcripts are kept; older ones are dropped with their temporary audio, so cards you never answer cannot pile up.
 - Transport statuses stay attached to the exact message they describe, while Firstmate's replies are never threaded (see Reply threading).
-- The service unit holds no token and no message content; the token stays in `~/.firstmate-telegram/env` and pairing stays in `config.json`.
+- The service definition holds no token and no message content; the token stays in `~/.firstmate-telegram/env` and pairing stays in `config.json`.
+  On macOS the LaunchAgent's environment is only the two local directory paths and one random identifier for the launch it started.
 - Temporary voice audio is owner-only and is deleted after send, cancel, failure, and at bot start and stop; images are never written to disk at all.
+  The private directory itself must be a real directory this account owns, not a symlink, on either platform.
 - Transcription memory belongs to the local speech model rather than the bot process, and the service's memory accounting includes the transcriber and its children.
 - `FM_TELEGRAM_DIR` moves the private directory; `bin/fm-telegram.py --help` owns the remaining flags and environment.
 
 The wire protocol between the bot and the Pi extension is stated once in `bin/fm-telegram.py`'s header.
 
+## What still needs your Mac
+
+The regressions below run on any host, and the macOS service tests drive the real service commands against a stand-in for launchd where the host has none.
+That proves the lifecycle decisions - what is started, what is waited for, what is refused, and what is rolled back - but it cannot prove the things only macOS itself supplies.
+Until the checklist below has been run on your Mac, treat macOS support as implemented and unverified rather than accepted:
+
+- Real `launchctl`: whether `bootstrap`, `bootout`, `enable`, `disable`, `print`, and `print-disabled` behave in your login session as modelled, including the exit codes and the `gui/<uid>` domain.
+- Real `plutil`: whether it accepts the generated LaunchAgent.
+- macOS peer identity: whether the bot can read the connected Pi session's account and process from the socket, which uses macOS's own local-peer options rather than the Linux ones.
+- Real Apple Silicon Parakeet: whether your configured command transcribes a voice note under the LaunchAgent's own environment.
+
+A GitHub macOS runner cannot stand in for this, because it has no logged-in GUI session for the LaunchAgent to load into.
+
+### Checklist for your Mac
+
+Each step is one command and one thing to look for.
+
+1. `bin/fm-telegram.py install-service` then `bin/fm-telegram.py status` - it reports the definition as `owned`, enabled, and running with a pid.
+2. `launchctl print gui/$(id -u)/com.firstmate.telegram` - one job, one pid, loaded from the file `status` named.
+3. `plutil -lint ~/Library/LaunchAgents/com.firstmate.telegram.plist` - it reports OK, and `grep` finds neither your token nor your paired ids in that file.
+4. Start Pi in your Firstmate home, then `/telegram` in the terminal - the footer stops saying `unavailable` and the bot answers, which is the peer identity working.
+5. Send `/telegram_on` from your phone, type a message in the terminal, and send one from Telegram - both directions arrive, and the Telegram one is confirmed.
+6. Send a screenshot from Telegram and paste one into the terminal - each arrives as a real image at the other end.
+7. Send a voice note and tap `Send to Firstmate` - it transcribes with your local command, and `~/.firstmate-telegram/audio/` is empty afterwards.
+8. `bin/fm-telegram.py restart-service` while that Pi session is up - it returns success, `status` shows a new pid, and the footer recovers on its own.
+9. `bin/fm-telegram.py disable-service`, then log out and back in - the bot does not come back, and `launchctl print-disabled gui/$(id -u)` lists it as disabled.
+10. `bin/fm-telegram.py install-service` again, then log out and back in - the bot is running before you touch anything.
+11. `bin/fm-telegram.py uninstall-service` - the LaunchAgent file is gone, `launchctl print` no longer finds the job, and nothing starts at the next login.
+
 Regression entry points:
 
 ```sh
 tests/fm-telegram-mirror.test.sh
+tests/fm-telegram-macos-service.test.sh
 tests/fm-telegram-extension.test.sh
+tests/fm-session-lock-ancestry.test.sh
 tests/fm-pi-primary-types.test.sh
 FM_TELEGRAM_LIVE_E2E=1 tests/fm-telegram-mirror-live-e2e.test.sh
 ```

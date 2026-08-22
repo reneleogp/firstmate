@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""fm-telegram.py - Firstmate's Telegram terminal mirror bot (WSL only).
+"""fm-telegram.py - Firstmate's Telegram terminal mirror bot (WSL and macOS).
 
 One private Telegram bot that mirrors the one Firstmate terminal conversation
-in both directions. It runs beside Pi as a WSL user service and talks to the
-tracked Pi extension .pi/extensions/fm-telegram-mirror.ts over one local Unix
-socket. The bot contains no model, agent loop, or Firstmate reasoning.
+in both directions. It runs beside Pi as a per-user service - a systemd user
+unit on WSL, a LaunchAgent on macOS - and talks to the tracked Pi extension
+.pi/extensions/fm-telegram-mirror.ts over one local Unix socket. The bot
+contains no model, agent loop, or Firstmate reasoning.
+
+Everything except the service manager and the peer-identity syscall is one
+platform-independent implementation: mirror mode, the queue, voice, images,
+formatting, and every bound below behave identically on both platforms.
 
 Layout (one private directory, owner-only, default ~/.firstmate-telegram,
 overridden by FM_TELEGRAM_DIR):
@@ -14,13 +19,24 @@ overridden by FM_TELEGRAM_DIR):
                  user_id            paired Telegram account id (integer)
                  chat_id            paired private chat id (integer)
                  transcribe_command local Parakeet command (string; the audio
-                                    path replaces {audio} or is appended)
+                                    path replaces {audio} or is appended). Give
+                                    it as an absolute path when the service
+                                    manager's PATH cannot find it, which is the
+                                    normal case for a macOS LaunchAgent.
                  confirmations      send "Pi · Sent to Firstmate." or not
                                     (boolean, default true, persisted by the
                                     Telegram commands and Pi's settings)
   bot.sock     Unix socket the Pi extension connects to
   audio/       temporary voice downloads, deleted after send, cancel, failure,
                and at start and stop
+  service-ready.json  written by the running bot once its socket is listening,
+               naming its own pid and the FM_TELEGRAM_LAUNCH_ID its service
+               manager gave it. An installer waits for the generation it just
+               launched, so a marker left by an earlier child can never answer
+               for a new one. Removed when the bot stops.
+  service.log  macOS only: the LaunchAgent's stdout and stderr. It carries the
+               same transport diagnostics the bot logs, never a token, a paired
+               identifier, or message content.
 
 Wire protocol (newline-delimited JSON, both directions):
 
@@ -71,14 +87,34 @@ Usage:
   fm-telegram.py run                run the bot in the foreground (the service)
   fm-telegram.py pair               record the first private sender as the pair
   fm-telegram.py status             print pairing, service, and socket status
-  fm-telegram.py service-unit       print the systemd user unit text
-  fm-telegram.py install-service    write, enable, and start the WSL user service
-  fm-telegram.py uninstall-service  stop, disable, and remove that service
+  fm-telegram.py service-unit       print this platform's service definition
+  fm-telegram.py install-service    install or update the user service, start it,
+                                    and wait for the child it just launched
+  fm-telegram.py restart-service    republish the service definition and relaunch
+  fm-telegram.py stop-service       stop the service within a bounded time
+  fm-telegram.py disable-service    stop it and keep it from starting at login
+  fm-telegram.py uninstall-service  stop and remove that service
+
+Every service command owns exactly one installation: the one whose definition
+names this private directory. A service definition or a loaded job that this
+installation cannot prove is its own is reported and left untouched rather than
+replaced, stopped, or deleted.
 
 Environment:
   FM_TELEGRAM_DIR        private directory (default ~/.firstmate-telegram)
   FM_TELEGRAM_API_BASE   Telegram API base URL (tests point this at a fake)
   FM_TELEGRAM_ASSUME_WSL 1 or 0 to force the WSL verdict for service commands
+  FM_TELEGRAM_ASSUME_PLATFORM  wsl, macos, or none to force the service platform
+  FM_TELEGRAM_LAUNCH_ID  set by the macOS service definition; the launch
+                         generation this process publishes when it is ready
+
+Test-only, and read only while FM_TELEGRAM_TESTING=1:
+  FM_TELEGRAM_LAUNCHCTL  launchctl to drive (default /bin/launchctl)
+  FM_TELEGRAM_PLUTIL     plutil to validate with (default /usr/bin/plutil)
+  FM_TELEGRAM_SERVICE_PROGRAM  argv the generated LaunchAgent runs
+  FM_TELEGRAM_READY_TIMEOUT    shorten (never lengthen) the readiness bound
+  FM_TELEGRAM_STOP_TIMEOUT     shorten (never lengthen) the stop bound
+  FM_TELEGRAM_SESSION_LOCK_CHECK  session-lock checker for peer authentication
 """
 
 from __future__ import annotations
@@ -90,8 +126,10 @@ import binascii
 import contextlib
 import json
 import os
+import plistlib
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import struct
@@ -107,6 +145,7 @@ from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 from typing import Any, Optional
+from xml.parsers.expat import ExpatError
 
 try:  # Debian/Ubuntu: python3-mistune
     import mistune
@@ -114,6 +153,7 @@ except ImportError:  # pragma: no cover - exercised by its own regression
     mistune = None
 
 SERVICE_NAME = "firstmate-telegram.service"
+LAUNCHD_LABEL = "com.firstmate.telegram"
 DEFAULT_API_BASE = "https://api.telegram.org"
 DEFAULT_TRANSCRIBE_COMMAND = "parakeet-tdt-0.6b-v3"
 
@@ -198,6 +238,24 @@ MAX_PENDING_VOICES = 32
 STOP_GRACE_SECONDS = 5
 TRANSCRIBE_STOP_GRACE = 2
 
+# --- macOS LaunchAgent bounds ---
+# Readiness has to outlast every wait the newly launched bot can hit before it
+# publishes its marker - its longest Telegram poll is POLL_TIMEOUT + 15 - or a
+# healthy service would be torn down for being slow rather than broken.
+LAUNCHD_READY_TIMEOUT = 120.0
+# The bot's own stop is bounded by two STOP_GRACE_SECONDS waits plus
+# TRANSCRIBE_STOP_GRACE, and launchd sends its own SIGKILL after ExitTimeOut.
+# This waits past both, then escalates rather than reporting a stop that did not
+# happen.
+LAUNCHD_STOP_TIMEOUT = 40.0
+LAUNCHD_KILL_TIMEOUT = 10.0
+LAUNCHD_POLL_SECONDS = 0.2
+# launchd's own exit grace, matching the systemd unit's TimeoutStopSec.
+LAUNCHD_EXIT_TIMEOUT = 20
+# launchctl exit codes that mean "already on its way out" rather than a failure.
+LAUNCHCTL_IN_PROGRESS = 36
+LAUNCHCTL_NO_SUCH_PROCESS = 3
+
 
 class TelegramError(RuntimeError):
     """A Telegram API or local configuration failure."""
@@ -217,7 +275,22 @@ def log(message: str) -> None:
 
 
 def private_dir(path: Path) -> Path:
+    """This account's own directory, never one a symlink or another user owns.
+
+    Voice audio and every private artifact land here on both platforms, so the
+    ownership and symlink boundary is checked once, here, rather than at each
+    write.
+    """
+    if path.is_symlink():
+        raise TelegramError(f"{path} is a symlink; refusing to keep private Telegram state there")
     path.mkdir(parents=True, exist_ok=True)
+    if hasattr(os, "getuid"):
+        try:
+            owner = path.stat().st_uid
+        except OSError as exc:
+            raise TelegramError(f"could not read {path}: {exc}") from exc
+        if owner != os.getuid():
+            raise TelegramError(f"{path} belongs to uid {owner}, not this account")
     try:
         path.chmod(0o700)
     except OSError:
@@ -246,6 +319,39 @@ def socket_path(home: Path) -> Path:
 
 def audio_dir(home: Path) -> Path:
     return home / "audio"
+
+
+def ready_marker(home: Path) -> Path:
+    return home / "service-ready.json"
+
+
+def service_log(home: Path) -> Path:
+    return home / "service.log"
+
+
+def write_private_bytes(target: Path, payload: bytes) -> None:
+    """Write owner-only, never through a symlink someone else left in place."""
+    descriptor = os.open(
+        target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+    )
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(payload)
+
+
+def publish_ready_marker(home: Path) -> None:
+    """Say that THIS process is the one now serving.
+
+    An installer waits for the launch generation it published, so a marker an
+    earlier child left behind can never make a new launch look ready.
+    """
+    payload = json.dumps({
+        "launch_id": os.environ.get("FM_TELEGRAM_LAUNCH_ID", ""),
+        "pid": os.getpid(),
+    })
+    try:
+        write_private_bytes(ready_marker(home), payload.encode("utf-8"))
+    except OSError as exc:
+        log(f"could not publish the readiness marker: {exc}")
 
 
 def read_env(home: Path) -> dict[str, str]:
@@ -398,8 +504,7 @@ class TelegramApi:
         return await asyncio.to_thread(self.request_sync, method, params or {}, timeout)
 
     def _download(self, file_path: str, target: Path, timeout: float) -> None:
-        target.write_bytes(self._fetch(file_path, MAX_VOICE_BYTES, timeout))
-        target.chmod(0o600)
+        write_private_bytes(target, self._fetch(file_path, MAX_VOICE_BYTES, timeout))
 
     def _fetch(self, file_path: str, limit: int, timeout: float) -> bytes:
         url = f"{self._base}/file/bot{self._token}/{file_path}"
@@ -688,7 +793,7 @@ class MirrorBot:
         data["confirmations"] = enabled
         try:
             write_config(self.config.home, data)
-        except OSError as exc:
+        except (OSError, TelegramError) as exc:
             # The choice still applies to this run; only its persistence failed.
             log(f"could not persist the confirmations setting: {exc}")
 
@@ -1093,6 +1198,9 @@ class MirrorBot:
                                                  limit=MAX_FRAME_BYTES)
         os.chmod(path, 0o600)
         log(f"listening on {path}")
+        # Only now is this process actually serving, so only now may a service
+        # manager treat the launch it started as ready.
+        publish_ready_marker(self.config.home)
         loop = asyncio.get_running_loop()
         stopping = asyncio.Event()
         for name in (signal.SIGTERM, signal.SIGINT):
@@ -1130,6 +1238,7 @@ class MirrorBot:
                 task.cancel()
             await asyncio.wait(tasks, timeout=STOP_GRACE_SECONDS)
             remove_file(path)
+            remove_file(ready_marker(self.config.home))
             clear_audio(self.config.home)
             log("stopped")
             sys.stderr.flush()
@@ -1529,16 +1638,80 @@ def accept_outbound_images(images: Any) -> tuple[list[tuple[bytes, str]], int]:
     return accepted, refused
 
 
-def peer_credentials(writer: asyncio.StreamWriter) -> Optional[tuple[int, int]]:
-    """Linux kernel identity for this Unix-socket peer."""
+# macOS <sys/un.h>: the peer of a Unix socket is read with these local-domain
+# options rather than Linux's SO_PEERCRED. LOCAL_PEERCRED returns struct xucred
+# (u_int cr_version; uid_t cr_uid; short cr_ngroups; gid_t cr_groups[16]) and
+# LOCAL_PEERPID returns the peer's pid_t.
+SOL_LOCAL = 0
+LOCAL_PEERCRED = 1
+LOCAL_PEERPID = 2
+XUCRED_VERSION = 0
+XUCRED_SIZE = 128
+
+
+def decode_xucred(raw: bytes) -> Optional[int]:
+    """The uid inside a macOS struct xucred, or None if it is not one."""
+    header = "=IIh"
+    if len(raw) < struct.calcsize(header):
+        return None
+    version, uid, _groups = struct.unpack_from(header, raw)
+    if version != XUCRED_VERSION:
+        return None
+    return uid
+
+
+def macos_peer_credentials(sock: Any) -> Optional[tuple[int, int]]:
     try:
-        sock = writer.get_extra_info("socket")
+        uid = decode_xucred(sock.getsockopt(SOL_LOCAL, LOCAL_PEERCRED, XUCRED_SIZE))
+        raw_pid = sock.getsockopt(SOL_LOCAL, LOCAL_PEERPID, struct.calcsize("=i"))
+        pid = struct.unpack("=i", raw_pid)[0]
+    except (OSError, AttributeError, struct.error):
+        return None
+    if uid is None or pid <= 0:
+        return None
+    return pid, uid
+
+
+def linux_peer_credentials(sock: Any) -> Optional[tuple[int, int]]:
+    try:
         credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
                                       struct.calcsize("3i"))
         pid, uid, _gid = struct.unpack("3i", credentials)
     except (OSError, AttributeError, struct.error):
         return None
     return pid, uid
+
+
+def peer_credentials(writer: asyncio.StreamWriter) -> Optional[tuple[int, int]]:
+    """Kernel identity for this Unix-socket peer, however this kernel reports it.
+
+    Both sources are kernel-supplied and unforgeable by the peer; only the
+    option names differ, because macOS has no SO_PEERCRED.
+    """
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return None
+    if sys.platform == "darwin":
+        return macos_peer_credentials(sock)
+    return linux_peer_credentials(sock)
+
+
+def process_command_name(pid: int) -> str:
+    """The kernel's own name for a process, never anything the peer supplied."""
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "comm=", "-p", str(pid)], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, check=False, timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "unknown"
+        name = result.stdout.strip()
+        return os.path.basename(name) if name else "unknown"
+    try:
+        return Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unknown"
 
 
 def session_lock_checker() -> Path:
@@ -1576,11 +1749,7 @@ def peer_description(writer: asyncio.StreamWriter) -> str:
     if credentials is None:
         return "an unidentified process"
     pid, uid = credentials
-    try:
-        command = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
-    except OSError:
-        command = "unknown"
-    return f"pid {pid} ({command}, uid {uid})"
+    return f"pid {pid} ({process_command_name(pid)}, uid {uid})"
 
 
 def api_rejection(method: str, http_status: int, detail: str) -> TelegramError:
@@ -1668,6 +1837,17 @@ def transcribe_argv(command: str, audio: Path) -> list[str]:
     parts = shlex.split(command)
     if not parts:
         raise TelegramError("transcribe_command is empty")
+    program = parts[0]
+    # A service manager's PATH is not a login shell's. A macOS LaunchAgent in
+    # particular starts with /usr/bin:/bin:/usr/sbin:/sbin, so an Apple Silicon
+    # Parakeet under /opt/homebrew or ~/.local is only reachable by absolute
+    # path. Say that plainly instead of failing as "command not found".
+    if os.sep not in program and shutil.which(program) is None:
+        raise TelegramError(
+            f"the transcribe command {program!r} is not on this service's PATH; "
+            "set transcribe_command in config.json to the absolute path of the "
+            "local Parakeet command"
+        )
     if any("{audio}" in part for part in parts):
         return [part.replace("{audio}", str(audio)) for part in parts]
     return [*parts, str(audio)]
@@ -1737,7 +1917,14 @@ async def transcribe(command: str, audio: Path, register: Optional[Any] = None) 
     return await asyncio.to_thread(run_transcribe, command, audio, register)
 
 
-# --- service and CLI --------------------------------------------------------
+# --- platform and service management ----------------------------------------
+#
+# Everything above this line is platform-independent. Only the per-user service
+# manager differs: a systemd user unit on WSL, a LaunchAgent on macOS.
+
+
+PLATFORM_WSL = "wsl"
+PLATFORM_MACOS = "macos"
 
 
 def is_wsl() -> bool:
@@ -1752,16 +1939,106 @@ def is_wsl() -> bool:
         return False
 
 
+def detect_platform() -> Optional[str]:
+    """Which service manager runs this bot here, or None if neither does."""
+    assume = os.environ.get("FM_TELEGRAM_ASSUME_PLATFORM")
+    if assume in (PLATFORM_WSL, PLATFORM_MACOS):
+        return assume
+    if assume == "none":
+        return None
+    if is_wsl():
+        return PLATFORM_WSL
+    if sys.platform == "darwin":
+        return PLATFORM_MACOS
+    return None
+
+
+def testing_override(name: str) -> Optional[str]:
+    """A test-only override, ignored unless the tests set their own flag."""
+    if os.environ.get("FM_TELEGRAM_TESTING") != "1":
+        return None
+    value = os.environ.get(name)
+    return value or None
+
+
+def bounded_seconds(name: str, default: float) -> float:
+    """A test-only shortening of one bound below.
+
+    It can only shorten. No environment can stretch a bound this code promises
+    to hold, so a test that wants a refusal quickly cannot also weaken the
+    guarantee it is testing for everyone else.
+    """
+    override = testing_override(name)
+    if override is None:
+        return default
+    try:
+        value = float(override)
+    except ValueError:
+        return default
+    return value if 0 < value <= default else default
+
+
+def firstmate_home_path() -> Path:
+    return Path(os.environ.get("FM_HOME") or Path(__file__).resolve().parents[1]).resolve()
+
+
+def bot_script() -> Path:
+    return Path(__file__).resolve()
+
+
+def process_alive(pid: Optional[int]) -> bool:
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+class ServiceManager:
+    """One home's per-user service, however this platform runs one."""
+
+    def __init__(self, home: Path) -> None:
+        self.home = home
+
+    def unit_text(self) -> str:
+        raise NotImplementedError
+
+    def install(self) -> int:
+        raise NotImplementedError
+
+    def restart(self) -> int:
+        raise NotImplementedError
+
+    def stop(self) -> int:
+        raise NotImplementedError
+
+    def disable(self) -> int:
+        raise NotImplementedError
+
+    def uninstall(self) -> int:
+        raise NotImplementedError
+
+    def status_lines(self) -> list[str]:
+        raise NotImplementedError
+
+
+# --- WSL: systemd user unit -------------------------------------------------
+
+
 def unit_path() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base) / "systemd" / "user" / SERVICE_NAME
 
 
-def unit_text(home: Path) -> str:
-    script = Path(__file__).resolve()
-    firstmate_home = Path(
-        os.environ.get("FM_HOME") or Path(__file__).resolve().parents[1]
-    ).resolve()
+def systemd_unit_text(home: Path) -> str:
+    script = bot_script()
+    firstmate_home = firstmate_home_path()
     return (
         "[Unit]\n"
         "Description=Firstmate Telegram terminal mirror\n"
@@ -1784,39 +2061,516 @@ def unit_text(home: Path) -> str:
 
 
 def systemctl(*arguments: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["systemctl", "--user", *arguments], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, check=False,
-    )
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", *arguments], stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, check=False,
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess(list(arguments), 1, f"systemctl: {exc}\n")
 
 
-def require_wsl() -> None:
-    if not is_wsl():
-        raise TelegramError("the Telegram mirror service is WSL only; this host is not WSL")
+class SystemdService(ServiceManager):
+    def unit_text(self) -> str:
+        return systemd_unit_text(self.home)
 
-
-def install_service(home: Path) -> int:
-    require_wsl()
-    target = unit_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(unit_text(home), encoding="utf-8")
-    for arguments in (("daemon-reload",), ("enable", "--now", SERVICE_NAME)):
+    def _run(self, *arguments: str) -> None:
         result = systemctl(*arguments)
         if result.returncode != 0:
             print(result.stdout, end="")
             raise TelegramError(f"systemctl --user {' '.join(arguments)} failed")
-    print(f"installed {target} and started {SERVICE_NAME}")
-    return 0
+
+    def install(self) -> int:
+        target = unit_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.unit_text(), encoding="utf-8")
+        self._run("daemon-reload")
+        self._run("enable", "--now", SERVICE_NAME)
+        print(f"installed {target} and started {SERVICE_NAME}")
+        return 0
+
+    def restart(self) -> int:
+        self._run("restart", SERVICE_NAME)
+        print(f"restarted {SERVICE_NAME}")
+        return 0
+
+    def stop(self) -> int:
+        self._run("stop", SERVICE_NAME)
+        print(f"stopped {SERVICE_NAME}")
+        return 0
+
+    def disable(self) -> int:
+        self._run("disable", "--now", SERVICE_NAME)
+        print(f"disabled {SERVICE_NAME}")
+        return 0
+
+    def uninstall(self) -> int:
+        systemctl("disable", "--now", SERVICE_NAME)
+        target = unit_path()
+        remove_file(target)
+        systemctl("daemon-reload")
+        print(f"removed {target}")
+        return 0
+
+    def status_lines(self) -> list[str]:
+        result = systemctl("is-active", SERVICE_NAME)
+        return [f"service: {result.stdout.strip() or 'unknown'}"]
 
 
-def uninstall_service() -> int:
-    require_wsl()
-    systemctl("disable", "--now", SERVICE_NAME)
-    target = unit_path()
-    remove_file(target)
-    systemctl("daemon-reload")
-    print(f"removed {target}")
-    return 0
+# --- macOS: LaunchAgent -----------------------------------------------------
+
+
+@dataclass
+class LaunchdJob:
+    """What launchd currently reports for one label."""
+
+    loaded: bool = False
+    pid: Optional[int] = None
+    path: Optional[str] = None
+    state: Optional[str] = None
+    last_exit: Optional[int] = None
+
+
+def launch_agents_dir() -> Path:
+    return Path.home() / "Library" / "LaunchAgents"
+
+
+def launchctl_command() -> str:
+    return testing_override("FM_TELEGRAM_LAUNCHCTL") or "/bin/launchctl"
+
+
+def plutil_command() -> Optional[str]:
+    override = testing_override("FM_TELEGRAM_PLUTIL")
+    if override:
+        return override
+    return "/usr/bin/plutil" if os.access("/usr/bin/plutil", os.X_OK) else None
+
+
+def validate_plist(path: Path) -> None:
+    """Refuse to publish anything launchd would not read back.
+
+    The parse is portable and always runs; plutil is the platform's own opinion
+    and runs whenever this host has it.
+    """
+    try:
+        plistlib.loads(path.read_bytes())
+    except (OSError, ValueError, ExpatError) as exc:
+        raise TelegramError(f"generated an unreadable LaunchAgent: {exc}") from exc
+    command = plutil_command()
+    if command is None:
+        return
+    try:
+        result = subprocess.run(
+            [command, "-lint", str(path)], stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, check=False, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TelegramError(f"could not validate the generated LaunchAgent: {exc}") from exc
+    if result.returncode != 0:
+        raise TelegramError(f"plutil rejected the generated LaunchAgent: {result.stdout.strip()}")
+
+
+class LaunchdService(ServiceManager):
+    """The one LaunchAgent that serves this private directory, and only it.
+
+    Ownership is decided from the published definition rather than from the
+    path alone: a plist at this path that names another private directory, and
+    a loaded job at this label that launchd read from another plist, are both
+    reported and left exactly as they are.
+    """
+
+    def __init__(self, home: Path) -> None:
+        super().__init__(home)
+        self.uid = os.getuid() if hasattr(os, "getuid") else 0
+        self.domain = f"gui/{self.uid}"
+        self.target = f"{self.domain}/{LAUNCHD_LABEL}"
+        self.plist = launch_agents_dir() / f"{LAUNCHD_LABEL}.plist"
+        self.ready_timeout = bounded_seconds(
+            "FM_TELEGRAM_READY_TIMEOUT", LAUNCHD_READY_TIMEOUT)
+        self.stop_timeout = bounded_seconds(
+            "FM_TELEGRAM_STOP_TIMEOUT", LAUNCHD_STOP_TIMEOUT)
+
+    # --- launchctl ---
+
+    def launchctl(self, *arguments: str) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                [launchctl_command(), *arguments], stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, check=False, timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return subprocess.CompletedProcess(list(arguments), 1, f"launchctl: {exc}\n")
+
+    def checked(self, *arguments: str) -> None:
+        result = self.launchctl(*arguments)
+        if result.returncode != 0:
+            detail = result.stdout.strip()
+            raise TelegramError(f"launchctl {' '.join(arguments)} failed: {detail}")
+
+    def job(self) -> LaunchdJob:
+        result = self.launchctl("print", self.target)
+        if result.returncode != 0:
+            return LaunchdJob(loaded=False)
+        job = LaunchdJob(loaded=True)
+        for line in result.stdout.splitlines():
+            key, separator, value = line.strip().partition(" = ")
+            if not separator:
+                continue
+            value = value.strip().rstrip(";").strip()
+            if key == "pid" and value.isdigit():
+                job.pid = int(value)
+            elif key == "path":
+                job.path = value
+            elif key == "state":
+                job.state = value
+            elif key == "last exit code":
+                job.last_exit = int(value) if value.lstrip("-").isdigit() else None
+        return job
+
+    def disabled(self) -> Optional[bool]:
+        """Whether launchd will refuse to load this label, or None if unknown."""
+        result = self.launchctl("print-disabled", self.domain)
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            if f'"{LAUNCHD_LABEL}"' not in line:
+                continue
+            value = line.split("=>", 1)[-1].strip().rstrip(";").strip()
+            return value in ("true", "disabled")
+        return False
+
+    # --- ownership ---
+
+    def program_arguments(self) -> list[str]:
+        override = testing_override("FM_TELEGRAM_SERVICE_PROGRAM")
+        if override:
+            return shlex.split(override)
+        return [sys.executable, str(bot_script()), "run"]
+
+    def plist_data(self, launch_id: str) -> dict[str, Any]:
+        """Local paths and one launch generation. Never a secret.
+
+        The token stays in the private env file and the pairing in config.json,
+        so neither this file, the process arguments, nor the service log can
+        carry them.
+        """
+        return {
+            "Label": LAUNCHD_LABEL,
+            "ProgramArguments": self.program_arguments(),
+            "EnvironmentVariables": {
+                "FM_TELEGRAM_DIR": str(self.home),
+                "FM_HOME": str(firstmate_home_path()),
+                "FM_TELEGRAM_LAUNCH_ID": launch_id,
+            },
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "ThrottleInterval": 5,
+            "ProcessType": "Background",
+            "ExitTimeOut": LAUNCHD_EXIT_TIMEOUT,
+            "StandardOutPath": str(service_log(self.home)),
+            "StandardErrorPath": str(service_log(self.home)),
+        }
+
+    def unit_text(self) -> str:
+        return plistlib.dumps(self.plist_data(secrets.token_hex(16))).decode("utf-8")
+
+    def published(self) -> Optional[dict[str, Any]]:
+        try:
+            raw = self.plist.read_bytes()
+        except OSError:
+            return None
+        try:
+            data = plistlib.loads(raw)
+        except (ValueError, ExpatError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def ownership(self) -> str:
+        """Whether the plist at this path is absent, owned here, or foreign."""
+        data = self.published()
+        if data is None:
+            return "absent"
+        if data.get("Label") != LAUNCHD_LABEL:
+            return "foreign"
+        environment = data.get("EnvironmentVariables")
+        if not isinstance(environment, dict):
+            return "foreign"
+        if environment.get("FM_TELEGRAM_DIR") != str(self.home):
+            return "foreign"
+        arguments = data.get("ProgramArguments")
+        if not isinstance(arguments, list) or not arguments or arguments[-1] != "run":
+            return "foreign"
+        return "owned"
+
+    def require_own_plist(self, action: str) -> str:
+        state = self.ownership()
+        if state == "foreign":
+            raise TelegramError(
+                f"{self.plist} serves another Telegram mirror installation; "
+                f"nothing was {action}"
+            )
+        return state
+
+    def require_own_job(self, job: LaunchdJob, action: str) -> None:
+        """Never touch a job at this label that this installation cannot prove.
+
+        Two ways it cannot: launchd read the job from another file, or the file
+        it read is gone, leaving nothing to compare. Both are reported with the
+        command that inspects the job, because stopping or disabling a label
+        that belongs to another installation is a side effect on that one.
+        """
+        if not job.loaded:
+            return
+        if job.path and Path(job.path) != self.plist:
+            raise TelegramError(
+                f"launchd serves {LAUNCHD_LABEL} from {job.path}, which this "
+                f"installation does not own; nothing was {action}"
+            )
+        if self.ownership() == "absent":
+            raise TelegramError(
+                f"launchd still serves {LAUNCHD_LABEL} but {self.plist} is gone, "
+                f"so this installation cannot prove that job is its own; nothing "
+                f"was {action}. Inspect it with: launchctl print {self.target}"
+            )
+
+    # --- publication ---
+
+    def publish(self, payload: bytes) -> None:
+        """Replace the definition atomically, so launchd never reads a half file."""
+        directory = self.plist.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        temporary = directory / f".{LAUNCHD_LABEL}.{secrets.token_hex(8)}.plist"
+        try:
+            write_private_bytes(temporary, payload)
+            validate_plist(temporary)
+            os.replace(temporary, self.plist)
+        except OSError as exc:
+            remove_file(temporary)
+            raise TelegramError(f"could not write {self.plist}: {exc}") from exc
+        except TelegramError:
+            remove_file(temporary)
+            raise
+
+    def log_hint(self) -> str:
+        return f"; see {service_log(self.home)}"
+
+    # --- lifecycle ---
+
+    def stop_job(self, job: LaunchdJob, action: str) -> None:
+        """Stop within a bound, escalating rather than reporting a stop that did
+        not happen.
+
+        launchd sends its own SIGTERM and then SIGKILL after ExitTimeOut. A
+        transcription or a Telegram poll can outlast a single check, so the wait
+        is a bounded poll of both the job and the process it left behind, and a
+        process that survives the whole bound is ended here.
+        """
+        self.require_own_job(job, action)
+        pid = job.pid
+        result = self.launchctl("bootout", self.target)
+        if result.returncode not in (0, LAUNCHCTL_IN_PROGRESS, LAUNCHCTL_NO_SUCH_PROCESS) \
+                and self.job().loaded:
+            raise TelegramError(f"could not stop {LAUNCHD_LABEL}: {result.stdout.strip()}")
+        deadline = time.monotonic() + self.stop_timeout
+        while time.monotonic() < deadline:
+            if not self.job().loaded and not process_alive(pid):
+                return
+            time.sleep(LAUNCHD_POLL_SECONDS)
+        if process_alive(pid):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+            kill_deadline = time.monotonic() + LAUNCHD_KILL_TIMEOUT
+            while time.monotonic() < kill_deadline and process_alive(pid):
+                time.sleep(LAUNCHD_POLL_SECONDS)
+        if self.job().loaded or process_alive(pid):
+            raise TelegramError(
+                f"{LAUNCHD_LABEL} did not stop within {int(self.stop_timeout)}s"
+            )
+
+    def wait_ready(self, launch_id: str) -> None:
+        """Wait for the child this launch started, not for any child.
+
+        The generation this install published is in the child's own environment
+        and in the marker it writes once its socket is listening, and the pid in
+        that marker must be the pid launchd reports for the job. A marker an
+        earlier child left behind therefore never answers for this launch.
+        """
+        deadline = time.monotonic() + self.ready_timeout
+        while True:
+            job = self.job()
+            if not job.loaded:
+                raise TelegramError(
+                    f"{LAUNCHD_LABEL} left launchd before it was ready{self.log_hint()}"
+                )
+            if job.last_exit not in (None, 0):
+                raise TelegramError(
+                    f"the service exited with status {job.last_exit} before it was "
+                    f"ready{self.log_hint()}"
+                )
+            marker = self.read_marker()
+            if marker is not None and marker.get("launch_id") == launch_id:
+                pid = marker.get("pid")
+                if isinstance(pid, int) and job.pid is not None and pid == job.pid:
+                    return
+            if time.monotonic() >= deadline:
+                raise TelegramError(
+                    f"{LAUNCHD_LABEL} did not report itself ready within "
+                    f"{int(self.ready_timeout)}s{self.log_hint()}"
+                )
+            time.sleep(LAUNCHD_POLL_SECONDS)
+
+    def read_marker(self) -> Optional[dict[str, Any]]:
+        try:
+            data = json.loads(ready_marker(self.home).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def launch(self, launch_id: str) -> None:
+        job = self.job()
+        if job.loaded:
+            self.stop_job(job, "changed")
+        if self.disabled():
+            # launchd refuses to bootstrap a disabled label, and a disable an
+            # earlier disable-service recorded must not silently outlive an
+            # explicit install.
+            self.checked("enable", self.target)
+        remove_file(ready_marker(self.home))
+        self.checked("bootstrap", self.domain, str(self.plist))
+        # RunAtLoad already started exactly one child. Kickstarting here would
+        # start a second one and let the first one's marker answer for it.
+        self.wait_ready(launch_id)
+
+    def roll_back(self, previous: Optional[bytes], was_disabled: Optional[bool]) -> None:
+        """Leave a failed install exactly as enabled as it was before it ran."""
+        with contextlib.suppress(TelegramError):
+            job = self.job()
+            if job.loaded and (not job.path or Path(job.path) == self.plist):
+                self.stop_job(job, "rolled back")
+        with contextlib.suppress(TelegramError, OSError):
+            if previous is None:
+                # A fresh install that failed must leave nothing behind that
+                # launchd would start at the next login.
+                remove_file(self.plist)
+            else:
+                self.publish(previous)
+        if was_disabled:
+            self.launchctl("disable", self.target)
+
+    def relaunch(self, action: str) -> None:
+        previous = self.plist.read_bytes() if self.plist.exists() else None
+        was_disabled = self.disabled()
+        # A fresh generation every time, so readiness can never be satisfied by
+        # the child being replaced.
+        launch_id = secrets.token_hex(16)
+        self.publish(plistlib.dumps(self.plist_data(launch_id)))
+        try:
+            self.launch(launch_id)
+        except TelegramError as error:
+            self.roll_back(previous, was_disabled)
+            raise TelegramError(f"{error}; the previous state was restored") from error
+        print(f"{action} {LAUNCHD_LABEL} ({self.plist})")
+
+    def install(self) -> int:
+        self.require_own_plist("installed")
+        self.require_own_job(self.job(), "installed")
+        private_dir(self.home)
+        self.relaunch("installed and started")
+        return 0
+
+    def restart(self) -> int:
+        if self.require_own_plist("restarted") == "absent":
+            self.require_own_job(self.job(), "restarted")
+            raise TelegramError(
+                f"{LAUNCHD_LABEL} is not installed; run install-service first"
+            )
+        self.require_own_job(self.job(), "restarted")
+        self.relaunch("restarted")
+        return 0
+
+    def stop(self) -> int:
+        self.require_own_plist("stopped")
+        job = self.job()
+        self.require_own_job(job, "stopped")
+        if not job.loaded:
+            print(f"{LAUNCHD_LABEL} is not running")
+            return 0
+        self.stop_job(job, "stopped")
+        print(f"stopped {LAUNCHD_LABEL}")
+        return 0
+
+    def disable(self) -> int:
+        self.require_own_plist("disabled")
+        job = self.job()
+        self.require_own_job(job, "disabled")
+        if job.loaded:
+            self.stop_job(job, "disabled")
+        # Unconditional: an unloaded job whose plist is still installed starts
+        # again at the next login, so the disable must be recorded even when
+        # nothing is running now.
+        self.checked("disable", self.target)
+        if self.disabled() is False:
+            raise TelegramError(f"launchd did not record {LAUNCHD_LABEL} as disabled")
+        print(f"disabled {LAUNCHD_LABEL}; it will not start at login until it is "
+              "installed again")
+        return 0
+
+    def uninstall(self) -> int:
+        state = self.require_own_plist("removed")
+        job = self.job()
+        self.require_own_job(job, "removed")
+        if state == "absent":
+            print(f"{LAUNCHD_LABEL} is not installed")
+            remove_file(ready_marker(self.home))
+            return 0
+        if job.loaded:
+            self.stop_job(job, "removed")
+        remove_file(self.plist)
+        remove_file(ready_marker(self.home))
+        # This installation's own disable record must not outlive it and
+        # silently suppress the next one.
+        if self.disabled():
+            self.launchctl("enable", self.target)
+        print(f"removed {self.plist}")
+        return 0
+
+    def status_lines(self) -> list[str]:
+        state = self.ownership()
+        job = self.job()
+        lines = [f"service definition: {self.plist} ({state})"]
+        disabled = self.disabled()
+        lines.append("service enabled: " + (
+            "unknown" if disabled is None else ("no" if disabled else "yes")
+        ))
+        if not job.loaded:
+            lines.append("service: not loaded")
+        elif job.pid:
+            lines.append(f"service: running (pid {job.pid})")
+        else:
+            exit_note = "" if job.last_exit in (None, 0) else f", last exit {job.last_exit}"
+            lines.append(f"service: {job.state or 'loaded'}, not running{exit_note}")
+        return lines
+
+
+UNSUPPORTED_PLATFORM = (
+    "the Telegram mirror service supports WSL and macOS only; this host is neither"
+)
+
+
+def service_manager(home: Path) -> ServiceManager:
+    platform = detect_platform()
+    if platform == PLATFORM_WSL:
+        return SystemdService(home)
+    if platform == PLATFORM_MACOS:
+        return LaunchdService(home)
+    raise TelegramError(UNSUPPORTED_PLATFORM)
+
+
+def service_definition(home: Path) -> str:
+    """Print-only preview, which stays available on any host."""
+    if detect_platform() == PLATFORM_MACOS:
+        return LaunchdService(home).unit_text()
+    return SystemdService(home).unit_text()
 
 
 def pair(home: Path) -> int:
@@ -1854,15 +2608,31 @@ def status(home: Path) -> int:
     data = read_config(home)
     token = "present" if (os.environ.get("TELEGRAM_BOT_TOKEN")
                           or read_env(home).get("TELEGRAM_BOT_TOKEN")) else "missing"
+    command = str(data.get("transcribe_command", DEFAULT_TRANSCRIBE_COMMAND))
     print(f"home: {home}")
     print(f"token: {token}")
     print(f"paired user: {data.get('user_id', 'none')}")
     print(f"paired chat: {data.get('chat_id', 'none')}")
-    print(f"transcribe command: {data.get('transcribe_command', DEFAULT_TRANSCRIBE_COMMAND)}")
+    print(f"transcribe command: {command}{transcribe_note(command)}")
     print(f"socket: {'present' if socket_path(home).exists() else 'absent'}")
-    result = systemctl("is-active", SERVICE_NAME)
-    print(f"service: {result.stdout.strip() or 'unknown'}")
+    try:
+        lines = service_manager(home).status_lines()
+    except TelegramError as error:
+        lines = [f"service: unavailable ({error})"]
+    for line in lines:
+        print(line)
     return 0
+
+
+def transcribe_note(command: str) -> str:
+    """Say plainly when the configured command is not reachable from here."""
+    parts = shlex.split(command)
+    if not parts:
+        return " (empty)"
+    program = parts[0]
+    if os.sep in program:
+        return "" if os.access(program, os.X_OK) else " (not executable)"
+    return "" if shutil.which(program) else " (not on PATH; set an absolute path)"
 
 
 def run(home: Path) -> int:
@@ -1878,13 +2648,15 @@ def run(home: Path) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="fm-telegram.py",
-        description="Firstmate's Telegram terminal mirror bot (WSL only).",
+        description="Firstmate's Telegram terminal mirror bot (WSL and macOS).",
         epilog=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "command",
-        choices=["run", "pair", "status", "service-unit", "install-service", "uninstall-service"],
+        choices=["run", "pair", "status", "service-unit", "install-service",
+                 "restart-service", "stop-service", "disable-service",
+                 "uninstall-service"],
     )
     args = parser.parse_args(argv)
     home = private_dir(home_dir())
@@ -1895,11 +2667,18 @@ def main(argv: list[str]) -> int:
     if args.command == "status":
         return status(home)
     if args.command == "service-unit":
-        print(unit_text(home), end="")
+        print(service_definition(home), end="")
         return 0
+    manager = service_manager(home)
     if args.command == "install-service":
-        return install_service(home)
-    return uninstall_service()
+        return manager.install()
+    if args.command == "restart-service":
+        return manager.restart()
+    if args.command == "stop-service":
+        return manager.stop()
+    if args.command == "disable-service":
+        return manager.disable()
+    return manager.uninstall()
 
 
 if __name__ == "__main__":

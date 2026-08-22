@@ -43,8 +43,8 @@ fi
 FIXTURE="$TMP_ROOT/ext"
 mkdir -p "$FIXTURE/lib" "$FIXTURE/node_modules/@earendil-works"
 # This node process stands in for the one live Firstmate session: the bridge
-# only mirrors when it runs inside the session that holds the home's lock.
-mkdir -p "$TMP_ROOT/fmhome/state" "$TMP_ROOT/workerhome/state"
+# only mirrors when it runs inside the session that holds the home's lock. Each
+# run below gets its own home, worker home, and private bot directory.
 cp "$ROOT/.pi/extensions/fm-telegram-mirror.ts" "$FIXTURE/fm-telegram-mirror.ts"
 cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$FIXTURE/lib/fm-operational-input.ts"
 ln -s "$PI_PACKAGE_DIR" "$FIXTURE/node_modules/@earendil-works/pi-coding-agent"
@@ -57,19 +57,8 @@ cat >"$TMP_ROOT/session-lock-check" <<'SH'
 SH
 chmod +x "$TMP_ROOT/session-lock-check"
 
-OUT="$TMP_ROOT/node-output"
-if ! (cd "$FIXTURE" && \
-  timeout 90 env \
-  EXT="$FIXTURE/fm-telegram-mirror.ts" \
-  OPERATIONAL_INPUT="$ROOT/bin/fm-operational-input.sh" \
-  FM_OPERATIONAL_INPUT_SCRIPT="$ROOT/bin/fm-operational-input.sh" \
-  FM_TELEGRAM_DIR="$TMP_ROOT/home" \
-  FM_TELEGRAM_MAX_OUTSTANDING_WRITE_BYTES=100000 \
-  FM_TELEGRAM_TESTING=1 \
-  FM_TELEGRAM_SESSION_LOCK_CHECK="$TMP_ROOT/session-lock-check" \
-  FM_HOME="$TMP_ROOT/fmhome" \
-  WORKER_HOME="$TMP_ROOT/workerhome" \
-  node --input-type=module >"$OUT" 2>&1) <<'JS'
+FIXTURE_JS="$TMP_ROOT/fixture.mjs"
+cat >"$FIXTURE_JS" <<'JS'
 import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -226,6 +215,13 @@ if (imageFrames[1].text !== "" || imageFrames[1].images.length !== 1) {
 //     all, so the artifact itself is the only signal. Recognition must be
 //     narrow enough that naming any other file uploads nothing.
 const clipboardDir = tmpdir();
+// The temp root shape this run is proving. macOS exports TMPDIR with a trailing
+// slash and Node strips it, which is exactly what makes Pi's own inserted path
+// and this bridge's prefix agree; a run that quietly fell back to the default
+// root would prove nothing about that.
+if (process.env.EXPECT_TMPDIR && clipboardDir !== process.env.EXPECT_TMPDIR) {
+  fail(`the clipboard temp root is ${clipboardDir}, not the ${process.env.EXPECT_TMPDIR} shape under test`);
+}
 const uuid = "a864c680-178e-4995-86d9-48d62744aa3e";
 const pngBytes = Buffer.from("89504e470d0a1a0a" + "00".repeat(24), "hex");
 const jpegBytes = Buffer.from("ffd8ff" + "11".repeat(24), "hex");
@@ -737,9 +733,45 @@ await new Promise((resolve) => setTimeout(resolve, 50));
 await new Promise((resolve) => server.close(resolve));
 clearTimeout(watchdog);
 JS
-then
-  fail "Telegram mirror extension checks failed: $(cat "$OUT")"
-fi
-[ -s "$OUT" ] && fail "Telegram mirror extension test printed output: $(cat "$OUT")"
 
-pass "the Pi mirror bridge mirrors only the live session's terminal submissions and final replies, hides thinking, tools, and operational input, submits queued Telegram text through Pi's own input path in order, toggles with bare /telegram, keeps the footer on the bot's published state, and stays completely inert in a worker session"
+# Pi writes a pasted screenshot into the system temp directory and inserts that
+# path into the message as ordinary text, so the artifact this bridge has to
+# recognise is shaped by the platform's own temp root. macOS gives each account
+# a private root under /var/folders whose name contains characters a regular
+# expression cares about, and exports it with a trailing slash; Linux and WSL
+# give a plain shared /tmp. The whole fixture runs against both shapes, so the
+# recognition, ownership, symlink, magic-byte, size, ordering, and caption
+# boundaries are proven under each.
+run_fixture() {  # <label> <temp-root>
+  local label=$1 temp_root=$2 run out expected
+  run="$TMP_ROOT/$label"
+  out="$TMP_ROOT/node-output-$label"
+  # What Node reports for this root: the shape the run must actually get.
+  expected=${temp_root%/}
+  mkdir -p "$temp_root" "$run/home" "$run/fmhome/state" "$run/workerhome/state"
+  chmod 700 "$temp_root"
+  if ! (cd "$FIXTURE" && \
+    timeout 90 env \
+    TMPDIR="$temp_root" \
+    EXPECT_TMPDIR="$expected" \
+    EXT="$FIXTURE/fm-telegram-mirror.ts" \
+    OPERATIONAL_INPUT="$ROOT/bin/fm-operational-input.sh" \
+    FM_OPERATIONAL_INPUT_SCRIPT="$ROOT/bin/fm-operational-input.sh" \
+    FM_TELEGRAM_DIR="$run/home" \
+    FM_TELEGRAM_MAX_OUTSTANDING_WRITE_BYTES=100000 \
+    FM_TELEGRAM_TESTING=1 \
+    FM_TELEGRAM_SESSION_LOCK_CHECK="$TMP_ROOT/session-lock-check" \
+    FM_HOME="$run/fmhome" \
+    WORKER_HOME="$run/workerhome" \
+    node "$FIXTURE_JS" >"$out" 2>&1)
+  then
+    fail "Telegram mirror extension checks failed under the $label temp root: $(cat "$out")"
+  fi
+  [ -s "$out" ] && fail "Telegram mirror extension test printed output under the $label temp root: $(cat "$out")"
+  return 0
+}
+
+run_fixture linux "$TMP_ROOT/tmp"
+run_fixture macos "$TMP_ROOT/var/folders/8x/_q+3zk9s0000gn/T/"
+
+pass "the Pi mirror bridge mirrors only the live session's terminal submissions and final replies, hides thinking, tools, and operational input, submits queued Telegram text through Pi's own input path in order, toggles with bare /telegram, keeps the footer on the bot's published state, recognises pasted clipboard images under both the Linux and macOS temp-root shapes, and stays completely inert in a worker session"

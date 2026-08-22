@@ -857,6 +857,16 @@ families_for_changed_path() {
     tests/fm-telegram-mirror.test.py)
       printf '%s\n' "__script__:fm-telegram-mirror.test.sh"
       ;;
+    bin/fm-telegram.py|.pi/extensions/fm-telegram-mirror.ts)
+      printf '%s\n' "__script__:fm-telegram-mirror.test.sh"
+      printf '%s\n' "__script__:fm-telegram-macos-service.test.sh"
+      printf '%s\n' "__script__:fm-telegram-extension.test.sh"
+      ;;
+    bin/fm-session-lock-check.sh)
+      # The Telegram peer authenticator and the session-lock identity it reads.
+      printf '%s\n' "__script__:fm-telegram-macos-service.test.sh"
+      printf '%s\n' watcher-wake-lock
+      ;;
     tests/*.test.sh)
       # A single test file change selects only that script via basename family
       # resolution in the caller; emit a marker family of __script__
