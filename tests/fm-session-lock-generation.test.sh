@@ -169,7 +169,7 @@ test_publication_replaces_a_dead_owners_record() {
 # --- the recycled-pid boundary ----------------------------------------------
 
 test_recycled_pid_is_rejected_while_the_true_owner_is_accepted() {
-  local home pid gen state out
+  local home pid gen identity state out
   home="$TMP_ROOT/recycled"
   state="$home/state"
   mkdir -p "$state"
@@ -182,6 +182,8 @@ test_recycled_pid_is_rejected_while_the_true_owner_is_accepted() {
     || fail "the genuine publishing process was not recognized as the live holder"
   lib_eval "fm_session_lock_owned_by_pid '$state' '$pid'" \
     || fail "the genuine owner's own process was refused ownership"
+  identity=$(lib_eval "fm_session_lock_identity '$state'") \
+    || fail "the genuine publisher had no complete lock identity"
   assert_contains "$(FM_STATE_OVERRIDE="$state" "$LOCK_SH" status)" "lock: held by live harness pid $pid" \
     "the genuine owner was not reported as holding the lock"
 
@@ -194,6 +196,11 @@ test_recycled_pid_is_rejected_while_the_true_owner_is_accepted() {
   if lib_eval "fm_session_lock_owned_by_pid '$state' '$pid'"; then
     fail "a recycled pid authorized its own process as the lock owner"
   fi
+  if lib_eval "fm_session_lock_identity_holds '$state' '$identity'"; then
+    fail "a deferred worker retained authority after same-pid generation replacement"
+  fi
+  [ "$(FM_STATE_OVERRIDE="$state" "$LOCK_SH" ownership "$pid")" = missing ] \
+    || fail "the owning executable reported a recycled pid as owned or competing"
   assert_contains "$(FM_STATE_OVERRIDE="$state" "$LOCK_SH" status)" "lock: stale" \
     "a recycled pid was still reported as a live holder"
 
@@ -255,6 +262,8 @@ unknown key|PID\ngeneration=proc:x:1\n
 bare second line|PID\nproc:x:1\n
 whitespace in token|PID\ngen=proc x 1\n
 extra line|PID\ngen=proc:x:1\nextra\n
+trailing blank line|PID\ngen=proc:x:1\n\n
+legacy trailing blank line|PID\n\n
 non-numeric pid|not-a-pid\ngen=proc:x:1\n
 init pid|1\ngen=proc:x:1\n
 EOF
@@ -392,7 +401,7 @@ SH
 # --- supported-platform behavior ---------------------------------------------
 
 test_process_generation_sources_on_this_platform() {
-  local first second other_pid other empty_root fallback dead
+  local first second other_pid other empty_root dead
   first=$(generation_of "$$") || fail "no process generation source is available on this platform"
   second=$(generation_of "$$")
   [ "$first" = "$second" ] || fail "the same process reported two different generations: '$first' then '$second'"
@@ -402,8 +411,8 @@ test_process_generation_sources_on_this_platform() {
   [ "$other" != "$first" ] || fail "two distinct live processes reported the same generation '$other'"
 
   case "$first" in
-    proc:*|lstart:*) : ;;
-    *) fail "unknown generation scheme '$first'" ;;
+    proc:*) : ;;
+    *) fail "unknown or insufficient-resolution generation scheme '$first'" ;;
   esac
   if [ -r /proc/$$/stat ]; then
     case "$first" in
@@ -412,16 +421,14 @@ test_process_generation_sources_on_this_platform() {
     esac
   fi
 
-  # The portable source must answer on its own, which is what a host without
-  # procfs (macOS) relies on entirely.
+  # ps lstart has only one-second precision. Without procfs or another positive
+  # high-resolution source, generation-bound authority must fail closed rather
+  # than let a same-second recycled pid inherit the token.
   empty_root="$TMP_ROOT/empty-proc"
   mkdir -p "$empty_root"
-  fallback=$(FM_SESSION_LOCK_PROC_ROOT="$empty_root" generation_of "$$") \
-    || fail "the portable ps-based generation source did not answer on this platform"
-  case "$fallback" in
-    lstart:*) : ;;
-    *) fail "the portable source did not use the lstart scheme: '$fallback'" ;;
-  esac
+  if FM_SESSION_LOCK_PROC_ROOT="$empty_root" generation_of "$$" >/dev/null; then
+    fail "a host with only insufficient-resolution process-start evidence issued a generation token"
+  fi
 
   # A dead pid has no generation at all, so a record naming one can never verify.
   dead=$(start_harness)
@@ -430,7 +437,7 @@ test_process_generation_sources_on_this_platform() {
   if generation_of "$dead" >/dev/null; then
     fail "a dead pid still reported a process generation"
   fi
-  pass "session-lock generation: both supported generation sources answer on this platform"
+  pass "session-lock generation: supported positive sources bind, insufficient-resolution fallback fails closed"
 }
 
 test_publication_binds_the_record_to_the_publishing_generation

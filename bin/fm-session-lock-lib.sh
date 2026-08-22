@@ -228,17 +228,13 @@ fm_proc_boot_anchor() {
 # Print pid $1's kernel process-generation identity as one opaque token, or
 # return 1 when this host exposes neither source.
 #
-# Two schemes, both self-contained so they never need to be compared with each
-# other:
-#   proc:<boot-anchor>:<start-ticks>  procfs, the higher-resolution source
-#   lstart:<absolute start time>      ps, the portable source (macOS/BSD), whose
-#                                     value is already absolute wall-clock time
-#                                     and needs no boot anchor
-# LC_ALL=C pins the ps rendering so a locale change cannot look like a different
-# process. Whitespace is folded and the value reduced to a safe token alphabet so
-# the record stays a single well-formed line.
+# proc:<boot-anchor>:<start-ticks> is the portable positive source currently
+# available to this repository. ps lstart is deliberately not an identity
+# source: its one-second resolution lets a same-second recycled pid inherit the
+# token. A host without positive higher-resolution evidence uses the explicit
+# legacy compatibility path instead of publishing an unverifiable generation.
 fm_process_generation() {  # <pid>
-  local pid=$1 ticks anchor lstart
+  local pid=$1 ticks anchor
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
@@ -246,12 +242,7 @@ fm_process_generation() {  # <pid>
     printf 'proc:%s:%s' "$anchor" "$ticks"
     return 0
   fi
-  lstart=$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null) || return 1
-  lstart=$(printf '%s' "$lstart" | tr -s '[:space:]' '_' | tr -cd 'A-Za-z0-9:_.+-')
-  lstart=${lstart#_}
-  lstart=${lstart%_}
-  [ -n "$lstart" ] || return 1
-  printf 'lstart:%s' "$lstart"
+  return 1
 }
 
 # Print pid $1's start time in whole epoch seconds, or return 1. procfs only:
@@ -305,22 +296,26 @@ FM_SESSION_LOCK_GEN=''
 # shellcheck disable=SC2034 # read by callers after the function returns
 FM_SESSION_LOCK_FORMAT=''
 fm_session_lock_parse() {  # <state>
-  local state=$1 lock content pid_line gen_line extra_line token
+  local state=$1 lock pid_line gen_line token line
+  local -a lines
   FM_SESSION_LOCK_PID=''
   FM_SESSION_LOCK_GEN=''
   FM_SESSION_LOCK_FORMAT=''
   lock="$state/.lock"
   [ -f "$lock" ] && [ ! -L "$lock" ] || return 1
-  content=$(cat "$lock" 2>/dev/null) || return 1
-  { IFS= read -r pid_line || true; IFS= read -r gen_line || true; IFS= read -r extra_line || true; } <<EOF
-$content
-EOF
+  while IFS= read -r line || [ -n "$line" ]; do
+    lines+=("$line")
+  done < "$lock" 2>/dev/null || return 1
+  case "${#lines[@]}" in
+    1) pid_line=${lines[0]}; gen_line='' ;;
+    2) pid_line=${lines[0]}; gen_line=${lines[1]} ;;
+    *) return 1 ;;
+  esac
   case "$pid_line" in
     ''|*[!0-9]*) return 1 ;;
   esac
   [ "$pid_line" -gt 1 ] 2>/dev/null || return 1
-  [ -z "$extra_line" ] || return 1
-  if [ -z "$gen_line" ]; then
+  if [ "${#lines[@]}" -eq 1 ]; then
     FM_SESSION_LOCK_PID=$pid_line
     FM_SESSION_LOCK_FORMAT=legacy
     return 0
@@ -428,6 +423,31 @@ fm_session_lock_generation_verified() {  # <state>
     bound|compat) return 0 ;;
   esac
   return 1
+}
+
+# Print one canonical snapshot of state dir $1's complete validated lock
+# identity. Consumers that defer mutation carry this opaque value and ask this
+# owner whether it still holds, so replacing a lock with the same recycled pid
+# cannot preserve authority.
+fm_session_lock_identity() {  # <state>
+  local state=$1 verdict pid gen
+  fm_session_lock_parse "$state" || return 1
+  pid=$FM_SESSION_LOCK_PID
+  gen=$FM_SESSION_LOCK_GEN
+  verdict=$(fm_session_lock_generation_verdict "$state") || return 1
+  case "$verdict" in
+    bound) printf 'v1:%s:%s' "$pid" "$gen" ;;
+    compat|unbound) printf 'legacy:%s' "$pid" ;;
+    *) return 1 ;;
+  esac
+}
+
+# True only while state dir $1 still has exactly opaque identity $2.
+fm_session_lock_identity_holds() {  # <state> <identity>
+  local current
+  [ -n "$2" ] || return 1
+  current=$(fm_session_lock_identity "$1") || return 1
+  [ "$current" = "$2" ]
 }
 
 # True when state dir $1's lock names a live verified harness that is still the

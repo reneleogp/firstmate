@@ -170,13 +170,9 @@ local_phase() { [ "$FM_BOOTSTRAP_NETWORK_PHASE" != only ]; }
 network_phase() { [ "$FM_BOOTSTRAP_NETWORK_PHASE" != skip ]; }
 
 network_mutation_authorized() {
-  local expected=${FM_BOOTSTRAP_NETWORK_LOCK_PID:-} current
+  local expected=${FM_BOOTSTRAP_NETWORK_LOCK_IDENTITY:-}
   [ -n "$expected" ] || return 0
-  case "$expected" in *[!0-9]*) return 1 ;; esac
-  # Read through the session-lock owner, never the file: the record's shape is
-  # owned by bin/fm-session-lock-lib.sh, and a malformed one authorizes nothing.
-  current=$(fm_session_lock_pid "$STATE") || return 1
-  [ "$current" = "$expected" ]
+  fm_session_lock_identity_holds "$STATE" "$expected"
 }
 
 network_sweep_authorized() {

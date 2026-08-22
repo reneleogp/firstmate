@@ -929,11 +929,13 @@ SH
 }
 
 test_network_sweeps_recheck_lock_ownership() {
-  local case_dir fakebin fake_root marker out
+  local case_dir fakebin fake_root marker out generation identity
   case_dir="$TMP_ROOT/network-lock-handoff"
   mkdir -p "$case_dir/home/config" "$case_dir/home/projects" "$case_dir/home/state"
   printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
-  printf '222222\n' > "$case_dir/home/state/.lock"
+  generation=$(bash -c '. "$1"; fm_process_generation "$2"' _ "$ROOT/bin/fm-session-lock-lib.sh" "$$")
+  identity="v1:$$:$generation"
+  printf '%s\ngen=%sX\n' "$$" "$generation" > "$case_dir/home/state/.lock"
   fakebin=$(make_fake_toolchain "$case_dir")
   fake_root="$case_dir/root"
   marker="$case_dir/fleet-sync.started"
@@ -946,9 +948,9 @@ SH
 
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$fake_root" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_BOOTSTRAP_NETWORK=only \
-    FM_BOOTSTRAP_NETWORK_LOCK_PID=111111 FM_FAKE_FLEET_SYNC_STARTED_MARKER="$marker" \
+    FM_BOOTSTRAP_NETWORK_LOCK_IDENTITY="$identity" FM_FAKE_FLEET_SYNC_STARTED_MARKER="$marker" \
     "$ROOT/bin/fm-bootstrap.sh")
-  assert_absent "$marker" "a stale worker refreshed project clones after lock handoff"
+  assert_absent "$marker" "a stale worker refreshed project clones after same-pid generation replacement"
   assert_contains "$out" "changed before dead-secondmate relaunch" \
     "the stale worker did not report the refused liveness sweep"
   assert_contains "$out" "changed before secondmate convergence" \
@@ -997,7 +999,7 @@ test_network_phases_record_per_step_elapsed_times() {
   log="$case_dir/timings.tsv"
   PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$ROOT" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_BOOTSTRAP_NETWORK=only \
-    FM_BOOTSTRAP_NETWORK_LOCK_PID=$$ FM_TIMING_LOG="$log" FM_TIMING_EPOCH_MS=0 \
+    FM_BOOTSTRAP_NETWORK_LOCK_IDENTITY=legacy:$$ FM_TIMING_LOG="$log" FM_TIMING_EPOCH_MS=0 \
     "$ROOT/bin/fm-bootstrap.sh" >/dev/null 2>&1
 
   assert_present "$log" "the network phase recorded no elapsed times at all"
@@ -1022,7 +1024,7 @@ test_network_phases_record_per_step_elapsed_times() {
   rm -f "$log"
   PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$ROOT" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_BOOTSTRAP_NETWORK=only \
-    FM_BOOTSTRAP_NETWORK_LOCK_PID=$$ \
+    FM_BOOTSTRAP_NETWORK_LOCK_IDENTITY=legacy:$$ \
     "$ROOT/bin/fm-bootstrap.sh" >/dev/null 2>&1
   assert_absent "$log" "a run that never asked for timings recorded them anyway"
   pass "bootstrap: each deferred network phase, secondmate, and clone records its own elapsed time"
