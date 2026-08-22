@@ -60,12 +60,17 @@ chmod +x "$TMP_ROOT/session-lock-check"
 FIXTURE_JS="$TMP_ROOT/fixture.mjs"
 cat >"$FIXTURE_JS" <<'JS'
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
+const piPackage = join(
+  dirname(process.env.EXT), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js",
+);
+const { initTheme } = await import(pathToFileURL(piPackage).href);
+initTheme("dark");
 const home = process.env.FM_TELEGRAM_DIR;
 mkdirSync(home, { recursive: true });
 const socketPath = join(home, "bot.sock");
@@ -683,6 +688,33 @@ await settingsDefinition.handler("", ctx);
 if (!notifications.at(-1)?.message.includes("delivery confirmations off")) {
   fail(`settings did not report the published confirmations value: ${JSON.stringify(notifications.at(-1))}`);
 }
+
+const displayPreference = join(home, "pi-display-status");
+const preferenceVictim = join(home, "preference-victim");
+writeFileSync(preferenceVictim, "do not overwrite\n");
+try { unlinkSync(displayPreference); } catch {}
+symlinkSync(preferenceVictim, displayPreference);
+const persistenceErrors = [];
+const originalConsoleError = console.error;
+console.error = (message) => persistenceErrors.push(String(message));
+ctx.mode = "tui";
+ctx.ui.custom = async (build) => {
+  const theme = { fg: (_color, text) => text, bold: (text) => text };
+  const component = build(undefined, theme, undefined, () => {});
+  component.handleInput(" ");
+};
+await settingsDefinition.handler("", ctx);
+console.error = originalConsoleError;
+if (readFileSync(preferenceVictim, "utf8") !== "do not overwrite\n") {
+  fail("the display preference write followed a symlink");
+}
+if (!lstatSync(displayPreference).isSymbolicLink()) {
+  fail("the refused display preference symlink was replaced");
+}
+if (!persistenceErrors.some((message) => message.includes("could not persist"))) {
+  fail(`the refused display preference write was not reported: ${JSON.stringify(persistenceErrors)}`);
+}
+ctx.mode = "print";
 
 // 7. Shutdown releases the connection and stops reconnecting, and a later
 //    session start (/new, /resume, /fork, reload) reconnects.

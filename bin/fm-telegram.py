@@ -1872,11 +1872,29 @@ def remove_file(path: Optional[Path]) -> None:
 
 def clear_audio(home: Path) -> None:
     directory = audio_dir(home)
-    if not directory.is_dir():
+    try:
+        descriptor = os.open(
+            directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+    except FileNotFoundError:
         return
-    for entry in directory.iterdir():
-        if entry.is_file():
-            remove_file(entry)
+    except OSError as exc:
+        raise TelegramError(f"could not safely clean {directory}: {exc}") from exc
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISDIR(details.st_mode):
+            raise OSError(errno.ENOTDIR, "audio target is not a directory", directory)
+        if hasattr(os, "getuid") and details.st_uid != os.getuid():
+            raise OSError(errno.EPERM, "audio directory belongs to another account", directory)
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                if entry.is_file(follow_symlinks=False):
+                    with contextlib.suppress(OSError):
+                        os.unlink(entry.name, dir_fd=descriptor)
+    except OSError as exc:
+        raise TelegramError(f"could not safely clean {directory}: {exc}") from exc
+    finally:
+        os.close(descriptor)
 
 
 def transcribe_argv(command: str, audio: Path) -> list[str]:
@@ -2510,21 +2528,24 @@ class LaunchdService(ServiceManager):
             try:
                 if was_disabled:
                     self.checked("enable", self.target)
-                if previous_job.pid is None:
-                    dormant = plistlib.loads(previous)
+                previous_data = plistlib.loads(previous)
+                keep_alive = previous_data.get("KeepAlive") is True
+                restore_running = previous_job.pid is not None or keep_alive
+                if restore_running:
+                    remove_file(ready_marker(self.home))
+                    self.checked("bootstrap", self.domain, str(self.plist))
+                    environment = previous_data.get("EnvironmentVariables", {})
+                    launch_id = environment.get("FM_TELEGRAM_LAUNCH_ID")
+                    if not isinstance(launch_id, str):
+                        raise TelegramError("the previous LaunchAgent has no launch generation")
+                    self.wait_ready(launch_id)
+                else:
+                    dormant = dict(previous_data)
                     dormant["RunAtLoad"] = False
                     dormant["KeepAlive"] = False
                     self.publish(plistlib.dumps(dormant))
                     self.checked("bootstrap", self.domain, str(self.plist))
                     self.publish(previous)
-                else:
-                    remove_file(ready_marker(self.home))
-                    self.checked("bootstrap", self.domain, str(self.plist))
-                    environment = plistlib.loads(previous).get("EnvironmentVariables", {})
-                    launch_id = environment.get("FM_TELEGRAM_LAUNCH_ID")
-                    if not isinstance(launch_id, str):
-                        raise TelegramError("the previous LaunchAgent has no launch generation")
-                    self.wait_ready(launch_id)
             except (TelegramError, OSError, ValueError, ExpatError) as exc:
                 failures.append(str(exc))
 

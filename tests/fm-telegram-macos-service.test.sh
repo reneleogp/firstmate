@@ -231,6 +231,29 @@ test_install_refuses_a_service_log_symlink() {
   pass "telegram macOS: install refuses a service-log symlink before publication"
 }
 
+test_audio_cleanup_refuses_a_symlinked_directory() {
+  local out victim
+  new_case
+  victim="$CASE_DIR/audio-victim"
+  mkdir -p "$victim"
+  printf 'do not delete\n' >"$victim/recording.ogg"
+  ln -s "$victim" "$CASE_HOME/audio"
+  if out=$(service install-service); then
+    fail "install started a service through a symlinked audio directory: $out"
+  fi
+  [ "$(cat "$victim/recording.ogg")" = "do not delete" ] \
+    || fail "startup audio cleanup escaped through its directory symlink"
+  [ -L "$CASE_HOME/audio" ] \
+    || fail "startup audio cleanup replaced the refusing directory symlink"
+  case "$out" in
+    *"service exited with status 1"*) : ;;
+    *) fail "the symlinked audio directory refusal did not stop startup: $out" ;;
+  esac
+  assert_grep "could not safely clean" "$CASE_HOME/service.log" \
+    "the symlinked audio directory refusal was not reported in the service log"
+  pass "telegram macOS: audio cleanup refuses a symlinked directory"
+}
+
 test_a_login_launch_refuses_a_swapped_service_log_symlink() {
   local out victim pid attempts
   new_case
@@ -336,6 +359,36 @@ test_a_failed_update_restores_the_previous_definition_and_child() {
     *) fail "a complete rollback was not reported as restored: $out" ;;
   esac
   pass "telegram macOS: a failed update restores its definition and one running child"
+}
+
+test_a_failed_update_restores_a_keepalive_job_between_children() {
+  local out previous_pid restored_pid attempts
+  new_case
+  out=$(service install-service) || fail "first install failed: $out"
+  previous_pid=$(running_pid)
+  kill -9 "$previous_pid" 2>/dev/null || fail "could not stop the prior child"
+  attempts=0
+  while kill -0 "$previous_pid" 2>/dev/null && [ "$attempts" -lt 50 ]; do
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  fake_launchctl print "gui/$(id -u)/$LABEL" >/dev/null \
+    || fail "the simulated job did not remain loaded between KeepAlive children"
+  [ "$(running_pid)" = 0 ] \
+    || fail "the simulated job was not observed between KeepAlive children"
+  if out=$(service install-service fail); then
+    fail "an update to a broken service reported success: $out"
+  fi
+  restored_pid=$(running_pid)
+  [ "$restored_pid" != 0 ] && [ "$restored_pid" != "$previous_pid" ] \
+    || fail "rollback did not restore the self-restarting service child"
+  [ "$(launch_count)" = 3 ] \
+    || fail "rollback launched $(launch_count) children instead of old, failed, restored"
+  case "$out" in
+    *"the previous state was restored"*) : ;;
+    *) fail "the restored KeepAlive service was not reported as restored: $out" ;;
+  esac
+  pass "telegram macOS: rollback restarts one KeepAlive child from a dormant instant"
 }
 
 test_an_incomplete_update_rollback_is_reported() {
@@ -643,11 +696,13 @@ PY
 test_install_starts_one_service_and_waits_for_that_child
 test_the_published_definition_carries_no_secret
 test_install_refuses_a_service_log_symlink
+test_audio_cleanup_refuses_a_symlinked_directory
 test_a_login_launch_refuses_a_swapped_service_log_symlink
 test_update_relaunches_once_and_ignores_the_previous_marker
 test_a_stale_marker_never_reports_a_new_launch_ready
 test_a_failed_install_leaves_nothing_that_starts_at_login
 test_a_failed_update_restores_the_previous_definition_and_child
+test_a_failed_update_restores_a_keepalive_job_between_children
 test_an_incomplete_update_rollback_is_reported
 test_a_failed_install_restores_a_previous_disable
 test_stop_escalates_past_a_service_that_ignores_it

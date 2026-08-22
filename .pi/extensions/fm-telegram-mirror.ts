@@ -22,7 +22,9 @@ import {
   closeSync,
   constants as fsConstants,
   existsSync,
+  fchmodSync,
   fstatSync,
+  ftruncateSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -121,13 +123,30 @@ function readDisplayStatus(): boolean {
 }
 
 function writeDisplayStatus(shown: boolean): void {
+  let descriptor: number | undefined;
   try {
     const home = botHome();
     if (!existsSync(home)) mkdirSync(home, { recursive: true, mode: 0o700 });
-    writeFileSync(join(home, DISPLAY_SETTING_FILE), shown ? "on\n" : "off\n", { mode: 0o600 });
+    const target = join(home, DISPLAY_SETTING_FILE);
+    descriptor = openSync(
+      target,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_NONBLOCK |
+        fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    const details = fstatSync(descriptor);
+    if (!details.isFile()) throw new Error(`${target} is not a regular file`);
+    if (typeof process.getuid === "function" && details.uid !== process.getuid()) {
+      throw new Error(`${target} belongs to another account`);
+    }
+    fchmodSync(descriptor, 0o600);
+    ftruncateSync(descriptor, 0);
+    writeFileSync(descriptor, shown ? "on\n" : "off\n");
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     console.error(`fm-telegram-mirror: could not persist the status display choice: ${detail}`);
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
   }
 }
 
