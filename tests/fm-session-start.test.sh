@@ -677,6 +677,9 @@ install_pi_watch_extension_fixture() {
   local root=$1
   mkdir -p "$root/.pi/extensions"
   cp "$ROOT/.pi/extensions/fm-primary-pi-watch.ts" "$root/.pi/extensions/fm-primary-pi-watch.ts"
+  # Extension ownership is validated through the installation's public lock
+  # command, so this fixture must expose that command just as a real root does.
+  [ -e "$root/bin" ] || ln -s "$ROOT/bin" "$root/bin"
 }
 
 write_pi_watch_loaded_marker() {
