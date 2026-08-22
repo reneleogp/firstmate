@@ -1,0 +1,39 @@
+{
+  "scenario": "completed transcript -> Edit -> Back -> reply to retired prompt -> Edit -> corrected reply",
+  "observable_result": "Back deleted the first instruction; its reply routed to Firstmate as ordinary text; the second Edit created a new live target which corrected the original card.",
+  "transcript_card_id": 1001,
+  "first_edit": {
+    "instruction_message_id": 1002,
+    "force_reply": true
+  },
+  "back": {
+    "telegram_deleteMessage_ids": [
+      1002
+    ],
+    "restored_buttons": [
+      "Send to Firstmate",
+      "Edit",
+      "Cancel"
+    ]
+  },
+  "retired_prompt_reply": {
+    "reply_to_message_id": 1002,
+    "pi_delivery_type": "deliver",
+    "pi_delivered_text": "stray reply to retired prompt"
+  },
+  "second_edit": {
+    "instruction_message_id": 1004,
+    "fresh_id": true,
+    "force_reply": true
+  },
+  "fresh_prompt_reply": {
+    "reply_to_message_id": 1004,
+    "card_text_after_correction": "please rebase the release branch",
+    "restored_buttons": [
+      "Send to Firstmate",
+      "Edit",
+      "Cancel"
+    ]
+  },
+  "delete_count": 1
+}
