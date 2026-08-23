@@ -93,6 +93,14 @@
 #                          terminal result. Action required: inspect the queued
 #                          outcome and record or recover it. Task identity remains
 #                          private in the durable queue record.
+#   check: inactive-outcome bounded poll-loop reconciliation found a suspicious
+#                          inactive terminal outcome that still lacks its durable
+#                          upstream receipt
+#   check: secondmate wake-loop stalled: mate=<id> row=<seq> age=<seconds>s
+#                          the oldest valid row in an endpoint-recorded local
+#                          secondmate home's durable wake queue exceeded
+#                          FM_SECONDMATE_WAKE_STALL_SECS; observation is read-only
+#                          and one parent receipt suppresses repeats for that row
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.
@@ -197,6 +205,9 @@ STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provabl
 # turn-ended and resets the age. Set generously above any legitimate interval
 # between completed turns, including long tool calls, builds, or test runs.
 BUSY_TURN_MAX_SECS=${FM_BUSY_TURN_MAX_SECS:-3600}
+# A local secondmate's foreign queue is checked on every poll, but only after this
+# bounded age can it produce a parent notification.
+SECONDMATE_WAKE_STALL_SECS=${FM_SECONDMATE_WAKE_STALL_SECS:-60}
 # A crew that declared a pause is idling on a known external wait, so its stale
 # pane is absorbed rather than wedge-escalated.
 # A paused crew whose agent has confidently exited uses the bounded external-wait
@@ -384,6 +395,85 @@ recorded_windows() {
     seen="$seen|$w|"
     printf '%s\n' "$w"
   done
+}
+
+# Print the oldest structurally valid row in a local secondmate's foreign queue.
+# This is a read-only observation: the receiving home owns acknowledgement and
+# this parent never changes the row or the foreign queue.
+secondmate_oldest_queue_row() {  # <queue-path>
+  local queue=$1
+  [ -f "$queue" ] && [ ! -L "$queue" ] || return 0
+  awk -F '\t' '
+    NF >= 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      if (!found || $2 < seq) {
+        found = 1
+        seq = $2
+        row = $0
+      }
+    }
+    END { if (found) print row }
+  ' "$queue" 2>/dev/null || true
+}
+
+# Surface one durable parent check for one unchanged foreign row after its
+# bounded age. The primary marker and queued-key check make repeated watcher
+# cycles converge without a notification storm, while an empty queue removes
+# only this home's marker so a later row can be observed.
+secondmate_wake_stall_tick() {
+  local now=$(( $(date +%s) )) threshold=$SECONDMATE_WAKE_STALL_SECS
+  local meta task kind remote_host home queue row epoch seq row_key marker receipt receipt_dir notify_key queued age reason
+  case "$threshold" in ''|*[!0-9]*|0) threshold=60 ;; esac
+  # Endpoint metadata admits this queue-loop check; secondmate-liveness owns registered mates whose endpoint is missing or dead.
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    kind=$(fm_meta_get "$meta" kind)
+    [ "$kind" = secondmate ] || continue
+    remote_host=$(fm_meta_get "$meta" remote_host)
+    [ -z "$remote_host" ] || continue
+    task=${meta##*/}
+    task=${task%.meta}
+    case "$task" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+    home=$(fm_meta_get "$meta" home)
+    [ -n "$home" ] || continue
+    [ -f "$home/.fm-secondmate-home" ] && [ ! -L "$home/.fm-secondmate-home" ] || continue
+    [ "$(cat "$home/.fm-secondmate-home" 2>/dev/null || true)" = "$task" ] || continue
+    queue="$home/state/.wake-queue"
+    row=$(secondmate_oldest_queue_row "$queue")
+    marker="$STATE/.secondmate-wake-stall-$task"
+    receipt_dir="$STATE/.secondmate-wake-stall-receipts/$task"
+    if [ -z "$row" ]; then
+      rm -f "$marker"
+      if [ -e "$receipt_dir" ] || [ -L "$receipt_dir" ]; then
+        [ -d "$receipt_dir" ] && [ ! -L "$receipt_dir" ] || return 1
+        rm -rf -- "$receipt_dir" || return 1
+      fi
+      continue
+    fi
+    IFS=$(printf '\t') read -r epoch seq _row_kind _row_key _row_payload <<EOF
+$row
+EOF
+    case "$epoch" in ''|*[!0-9]*) continue ;; esac
+    case "$seq" in ''|*[!0-9]*) continue ;; esac
+    age=$((now - epoch))
+    [ "$age" -ge "$threshold" ] || continue
+    row_key="$epoch-$seq"
+    receipt="$receipt_dir/$row_key"
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+      [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+    fi
+    [ "$(cat "$marker" 2>/dev/null || true)" = "$row_key" ] && continue
+    [ "$(cat "$receipt" 2>/dev/null || true)" = "$row_key" ] && continue
+    notify_key="secondmate-wake-loop-$task-$row_key"
+    reason="check: secondmate wake-loop stalled: mate=$task row=$seq age=${age}s"
+    queued=$(fm_wake_queued_keys check)
+    if ! printf '%s\n' "$queued" | grep -Fx "$notify_key" >/dev/null 2>&1; then
+      fm_wake_append check "$notify_key" "$reason" || return 1
+    fi
+    fm_wake_secondmate_stall_receipt_write "$task" "$row_key" || return 1
+    fm_wake_secondmate_stall_marker_write "$task" "$row_key" || return 1
+    wake "$reason"
+  done
+  return 0
 }
 
 # Consecutive wedge-escalation count for a window past FM_WEDGE_DEMAND_INSPECT_COUNT
@@ -1478,6 +1568,14 @@ while :; do
   # repost after grace, and escalate once if the recovery turn is also missed.
   # No conversation scraping; unresolved records are never silently expired.
   fm_pending_reply_tick "$STATE" || true
+
+  # A live secondmate endpoint does not prove that its own wake loop is alive.
+  # Observe the foreign queue before the rest of this cycle so an aged row wakes
+  # the parent without consuming or rewriting the receiving home's record.
+  secondmate_wake_stall_tick || {
+    echo "watcher: secondmate wake-loop observation failed" >&2
+    exit 1
+  }
 
   # Process-to-event liveness repair. This never discovers a result by polling:
   # each registered source has its own child blocking on that source, and this

@@ -1174,6 +1174,19 @@ assert_present "$REMOTE_HOME" "unsafe pending-replies retirement removed the rem
 assert_present "$TMP_ROOT/external-pending/escape" "unsafe retirement removed an external pending reply"
 rm -f "$PARENT/state/pending-replies"
 mv "$PARENT/state/pending-replies.safe" "$PARENT/state/pending-replies"
+retired_wake_corr=$(FM_HOME="$PARENT" bash -c '
+  . "$1"
+  fm_pending_reply_create "$2" "$2/state" ios "New routed work is in your backlog."
+' _ "$ROOT/bin/fm-pending-reply-lib.sh" "$PARENT") \
+  || fail "could not seed remote receiver wake retirement state"
+retired_wake_rec="$PARENT/state/pending-replies/$retired_wake_corr"
+FM_HOME="$PARENT" bash -c '
+  . "$1"
+  fm_pending_reply_set "$2" phase resolved
+  fm_pending_reply_set "$2" delivered_epoch 1
+' _ "$ROOT/bin/fm-pending-reply-lib.sh" "$retired_wake_rec" \
+  || fail "could not settle remote receiver wake retirement state"
+printf 'confirmed:%s\n' "$retired_wake_corr" > "$PARENT/state/.backlog-handoff-ios.wake-pending"
 handoff_lock="$PARENT/state/.backlog-handoff-ios.lock"
 FM_HOME="$PARENT" /bin/bash -c '
   . "$1"
@@ -1224,6 +1237,9 @@ if ! wait "$teardown_pid"; then
 fi
 assert_absent "$REMOTE_HOME" "remote retirement did not remove the remote home"
 assert_absent "$PARENT/state/ios.meta" "remote retirement did not remove parent metadata"
+assert_absent "$PARENT/state/.backlog-handoff-ios.wake-pending" \
+  "remote retirement left receiver wake state that could poison a replacement route"
+assert_absent "$retired_wake_rec" "remote retirement left the retired receiver wake correlation"
 assert_no_grep '- ios ' "$PARENT/data/secondmates.md" "remote retirement did not remove the registry route"
 jq -e --arg workspace "$SIBLING_WORKSPACE" --arg pane "$SIBLING_PANE" '
   any(.workspaces[]; .workspace_id == $workspace and .label == "2ndmate-macos")
