@@ -12,6 +12,8 @@
 #      and handled/.
 #   2. Sequencing dedups per worker lifetime: the handled mv retires a record,
 #      re-acking it is a no-op, and an acknowledged sequence is never reissued.
+#      The idempotent enqueue (the remote steer leg's primitive) additionally
+#      dedups an exact-body re-run onto the existing record, handled or not.
 #   3. Concurrent writers serialize on the sequence lock: no clobbered records.
 #   4. The re-ring ladder: within grace is quiet, past grace rings, ring
 #      spacing holds, a spent budget escalates exactly once, and an
@@ -156,6 +158,66 @@ test_write_is_durable_and_exact() {
     *$'\n'*) fail "the doorbell must be a single line" ;;
   esac
   pass "inbox: a steer is written durably and round-trips byte-exact with a self-describing doorbell"
+}
+
+test_idempotent_write_dedups_exact_body() {
+  local state r1 r2 r3 r4 count text
+  state="$TMP_ROOT/idem/state"; mkdir -p "$state"
+  text=$'re-runnable steer\nsecond line'
+  r1=$(inbox_lib "$state" fm_task_inbox_write_idempotent "$state" t1 "$text") \
+    || fail "idempotent write failed"
+  [ "$r1" = "$state/t1.inbox/001.msg" ] || fail "first idempotent write should create 001.msg, got $r1"
+  # Re-running the same enqueue (the safe recovery after an ambiguous remote
+  # transport failure) lands on the SAME record, never a duplicate.
+  r2=$(inbox_lib "$state" fm_task_inbox_write_idempotent "$state" t1 "$text") \
+    || fail "idempotent re-run failed"
+  [ "$r2" = "$r1" ] || fail "an identical re-run should return the existing record, got $r2"
+  count=$(find "$state/t1.inbox" -maxdepth 1 -name '*.msg' | wc -l | tr -d ' ')
+  [ "$count" = 1 ] || fail "an identical re-run must not enqueue a duplicate, found $count records"
+  # A different body - two logical requests differ at least by their embedded
+  # correlation token - still enqueues normally.
+  r3=$(inbox_lib "$state" fm_task_inbox_write_idempotent "$state" t1 $'re-runnable steer\nsecond line changed') \
+    || fail "idempotent write of a different body failed"
+  [ "$r3" = "$state/t1.inbox/002.msg" ] || fail "a different body should enqueue a new record, got $r3"
+  # A body the worker already acknowledged still dedups: the re-run reports
+  # the handled record rather than re-delivering an instruction that was
+  # already acted on.
+  mv "$r1" "$state/t1.inbox/handled/"
+  r4=$(inbox_lib "$state" fm_task_inbox_write_idempotent "$state" t1 "$text") \
+    || fail "idempotent re-run after the ack failed"
+  [ "$r4" = "$state/t1.inbox/handled/001.msg" ] \
+    || fail "a re-run of an acknowledged steer should land on the handled record, got $r4"
+  count=$(find "$state/t1.inbox" -maxdepth 1 -name '*.msg' | wc -l | tr -d ' ')
+  [ "$count" = 1 ] || fail "a re-run of an acknowledged steer must not re-enqueue it, found $count unhandled records"
+  pass "inbox: the idempotent enqueue dedups an exact re-run onto the same record, handled or not"
+}
+
+test_idempotent_write_follows_concurrent_ack() {
+  local state rec result count text
+  state="$TMP_ROOT/idem-ack-race/state"; mkdir -p "$state"
+  text="acknowledge while dedup scans"
+  rec=$(inbox_lib "$state" fm_task_inbox_write_idempotent "$state" t1 "$text") \
+    || fail "race fixture write failed"
+  result=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    eval "$(declare -f fm_task_inbox_body | sed "1s/fm_task_inbox_body/_original_fm_task_inbox_body/")"
+    fm_task_inbox_body() {
+      candidate=$1
+      case "$candidate" in
+        */handled/*) ;;
+        *) mv "$candidate" "${candidate%/*}/handled/" || return 1
+           candidate="${candidate%/*}/handled/${candidate##*/}" ;;
+      esac
+      _original_fm_task_inbox_body "$candidate"
+    }
+    fm_task_inbox_write_idempotent "$2" t1 "$3"
+  ' _ "$ROOT/bin/fm-task-inbox-lib.sh" "$state" "$text") \
+    || fail "idempotent enqueue failed while acknowledgement moved its candidate"
+  [ "$result" = "$state/t1.inbox/handled/${rec##*/}" ] \
+    || fail "dedup did not follow the concurrently acknowledged record: $result"
+  count=$(find "$state/t1.inbox" -name '*.msg' | wc -l | tr -d ' ')
+  [ "$count" = 1 ] || fail "acknowledgement racing dedup created a duplicate record"
+  pass "inbox: idempotent enqueue follows a record concurrently moved to handled"
 }
 
 test_handled_mv_dedups_by_sequence() {
@@ -418,6 +480,8 @@ test_watcher_escalates_once_after_budget() {
 }
 
 test_write_is_durable_and_exact
+test_idempotent_write_dedups_exact_body
+test_idempotent_write_follows_concurrent_ack
 test_handled_mv_dedups_by_sequence
 test_concurrent_writers_never_clobber
 test_ladder_writes_ignore_vanished_inbox

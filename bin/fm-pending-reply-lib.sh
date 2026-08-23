@@ -178,7 +178,7 @@ fm_pending_reply_get() {  # <record-path> <key>
 }
 
 fm_pending_reply_corr_reusable() {  # <state-dir> <corr_id> <task_id>
-  local state=$1 corr=$2 task_id=$3 rec phase
+  local state=$1 corr=$2 task_id=$3 rec phase delivered
   printf '%s' "$corr" | grep -Eq '^[A-Fa-f0-9]{16}$' || return 1
   rec=$(fm_pending_reply_path "$state" "$corr")
   [ -f "$rec" ] || return 1
@@ -186,6 +186,11 @@ fm_pending_reply_corr_reusable() {  # <state-dir> <corr_id> <task_id>
   phase=$(fm_pending_reply_get "$rec" phase)
   case "$phase" in
     awaiting_report|recovery_sending|recovery_sent) return 0 ;;
+    delivery_unknown)
+      delivered=$(fm_pending_reply_get "$rec" delivered_epoch)
+      [ -z "$delivered" ]
+      return $?
+      ;;
   esac
   return 1
 }
