@@ -164,6 +164,9 @@ control_cleanup() {
     CONTROL_LOCK_HELD=0
     fm_lock_release "$CONTROL_LOCK" || true
   fi
+  if declare -F fm_lease_guard_release >/dev/null 2>&1; then
+    fm_lease_guard_release || true
+  fi
   return "$status"
 }
 
@@ -263,6 +266,12 @@ if ! fm_task_id_creation_valid "$RAW_ID"; then
   die "'$RAW_ID' is not a valid task id"
 fi
 ID=$RAW_ID
+# Supervision lease guard: lifecycle control is overlap territory between the
+# two Pi supervision actors; refuse while the OTHER actor holds this task's
+# live lease (contract: bin/fm-lease-lib.sh; no-op in homes without leases).
+# shellcheck source=bin/fm-lease-lib.sh
+. "$SCRIPT_DIR/fm-lease-lib.sh"
+fm_lease_guard "$ID" "lifecycle control (fm-control)"
 CONTROL_LOCK="$STATE/.control-$ID.lock"
 trap control_cleanup EXIT
 fm_lock_try_acquire "$CONTROL_LOCK" \

@@ -403,6 +403,20 @@ fm_send_resolve_target "$RAW_TARGET" || exit 1
 T=$RESOLVED_TARGET
 shift
 
+# Supervision lease guard: a steer is overlap territory between the two Pi
+# supervision actors, so refuse while the OTHER actor holds this task's live
+# lease. A home with no supervision branch has no lease files and passes
+# untouched (contract: bin/fm-lease-lib.sh).
+# shellcheck source=bin/fm-lease-lib.sh
+. "$SCRIPT_DIR/fm-lease-lib.sh"
+if [ -n "$TARGET_META" ]; then
+  LEASE_GUARD_TASK=$(fm_send_id_from_meta "$TARGET_META")
+  if [ -n "$LEASE_GUARD_TASK" ]; then
+    fm_lease_guard "$LEASE_GUARD_TASK" "steer (fm-send)"
+    trap 'fm_lease_guard_release' EXIT
+  fi
+fi
+
 # Collect --resolve-key flags (answerer-closes; see the header contract). They
 # must precede --key or the message text; everything after the last flag is the
 # message exactly as before, so ordinary sends are byte-identical.

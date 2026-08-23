@@ -52,6 +52,16 @@ The `/calm` command replaces the file atomically before changing live presentati
 The extension reloads this preference on every Pi `session_start`, including startup, new, resume, fork, and reload reasons.
 This preference is local to each Firstmate home and is not part of secondmate inherited configuration.
 
+## Pi supervision branch (config/pi-supervision-branch)
+
+On a Pi primary, ordinary actionable fleet wakes that pass the unchanged watcher classifier are handled by a persistent in-process supervision branch that keeps the captain's conversation clean; [docs/pi-supervision-branch.md](pi-supervision-branch.md) owns the architecture.
+The gitignored `config/pi-supervision-branch` file under the effective home is the captain's explicit, project-local autonomy grant. It contains one or more exact `project=<value>` lines, where each value exactly matches the `project=` field in task metadata; blank lines and `#` comments are allowed. A wake is delegated only when every unread queue row is task-local and every task's project is listed. Fleet-wide, unresolvable, mixed-scope, absent, unreadable, empty, legacy `on`, `off`, or otherwise malformed grants stay on the captain-facing main path and activate no branch-owned runtime state or lease cleanup.
+The grant enables only the Pi-primary routing and bounded supervision role in the captain-approved architecture: sharing a home does not extend authority to unlisted projects, the branch cannot merge a PR, land local work, or freshly spawn, and every existing captain gate remains unchanged.
+The file is read fresh at every wake offer, so an edit takes effect without restarting Pi.
+Homes on any other primary harness never read this file and are entirely unaffected.
+Runtime state lives in `state/branch-outcomes.jsonl` with its `.branch-outcomes-cursor`, the persistent conversation under `state/branch-session/` with its `.branch-session` pointer and `.branch-mirror-cursor`, and per-task `state/.lease-<task>` files; `bin/fm-branch-outcome.sh` and `bin/fm-lease-lib.sh` own those formats.
+This grant is local to each Firstmate home and is not part of secondmate inherited configuration; each home remains disabled until its captain explicitly writes `on`.
+
 ## Backlog backend (.tasks.toml / config/backlog-backend)
 
 The tracked `.tasks.toml` pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.
