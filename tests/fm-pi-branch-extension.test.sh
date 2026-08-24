@@ -120,8 +120,10 @@ JS
 JSON
   cat > "$repo/node_modules/@earendil-works/pi-tui/index.js" <<'JS'
 export class Text {
-  constructor(text) {
+  constructor(text, paddingX, paddingY) {
     this.text = text;
+    this.paddingX = paddingX;
+    this.paddingY = paddingY;
   }
 }
 JS
@@ -332,8 +334,20 @@ await report.execute("call-3", { task: "task-9", verdict: "captain", summary: "P
 if (sentToMain[2].options.triggerTurn !== true || sentToMain[2].options.deliverAs !== "followUp") {
   throw new Error(`captain merge must trigger exactly one follow-up turn: ${JSON.stringify(sentToMain[2].options)}`);
 }
-if (!sentToMain[2].message.content.includes("[captain] task-9: PR https://example.com/pr/9")) {
-  throw new Error(`captain note lost its content: ${sentToMain[2].message.content}`);
+if (typeof sentToMain[0].message.content !== "string" || !sentToMain[0].message.content.startsWith("⛵ ")) {
+  throw new Error(`routine note missing sailboat prefix: ${sentToMain[0].message.content}`);
+}
+if (/branch merged|\[routine\]|\[captain\]/.test(sentToMain[0].message.content)) {
+  throw new Error(`routine note still has boilerplate: ${sentToMain[0].message.content}`);
+}
+if (typeof sentToMain[2].message.content !== "string" || !sentToMain[2].message.content.startsWith("⚓ ")) {
+  throw new Error(`captain note missing anchor prefix: ${sentToMain[2].message.content}`);
+}
+if (!sentToMain[2].message.content.includes("task-9: PR https://example.com/pr/9")) {
+  throw new Error(`captain note lost its outcome: ${sentToMain[2].message.content}`);
+}
+if (/branch merged|\[routine\]|\[captain\]/.test(sentToMain[2].message.content)) {
+  throw new Error(`captain note still has boilerplate: ${sentToMain[2].message.content}`);
 }
 
 // The store (the owned durable contract) holds all three outcomes in order,
@@ -354,8 +368,39 @@ if (listedText.split("\n").length !== 2 || !listedText.includes("checks green"))
   throw new Error(`fm_branch_outcomes did not read the store: ${listedText}`);
 }
 if (!renderers.has("fm-branch-merge")) throw new Error("merge-note renderer missing");
-const rendered = renderers.get("fm-branch-merge")({ content: "note body" }, { expanded: false }, { fg: (_c, text) => text });
-if (rendered.text !== "note body") throw new Error("merge-note renderer dropped the note");
+const assertRenderedNote = (note, glyph) => {
+  const fgCalls = [];
+  const rendered = renderers.get("fm-branch-merge")(
+    { content: note },
+    { expanded: false },
+    {
+      fg(color, text) {
+        fgCalls.push({ color, text });
+        return text;
+      },
+    },
+  );
+  if (!String(rendered.text).includes(glyph)) throw new Error(`renderer dropped ${glyph}: ${rendered.text}`);
+  if (String(rendered.text).includes("branch merged")) throw new Error(`renderer kept boilerplate: ${rendered.text}`);
+  if (rendered.paddingX === 0 && rendered.paddingY === 0) {
+    throw new Error("renderer still pads with 0,0 instead of outputPad");
+  }
+  if (rendered.paddingX !== 1 || rendered.paddingY !== 0) {
+    throw new Error(
+      `renderer padding should match real Pi messages (outputPad, 0), got ${rendered.paddingX},${rendered.paddingY}`,
+    );
+  }
+  const glyphCalls = fgCalls.filter((call) => call.text === glyph);
+  if (glyphCalls.length !== 1 || glyphCalls[0].color === "dim") {
+    throw new Error(`icon ${glyph} must carry color, not dim: ${JSON.stringify(fgCalls)}`);
+  }
+  const restCalls = fgCalls.filter((call) => call.text !== glyph);
+  if (restCalls.length === 0 || restCalls.some((call) => call.color !== "dim")) {
+    throw new Error(`note remainder must be dim: ${JSON.stringify(fgCalls)}`);
+  }
+};
+assertRenderedNote(sentToMain[0].message.content, "⛵");
+assertRenderedNote(sentToMain[2].message.content, "⚓");
 process.exit(0);
 EOF
   status=$?
