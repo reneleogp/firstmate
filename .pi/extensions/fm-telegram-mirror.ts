@@ -23,6 +23,7 @@ import {
   constants as fsConstants,
   existsSync,
   fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -138,15 +139,20 @@ function ownsSessionLock(): boolean {
 // Ownership itself stays with the checker script; this only decides whether
 // asking again could ever change the answer.
 function sessionLockClaimed(): boolean {
+  const lockPath = join(stateDirectory(), ".lock");
   let lockPid = "";
   try {
-    lockPid = readFileSync(join(stateDirectory(), ".lock"), "utf8").trim();
+    const lockStat = lstatSync(lockPath);
+    if (!lockStat.isFile() || lockStat.isSymbolicLink()) return false;
+    lockPid = readFileSync(lockPath, "utf8").trim();
   } catch {
     return false;
   }
   if (!/^[0-9]+$/.test(lockPid)) return false;
+  const pid = Number(lockPid);
+  if (!Number.isSafeInteger(pid) || pid <= 1) return false;
   try {
-    process.kill(Number(lockPid), 0);
+    process.kill(pid, 0);
     return true;
   } catch (error) {
     // A process this user cannot signal is still a live claim.

@@ -771,7 +771,8 @@ await waitFor(() => connections > connectionsAfterShutdown, "a reconnect on the 
 const connectionsBeforeWorker = connections;
 mkdirSync(join(process.env.WORKER_HOME, "state"), { recursive: true });
 // A live pid that is not this process's ancestor: exactly a crewmate's shape.
-writeFileSync(join(process.env.WORKER_HOME, "state", ".lock"), "1\n");
+const workerOwner = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"]);
+writeFileSync(join(process.env.WORKER_HOME, "state", ".lock"), `${workerOwner.pid}\n`);
 process.env.FM_HOME = process.env.WORKER_HOME;
 const workerHandlers = new Map();
 const workerCommands = [];
@@ -792,17 +793,20 @@ if (connections !== connectionsBeforeWorker) {
 if (workerFooter.size !== 0) {
   fail("a worker session published a Telegram footer");
 }
+workerOwner.kill();
+await new Promise((resolve) => workerOwner.once("exit", resolve));
 process.env.FM_HOME = process.env.WORKER_HOME.replace("workerhome", "fmhome");
 
 // 9. A home that has not recorded its live session yet is not a worker. Pi
 //    loads this file while the session is starting, and Firstmate records the
 //    session lock from inside that same session moments later, so a bridge that
 //    answered "not mine" once at load stayed dark until the captain reloaded Pi.
-//    Here the lock arrives after the session started, with no reload, no second
-//    import, and no further session_start.
+//    Malformed and symlink locks are also unclaimed and must keep retrying until
+//    the regular lock arrives, with no reload, second import, or session_start.
 const connectionsBeforePending = connections;
 const pendingState = join(process.env.PENDING_HOME, "state");
 mkdirSync(pendingState, { recursive: true });
+writeFileSync(join(pendingState, ".lock"), "1\n");
 process.env.FM_HOME = process.env.PENDING_HOME;
 const pendingHandlers = new Map();
 const pendingCommands = [];
@@ -837,7 +841,17 @@ if (pendingCommands.length !== 0 || pendingFooter.size !== 0) {
   fail(`an unrecorded session published ${pendingFooter.size} status(es) and ${pendingCommands.length} command(s)`);
 }
 
-writeFileSync(join(pendingState, ".lock"), `${process.pid}\n`);
+const pendingLock = join(pendingState, ".lock");
+const symlinkTarget = join(pendingState, "symlink-target");
+unlinkSync(pendingLock);
+writeFileSync(symlinkTarget, `${process.pid}\n`);
+symlinkSync(symlinkTarget, pendingLock);
+await new Promise((resolve) => setTimeout(resolve, 300));
+if (connections !== connectionsBeforePending || pendingCommands.length !== 0 || pendingFooter.size !== 0) {
+  fail("a symlink lock claimed the Telegram bridge before a valid session record arrived");
+}
+unlinkSync(pendingLock);
+writeFileSync(pendingLock, `${process.pid}\n`);
 await waitFor(() => connections > connectionsBeforePending, "the bridge to connect once the home recorded its session");
 await waitFor(() => pendingFooter.get("firstmate-telegram") !== undefined, "the Telegram footer to appear without a Pi reload");
 if (!pendingFooter.get("firstmate-telegram").startsWith("telegram: ")) {
