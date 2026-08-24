@@ -8,9 +8,10 @@
 // merges an append-only note to main's tail. Main's captain/assistant dialog
 // is mirrored into the branch as read-only fm-main-mirror context at main's
 // turn_end. Pi-only by construction: this file lives in .pi/extensions, so no
-// other harness ever loads it, and a home that has not explicitly granted the
-// wake's project in config/pi-supervision-branch (or runs away mode) keeps
-// today's wake-to-main behavior untouched.
+// other harness ever loads it. Supervision is default-on for every task once
+// this Pi session owns the fleet lock: no captain grant file is required.
+// Away mode (or a broken branch) keeps today's wake-to-main behavior
+// untouched regardless.
 //
 // Prefix stability (the cache contract, owner: bin/fm-branch-prompt.sh
 // header): the branch's system prompt is the generator's byte-stable output,
@@ -58,6 +59,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   FM_BRANCH_DISPATCH_EVENT,
+  scopeForUnreadWake,
   type BranchDispatchOffer,
 } from "./lib/fm-branch-dispatch.ts";
 import { encodeFirstmateOperationalInput } from "./lib/fm-operational-input.ts";
@@ -69,7 +71,6 @@ const fmHome = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || root;
 const fmRoot = process.env.FM_ROOT_OVERRIDE || root;
 const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
 const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
-const configFile = join(config, "pi-supervision-branch");
 const afkFlag = join(state, ".afk");
 const sessionsDir = join(state, "branch-session");
 const sessionPointer = join(state, ".branch-session");
@@ -90,7 +91,6 @@ const branchCacheKey = `fm-branch-${createHash("sha256").update(fmHome).digest("
 
 const MIRROR_MESSAGE_CAP = 4000;
 const MERGE_NOTE_BOAT = "⛵";
-const MERGE_NOTE_ANCHOR = "⚓";
 type MirrorItem = { tag: "captain" | "main"; text: string };
 type MirrorCursor = { file: string; index: number };
 type Verdict = "routine" | "captain";
@@ -104,32 +104,8 @@ const scriptEnv = {
   FM_CONFIG_OVERRIDE: config,
 };
 
-function grantedProjects(): Set<string> {
-  try {
-    // Standing autonomy is project-specific. Each line must be an exact
-    // `project=<value>` matching task metadata; comments and blank lines are
-    // allowed, while malformed content fails the whole grant closed.
-    const grants = new Set<string>();
-    for (const raw of readFileSync(configFile, "utf8").split(/\r?\n/)) {
-      const line = raw.trim();
-      if (!line || line.startsWith("#")) continue;
-      if (!line.startsWith("project=") || line.length === 8) return new Set();
-      grants.add(line.slice(8));
-    }
-    return grants;
-  } catch {
-    return new Set();
-  }
-}
-
-function branchConfigured(): boolean {
-  return grantedProjects().size > 0;
-}
-
-function offerIsGranted(offer: BranchDispatchOffer): boolean {
-  if (!Array.isArray(offer.projects) || offer.projects.length === 0) return false;
-  const grants = grantedProjects();
-  return grants.size > 0 && offer.projects.every((project) => grants.has(project));
+function offerEligible(offer: BranchDispatchOffer): boolean {
+  return offer.eligible === true;
 }
 
 function afkActive(): boolean {
@@ -343,28 +319,34 @@ export default function (pi: ExtensionAPI) {
   // Append-only merge into main. The store row is already durable when this
   // runs; the note is a cache of it at main's tail. Delivery modes per the
   // design: routine+idle appends now with no turn, routine+busy appends after
-  // the captain's next prompt, captain-relevant appends and triggers exactly
-  // one turn (queued as a follow-up while main is busy). The read cursor
-  // advances once the note is handed to Pi; a crash inside Pi's own delivery
-  // window leaves the outcome durable in the store, where main's
-  // fm_branch_outcomes tool still reads it on demand.
+  // the captain's next prompt, captain-relevant triggers exactly one turn
+  // (queued as a follow-up while main is busy) - that follow-up turn is
+  // itself the captain-visible outcome, so the captain-facing note is
+  // delivered silently (display: false) rather than printed or rendered a
+  // second time; routine notes stay rendered except an explicitly silent
+  // no-change heartbeat. The read cursor advances once the note is handed to
+  // Pi; a crash inside Pi's
+  // own delivery window leaves the outcome durable in the store, where
+  // main's fm_branch_outcomes tool still reads it on demand.
   function mergeIntoMain(
     expectedGeneration: number,
     seq: string,
     task: string,
     verdict: Verdict,
     summary: string,
+    silent: boolean,
   ): boolean {
     if (!actingAsOwner(expectedGeneration)) return false;
-    const glyph = verdict === "captain" ? MERGE_NOTE_ANCHOR : MERGE_NOTE_BOAT;
-    const note = `${glyph} ${task}: ${summary}`;
-    const message = { customType: "fm-branch-merge", content: note, display: true };
     if (verdict === "captain") {
+      const message = { customType: "fm-branch-merge", content: `${task}: ${summary}`, display: false };
       pi.sendMessage(message, { triggerTurn: true, deliverAs: "followUp" });
-    } else if (mainStreaming) {
-      pi.sendMessage(message, { deliverAs: "nextTurn" });
     } else {
-      pi.sendMessage(message, {});
+      const message = { customType: "fm-branch-merge", content: `${MERGE_NOTE_BOAT} ${task}: ${summary}`, display: !(task === "fleet" && silent) };
+      if (mainStreaming) {
+        pi.sendMessage(message, { deliverAs: "nextTurn" });
+      } else {
+        pi.sendMessage(message, {});
+      }
     }
     if (/^[0-9]+$/.test(seq)) {
       if (!actingAsOwner(expectedGeneration)) return false;
@@ -378,7 +360,7 @@ export default function (pi: ExtensionAPI) {
       name: "fm_branch_report",
       label: "Report supervision outcome",
       description:
-        "Record the outcome of one handled fleet event: write it durably to the outcome store, then merge an append-only note into the captain-facing main conversation. verdict captain surfaces it to the captain in one turn; verdict routine merges silently.",
+        "Record the outcome of one handled fleet event: write it durably to the outcome store, then merge an append-only note into the captain-facing main conversation. verdict captain surfaces it to the captain in one turn; routine notes render unless silent marks a no-change heartbeat.",
       parameters: Type.Object({
         task: Type.String({ description: "The task id the event belongs to (or 'fleet' for fleet-wide events)" }),
         verdict: Type.Union([Type.Literal("routine"), Type.Literal("captain")], {
@@ -389,13 +371,17 @@ export default function (pi: ExtensionAPI) {
             "One or two sentences in captain outcome language; include the full https:// PR URL when a PR is involved",
         }),
         wake: Type.Optional(Type.String({ description: "The wake reason line this outcome answers" })),
+        silent: Type.Optional(Type.Boolean({
+          description: "True only when a fleet-wide heartbeat review found literally nothing worth reporting; omit or use false whenever any action was taken or any routine result is worth a note",
+        })),
       }),
       execute: async (_toolCallId, params) => {
         const task = String((params as { task: unknown }).task || "").trim();
         const verdictRaw = String((params as { verdict: unknown }).verdict || "");
         const summary = String((params as { summary: unknown }).summary || "").trim();
         const wake = String((params as { wake?: unknown }).wake ?? "").trim();
-        if (!task || !summary || (verdictRaw !== "routine" && verdictRaw !== "captain")) {
+        const silent = (params as { silent?: unknown }).silent === true;
+        if (!task || !summary || (verdictRaw !== "routine" && verdictRaw !== "captain") || (silent && (task !== "fleet" || verdictRaw !== "routine"))) {
           return {
             content: [{ type: "text", text: "invalid report: task, verdict (routine|captain), and summary are required" }],
             details: undefined,
@@ -403,7 +389,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         const verdict = verdictRaw as Verdict;
-        const appendArgs = ["append", "--task", task, "--verdict", verdict, "--summary", summary];
+        const appendArgs = ["append", "--task", task, "--verdict", verdict, "--summary", summary, "--silent", String(silent)];
         if (wake) appendArgs.push("--wake", wake);
         if (!actingAsOwner(toolGeneration)) {
           return {
@@ -420,7 +406,7 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
-        if (!mergeIntoMain(toolGeneration, appended.stdout, task, verdict, summary)) {
+        if (!mergeIntoMain(toolGeneration, appended.stdout, task, verdict, summary, silent)) {
           return {
             content: [{ type: "text", text: `recorded seq ${appended.stdout}, but merge refused after supervision replacement or lock loss` }],
             details: undefined,
@@ -604,6 +590,14 @@ ${context.command}
         const session = await ensureBranch(acceptedGeneration);
         await flushMirror(session, acceptedGeneration);
         if (!actingAsOwner(acceptedGeneration)) throw new Error("supervision session no longer owns the fleet lock");
+        const heartbeat = /^heartbeat($|:)/.test(message);
+        const scope = scopeForUnreadWake(state, heartbeat);
+        if (scope.status === "empty") return;
+        if (scope.status === "unsafe") {
+          throw new Error("unread wake queue now contains a main-owned row or could not be read safely");
+        }
+        // A row can still arrive between this re-check and the model starting
+        // the drain; that residual is accepted by the confused-agent-grade boundary.
         await session.prompt(
           `FIRSTMATE SUPERVISION WAKE: ${message}\n\nHandle this per your operating procedure and finish with fm_branch_report.`,
         );
@@ -635,10 +629,10 @@ ${context.command}
   pi.events?.on?.(FM_BRANCH_DISPATCH_EVENT, (data) => {
     const offer = data as BranchDispatchOffer;
     if (!offer || typeof offer.accept !== "function") return;
-    // Check project-specific consent before ownership activation so an
-    // unconfigured or out-of-scope wake gets neither branch routing nor
-    // branch-owned state/lease cleanup side effects.
-    if (!offerIsGranted(offer)) return;
+    // Check eligibility before ownership activation so an out-of-scope wake
+    // gets neither branch routing nor branch-owned state/lease cleanup side
+    // effects.
+    if (!offerEligible(offer)) return;
     if (!actingAsOwner()) return; // cold start pre-lock, secondary session, or shutdown
     if (afkActive()) return; // the away daemon owns supervision while afk
     if (branchBroken) return; // fail back to today's wake-to-main path
@@ -661,7 +655,7 @@ ${context.command}
   // lands before any later wake. The durable cursor advances only in
   // flushMirror after the complete pending batch reaches the branch.
   pi.on?.("turn_end", (_event, ctx) => {
-    if (!branchConfigured() || !actingAsOwner()) return;
+    if (!actingAsOwner()) return;
     try {
       pendingMirror.push(...collectMainDialog(ctx.sessionManager, mirrorCollection));
     } catch {
@@ -681,7 +675,7 @@ ${context.command}
     shuttingDown = false;
     branchBroken = "";
     generation += 1;
-    if (branchConfigured()) actingAsOwner(generation);
+    actingAsOwner(generation);
   });
 
   pi.on?.("session_shutdown", () => {
@@ -727,17 +721,16 @@ ${context.command}
     },
   });
 
+  // Pi only calls this renderer for a message with display: true, which
+  // mergeIntoMain sets for every routine note except an explicitly silent
+  // fleet heartbeat; captain-facing notes are never printed or rendered here.
   pi.registerMessageRenderer?.("fm-branch-merge", (message, _options, theme) => {
     const note = textOfContent(message.content);
-    const glyph = note.startsWith(MERGE_NOTE_ANCHOR)
-      ? MERGE_NOTE_ANCHOR
-      : note.startsWith(MERGE_NOTE_BOAT)
-        ? MERGE_NOTE_BOAT
-        : "";
-    const rest = glyph ? note.slice(glyph.length) : note;
+    const hasGlyph = note.startsWith(MERGE_NOTE_BOAT);
+    const rest = hasGlyph ? note.slice(MERGE_NOTE_BOAT.length) : note;
     const outputPad = 1;
     return new Text(
-      `${glyph ? theme.fg("customMessageText", glyph) : ""}${theme.fg("dim", rest)}`,
+      `${hasGlyph ? theme.fg("customMessageText", MERGE_NOTE_BOAT) : ""}${theme.fg("dim", rest)}`,
       outputPad,
       0,
     );

@@ -19,6 +19,7 @@ import { Type } from "typebox";
 import {
   createBranchDispatchOffer,
   FM_BRANCH_DISPATCH_EVENT,
+  scopeForUnreadWake,
 } from "./lib/fm-branch-dispatch.ts";
 import {
   type CalmPresentationState,
@@ -354,65 +355,10 @@ export default function (pi: ExtensionAPI) {
     return confirmHandlingDelivery(snapshot(), reason, sequence);
   }
 
-  // Resolve every unread row that the branch's mandatory fm-wake-drain call
-  // would present. Only task-local signal/stale rows can be delegated: a
-  // fleet-wide check/heartbeat or an unresolvable task stays with main. This
-  // prevents one project's autonomy grant from authorizing work on another
-  // project merely because both projects share a firstmate home.
-  function projectsForUnreadWake(): string[] {
-    let queue = "";
-    try {
-      queue = readFileSync(`${state}/.wake-queue`, "utf8");
-    } catch {
-      return [];
-    }
-
-    const projects = new Set<string>();
-    const metadata = new Map<string, string>();
-    try {
-      for (const name of readdirSync(state)) {
-        if (!name.endsWith(".meta")) continue;
-        const task = name.slice(0, -5);
-        const fields = readFileSync(`${state}/${name}`, "utf8").split(/\r?\n/);
-        const project = fields.find((line) => line.startsWith("project="))?.slice(8) ?? "";
-        const window = fields.find((line) => line.startsWith("window="))?.slice(7) ?? "";
-        if (project) {
-          metadata.set(task, project);
-          if (window) metadata.set(window, project);
-        }
-      }
-    } catch {
-      return [];
-    }
-
-    let found = false;
-    for (const line of queue.split(/\r?\n/)) {
-      if (!line) continue;
-      const fields = line.split("\t");
-      if (fields.length < 4 || !/^[0-9]+$/.test(fields[1])) continue;
-      const kind = fields[2];
-      const key = fields[3];
-      let project = "";
-      if (kind === "signal") {
-        const task = key.replace(/\.(?:status|turn-ended)$/, "");
-        project = metadata.get(task) ?? "";
-      } else if (kind === "stale") {
-        project = metadata.get(key) ?? metadata.get(key.replace(/^fm-/, "")) ?? "";
-      } else {
-        return [];
-      }
-      if (!project) return [];
-      found = true;
-      projects.add(project);
-    }
-    return found ? [...projects] : [];
-  }
-
-  // Offer an ordinary, project-scoped actionable wake to the supervision
-  // branch. A synchronous accept means the branch now owns delivery and
-  // handling; every unsafe or unaccepted offer keeps today's main path.
   function offerWakeToBranch(message: string): boolean {
-    const offer = createBranchDispatchOffer(message, projectsForUnreadWake());
+    const heartbeat = /^heartbeat($|:)/.test(message);
+    const scope = scopeForUnreadWake(state, heartbeat);
+    const offer = createBranchDispatchOffer(message, scope.projects, heartbeat, scope.eligible);
     pi.events?.emit?.(FM_BRANCH_DISPATCH_EVENT, offer);
     return offer.accepted;
   }
@@ -420,6 +366,7 @@ export default function (pi: ExtensionAPI) {
   async function deliverActionableWake(
     owner: SessionGeneration,
     message: string,
+    repairFailed: boolean,
     recovery?: { generation: string; watcherPid: string },
     pendingReason = message,
     pendingSequence?: string,
@@ -441,7 +388,7 @@ export default function (pi: ExtensionAPI) {
       await sendWake(owner, wakeContent(`${message}\n\nwatcher: FAILED - actionable wake had no durable queue sequence`));
       return;
     }
-    if (offerWakeToBranch(message)) return;
+    if (!repairFailed && offerWakeToBranch(message)) return;
     await sendWake(owner, content);
   }
 
@@ -721,7 +668,7 @@ export default function (pi: ExtensionAPI) {
             const restoration = await restoreAfterActionableClose(owner, predecessor);
             if (!generationIsLive(owner)) return;
             const message = restoration.failure ? `${classification.message}\n\n${restoration.failure}` : classification.message;
-            await deliverActionableWake(owner, message, restoration.recovery, classification.payload ?? classification.message, classification.sequence);
+            await deliverActionableWake(owner, message, Boolean(restoration.failure), restoration.recovery, classification.payload ?? classification.message, classification.sequence);
           } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
             surfaceFailure(owner, `watcher: FAILED - Pi extension could not deliver an actionable wake\n${detail}`);
