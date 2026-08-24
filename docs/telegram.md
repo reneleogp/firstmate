@@ -62,6 +62,7 @@ Two independent rules prevent that:
 
 - The extension mirrors only from the session that holds the Firstmate home's session lock, checked against the running process's own ancestry.
   Every other Pi session stays completely inert: no connection, no footer, no commands.
+  A home that has not recorded a live session yet is the one exception to that answer being final: Pi loads the extension while your session is still starting, so the mirror waits a bounded time for that record and comes up on its own, without a Pi reload.
 - The bot serves one session at a time and refuses a second connection instead of handing the chat over to it.
   When your session ends, the next one may take over.
 
@@ -89,6 +90,11 @@ In the Pi terminal there are two commands: `/telegram` toggles mirror mode, and 
 
 Pi's footer shows `telegram: on`, `telegram: off`, or `telegram: unavailable`.
 `unavailable` means this Pi session cannot reach the bot service or its local socket, so mirror mode has no reachable owner to report.
+
+Pi renders every extension's status on one shared footer line, sorted by key and joined with a single space, so the Telegram status ends with `•`, the same separator Pi's other statuses use between their own fields.
+Telegram comes first on that line and whatever your other extensions publish, such as a voice status, reads as a separate item after the separator.
+The separator belongs to the Telegram status itself, because Pi lets an extension shape only its own text, so it stays at the end of the item even when nothing else is published.
+A terminal too narrow for the whole line keeps Telegram and truncates the rest.
 
 The bot owns mirror mode and publishes every change, so the footer updates promptly whether you switch from Telegram or from the terminal, and when the bot starts or stops.
 
