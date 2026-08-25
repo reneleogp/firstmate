@@ -1620,6 +1620,18 @@ if ! fm_pr_poll_retirement_recover_all "$STATE" "$SCRIPT_DIR/fm-pr-poll.sh"; the
   wake "$reason"
 fi
 
+# Shared by both the first-notification and already-notified paths below so
+# the retirement sequence (bin/fm-pr-lib.sh) is stated once.
+retire_merged_pr_poll() {  # <id>
+  local id=$1
+  if fm_pr_poll_retirement_publish "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" merged; then
+    fm_pr_poll_retirement_recover_one "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" \
+      || triage_log "merged PR poll retirement remains recoverable for $id"
+  else
+    triage_log "merged PR poll retirement deferred because its canonical snapshot changed for $id"
+  fi
+}
+
 resurface_after_downtime() {
   # Handling successors already have a predecessor-delivered wake on the way.
   # Re-announcing from this cycle is what turned a lost handshake into an
@@ -1794,6 +1806,20 @@ EOF
           check_display=$(fm_display_name_for_meta "$STATE/$id.meta" "$id")
         else
           check_display='State check'
+        fi
+        if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ] \
+          && fm_pr_poll_merge_already_notified "$STATE" "$id" \
+            "$provider" "$host" "$path" "$number"; then
+          retire_merged_pr_poll "$id"
+          triage_log "absorbed duplicate merged PR poll result for $id"
+          touch "$STATE/.last-check"
+          continue
+        fi
+        if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
+          fm_pr_poll_merge_mark_notified "$STATE" "$id" \
+            "$provider" "$host" "$path" "$number" \
+            || triage_log "merge notification receipt could not be recorded for $id"
+          retire_merged_pr_poll "$id"
         fi
         reason="check: $check_display: an authenticated state check produced a new result now. Action required: inspect the result and handle its reported outcome."
         fm_wake_append check "$c" "$queue_reason" || exit 1

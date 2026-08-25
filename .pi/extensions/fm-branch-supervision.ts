@@ -58,8 +58,12 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
+  activateEligibleRowsOwner,
+  deactivateEligibleRowsOwner,
   FM_BRANCH_DISPATCH_EVENT,
+  releaseEligibleRowsSnapshot,
   scopeForUnreadWake,
+  writeEligibleRowsSnapshot,
   type BranchDispatchOffer,
 } from "./lib/fm-branch-dispatch.ts";
 import { encodeFirstmateOperationalInput } from "./lib/fm-operational-input.ts";
@@ -78,6 +82,7 @@ const mirrorCursorFile = join(state, ".branch-mirror-cursor");
 const promptScript = join(fmRoot, "bin", "fm-branch-prompt.sh");
 const outcomeScript = join(fmRoot, "bin", "fm-branch-outcome.sh");
 const leaseScript = join(fmRoot, "bin", "fm-lease.sh");
+const wakeGrantScript = join(fmRoot, "bin", "fm-wake-grant.sh");
 const loadedMarker = join(state, ".pi-branch-extension-loaded");
 
 // Same tool set in the same order on every request (part of the cached
@@ -292,6 +297,11 @@ export default function (pi: ExtensionAPI) {
     if (activatedGeneration !== expectedGeneration) {
       if (!releaseBranchLeases(expectedGeneration)) return false;
       if (!generationOwnsLock(expectedGeneration)) return false;
+      if (!activateEligibleRowsOwner(state, wakeGrantScript, process.pid, String(expectedGeneration))) return false;
+      if (!generationOwnsLock(expectedGeneration)) {
+        deactivateEligibleRowsOwner(state, wakeGrantScript, process.pid, String(expectedGeneration));
+        return false;
+      }
       markLoaded();
       activatedGeneration = expectedGeneration;
     }
@@ -592,19 +602,41 @@ ${context.command}
         if (!actingAsOwner(acceptedGeneration)) throw new Error("supervision session no longer owns the fleet lock");
         const heartbeat = /^heartbeat($|:)/.test(message);
         const scope = scopeForUnreadWake(state, heartbeat);
-        if (scope.status === "empty") return;
-        if (scope.status === "unsafe") {
-          throw new Error("unread wake queue now contains a main-owned row or could not be read safely");
+        // A newly-arrived main-owned (check-kind) row never bounces this
+        // whole recheck back to main any more - scopeForUnreadWake already
+        // excludes it from eligibleSeqs rather than vetoing the scan, so it
+        // stays queued for main while whatever else is eligible right now
+        // still reaches the branch. A genuinely empty queue, or a queue that
+        // simply has nothing (or nothing further) eligible for the branch
+        // right now, is an ordinary quiet no-op - not a fault, so it is
+        // never reported back to main. Only a scan scopeForUnreadWake itself
+        // marks corrupted (the queue or its metadata could not be read
+        // safely, or - for a heartbeat review - a main-owned row anywhere in
+        // the unread queue, since a heartbeat needs full-fleet context)
+        // still falls back to main.
+        if (scope.status === "empty" || (!scope.corrupted && scope.eligibleSeqs.length === 0)) return;
+        if (scope.corrupted) {
+          throw new Error("the unread wake queue could not be read safely");
         }
+        const grant = writeEligibleRowsSnapshot(
+          state,
+          scope.eligibleSeqs,
+          wakeGrantScript,
+          String(acceptedGeneration),
+        );
+        if (grant === "main-owned") throw new Error("the wake rows are already claimed by main");
+        if (grant !== "published") throw new Error("could not record the branch's eligible row snapshot");
         // A row can still arrive between this re-check and the model starting
         // the drain; that residual is accepted by the confused-agent-grade boundary.
         await session.prompt(
           `FIRSTMATE SUPERVISION WAKE: ${message}\n\nHandle this per your operating procedure and finish with fm_branch_report.`,
         );
+        if (!releaseEligibleRowsSnapshot(state, wakeGrantScript, String(acceptedGeneration))) {
+          throw new Error("could not release the branch's settled wake-row grant");
+        }
       })
       .catch(async (error: unknown) => {
-        // Return the wake to main rather than losing it; the durable wake
-        // queue additionally re-presents anything never acknowledged.
+        releaseEligibleRowsSnapshot(state, wakeGrantScript, String(acceptedGeneration));
         try {
           await fallbackToMain(message, error instanceof Error ? error.message : String(error));
         } catch {}
@@ -679,6 +711,7 @@ ${context.command}
   });
 
   pi.on?.("session_shutdown", () => {
+    deactivateEligibleRowsOwner(state, wakeGrantScript, process.pid, String(generation));
     shuttingDown = true;
     generation += 1;
     pendingMirror.length = 0;
