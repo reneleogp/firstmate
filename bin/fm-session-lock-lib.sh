@@ -156,10 +156,10 @@ fm_harness_pid_alive() {
 # Print the pid of the live verified harness holding state dir $1's session
 # lock, or return 1 when no live firstmate session holds that home.
 #
-# This is the "is this home claimed at all?" half of ownership, and it is the
-# same question bin/fm-lock.sh answers when it decides whether a session start
-# may overwrite the record: absent, non-regular, symlinked, malformed, dead, and
-# reused-by-an-unrelated-process locks are all unclaimed. Generic pid liveness
+# This is the "is this home claimed at all?" half of ownership and uses the
+# same live verified-harness test that bin/fm-lock.sh applies to an existing
+# regular record. Absent, non-regular, symlinked, malformed, dead, and
+# reused-by-an-unrelated-process locks all fail this query. Generic pid liveness
 # is not enough on its own, because an ordinary process that inherited a
 # recycled pid would otherwise keep a dead session's home claimed forever.
 fm_session_lock_claimed() {  # <state>

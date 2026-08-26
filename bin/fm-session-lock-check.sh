@@ -2,7 +2,9 @@
 # Read-only session-lock answers for the Telegram integration, whose halves run
 # outside bash (bin/fm-telegram.py and .pi/extensions/fm-telegram-mirror.ts) and
 # must not restate the shared harness-identity rules of their own.
-# Both questions are decided by bin/fm-session-lock-lib.sh.
+# Shared harness identity and session-lock ownership are decided by
+# bin/fm-session-lock-lib.sh; peer authentication below additionally binds a Pi
+# owner to the lock file's process generation.
 #
 # Usage: fm-session-lock-check.sh <state-dir> <peer-pid>
 #          exit 0 when <peer-pid> belongs to the live Pi session holding the
@@ -10,8 +12,7 @@
 #        fm-session-lock-check.sh --claimed <state-dir>
 #          exit 0 when a live verified firstmate session holds the home's lock.
 #          Absent, non-regular, symlinked, malformed, dead, and
-#          reused-by-an-unrelated-process records are all unclaimed, the same
-#          set bin/fm-lock.sh lets a starting session overwrite.
+#          reused-by-an-unrelated-process records all fail this claimed query.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
