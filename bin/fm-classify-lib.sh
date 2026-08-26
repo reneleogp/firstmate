@@ -79,11 +79,76 @@ FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 # Bounded re-surface cadence for a declared pause or a verified captain hold.
 # Far longer than the wedge threshold (FM_STALE_ESCALATE_SECS, default 240s), it
 # avoids nagging a deliberate wait while ensuring a forgotten hold cannot rot
-# invisibly - it re-surfaces once for a recheck every window. One hour by default;
-# both consumers read FM_PAUSE_RESURFACE_SECS with this default so the cadence has
-# one owner.
+# invisibly - it re-surfaces once for a recheck every window. One hour by default,
+# which is the window until the FIRST recheck and the floor every later window is
+# derived from; both consumers read FM_PAUSE_RESURFACE_SECS with this default so
+# the cadence has one owner.
 # shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
 FM_PAUSE_RESURFACE_SECS_DEFAULT=3600
+
+# Capped exponential backoff for CONSECUTIVE UNCHANGED rechecks of the SAME wait,
+# the same shape the watcher's heartbeat already uses (FM_HEARTBEAT/FM_HEARTBEAT_MAX):
+# the first recheck still lands on the base cadence above, and each recheck that
+# finds the monitored evidence unchanged doubles the next window until this cap.
+# At the defaults the windows run 1h, 2h, 4h, 8h, then 12h forever, so a mature
+# unchanged wait costs about two rechecks a day instead of twenty-four while a
+# forgotten wait still cannot rot invisibly. Both consumers read
+# FM_PAUSE_RESURFACE_MAX_SECS with this default, so the cadence keeps ONE owner.
+# shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
+FM_PAUSE_RESURFACE_MAX_SECS_DEFAULT=43200
+
+# Tag of the one-line backoff record both consumers publish beside their own
+# recheck marker: "<tag>\t<consecutive-unchanged-rechecks>\t<evidence-signature>".
+# Any other content (a legacy epoch marker, a truncated write) reads as no record
+# at all, which resets the backoff rather than inflating it.
+FM_PAUSE_RECHECK_RECORD_TAG='pause-recheck-v1'
+
+# Seconds until the next recheck of a wait that has already been rechecked
+# <streak> times with no change in its monitored evidence.
+fm_pause_recheck_interval() {  # <streak> <base-secs> <cap-secs>
+  local streak=$1 base=$2 cap=$3 interval
+  case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
+  case "$base" in ''|*[!0-9]*|0) base=$FM_PAUSE_RESURFACE_SECS_DEFAULT ;; esac
+  case "$cap" in ''|*[!0-9]*|0) cap=$FM_PAUSE_RESURFACE_MAX_SECS_DEFAULT ;; esac
+  [ "$cap" -ge "$base" ] || cap=$base
+  [ "$streak" -le 30 ] || streak=30
+  interval=$(( base * (1 << streak) ))
+  [ "$interval" -gt 0 ] || interval=$cap
+  [ "$interval" -le "$cap" ] || interval=$cap
+  printf '%s' "$interval"
+}
+
+# Stable short signature of the evidence a wait is being rechecked against. The
+# caller decides WHICH evidence counts (the wait's own reason line, the status
+# file's mtime, the task incarnation, ...); this only turns it into a comparable
+# token that carries no tab or newline.
+fm_pause_recheck_signature() {  # <evidence-text>
+  printf '%s' "$1" | cksum | awk '{ printf "%s_%s", $1, $2 }'
+}
+
+# Consecutive unchanged rechecks already delivered for THIS evidence. Zero when
+# no record exists, the record is foreign or malformed, or the recorded evidence
+# differs - which is how a changed wait reason, status line, worker condition, or
+# task incarnation resets the backoff to the base cadence.
+fm_pause_recheck_streak() {  # <record-file> <evidence-signature>
+  local file=$1 sig=$2 line tag streak recorded
+  line=$(head -n 1 "$file" 2>/dev/null || true)
+  tag=; streak=; recorded=
+  IFS=$(printf '\t') read -r tag streak recorded <<EOF
+$line
+EOF
+  if [ "$tag" != "$FM_PAUSE_RECHECK_RECORD_TAG" ] || [ "$recorded" != "$sig" ]; then
+    printf '0'
+    return 0
+  fi
+  case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
+  printf '%s' "$streak"
+}
+
+# The one-line record a consumer publishes after delivering a recheck.
+fm_pause_recheck_record() {  # <streak> <evidence-signature>
+  printf '%s\t%s\t%s\n' "$FM_PAUSE_RECHECK_RECORD_TAG" "$1" "$2"
+}
 
 # The resolution verb and durable-backlog-transfer verb that CLOSE a keyed
 # status decision opened by needs-decision or blocked. See status_open_decisions
