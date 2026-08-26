@@ -1,0 +1,5 @@
+ok - five Telegram-origin messages delivered back-to-back mirror every one of the 5 replies Pi rendered, exactly once (Pi 0.84.3)
+ok - five terminal submissions typed back-to-back mirror every one of the 5 replies Pi rendered, exactly once (Pi 0.84.3)
+ok - a captioned Telegram screenshot reaches the model as one message carrying the caption, the [Image attached] marker, and the image (Pi 0.84.3)
+ok - a Telegram screenshot without a caption reaches the model as the [Image attached] marker plus the image (Pi 0.84.3)
+ok - a real Pi session started before its home recorded the session, and left holding a record an unrelated live process had inherited, brings the mirror up without a reload and renders it ahead of the next status on one separated footer line (Pi 0.84.3)
