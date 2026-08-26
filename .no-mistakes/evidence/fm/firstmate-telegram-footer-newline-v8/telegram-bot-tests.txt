@@ -1,0 +1,1 @@
+ok - the Telegram mirror bot pairs to one chat, starts every process with mirror mode on, mirrors terminal and reply text, queues Telegram text to Pi in order, and drives the voice send, edit, and cancel flow
