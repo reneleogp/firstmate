@@ -141,6 +141,17 @@ mkdir -p "$STATE"
 . "$SCRIPT_DIR/fm-push-transition-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# Single owner of durable merge-outcome publication, shared with
+# bin/fm-pr-merge.sh so self and poll origins use the same role-routed outcome.
+# The watcher still owns immediate delivery of its actionable poll result and
+# poll retirement.
+# This library is a canonical lint root in its own right, and it reaches the
+# wake queue, PR identity, and secondmate parent libraries. Keep it an analysis
+# boundary here for the same reason as the transition and inbox owners above and
+# below: following its graph from this large runtime exceeds the bounded CI lint
+# worker while adding no uncovered file.
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/fm-merge-outcome-lib.sh"
 # shellcheck source=bin/fm-x-lib.sh
 . "$SCRIPT_DIR/fm-x-lib.sh"
 # shellcheck source=bin/fm-check-lib.sh
@@ -1810,10 +1821,19 @@ EOF
         if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ] \
           && fm_pr_poll_merge_already_notified "$STATE" "$id" \
             "$provider" "$host" "$path" "$number"; then
+        merge_outcome_rc=0
+        if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
+          fm_merge_outcome_report "$FM_HOME" "$STATE" "$id" "$url" poll \
+            || merge_outcome_rc=$?
+          [ "$merge_outcome_rc" -eq 0 ] || exit 1
+        fi
           retire_merged_pr_poll "$id"
-          triage_log "absorbed duplicate merged PR poll result for $id"
           touch "$STATE/.last-check"
-          continue
+          if [ "$FM_MERGE_OUTCOME_ALREADY_RECORDED" = true ]; then
+            triage_log "absorbed duplicate merged PR poll result for $id"
+            continue
+          fi
+          wake "$reason"
         fi
         if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
           fm_pr_poll_merge_mark_notified "$STATE" "$id" \
