@@ -35,13 +35,15 @@
 // acknowledgement, so a branch that dies mid-handling re-presents its rows at
 // the next drain exactly as a mid-handling main crash always has.
 //
-// Model selection: supervision is an easier job than main, so the captain can
-// pin a cheaper model for the branch alone with /supervision-model, which
-// picks from Pi's own catalog and persists one line under this home's
-// config/. docs/configuration.md owns that file's operator-facing schema. No
-// pin makes the branch follow main's own model when the isolated runtime can
-// resolve it, applied explicitly on every build so a reopened branch cannot
-// restore a model an earlier pin left in its session.
+// Model and effort selection: supervision is an easier job than main, so the
+// captain can pin a cheaper model AND a shallower reasoning effort for the
+// branch alone with /supervision-model, which picks from Pi's own catalog and
+// Pi's own supported-thinking-level list and persists each choice as one line
+// under this home's config/. docs/configuration.md owns those files'
+// operator-facing schema. The two pins are independent: either, both, or
+// neither may be set. An absent pin makes the branch follow main's own
+// current model or effort, applied explicitly on every build so a reopened
+// branch cannot restore what an earlier pin left in its session.
 //
 // Threat model (captain-decided): the branch's actor identity is
 // CONFUSED-AGENT-GRADE - deterministic spawnHook env injection plus a
@@ -53,6 +55,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+// Pi exposes pi-ai to extensions as a first-class module in both its Node
+// and compiled-binary loaders, the same standing as pi-tui and typebox
+// below, and aliases this root specifier to its compat entrypoint.
+import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   createBashToolDefinition,
@@ -99,6 +105,7 @@ const leaseScript = join(fmRoot, "bin", "fm-lease.sh");
 const wakeGrantScript = join(fmRoot, "bin", "fm-wake-grant.sh");
 const loadedMarker = join(state, ".pi-branch-extension-loaded");
 const modelPinFile = join(config, "supervision-branch-model");
+const effortPinFile = join(config, "supervision-branch-effort");
 
 // Same tool set in the same order on every request (part of the cached
 // prefix). "bash" resolves to the customTools override below, which injects
@@ -132,10 +139,30 @@ function afkActive(): boolean {
   return existsSync(afkFlag);
 }
 
-// One model the runtime can hand back, without importing pi-ai directly.
+// One model the runtime can hand back, without importing a model type
+// directly, and Pi's own reasoning-effort vocabulary taken from the API
+// surface Pi already hands this extension.
 type BranchModel = NonNullable<ReturnType<ModelRuntime["getModel"]>>;
+type BranchEffort = ReturnType<NonNullable<ExtensionAPI["getThinkingLevel"]>>;
 type PinnedBranchModel = { model: BranchModel; modelRuntime: ModelRuntime };
 type BranchModelResolution = { ok: true; selection: PinnedBranchModel } | { ok: false; reason: string };
+
+// Pi owns the effort vocabulary. The picker's options and every clamp still
+// come from Pi's own getSupportedThinkingLevels/clampThinkingLevel, so this
+// array exists for exactly one job the type system cannot do at runtime:
+// rejecting a hand-edited pin token Pi would not recognize at all. The
+// assertion below fails the tracked strict typecheck against the INSTALLED Pi
+// package (tests/fm-pi-primary-types.test.sh) the moment Pi adds or removes a
+// level, in either direction, so the list cannot drift into a stale Firstmate
+// catalog.
+const BRANCH_EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+type DeclaredBranchEffort = (typeof BRANCH_EFFORT_LEVELS)[number];
+const piOwnsTheEffortVocabulary: [DeclaredBranchEffort] extends [BranchEffort]
+  ? [BranchEffort] extends [DeclaredBranchEffort]
+    ? true
+    : never
+  : never = true;
+void piOwnsTheEffortVocabulary;
 
 // The supervision-branch model pin, owned operator-side by
 // docs/configuration.md: one "<provider>/<model-id>" line under this home's
@@ -156,21 +183,37 @@ function readModelPin(): { provider: string; modelId: string } | null {
   return { provider: line.slice(0, separator), modelId: line.slice(separator + 1) };
 }
 
-// Replaces the pin atomically so a failed write leaves the current choice
+// The supervision-branch effort pin, owned operator-side by the same
+// docs/configuration.md section: one Pi thinking-level line under this home's
+// config/, independent of the model pin. An absent, unreadable, or
+// unrecognized file means no pin, and the branch then follows main's own
+// effort.
+function readEffortPin(): BranchEffort | null {
+  let stored: string;
+  try {
+    stored = readFileSync(effortPinFile, "utf8");
+  } catch {
+    return null;
+  }
+  const line = (stored.split("\n")[0] ?? "").trim();
+  return (BRANCH_EFFORT_LEVELS as readonly string[]).includes(line) ? (line as BranchEffort) : null;
+}
+
+// Replaces a pin atomically so a failed write leaves the current choice
 // intact rather than claiming persistence (the config/calm precedent).
-function writeModelPin(selection: string): void {
-  mkdirSync(dirname(modelPinFile), { recursive: true });
-  const temporaryPath = `${modelPinFile}.${process.pid}.${randomUUID()}.tmp`;
+function writePinFile(pinFile: string, selection: string): void {
+  mkdirSync(dirname(pinFile), { recursive: true });
+  const temporaryPath = `${pinFile}.${process.pid}.${randomUUID()}.tmp`;
   try {
     writeFileSync(temporaryPath, `${selection}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
-    renameSync(temporaryPath, modelPinFile);
+    renameSync(temporaryPath, pinFile);
   } finally {
     rmSync(temporaryPath, { force: true });
   }
 }
 
-function clearModelPin(): void {
-  rmSync(modelPinFile, { force: true });
+function clearPinFile(pinFile: string): void {
+  rmSync(pinFile, { force: true });
 }
 
 function modelLabel(model: { provider: string; id: string }): string {
@@ -317,11 +360,25 @@ export default function (pi: ExtensionAPI) {
   let branchChain: Promise<void> = Promise.resolve();
   const pendingMirror: MirrorItem[] = [];
   const mirrorCollection: MirrorCollectionState = { collectAnchor: null, pendingCursor: null };
-  let modelSelectionRevision = 0;
+  // One revision for BOTH selections: a model or effort change invalidates an
+  // in-flight branch build exactly the same way.
+  let branchSelectionRevision = 0;
   // Main's own current model, tracked from the contexts Pi already hands this
   // extension plus its model_select event, because createBranch runs at wake
   // time with no context of its own. It is what "follow main" applies.
   let mainModel: { provider: string; id: string } | null = null;
+
+  // Main's own current effort needs no such tracking: Pi answers it directly
+  // on demand, including at wake time. It throws only when the extension
+  // runtime is unbound or the captured API is stale, which is never a reason
+  // to refuse a wake.
+  function mainEffort(): BranchEffort | undefined {
+    try {
+      return pi.getThinkingLevel?.();
+    } catch {
+      return undefined;
+    }
+  }
 
   function rememberMainModel(ctx?: { model?: { provider: string; id: string } }): void {
     if (ctx?.model) mainModel = { provider: ctx.model.provider, id: ctx.model.id };
@@ -370,6 +427,37 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return undefined;
     }
+  }
+
+  async function effectiveBranchModel(selected: BranchModel | undefined): Promise<BranchModel | undefined> {
+    if (selected) return selected;
+    try {
+      const recorded = readFileSync(sessionPointer, "utf8").trim();
+      if (!recorded || !existsSync(recorded)) return undefined;
+      const context = SessionManager.open(recorded, sessionsDir).buildSessionContext();
+      if (context.messages.length === 0 || !context.model) return undefined;
+      const resolved = await resolveBranchModel(context.model.provider, context.model.modelId);
+      return resolved.ok ? resolved.selection.model : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // The effort pin file's CURRENT state decides the branch's reasoning effort
+  // on every branch build, create and reopen alike, on exactly the model-pin
+  // contract above and for exactly the same reason: a reopened branch session
+  // records the effort it last ran under, so an unpinned branch must apply
+  // main's own effort EXPLICITLY or clearing a pin would silently restore the
+  // level that pin left behind. Pi owns the clamp, so a level the branch's
+  // model does not support becomes that model's nearest supported level
+  // rather than a refusal - the branch is never refused over effort. Only
+  // when main's own effort is unknowable too does the build fall back to
+  // passing no effort override at all, which is the behavior from before this
+  // file existed.
+  function branchEffortSelection(model: BranchModel | undefined): BranchEffort | undefined {
+    const chosen = readEffortPin() ?? mainEffort();
+    if (chosen === undefined) return undefined;
+    return model ? (clampThinkingLevel(model, chosen) as BranchEffort) : chosen;
   }
 
   function generationOwnsLock(expectedGeneration: number): boolean {
@@ -546,12 +634,14 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function createBranch(branchGeneration: number): Promise<AgentSession> {
-    // Resolved first, before any session file or prompt work: a pin Pi cannot
-    // honor must fail before this build leaves anything behind. Every branch
-    // build goes through here - first wake of a cold start, and the reopen
-    // after /new, /resume, /fork, or reload - so resolving it here is what
-    // makes the captain's current choice authoritative on all of them.
+    // Resolved first, before any session file or prompt work: a model pin Pi
+    // cannot honor must fail before this build leaves anything behind. Every
+    // branch build goes through here - first wake of a cold start, and the
+    // reopen after /new, /resume, /fork, or reload - so resolving the model
+    // and the effort here is what makes the captain's current choices
+    // authoritative on all of them.
     const pinned = await branchModelSelection();
+    const effort = branchEffortSelection(pinned?.model);
     const prompt = spawnSync("bash", [promptScript], {
       cwd: fmRoot,
       encoding: "utf8",
@@ -642,6 +732,7 @@ ${context.command}
       tools: [...BRANCH_TOOL_NAMES],
       customTools: [bashTool as unknown as ToolDefinition, createReportTool(branchGeneration)],
       ...(pinned ? { model: pinned.model, modelRuntime: pinned.modelRuntime } : {}),
+      ...(effort === undefined ? {} : { thinkingLevel: effort }),
     });
     if (!actingAsOwner(branchGeneration)) {
       try {
@@ -662,10 +753,10 @@ ${context.command}
     if (branch) return branch;
     if (branchBroken) throw new Error(branchBroken);
     while (true) {
-      const buildRevision = modelSelectionRevision;
+      const buildRevision = branchSelectionRevision;
       try {
         const created = await createBranch(expectedGeneration);
-        if (buildRevision !== modelSelectionRevision) {
+        if (buildRevision !== branchSelectionRevision) {
           try {
             created.dispose();
           } catch {}
@@ -680,7 +771,7 @@ ${context.command}
         branch = created;
         return created;
       } catch (error) {
-        if (buildRevision !== modelSelectionRevision) continue;
+        if (buildRevision !== branchSelectionRevision) continue;
         if (expectedGeneration === generation && !shuttingDown) {
           branchBroken = error instanceof Error ? error.message : String(error);
         }
@@ -774,13 +865,14 @@ ${context.command}
       });
   }
 
-  // A model change applies to the next branch turn without waiting for /new:
-  // the live session is dropped synchronously so nothing enqueued afterwards
-  // can capture it, then disposed in dispatch order behind work already
-  // queued. The branch CONVERSATION is persistent (state/.branch-session), so
-  // the next wake reopens the same conversation under the new model. Clearing
-  // the broken latch is what lets a corrected pin recover in place.
-  function releaseBranchForModelChange(): void {
+  // A model or effort change applies to the next branch turn without waiting
+  // for /new: the live session is dropped synchronously so nothing enqueued
+  // afterwards can capture it, then disposed in dispatch order behind work
+  // already queued. The branch CONVERSATION is persistent
+  // (state/.branch-session), so the next wake reopens the same conversation
+  // under the new selection. Clearing the broken latch is what lets a
+  // corrected pin recover in place.
+  function releaseBranchForSelectionChange(): void {
     branchBroken = "";
     const stale = branch;
     branch = null;
@@ -873,8 +965,20 @@ ${context.command}
     const changed = !mainModel || mainModel.provider !== selected.provider || mainModel.id !== selected.id;
     mainModel = { provider: selected.provider, id: selected.id };
     if (!changed || readModelPin()) return;
-    modelSelectionRevision += 1;
-    releaseBranchForModelChange();
+    branchSelectionRevision += 1;
+    releaseBranchForSelectionChange();
+  });
+
+  // Pi emits this only when main's effort actually changes, so an unpinned
+  // supervision branch follows main's effort live for the same reason it
+  // follows main's model: the captain's current setting, not the level the
+  // branch conversation happens to have recorded, is what supervision should
+  // run at. A pin stays authoritative and is left alone.
+  pi.on?.("thinking_level_select", (event) => {
+    const level = (event as { level?: BranchEffort }).level;
+    if (!level || readEffortPin()) return;
+    branchSelectionRevision += 1;
+    releaseBranchForSelectionChange();
   });
 
   pi.on?.("session_shutdown", () => {
@@ -894,12 +998,15 @@ ${context.command}
     }
   });
 
-  // Pi keeps /model for the captain's own conversation and exposes no hook an
-  // extension can use to open that picker, so this is the smallest supported
-  // equivalent: Pi's own catalog intersected with the isolated branch
-  // runtime, Pi's own selector dialog, and no parallel Firstmate model list.
+  // Pi keeps /model and its own thinking selector for the captain's own
+  // conversation and exposes no hook an extension can use to open either
+  // picker, so this is the smallest supported equivalent: Pi's own catalog
+  // intersected with the isolated branch runtime, then Pi's own supported
+  // thinking levels for the model just chosen, both through Pi's own selector
+  // dialog and with no parallel Firstmate model or effort list. The effort
+  // step follows the model step because the model decides which levels exist.
   pi.registerCommand?.("supervision-model", {
-    description: "Pick the model Firstmate's Pi supervision branch uses, or follow main's.",
+    description: "Pick the model and reasoning effort Firstmate's Pi supervision branch uses, or follow main's.",
     handler: async (_args, ctx) => {
       rememberMainModel(ctx);
       const pin = readModelPin();
@@ -921,14 +1028,20 @@ ${context.command}
       }
       const picked = await ctx.ui.select(`Supervision branch model (now: ${current})`, [followMain, ...available]);
       if (picked === undefined) return; // cancelled: the current choice stands
+      // Whatever the model step resolves is also the model the effort step
+      // builds its menu from, so it is captured here rather than resolved a
+      // second time through another isolated runtime.
+      let branchModel: BranchModel | undefined;
       try {
         if (picked === followMain) {
-          clearModelPin();
+          clearPinFile(modelPinFile);
         } else {
           const separator = picked.indexOf("/");
           if (separator <= 0 || separator >= picked.length - 1) throw new Error(`invalid model selection: ${picked}`);
-          await preparePinnedBranchModel({ provider: picked.slice(0, separator), modelId: picked.slice(separator + 1) });
-          writeModelPin(picked);
+          branchModel = (
+            await preparePinnedBranchModel({ provider: picked.slice(0, separator), modelId: picked.slice(separator + 1) })
+          ).model;
+          writePinFile(modelPinFile, picked);
         }
       } catch (error) {
         ctx.ui.notify(
@@ -937,34 +1050,110 @@ ${context.command}
         );
         return;
       }
-      modelSelectionRevision += 1;
-      releaseBranchForModelChange();
+      // The model choice is persisted; report it exactly, then run the effort
+      // step on the model the branch will actually use.
+      let modelReport: { message: string; warning: boolean };
       if (picked !== followMain) {
-        ctx.ui.notify(`Supervision branch model: ${picked}.`, "info");
-        return;
-      }
-      // Clearing the pin only follows main if main's model can actually be
-      // applied to the branch; say what will really happen rather than
-      // reporting a state that did not take effect.
-      try {
-        const following = mainModel ? await resolveBranchModel(mainModel.provider, mainModel.id) : null;
-        if (following?.ok) {
-          ctx.ui.notify(`Supervision branch follows main's model (${modelLabel(following.selection.model)}).`, "info");
-          return;
+        modelReport = { message: `Supervision branch model: ${picked}.`, warning: false };
+      } else {
+        // Clearing the pin only follows main if main's model can actually be
+        // applied to the branch; say what will really happen rather than
+        // reporting a state that did not take effect.
+        try {
+          const following = mainModel ? await resolveBranchModel(mainModel.provider, mainModel.id) : null;
+          if (following?.ok) branchModel = following.selection.model;
+          modelReport = following?.ok
+            ? {
+                message: `Supervision branch follows main's model (${modelLabel(following.selection.model)}).`,
+                warning: false,
+              }
+            : {
+                message: `Supervision branch pin cleared, but main's model could not be applied (${following ? following.reason : "main's model is not known yet"}); the branch keeps the model its own session recorded until that conversation is replaced.`,
+                warning: true,
+              };
+        } catch (error) {
+          modelReport = {
+            message: `Supervision branch pin cleared, but main's model could not be applied (${error instanceof Error ? error.message : String(error)}); the branch keeps the model its own session recorded until that conversation is replaced.`,
+            warning: true,
+          };
         }
-        const why = following ? following.reason : "main's model is not known yet";
-        ctx.ui.notify(
-          `Supervision branch pin cleared, but main's model could not be applied (${why}); the branch keeps the model its own session recorded until that conversation is replaced.`,
-          "warning",
-        );
-      } catch (error) {
-        ctx.ui.notify(
-          `Supervision branch pin cleared, but main's model could not be applied (${error instanceof Error ? error.message : String(error)}); the branch keeps the model its own session recorded until that conversation is replaced.`,
-          "warning",
-        );
       }
+
+      // The model choice is already persisted, so a failing effort step must
+      // never swallow it: the branch still rebinds and the captain still
+      // hears what took effect and what did not.
+      let effortReport: { message: string; warning: boolean };
+      try {
+        effortReport = await pickBranchEffort(ctx, branchModel);
+      } catch (error) {
+        effortReport = {
+          message: `The effort step failed (${error instanceof Error ? error.message : String(error)}); the branch keeps its current effort choice.`,
+          warning: true,
+        };
+      }
+      branchSelectionRevision += 1;
+      releaseBranchForSelectionChange();
+      ctx.ui.notify(
+        `${modelReport.message} ${effortReport.message}`,
+        modelReport.warning || effortReport.warning ? "warning" : "info",
+      );
     },
   });
+
+  // Step two of /supervision-model, shown after the model pick and driven by
+  // Pi's own supported-level list for the model the branch will now use, so
+  // the menu is the one Pi's own thinking selector would show and keeps no
+  // parallel Firstmate picker catalog. Cancelling leaves the current effort
+  // choice standing; the model pick already made is still applied.
+  async function pickBranchEffort(
+    ctx: { ui: { select: (title: string, options: string[]) => Promise<string | undefined> } },
+    selectedModel: BranchModel | undefined,
+  ): Promise<{ message: string; warning: boolean }> {
+    const branchModel = await effectiveBranchModel(selectedModel);
+    const currentPin = readEffortPin();
+    const current = currentPin ?? "follows main";
+    const main = mainEffort();
+    const followMainEffort = `Follow main${main ? ` (${main})` : ""}`;
+    const levels = branchModel ? getSupportedThinkingLevels(branchModel) : [];
+    const picked = await ctx.ui.select(`Supervision branch effort (now: ${current})`, [followMainEffort, ...levels]);
+    if (picked === undefined) {
+      return { message: describeBranchEffort(currentPin, branchModel), warning: branchModel === undefined };
+    }
+    try {
+      if (picked === followMainEffort) {
+        clearPinFile(effortPinFile);
+      } else if ((BRANCH_EFFORT_LEVELS as readonly string[]).includes(picked)) {
+        writePinFile(effortPinFile, picked);
+      } else {
+        throw new Error(`invalid effort selection: ${picked}`);
+      }
+    } catch (error) {
+      return {
+        message: `The effort choice could not be saved (${error instanceof Error ? error.message : String(error)}). ${describeBranchEffort(currentPin, branchModel)}`,
+        warning: true,
+      };
+    }
+    return {
+      message: describeBranchEffort(readEffortPin(), branchModel),
+      warning: branchModel === undefined,
+    };
+  }
+
+  // Reports the effort the branch will actually run at, never the raw choice:
+  // Pi clamps a level the branch's model does not support, and an unpinned
+  // branch follows main's own effort only when Pi can tell us what that is.
+  function describeBranchEffort(pin: BranchEffort | null, branchModel: BranchModel | undefined): string {
+    if (!branchModel) {
+      return "The effort level the branch will run at cannot be determined because its effective model could not be resolved.";
+    }
+    const chosen = pin ?? mainEffort();
+    if (chosen === undefined) {
+      return "Effort follows main, whose own effort is not known yet, so the branch keeps the effort its own session recorded until that conversation is replaced.";
+    }
+    const applied = clampThinkingLevel(branchModel, chosen) as BranchEffort;
+    if (pin === null) return `Effort follows main (${applied}).`;
+    return applied === pin ? `Effort: ${pin}.` : `Effort: ${pin}, which this model runs at ${applied}.`;
+  }
 
   let calmPresentation: CalmPresentationState = {
     active: false,

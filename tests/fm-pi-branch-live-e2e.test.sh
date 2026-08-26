@@ -12,7 +12,10 @@
 # build rather than silently running the branch on main's model. A second
 # probe pins the vendor contract that pin rests on: an explicit model must beat
 # the model a reopened session recorded, proven against a local,
-# never-contacted fake provider.
+# never-contacted fake provider. A third probe does the same for the
+# supervision-branch effort pin: Pi's own supported-level list is what the
+# picker offers, Pi's own clamp is what lowers a level a model cannot run, and
+# an explicit thinking level must beat the level a reopened session recorded.
 #
 # No provider call leaves the machine. The branch probe points
 # PI_CODING_AGENT_DIR at an empty directory, so it reads no credentials and
@@ -45,12 +48,14 @@ mkdir -p "$repo/.pi/extensions/lib" "$repo/node_modules/@earendil-works" \
   "$home/state" "$home/config" "$agentdir"
 cp "$ROOT/.pi/extensions/fm-branch-supervision.ts" "$repo/.pi/extensions/fm-branch-supervision.ts"
 cp "$ROOT/.pi/extensions/lib/fm-branch-dispatch.ts" "$repo/.pi/extensions/lib/fm-branch-dispatch.ts"
+cp "$ROOT/.pi/extensions/lib/fm-calm-visibility.ts" "$repo/.pi/extensions/lib/fm-calm-visibility.ts"
 cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$repo/.pi/extensions/lib/fm-operational-input.ts"
 mkdir -p "$repo/bin"
 cp "$ROOT/bin/fm-operational-input.sh" "$repo/bin/fm-operational-input.sh"
 chmod +x "$repo/bin/fm-operational-input.sh"
 ln -s "$PI_PACKAGE_DIR" "$repo/node_modules/@earendil-works/pi-coding-agent"
 ln -s "$PI_PACKAGE_DIR/node_modules/@earendil-works/pi-tui" "$repo/node_modules/@earendil-works/pi-tui"
+ln -s "$PI_PACKAGE_DIR/node_modules/@earendil-works/pi-ai" "$repo/node_modules/@earendil-works/pi-ai"
 ln -s "$PI_PACKAGE_DIR/node_modules/typebox" "$repo/node_modules/typebox"
 
 # Stock macOS Bash 3.2 cannot reliably parse JavaScript template literals in a
@@ -284,3 +289,170 @@ if [ "$status" -ne 0 ] || [ "$out" != "MODEL_OK" ]; then
   fail "real-SDK model-pin precedence guard failed against pi-coding-agent $PI_VERSION: $out"
 fi
 pass "real Pi SDK $PI_VERSION applies an explicit branch model on create and over a reopened session's recorded model"
+
+# Third probe: the vendor contract the supervision-branch EFFORT pin rests on.
+# Same never-contacted local provider, now declaring models with different
+# reasoning ceilings so Pi's own supported-level list and clamp are exercised
+# for real. The recorded-level case needs a session file on disk, and Pi
+# flushes one only once an assistant message exists, so the probe appends both
+# entries through the real SessionManager rather than hand-writing the format.
+effortdir="$TMP_ROOT/effort-agent-dir"
+mkdir -p "$effortdir" "$TMP_ROOT/effort-sessions"
+cat > "$effortdir/models.json" <<'JSON'
+{
+  "providers": {
+    "fm-live-fake": {
+      "baseUrl": "http://127.0.0.1:9/v1",
+      "api": "openai-completions",
+      "apiKey": "fm-live-placeholder",
+      "models": [
+        {
+          "id": "fm-live-deep",
+          "name": "fm live deep",
+          "contextWindow": 8192,
+          "maxTokens": 512,
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          }
+        },
+        { "id": "fm-live-shallow", "name": "fm live shallow", "contextWindow": 8192, "maxTokens": 512, "reasoning": true },
+        { "id": "fm-live-plain", "name": "fm live plain", "contextWindow": 8192, "maxTokens": 512 }
+      ]
+    }
+  }
+}
+JSON
+PI_PACKAGE_DIR="$PI_PACKAGE_DIR" PI_CODING_AGENT_DIR="$effortdir" FM_LIVE_SESSIONS="$TMP_ROOT/effort-sessions" \
+  node --input-type=module > "$TMP_ROOT/effort-output" 2>&1 <<'EOF'
+import { pathToFileURL } from "node:url";
+
+const packageRoot = process.env.PI_PACKAGE_DIR;
+const pkg = pathToFileURL(`${packageRoot}/dist/index.js`).href;
+const { ModelRegistry, ModelRuntime, SessionManager, createAgentSession } = await import(pkg);
+// The same specifier the extension imports; Pi's extension loader aliases it
+// to this package's own bundled copy.
+const { clampThinkingLevel, getSupportedThinkingLevels } = await import(
+  pathToFileURL(`${packageRoot}/node_modules/@earendil-works/pi-ai/dist/compat.js`).href
+);
+const runtime = await ModelRuntime.create({
+  authPath: `${process.env.PI_CODING_AGENT_DIR}/auth.json`,
+  modelsPath: `${process.env.PI_CODING_AGENT_DIR}/models.json`,
+});
+const registry = new ModelRegistry(runtime);
+await registry.refresh();
+
+const deep = registry.find("fm-live-fake", "fm-live-deep");
+const shallow = registry.find("fm-live-fake", "fm-live-shallow");
+const plain = registry.find("fm-live-fake", "fm-live-plain");
+if (!deep || !shallow || !plain) throw new Error("the real registry did not resolve the locally declared effort models");
+
+// Pi's own vocabulary, and the same list the extension declares for rejecting
+// an unrecognized hand-edited pin. The tracked strict typecheck enforces this
+// from the type side; this is the runtime half, checked after a Pi upgrade.
+const vocabulary = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const deepLevels = getSupportedThinkingLevels(deep);
+if (JSON.stringify(deepLevels) !== JSON.stringify(vocabulary)) {
+  throw new Error(`Pi's own effort vocabulary changed: ${JSON.stringify(deepLevels)}`);
+}
+// A reasoning model that maps no extended levels stops below them, and a
+// non-reasoning model offers only "off" - so the picker's menu really does
+// narrow with the model the captain just chose.
+const shallowLevels = getSupportedThinkingLevels(shallow);
+if (shallowLevels.includes("xhigh") || shallowLevels.includes("max") || !shallowLevels.includes("high")) {
+  throw new Error(`Pi no longer narrows the level list for an unmapped model: ${JSON.stringify(shallowLevels)}`);
+}
+if (JSON.stringify(getSupportedThinkingLevels(plain)) !== JSON.stringify(["off"])) {
+  throw new Error("Pi no longer reports a non-reasoning model as effort-off only");
+}
+if (clampThinkingLevel(shallow, "max") !== "high") {
+  throw new Error(`Pi's own clamp no longer lowers an unsupported level: ${clampThinkingLevel(shallow, "max")}`);
+}
+// An unrecognized token collapses to the model's lowest level, which is why
+// the extension rejects one as "no pin" before it can reach this clamp.
+if (clampThinkingLevel(shallow, "fm-not-a-level") !== "off") {
+  throw new Error("Pi's clamp no longer collapses an unrecognized token, so the extension's guard needs review");
+}
+
+const cwd = process.cwd();
+const sessions = process.env.FM_LIVE_SESSIONS;
+const creating = SessionManager.create(cwd, sessions);
+const created = await createAgentSession({
+  cwd,
+  sessionManager: creating,
+  modelRuntime: runtime,
+  model: deep,
+  thinkingLevel: "xhigh",
+  tools: [],
+});
+if (created.session.thinkingLevel !== "xhigh") {
+  throw new Error(`a pinned effort was not applied on create: ${created.session.thinkingLevel}`);
+}
+
+// Record a level in a session file Pi will actually restore from.
+const recording = SessionManager.create(cwd, sessions);
+recording.appendThinkingLevelChange("xhigh");
+recording.appendMessage({
+  role: "assistant",
+  content: [{ type: "text", text: "recorded" }],
+  api: "openai-completions",
+  provider: "fm-live-fake",
+  model: "fm-live-deep",
+  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  stopReason: "stop",
+});
+const recorded = recording.getSessionFile();
+
+// With no override the reopened session restores its own recorded level -
+// which is exactly why an unpinned branch must apply main's effort
+// explicitly instead of merely omitting it.
+const restored = await createAgentSession({
+  cwd,
+  sessionManager: SessionManager.open(recorded, sessions),
+  modelRuntime: runtime,
+  model: deep,
+  tools: [],
+});
+if (restored.session.thinkingLevel !== "xhigh") {
+  throw new Error(`a reopened session no longer restores its recorded effort: ${restored.session.thinkingLevel}`);
+}
+// An explicit level must beat that recorded one, or the pin would silently
+// stop applying the first time the branch reopens.
+const overridden = await createAgentSession({
+  cwd,
+  sessionManager: SessionManager.open(recorded, sessions),
+  modelRuntime: runtime,
+  model: deep,
+  thinkingLevel: "low",
+  tools: [],
+});
+if (overridden.session.thinkingLevel !== "low") {
+  throw new Error(`a reopened session ignored the effort override and kept its recorded level: ${overridden.session.thinkingLevel}`);
+}
+// Pi clamps at build time, so a pin above the branch model's ceiling lowers
+// the branch rather than refusing it.
+const clamped = await createAgentSession({
+  cwd,
+  sessionManager: SessionManager.open(recorded, sessions),
+  modelRuntime: runtime,
+  model: shallow,
+  thinkingLevel: "max",
+  tools: [],
+});
+if (clamped.session.thinkingLevel !== "high") {
+  throw new Error(`an over-ceiling effort override was not clamped on build: ${clamped.session.thinkingLevel}`);
+}
+console.log("EFFORT_OK");
+process.exit(0);
+EOF
+status=$?
+out=$(cat "$TMP_ROOT/effort-output")
+if [ "$status" -ne 0 ] || [ "$out" != "EFFORT_OK" ]; then
+  fail "real-SDK effort-pin guard failed against pi-coding-agent $PI_VERSION: $out"
+fi
+pass "real Pi SDK $PI_VERSION reports its own supported effort levels and applies an explicit branch effort over a reopened session's recorded level"
