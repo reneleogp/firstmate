@@ -407,6 +407,28 @@ test_housekeeping_pause_recheck_backs_off_when_unchanged() {
   pass "away-mode rechecks of an unchanged declared wait back off on the same shared cadence"
 }
 
+test_housekeeping_recovers_pause_batch_atomically() {
+  local dir state now sig1 sig2
+  dir=$(make_supercase paused-publication-recovery)
+  state="$dir/state"
+  now=$(date +%s)
+  sig1=$(fm_pause_recheck_signature wait-one)
+  sig2=$(fm_pause_recheck_signature wait-two)
+  printf 'pause-publish-v1\tdaemon\nI\tpaused 500s (awaiting external, recheck whether the wait still holds): sess:fm-one\nI\tpaused 500s (awaiting external, recheck whether the wait still holds): sess:fm-two\nR\t%s\t2\t%s\tidle\t%s\t%s\nR\t%s\t4\t%s\tidle\t%s\t%s\n' \
+    "$state/.subsuper-pause-backoff-one" "$sig1" "$state/.subsuper-paused-one" "$now" \
+    "$state/.subsuper-pause-backoff-two" "$sig2" "$state/.subsuper-paused-two" "$now" \
+    > "$state/.paused-recheck-publish"
+  FM_STATE_OVERRIDE="$state" pause_recheck_publish_recover "$state"
+  [ "$(grep -c 'awaiting external' "$state/.subsuper-escalations")" -eq 2 ] \
+    || fail "away-mode recovery did not restore both sibling rechecks exactly once"
+  [ "$(fm_pause_recheck_streak "$state/.subsuper-pause-backoff-one" "$sig1" idle)" = 2 ] \
+    || fail "away-mode recovery did not advance the first sibling"
+  [ "$(fm_pause_recheck_streak "$state/.subsuper-pause-backoff-two" "$sig2" idle)" = 4 ] \
+    || fail "away-mode recovery did not advance the second sibling"
+  [ ! -e "$state/.paused-recheck-publish" ] || fail "away-mode recovery left its publication journal behind"
+  pass "away-mode recovery publishes one buffered sibling batch and advances every record together"
+}
+
 # The other half of quieting a captain-held task: it must NOT be silenced outright.
 # fm-classify-lib.sh's cadence comment is explicit that a forgotten hold cannot rot
 # invisibly, so a held task re-surfaces on the same bounded window as a pause, with
@@ -1987,6 +2009,7 @@ test_housekeeping_persistent_stale_escalates
 test_housekeeping_resumed_stale_cleared
 test_housekeeping_paused_resurfaces_and_resets
 test_housekeeping_pause_recheck_backs_off_when_unchanged
+test_housekeeping_recovers_pause_batch_atomically
 test_housekeeping_captain_held_resurfaces_and_resets
 test_housekeeping_paused_resumed_cleared
 test_housekeeping_paused_unpaused_cleared

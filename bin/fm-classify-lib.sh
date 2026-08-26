@@ -130,14 +130,32 @@ fm_pause_recheck_signature() {  # <evidence-text>
 # no record exists, the record is foreign or malformed, or the recorded evidence
 # differs - which is how a changed wait reason, status line, worker condition, or
 # task incarnation resets the backoff to the base cadence.
-fm_pause_recheck_streak() {  # <record-file> <evidence-signature>
-  local file=$1 sig=$2 line tag streak recorded
+fm_pause_recheck_condition() {  # <record-file> <current-condition>
+  local file=$1 current=$2 line tag streak recorded previous
+  case "$current" in busy|idle) printf '%s' "$current"; return 0 ;; esac
   line=$(head -n 1 "$file" 2>/dev/null || true)
-  tag=; streak=; recorded=
-  IFS=$(printf '\t') read -r tag streak recorded <<EOF
+  tag=; streak=; recorded=; previous=
+  IFS=$(printf '\t') read -r tag streak recorded previous <<EOF
+$line
+EOF
+  if [ "$tag" = "$FM_PAUSE_RECHECK_RECORD_TAG" ]; then
+    case "$previous" in busy|idle) printf '%s' "$previous"; return 0 ;; esac
+  fi
+  printf 'unknown'
+}
+
+fm_pause_recheck_streak() {  # <record-file> <evidence-signature> [<worker-condition>]
+  local file=$1 sig=$2 current=${3:-unknown} line tag streak recorded previous
+  line=$(head -n 1 "$file" 2>/dev/null || true)
+  tag=; streak=; recorded=; previous=
+  IFS=$(printf '\t') read -r tag streak recorded previous <<EOF
 $line
 EOF
   if [ "$tag" != "$FM_PAUSE_RECHECK_RECORD_TAG" ] || [ "$recorded" != "$sig" ]; then
+    printf '0'
+    return 0
+  fi
+  if [ "$current" != unknown ] && [ "$previous" != "$current" ]; then
     printf '0'
     return 0
   fi
@@ -146,8 +164,8 @@ EOF
 }
 
 # The one-line record a consumer publishes after delivering a recheck.
-fm_pause_recheck_record() {  # <streak> <evidence-signature>
-  printf '%s\t%s\t%s\n' "$FM_PAUSE_RECHECK_RECORD_TAG" "$1" "$2"
+fm_pause_recheck_record() {  # <streak> <evidence-signature> [<worker-condition>]
+  printf '%s\t%s\t%s\t%s\n' "$FM_PAUSE_RECHECK_RECORD_TAG" "$1" "$2" "${3:-unknown}"
 }
 
 # The resolution verb and durable-backlog-transfer verb that CLOSE a keyed

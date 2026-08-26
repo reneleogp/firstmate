@@ -667,6 +667,51 @@ escalate_add() {  # <state> <distilled-item>
   printf '%s\n' "$item" >> "$buf"
 }
 
+pause_recheck_publish_recover() {  # <state>
+  local state=$1 journal header tag mode row type item backoff streak sig condition marker epoch
+  journal="$state/.paused-recheck-publish"
+  [ -s "$journal" ] || return 0
+  IFS= read -r header < "$journal" || return 1
+  IFS=$(printf '\t') read -r tag mode <<EOF
+$header
+EOF
+  [ "$tag" = pause-publish-v1 ] && [ "$mode" = daemon ] || return 0
+  while IFS= read -r row; do
+    type=${row%%$(printf '\t')*}
+    case "$type" in
+      I)
+        item=${row#*$(printf '\t')}
+        grep -Fqx "$item" "$state/.subsuper-escalations" 2>/dev/null || escalate_add "$state" "$item"
+        ;;
+      R)
+        IFS=$(printf '\t') read -r type backoff streak sig condition marker epoch <<EOF
+$row
+EOF
+        case "$backoff" in "$state"/.subsuper-pause-backoff-*) ;; *) continue ;; esac
+        case "$marker" in "$state"/.subsuper-paused-*) ;; *) continue ;; esac
+        fm_pause_recheck_record "$streak" "$sig" "$condition" > "$backoff" || return 1
+        printf '%s\n' "$epoch" > "$marker" || return 1
+        ;;
+    esac
+  done < <(tail -n +2 "$journal")
+  rm -f "$journal"
+}
+
+pause_recheck_publish_daemon() {  # <state> <items> <records>
+  local state=$1 items=$2 records=$3 journal tmp item
+  [ -n "$items" ] || return 0
+  journal="$state/.paused-recheck-publish"
+  tmp="$journal.tmp.$$"
+  {
+    printf 'pause-publish-v1\tdaemon\n'
+    while IFS= read -r item; do [ -z "$item" ] || printf 'I\t%s\n' "$item"; done <<EOF
+$items
+EOF
+    printf '%s' "$records"
+  } > "$tmp" && mv -f "$tmp" "$journal" || { rm -f "$tmp"; return 1; }
+  pause_recheck_publish_recover "$state"
+}
+
 # Flush the escalation buffer as ONE batched, single-line digest to the
 # supervisor pane. Returns 0 on successful inject (or empty buffer), non-zero on
 # inject failure (buffer preserved for retry / catch-up).
@@ -990,9 +1035,11 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
   local state=$1 now due f key task win marker age last max_defer oldest pause_secs
-  local pause_max backoff_file backoff_sig backoff_streak recheck_window
+  local pause_max backoff_file backoff_sig backoff_streak recheck_window worker_status worker_condition
+  local pause_items= pause_records= pause_item
   now=$(_now)
   migrate_watcher_pause_markers "$state"
+  pause_recheck_publish_recover "$state" || return 1
 
   # (1) batch flush
   if [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ]; then
@@ -1082,29 +1129,37 @@ housekeeping() {  # <state>
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
     backoff_file="$state/.subsuper-pause-backoff-$key"
     backoff_sig=$(pause_backoff_signature "$state" "$task")
-    backoff_streak=$(fm_pause_recheck_streak "$backoff_file" "$backoff_sig")
+    stale_window_is_busy "$win" "$state"
+    worker_status=$?
+    case "$worker_status" in
+      0) worker_condition=busy ;;
+      1) worker_condition=idle ;;
+      *) worker_condition=unknown ;;
+    esac
+    worker_condition=$(fm_pause_recheck_condition "$backoff_file" "$worker_condition")
+    backoff_streak=$(fm_pause_recheck_streak "$backoff_file" "$backoff_sig" "$worker_condition")
     recheck_window=$(fm_pause_recheck_interval "$backoff_streak" "$pause_secs" "$pause_max")
     [ "$age" -ge "$recheck_window" ] || continue
-    stale_window_is_busy "$win" "$state"
-    case "$?" in
+    case "$worker_status" in
       0) rm -f "$marker" "$backoff_file" ;;
-      2) rm -f "$marker" "$backoff_file" ;;
+      2) ;;
       *)
         last=$(last_status_line "$state/$task.status")
         if [ -n "$last" ] && status_is_captain_held "$last"; then
-          escalate_add "$state" "captain-held ${age}s (awaiting the captain, answer the held decision or release the hold): $win"
-          fm_pause_recheck_record "$(( backoff_streak + 1 ))" "$backoff_sig" > "$backoff_file"
-          _now > "$marker"
+          pause_item="captain-held ${age}s (awaiting the captain, answer the held decision or release the hold): $win"
+          pause_items="$pause_items$pause_item"$'\n'
+          pause_records="$pause_records"'R'$(printf '\t')"$backoff_file"$(printf '\t')"$(( backoff_streak + 1 ))"$(printf '\t')"$backoff_sig"$(printf '\t')"$worker_condition"$(printf '\t')"$marker"$(printf '\t')"$now"$'\n'
         elif [ -n "$last" ] && status_is_paused "$last"; then
-          escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
-          fm_pause_recheck_record "$(( backoff_streak + 1 ))" "$backoff_sig" > "$backoff_file"
-          _now > "$marker"
+          pause_item="paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
+          pause_items="$pause_items$pause_item"$'\n'
+          pause_records="$pause_records"'R'$(printf '\t')"$backoff_file"$(printf '\t')"$(( backoff_streak + 1 ))"$(printf '\t')"$backoff_sig"$(printf '\t')"$worker_condition"$(printf '\t')"$marker"$(printf '\t')"$now"$'\n'
         else
           rm -f "$marker" "$backoff_file"
         fi
         ;;
     esac
   done
+  pause_recheck_publish_daemon "$state" "$pause_items" "$pause_records" || return 1
 
   # (3) heartbeat scan (catch-all for a captain-relevant status the per-wake
   #     classifier may have missed). Cheap: status files only, no tmux. The

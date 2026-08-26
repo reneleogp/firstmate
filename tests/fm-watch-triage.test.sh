@@ -1076,9 +1076,13 @@ test_pause_recheck_cadence_contract() {
     || fail "the same evidence produced two different signatures"
   [ "$sig" != "$other" ] || fail "changed evidence produced the same signature"
   [ "$(fm_pause_recheck_streak "$f" "$sig")" = 0 ] || fail "an empty record did not read as no rechecks yet"
-  fm_pause_recheck_record 4 "$sig" > "$f"
-  [ "$(fm_pause_recheck_streak "$f" "$sig")" = 4 ] || fail "a published record did not read its own streak back"
-  [ "$(fm_pause_recheck_streak "$f" "$other")" = 0 ] || fail "changed evidence did not reset the streak"
+  fm_pause_recheck_record 4 "$sig" busy > "$f"
+  [ "$(fm_pause_recheck_streak "$f" "$sig" busy)" = 4 ] || fail "a published record did not read its own streak back"
+  [ "$(fm_pause_recheck_streak "$f" "$sig" idle)" = 0 ] || fail "a changed worker condition did not reset the streak"
+  [ "$(fm_pause_recheck_condition "$f" unknown)" = busy ] || fail "an unknown worker read did not retain the last known condition"
+  [ "$(fm_pause_recheck_streak "$f" "$sig" "$(fm_pause_recheck_condition "$f" unknown)")" = 4 ] \
+    || fail "an unknown worker read reset an unchanged wait"
+  [ "$(fm_pause_recheck_streak "$f" "$other" busy)" = 0 ] || fail "changed evidence did not reset the streak"
   date +%s > "$f"
   [ "$(fm_pause_recheck_streak "$f" "$sig")" = 0 ] || fail "a legacy epoch marker was read as a backoff streak"
   [ "$(fm_pause_recheck_streak "$TMP_ROOT/absent-record" "$sig")" = 0 ] || fail "an absent record did not read as no rechecks yet"
@@ -1289,7 +1293,7 @@ test_unrelated_stale_is_not_delayed_by_a_due_recheck() {
 # records finishes that one publication on restart: applied exactly once, never
 # re-delivered, and never left half-advanced.
 test_interrupted_recheck_publication_is_repaired_on_restart() {
-  local dir state fakebin out capture window key sig record now
+  local dir state fakebin out capture window key sig record now target
   dir=$(make_case pause-recheck-replay); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture="$dir/pane.txt"
   window="test:fm-replay"
@@ -1299,14 +1303,22 @@ test_interrupted_recheck_publication_is_repaired_on_restart() {
   export FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting the merge decision'
 
   sig=$(fm_pause_recheck_signature 'interrupted-publication-evidence')
-  record=$(fm_pause_recheck_record 3 "$sig")
-  printf '%s\t3\t%s\n' "$state/.paused-resurfaced-$key" "$sig" > "$state/.paused-recheck-publish"
+  record=$(fm_pause_recheck_record 3 "$sig" idle)
+  target=$(( $(cat "$state/.wake-queue.seq" 2>/dev/null || echo 0) + 1 ))
+  printf 'pause-publish-v1\t%s\tstale\t%s\t%s\n%s\t3\t%s\tidle\n' \
+    "$target" "$window" "stale: $window (awaiting external, recheck whether the wait still holds)" \
+    "$state/.paused-resurfaced-$key" "$sig" > "$state/.paused-recheck-publish"
 
   run_pause_watcher "$state" "$fakebin" "$window" "$capture" "$out" \
     FM_PAUSE_RESURFACE_SECS=240 FM_PAUSE_RESURFACE_MAX_SECS=960 \
-    && fail "an already-published recheck was delivered a second time after restart: $(cat "$out")"
+    || fail "a prepared recheck publication was not completed on restart: $(cat "$out")"
+  [ "$(cat "$state/.wake-queue.seq")" = "$target" ] \
+    || fail "the recovered publication did not append exactly one stable queue delivery"
   [ ! -e "$state/.paused-recheck-publish" ] || fail "the committed publication journal was not consumed"
   [ "$(cat "$state/.paused-resurfaced-$key")" = "$record" ] || fail "the interrupted publication was not finished on restart"
+  run_pause_watcher "$state" "$fakebin" "$window" "$capture" "$out" \
+    FM_PAUSE_RESURFACE_SECS=240 FM_PAUSE_RESURFACE_MAX_SECS=960 \
+    && fail "an acknowledged recovered publication was delivered again: $(cat "$out")"
 
   # Repaired, not silenced: the wait still comes due on its own window.
   now=$(date +%s)
