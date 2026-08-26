@@ -63,14 +63,16 @@ import {
   createAgentSession,
   createBashToolDefinition,
   DefaultResourceLoader,
+  DynamicBorder,
   getAgentDir,
   ModelRuntime,
   SessionManager,
   type AgentSession,
   type ExtensionAPI,
+  type ExtensionCommandContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Text } from "@earendil-works/pi-tui";
+import { Box, Container, fuzzyFilter, Input, SelectList, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   type CalmPresentationState,
@@ -86,6 +88,13 @@ import {
   writeEligibleRowsSnapshot,
   type BranchDispatchOffer,
 } from "./lib/fm-branch-dispatch.ts";
+import {
+  BRANCH_PICKER_MAX_VISIBLE,
+  buildBranchModelItems,
+  filterBranchPickerItems,
+  FOLLOW_MAIN_VALUE,
+  type BranchPickerItem,
+} from "./lib/fm-branch-model-picker.ts";
 import { encodeFirstmateOperationalInput } from "./lib/fm-operational-input.ts";
 
 const extensionFile = fileURLToPath(import.meta.url);
@@ -1001,9 +1010,12 @@ ${context.command}
   // conversation and exposes no hook an extension can use to open either
   // picker, so this is the smallest supported equivalent: Pi's own catalog
   // intersected with the isolated branch runtime, then Pi's own supported
-  // thinking levels for the model just chosen, both through Pi's own selector
-  // dialog and with no parallel Firstmate model or effort list. The effort
-  // step follows the model step because the model decides which levels exist.
+  // thinking levels for the model just chosen, with no parallel Firstmate
+  // model or effort list. The model step shows that catalog through the same
+  // bounded, searchable SelectList primitive Pi's own /model dialog scrolls
+  // (pickBranchModel below); the effort step's menu is a handful of levels
+  // and stays on Pi's generic selector dialog. The effort step follows the
+  // model step because the model decides which levels exist.
   pi.registerCommand?.("supervision-model", {
     description: "Pick the model and reasoning effort Firstmate's Pi supervision branch uses, or follow main's.",
     handler: async (_args, ctx) => {
@@ -1025,14 +1037,18 @@ ${context.command}
         );
         return;
       }
-      const picked = await ctx.ui.select(`Supervision branch model (now: ${current})`, [followMain, ...available]);
+      const picked = await pickBranchModel(
+        ctx,
+        `Supervision branch model (now: ${current})`,
+        buildBranchModelItems(followMain, available, pin ? `${pin.provider}/${pin.modelId}` : null),
+      );
       if (picked === undefined) return; // cancelled: the current choice stands
       // Whatever the model step resolves is also the model the effort step
       // builds its menu from, so it is captured here rather than resolved a
       // second time through another isolated runtime.
       let branchModel: BranchModel | undefined;
       try {
-        if (picked === followMain) {
+        if (picked === FOLLOW_MAIN_VALUE) {
           clearPinFile(modelPinFile);
         } else {
           const separator = picked.indexOf("/");
@@ -1052,7 +1068,7 @@ ${context.command}
       // The model choice is persisted; report it exactly, then run the effort
       // step on the model the branch will actually use.
       let modelReport: { message: string; warning: boolean };
-      if (picked !== followMain) {
+      if (picked !== FOLLOW_MAIN_VALUE) {
         modelReport = { message: `Supervision branch model: ${picked}.`, warning: false };
       } else {
         // Clearing the pin only follows main if main's model can actually be
@@ -1098,6 +1114,83 @@ ${context.command}
       );
     },
   });
+
+  // Step one of /supervision-model's dialog. Pi's generic extension selector
+  // renders every option at once with no search box, so a real eligible
+  // catalog ran off the top of the terminal; this shows the same rows through
+  // Pi's own SelectList - the bounded, scrolling primitive behind Pi's /model
+  // picker - with Pi's own Input and fuzzy filter above it for search.
+  // Pi's ModelSelectorComponent is deliberately NOT reused: its own selection
+  // handler writes the captain's default model through Pi's settings manager,
+  // which would move main's conversation as a side effect of pinning the
+  // branch, and it has no room for the "follow main" row or for Firstmate's
+  // branch-runtime eligibility filter. Ordering and filtering live in
+  // lib/fm-branch-model-picker.ts; everything here is Pi's own rendering.
+  // Returns the chosen item's value, or undefined when the captain cancels.
+  // Non-TUI modes have no custom component surface, so they keep Pi's generic
+  // selector: overflow is a terminal-rendering problem those modes do not have.
+  async function pickBranchModel(
+    ctx: ExtensionCommandContext,
+    title: string,
+    items: BranchPickerItem[],
+  ): Promise<string | undefined> {
+    if (ctx.mode !== "tui" || typeof ctx.ui.custom !== "function") {
+      const picked = await ctx.ui.select(
+        title,
+        items.map((item) => item.label),
+      );
+      if (picked === undefined) return undefined;
+      return items.find((item) => item.label === picked)?.value;
+    }
+    const picked = await ctx.ui.custom<string | null>((tui, theme, keybindings, done) => {
+      const accent = (text: string) => theme.fg("accent", text);
+      const muted = (text: string) => theme.fg("muted", text);
+      const container = new Container();
+      container.addChild(new DynamicBorder(accent));
+      container.addChild(new Text(accent(theme.bold(title)), 1, 0));
+      const search = new Input();
+      search.focused = true;
+      container.addChild(search);
+      const listContainer = new Container();
+      container.addChild(listContainer);
+      container.addChild(new Text(muted("type to search - up/down navigate - enter select - esc cancel"), 1, 0));
+      container.addChild(new DynamicBorder(accent));
+
+      // SelectList takes its rows at construction, so a new query builds a new
+      // list into the same container rather than mutating the old one.
+      let list = buildList("");
+      function buildList(query: string): SelectList {
+        const rebuilt = new SelectList(filterBranchPickerItems(items, query, fuzzyFilter), BRANCH_PICKER_MAX_VISIBLE, {
+          selectedPrefix: accent,
+          selectedText: accent,
+          description: muted,
+          scrollInfo: muted,
+          noMatch: muted,
+        });
+        rebuilt.onSelect = (item) => done(item.value);
+        rebuilt.onCancel = () => done(null);
+        listContainer.clear();
+        listContainer.addChild(rebuilt);
+        return rebuilt;
+      }
+
+      const navigationKeys = ["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"] as const;
+      return {
+        render: (width: number) => container.render(width),
+        invalidate: () => container.invalidate(),
+        handleInput: (data: string) => {
+          if (navigationKeys.some((key) => keybindings.matches(data, key))) {
+            list.handleInput(data);
+          } else {
+            search.handleInput(data);
+            list = buildList(search.getValue());
+          }
+          tui.requestRender();
+        },
+      };
+    });
+    return picked === null ? undefined : picked;
+  }
 
   // Step two of /supervision-model, shown after the model pick and driven by
   // Pi's own supported-level list for the model the branch will now use, so
