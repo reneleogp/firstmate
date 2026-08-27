@@ -774,11 +774,20 @@ EOF
   body=$(./bin/fm-operational-input.sh body < "$home/state/delivered-captain-note") \
     || fail "captain outcome envelope carries no readable body"
   case "$body" in
-    *"task-9: PR https://example.com/pr/9"*) ;;
-    *) fail "captain outcome body lost the outcome itself: $body" ;;
+    *"This is a supervision outcome delivered automatically by the supervision branch."*"It was not typed by the captain."*"task-9: PR https://example.com/pr/9"*) ;;
+    *) fail "captain outcome body lost its self-description or the outcome itself: $body" ;;
+  esac
+  # Both halves of the delivered instruction matter and they pull against each
+  # other: main must be allowed to stay quiet about an outcome it has already
+  # given the captain, and must still be told to relay everything else instead
+  # of re-emitting its own last answer. An instruction carrying only one half
+  # reintroduces either the duplicate or the silent loss.
+  case "$body" in
+    *"already reported this outcome to the captain"*"do not report it again"*) ;;
+    *) fail "captain outcome body never lets main deduplicate what it already said: $body" ;;
   esac
   case "$body" in
-    *"Relay only this outcome"*"Do not restate or repeat any earlier answer"*) ;;
+    *"relay only this outcome to the captain now"*"Do not restate or repeat any earlier answer"*) ;;
     *) fail "captain outcome body never tells main to relay it instead of repeating: $body" ;;
   esac
   # The routine note is rendered in the TUI, and its renderer reads the glyph off
@@ -825,7 +834,8 @@ if (delivered.options.triggerTurn !== true || delivered.options.deliverAs !== "f
 if (delivered.message.content.includes("FIRSTMATE_OP:")) {
   throw new Error(`fallback unexpectedly carried an envelope: ${delivered.message.content}`);
 }
-if (!delivered.message.content.includes("Relay only this outcome") ||
+if (!delivered.message.content.includes("relay only this outcome to the captain now") ||
+    !delivered.message.content.includes("do not report it again") ||
     !delivered.message.content.includes("Do not restate or repeat any earlier answer") ||
     !delivered.message.content.includes("task-fallback: PR https://example.com/pr/fallback is ready")) {
   throw new Error(`fallback lost its instruction or outcome: ${delivered.message.content}`);
