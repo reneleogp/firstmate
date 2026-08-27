@@ -483,6 +483,51 @@ unit_tmux_absence_distinguishes_probe_failure() {
   rm -rf "$st"
 }
 
+unit_fresh_entry_rejects_stale_pi_handoff() {
+  local st state watch_version turnend_version publisher status
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stale-handoff.XXXXXX")
+  state="$st/state"
+  mkdir -p "$state"
+  watch_version=$(bash -c '. "$1"; fm_pi_extension_version "$2"' _ \
+    "$ROOT/bin/fm-wake-lib.sh" "$ROOT/.pi/extensions/fm-primary-pi-watch.ts")
+  turnend_version=$(bash -c '. "$1"; fm_pi_extension_version "$2"' _ \
+    "$ROOT/bin/fm-wake-lib.sh" "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts")
+  printf '%s\n%s\n' "$watch_version" "$$" > "$state/.pi-watch-extension-loaded"
+  printf '%s\n%s\n' "$turnend_version" "$$" > "$state/.pi-turnend-extension-loaded"
+  printf '%s\n' "$$" > "$state/.lock"
+  printf '%s\n%s\nold-generation\n' "$watch_version" "$$" > "$state/.pi-watch-away-standdown"
+  (
+    for _ in $(seq 1 100); do
+      [ ! -e "$state/.pi-watch-away-standdown" ] && break
+      sleep 0.02
+    done
+    [ ! -e "$state/.pi-watch-away-standdown" ] || exit 1
+    : > "$st/stale-receipt-invalidated"
+    for _ in $(seq 1 100); do
+      [ -e "$state/.afk" ] && break
+      sleep 0.02
+    done
+    [ -e "$state/.afk" ] || exit 1
+    printf '%s\n%s\nfresh-generation\n' "$watch_version" "$$" \
+      > "$state/.pi-watch-away-standdown.pending"
+    mv "$state/.pi-watch-away-standdown.pending" "$state/.pi-watch-away-standdown"
+  ) &
+  publisher=$!
+  FM_HOME="$st" FM_STATE_OVERRIDE="$state" FM_PI_AWAY_HANDOFF_TIMEOUT=2 \
+    "$LAUNCH" start-native >/dev/null 2>&1
+  status=$?
+  wait "$publisher"
+  if [ "$status" -eq 0 ] \
+    && [ -e "$st/stale-receipt-invalidated" ] \
+    && [ "$(sed -n '3p' "$state/.pi-watch-away-standdown" 2>/dev/null)" = fresh-generation ]; then
+    pass "Pi handoff: fresh entry waits for a newly published standdown receipt"
+  else
+    fail "Pi handoff: fresh entry accepted the prior away cycle's standdown receipt"
+  fi
+  FM_HOME="$st" FM_STATE_OVERRIDE="$state" "$LAUNCH" stop >/dev/null 2>&1 || true
+  rm -rf "$st"
+}
+
 unit_failed_live_daemon_handoff_restores_flag() {
   local st entry prior status buffered
   for entry in fm_afk_launch_start fm_afk_launch_start_native; do
@@ -977,6 +1022,7 @@ unit_record_failure_closes_terminal
 unit_readiness_failure_rolls_back_terminal
 unit_readiness_failure_preserves_unconfirmed_record
 unit_tmux_absence_distinguishes_probe_failure
+unit_fresh_entry_rejects_stale_pi_handoff
 unit_failed_live_daemon_handoff_restores_flag
 unit_native_lifecycle
 unit_native_entry_preserves_prepared_state

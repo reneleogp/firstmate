@@ -77,6 +77,7 @@ fi
 FM_AFK_LAUNCH_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 FM_AFK_LAUNCH_RECORD="$FM_AFK_LAUNCH_STATE/.afk-daemon-terminal"
 FM_AFK_LAUNCH_LOCK="$FM_AFK_LAUNCH_STATE/.afk-launch.lock"
+FM_AFK_PI_HANDOFF_RECEIPT="$FM_AFK_LAUNCH_STATE/.pi-watch-away-standdown"
 FM_AFK_LAUNCH_WS_LABEL="firstmate-afk-daemon"
 
 # shellcheck source=bin/fm-backend.sh
@@ -96,9 +97,14 @@ fm_afk_launch_log() { printf 'fm-afk-launch: %s\n' "$*" >&2; }
 FM_AFK_PI_HANDOFF_TIMEOUT=${FM_PI_AWAY_HANDOFF_TIMEOUT:-5}
 case "$FM_AFK_PI_HANDOFF_TIMEOUT" in ''|*[!0-9]*|0) FM_AFK_PI_HANDOFF_TIMEOUT=5 ;; esac
 
+fm_afk_launch_invalidate_pi_handoff() {
+  rm -f "$FM_AFK_PI_HANDOFF_RECEIPT" 2>/dev/null || return 1
+  [ ! -e "$FM_AFK_PI_HANDOFF_RECEIPT" ]
+}
+
 fm_afk_launch_wait_pi_handoff() {
   local receipt marker lock expected_version expected_pid marker_version marker_pid receipt_version receipt_pid receipt_generation deadline
-  receipt="$FM_AFK_LAUNCH_STATE/.pi-watch-away-standdown"
+  receipt=$FM_AFK_PI_HANDOFF_RECEIPT
   marker="$FM_AFK_LAUNCH_STATE/.pi-watch-extension-loaded"
   lock="$FM_AFK_LAUNCH_STATE/.lock"
   marker_version=$(sed -n '1p' "$marker" 2>/dev/null)
@@ -435,7 +441,10 @@ fm_afk_launch_refresh_live_daemon() {
       cp -p "$FM_AFK_LAUNCH_STATE/$artifact" "$backup/$artifact" || { rm -rf "$backup"; return 1; }
     fi
   done
-  if ! fm_afk_launch_flag_write; then
+  if [ "$had_afk" -eq 0 ] && ! fm_afk_launch_invalidate_pi_handoff; then
+    fm_afk_launch_log "failed to invalidate the prior Pi standdown receipt"
+    result=1
+  elif ! fm_afk_launch_flag_write; then
     fm_afk_launch_log "failed to refresh away-mode flag"
     result=1
   elif ! fm_afk_launch_wait_pi_handoff; then
@@ -572,7 +581,10 @@ fm_afk_launch_start() {
     fi
   fi
   if [ "$result" -eq 0 ]; then
-    if ! fm_afk_launch_flag_write; then
+    if ! fm_afk_launch_invalidate_pi_handoff; then
+      fm_afk_launch_log "failed to invalidate the prior Pi standdown receipt"
+      result=1
+    elif ! fm_afk_launch_flag_write; then
       fm_afk_launch_log "failed to write away-mode flag"
       result=1
     fi
@@ -627,6 +639,9 @@ fm_afk_launch_start_native() {
   if [ "$result" -eq 0 ]; then
     if ! fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE"; then
       fm_afk_launch_log "failed to clear stale away-mode artifacts"
+      result=1
+    elif ! fm_afk_launch_invalidate_pi_handoff; then
+      fm_afk_launch_log "failed to invalidate the prior Pi standdown receipt"
       result=1
     elif ! fm_afk_launch_flag_write; then
       result=1
