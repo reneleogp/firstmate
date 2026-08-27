@@ -1151,7 +1151,9 @@ fm_wake_append() {
   if [ "$status" -eq 0 ]; then
     printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$seq" "$kind" "$clean_key" "$clean_payload" >> "$FM_WAKE_QUEUE" || status=$?
     if [ "$status" -eq 0 ]; then
+      # shellcheck disable=SC2034 # Public append result consumed by sourcing callers.
       FM_WAKE_APPENDED_SEQUENCE=$seq
+      # shellcheck disable=SC2034 # Public append result consumed by sourcing callers.
       FM_WAKE_APPENDED_PAYLOAD=$clean_payload
     fi
   fi

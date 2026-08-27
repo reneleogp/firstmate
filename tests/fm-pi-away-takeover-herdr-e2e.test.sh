@@ -5,6 +5,8 @@
 # named non-default Herdr lab. It proves an already-live ordinary Pi watcher is
 # retired before daemon launch, emits no direct follow-up during away mode, and
 # returns as exactly one ordinary cycle after the daemon stops.
+# The wait_for predicates intentionally defer variable expansion until eval.
+# shellcheck disable=SC2016
 set -u
 
 # shellcheck source=tests/lib.sh

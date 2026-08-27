@@ -777,7 +777,7 @@ procevent_surface_after_output() {
 }
 
 procevent_surface_queued() {
-  local sequence key payload reason selected_sequence= selected_payload=
+  local sequence key payload reason selected_sequence='' selected_payload=''
   PROCEVENT_SURFACED=
   [ -s "$FM_WAKE_QUEUE" ] || return 0
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
@@ -1321,14 +1321,11 @@ EOF
     # exact suppressors and stay silent. They are notifications, not current-state
     # evidence; stopped-worker detection remains with the independent stale path.
     actionable=0
+    # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
     if afk_present; then
       actionable=1
-    elif pending_signal_is_actionable <<EOF
-$pending
-EOF
-    then
+    elif pending_signal_is_actionable <<< "$pending"; then
       actionable=1
-    # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
     elif signal_has_parent_directed_status $files; then
       actionable=1
     fi
