@@ -49,9 +49,8 @@ batched digest rather than per-wake injections.
    The daemon is **presence-gated**: it injects escalations only while
    `state/.afk` exists, and stays quiet otherwise.
 
-3. **Do not separately arm `fm-watch.sh`.** The daemon must be the only watcher
-   owner while away.
-   The Pi launcher enforces the ownership transfer and return ordering defined in [`watcher-continuity.md`](../../../docs/watcher-continuity.md); other primary integrations retain their existing away gates.
+3. **Do not separately arm `fm-watch.sh`.** The daemon manages the watcher as
+   its child; the singleton lock no-ops a stray arm harmlessly.
 
 4. **Acknowledge** in `AGENTS.md` section 9 language: "Captain, away mode is active; I will batch routine updates and surface only decisions, failures, credentials, or review-ready work until you return."
 
@@ -135,19 +134,20 @@ The daemon still clears its buffer only on the backend's `empty` success verdict
 
 The daemon wraps `fm-watch.sh`, runs the watcher as a child, presents every durable wake after each actionable watcher close, classifies each presented record in bash, and acknowledges the presented generation only after routing completes.
 It self-handles the routine majority without consuming a firstmate turn.
-Changed captain-relevant events, plus a bounded recheck of a declared external wait that remains idle, escalate to firstmate's context as one pre-read, single-line, batched digest.
-The status predicates live in `bin/fm-classify-lib.sh`, while `bin/fm-human-notify-lib.sh` owns human-notification identity, evidence, resolution, and readable presentation for both attended and away supervision.
+Captain-relevant events, plus a bounded recheck of a declared wait that is still declared, escalate to firstmate's context as one pre-read, single-line, batched digest.
+The classification predicates (the captain-relevant verb set, declared-wait vocabulary, signal/stale tests, and fleet-scan) live in the shared `bin/fm-classify-lib.sh`, the same library the always-on watcher uses for its own triage when afk is off, so the two modes apply one identical policy.
 While `state/.afk` exists the daemon owns the watcher, so the watcher reverts to one-shot and lets the daemon do the triage - the two never run their triage at the same time.
 
 Classify each wake this way:
 
-- `signal` with a new terminal captain verb (`done:`, `needs-decision:`, `blocked:`, or `failed:`) -> escalate; an unchanged human-owned decision, blocker, or review-ready result is absorbed before injection.
+- `signal` with a terminal captain verb (`done:`, `needs-decision:`, `blocked:`, or `failed:`) -> escalate.
   A nonterminal progress verb remains nonterminal even when its prose contains a legacy free-text token such as `PR ready`, `checks green`, `ready in branch`, or `merged`; only a bare legacy line with such a token escalates.
   Other signals with no captain-relevant status -> self-handle.
-- `signal` or `stale` for a declared wait -> self-handle it rather than treating it as a wedge; only `paused:` external waits retain bounded timed rechecks, while a verified `captain-held` transfer stays silent until its evidence changes or the captain answers.
-  If an external pause remains declared and idle past `FM_PAUSE_RESURFACE_SECS` (default 3600s), housekeeping sends one recheck and resets the pause window.
-  Each external recheck that finds the wait unchanged widens the next window up to `FM_PAUSE_RESURFACE_MAX_SECS` (default 43200s), and any change in the wait returns it to the base cadence.
-  The external recheck names the dependency and asks whether it still holds; a captain-held decision remains visible in recovery and explicit status views without starting a timed model turn.
+- `signal` or `stale` for a declared wait, either a `paused:` external wait or a verified `captain-held` transfer -> self-handle and track the pause rather than a wedge, whether its pane reads idle or busy.
+  That outranks an enriched possible-wedge reason, so a declared wait never escalates on the `FM_STALE_ESCALATE_SECS` cadence.
+  If it is still declared past `FM_PAUSE_RESURFACE_SECS` (default 3600s), housekeeping sends one recheck and resets the pause window.
+  The window ages against the crew's own latest status line, so only a status append that stops declaring the wait ends this routing and restores wedge detection.
+  That recheck names which human the wait is on: the external dependency for `paused:`, and the captain themself for a `captain-held` transfer, who can answer the held decision or release the hold.
 - `check` -> always escalate. Check scripts print only when firstmate should wake.
 - `stale` with a terminal status or bare legacy captain-relevant line -> escalate.
   Nonterminal progress remains transient even when its prose contains a legacy free-text token or its seen-status marker already matches, so record a marker and self-handle.

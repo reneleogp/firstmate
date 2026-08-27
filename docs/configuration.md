@@ -25,25 +25,6 @@ Wake, watcher, away-mode, and Relay-specific state mechanics remain with their n
 `AGENTS.md` retains the run-once and read-once operator rules, lock-refusal safety, installation consent, and direct-report recovery boundaries because those facts apply at every session start.
 Ordinary dead-direct-report recovery is owned by `stuck-crewmate-recovery`, while persistent-secondmate recovery is owned by `secondmate-provisioning`.
 
-## Task display names
-
-Every new task metadata record carries one `display_name=` for concise human presentation, normally shaped like `Backend · CRM Core`, `CRM · Dashboard`, `Planning · CRM Scope`, or `Firstmate · Quiet Alerts`.
-Prefer short noun labels shaped like `<Project> · <Outcome>` rather than versions, random suffixes, full task slugs, branch names, or delivery mechanics.
-Pass it with `fm-spawn.sh --display-name`; the script's help owns spawn and relaunch persistence mechanics, while [`fm-display-name-lib.sh`](../bin/fm-display-name-lib.sh) owns exact validation and fallback.
-The immutable task id remains unchanged and is the only identity used for selectors, routing, endpoint ownership, recovery, relaunch, merge, cleanup, worktree binding, and incarnation tracking.
-Duplicate display names are harmless because no control operation resolves through them.
-Legacy metadata is rendered through a safe readable fallback without an eager migration.
-An explicit relaunch label updates only the single metadata presentation field and supported presentation surfaces; it never creates, adopts, renames, or destroys an endpoint.
-
-The human fleet view, Bearings projection, session-start fleet summary, and normal supervision wakes expose the display name while retaining the exact id or endpoint.
-Tmux renders it in the independent pane-title field while keeping the unique `fm-<id>` window name.
-Herdr renders the validated explicit or readable fallback name as display-only metadata on the exact pane, including flat and secondmate endpoints, and also in an optional projected workspace beside its random presentation token while the ordinary task tab, exact pane binding, and restart journal remain machine-owned.
-Zellij and cmux retain machine-scoped visible titles because those titles currently participate in endpoint verification.
-Orca retains machine labels because its creation name binds its worktree and terminal.
-Secondmate container and remote endpoint identities remain unchanged while their exact panes and fleet summaries expose the shared human field.
-Every verified worker harness receives the same backend-neutral metadata contract; no harness owns, parses, or resolves the display name.
-These adapter choices are presentation capabilities only; [`fm-backend.sh`](../bin/fm-backend.sh) owns the shared rendering dispatch and adapters never own naming rules.
-
 ## Pi Calm preference (config/calm)
 
 The Pi Calm extension stores the captain's home-local presentation choice in gitignored `config/calm` under the effective Firstmate home, resolved from `FM_HOME`, then `FM_ROOT_OVERRIDE`, then the tracked code root derived from the extension path, or under `FM_CONFIG_OVERRIDE` when that test and specialized-setup override is present.
@@ -771,9 +752,8 @@ FM_SIGNAL_GRACE=30      # seconds to coalesce nearby status and turn-end signals
 FM_CAPTAIN_RE='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'   # captain-relevant status regex; nonterminal progress verbs remain excluded even when their prose matches
 FM_CLASSIFY_PAUSED_VERB=paused     # leading status verb for a declared external wait; excluded from FM_CAPTAIN_RE and distinct from blocked
 FM_STALE_ESCALATE_SECS=240         # idle seconds before a provably-working stale pane escalates; stale panes whose crew is not provably working surface immediately unless they declare the pause verb
-FM_BUSY_TURN_MAX_SECS=3600         # maximum age of a busy pane's latest state/<id>.turn-ended marker, or its state/<id>.meta spawn record before any turn completes, before the same wedge escalation used for a provably-working non-busy stale takes over; inspection-only, never an automatic interrupt or restart; a declared external wait takes the FM_PAUSE_RESURFACE_SECS recheck below, while a verified captain-held transfer has no timer
-FM_PAUSE_RESURFACE_SECS=3600       # seconds before the watcher re-surfaces a declared external wait or active worktree-write deferral for a recheck, including a live busy pane past FM_BUSY_TURN_MAX_SECS; human-owned waits never use this cadence, and the away-mode daemon applies the same external-wait distinction
-FM_PAUSE_RESURFACE_MAX_SECS=43200  # cap on that recheck window; each recheck that finds its monitored evidence unchanged doubles the next window up to this cap (1h, 2h, 4h, 8h, then 12h by default), any evidence change returns it to the base cadence above, and collected rechecks published from the same pass use one notification naming each affected window; both supervision paths read this setting
+FM_BUSY_TURN_MAX_SECS=3600         # maximum age of a busy pane's latest state/<id>.turn-ended marker, or its state/<id>.meta spawn record before any turn completes, before the same wedge escalation used for a provably-working non-busy stale takes over; inspection-only, never an automatic interrupt or restart; a declared external wait or verified captain-held transfer takes the FM_PAUSE_RESURFACE_SECS recheck below instead
+FM_PAUSE_RESURFACE_SECS=3600       # seconds before the watcher re-surfaces a declared external wait or verified captain-held transfer for a recheck, including a live busy pane past FM_BUSY_TURN_MAX_SECS; the away-mode daemon uses the same setting for a declared external wait or verified captain-held transfer, ageing its window against the crew's own latest status line rather than pane busy state
 FM_SECONDMATE_WAKE_STALL_SECS=60   # minimum age of the oldest valid foreign wake-queue row before an endpoint-recorded local secondmate produces one durable parent wake-loop-stall notification; zero or invalid values use 60
 FM_WEDGE_DEMAND_INSPECT_COUNT=3    # consecutive provably-working stale escalations on the same unchanged pane before demand-deep-inspection is added
 FM_WORKTREE_WRITE_PRUNE='.git node_modules .venv venv __pycache__ .mypy_cache .pytest_cache .ruff_cache .tox target dist build .next .cache vendor'   # directory names the wedge detector's task-worktree write probe skips; the default keeps .git out so a supervisor's own read-only git command can never look like crew progress; set it to the empty string to prune nothing, which widens the probe to the whole depth-bounded tree rather than disabling it
