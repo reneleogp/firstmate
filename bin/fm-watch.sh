@@ -148,24 +148,19 @@ SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trai
 # Busy state is decided by the semantic contract in bin/fm-busy-lib.sh, which
 # is the single owner of per-harness sources, source attribution, and the one
 # remaining rendered-text fallback (Grok only).
-# Always-on wake triage: most wakes during a long crew validation are benign (a
-# working: note or turn-end while a pipeline runs, a no-change heartbeat). Rather
-# than wake firstmate's LLM for each, this watcher classifies every wake in bash
-# and ABSORBS the benign majority - it advances the suppression marker, logs to a
-# debug log, and keeps blocking WITHOUT enqueuing or exiting. The no-verb signal
-# / stale path is absorb-only-when-provably-working: such a wake is absorbed ONLY
-# while the crew shows positive evidence it is still working (an actively-running
-# no-mistakes step, or a busy pane, via crew_is_provably_working over
-# fm-crew-state.sh); a crew that stopped its turn with no running pipeline and no
-# busy pane is SURFACED, so a finish reported only through interactive pane menus
-# (no done: status) is never swallowed. An ACTIONABLE wake (a captain-relevant
-# signal, a no-verb signal whose crew is not provably working, any check, a stale
-# pane whose crew is not provably working, a provably-working stale past the
-# threshold, or anything unknown) is written to the durable queue and exits, which
-# is what wakes the LLM through the background-task completion. The same classifier
+# Always-on wake triage absorbs routine transport notifications and no-change
+# heartbeats in bash: it advances the suppression marker, logs to a debug log, and
+# keeps blocking without enqueuing or exiting. A signal is actionable only when
+# newly unread status carries a captain-relevant verb or belongs to a secondmate's
+# parent-directed reply stream; bare turn completion and routine progress never
+# consult stale status or current-state proof. The independent stale-pane path
+# detects stopped or wedged workers and uses crew_is_provably_working over
+# fm-crew-state.sh before suppressing that current condition. Any actionable
+# signal, check, stale condition, heartbeat, or unknown wake is written to the
+# durable queue before this cycle exits. The same classifier
 # (fm-classify-lib.sh) backs the away-mode daemon; while state/.afk exists the
 # daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
-# wake) and never double-triages - and never runs the costly provably-working read.
+# wake) and never double-triages.
 STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
 # A busy pane is unconditional proof of liveness with no built-in duration bound,
 # so a hung foreground call can remain hidden even while its rendered busy

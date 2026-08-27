@@ -5,8 +5,8 @@
 # wake, so firstmate's LLM re-arms once per actionable event instead of once per
 # wake. These tests cover the classifier predicates as pure functions, then drive
 # a real fm-watch.sh subprocess to assert the behavioral contract:
-# provably-working no-verb wakes absorbed (no exit, no queue entry, suppressor
-# advanced, beacon fresh), stopped-crew no-verb wakes surfaced (queue + exit),
+# routine status and turn-completion notifications absorbed regardless of worker
+# state, newly unread captain-relevant and secondmate status surfaced, and
 # provably-working stale panes absorbed-then-escalated past the threshold,
 # terminal-looking stale status lines overridden by an active run, the heartbeat
 # backstop fail-safe, and afk coherence (no double-triage while the away-mode
@@ -43,9 +43,9 @@ ack_stopped_cycle() {  # <state>
 
 # Common watcher knobs: tight poll/grace, no check or heartbeat cadence unless a
 # test overrides them, so a test only exercises the path it targets. FM_CREW_STATE_BIN
-# points at the case's hermetic fake fm-crew-state.sh (installed by make_case) so the
-# absorb-only-when-provably-working triage reads a canned verdict; a test fixes that
-# verdict via FM_FAKE_CREW_STATE in its environment before calling watch_bg.
+# points at the case's hermetic fake fm-crew-state.sh (installed by make_case) so
+# stale-state tests can fix the current-state verdict via FM_FAKE_CREW_STATE before
+# calling watch_bg. Routine signal tests prove that verdict does not control triage.
 watch_bg() {  # <state> <fakebin> <out> [extra env assignments...]
   local state=$1 fakebin=$2 out=$3
   shift 3
@@ -146,7 +146,7 @@ seen_sig() {
 }
 
 # Prime <file>'s .seen-* suppressor to its CURRENT signature, so the per-poll
-# no-verb signal scan (which watches every *.turn-ended for a size:mtime change)
+# routine signal scan (which watches every *.turn-ended for a size:mtime change)
 # treats a just-created or just-backdated turn-ended marker as already seen.
 # Busy-turn-age fixtures create/backdate turn-ended directly (there is no real
 # harness touching it), so without this the marker's own first sighting would
@@ -285,12 +285,10 @@ EOF
   pass "classifier primitives: keyed decisions and activity phases, captain relevance, window-to-task, and overrides"
 }
 
-# crew_is_provably_working: the absorb-only-when-provably-working predicate. It is
-# benign (absorb) ONLY when fm-crew-state.sh reports the crew as working from an
-# actively-running pipeline step (source run-step) or a busy pane (source pane);
-# everything else - a stale working: status-log line, a finished/parked/failed run,
-# an unknown/torn-down crew, or an empty id - is NOT provable, so it surfaces. The
-# fake fm-crew-state.sh (FM_CREW_STATE_BIN) returns a canned verdict per case.
+# crew_is_provably_working is positive only when fm-crew-state.sh reports working
+# from an active pipeline step (source run-step) or a busy pane (source pane).
+# Stale-state triage uses this predicate; routine transport notifications do not.
+# The fake fm-crew-state.sh (FM_CREW_STATE_BIN) returns a canned verdict per case.
 test_crew_is_provably_working_classifier() {
   local dir fakebin
   dir=$(make_case provably-working); fakebin="$dir/fakebin"
@@ -548,9 +546,9 @@ SH
   pass "the worktree write probe is wall-clock bounded, and hitting the bound reads as no write evidence"
 }
 
-# signal_crew_provably_working: a no-verb "signal:" wake is benign ONLY when EVERY
-# task it references is provably working; if any crew has stopped, or no task can be
-# resolved, it surfaces. Files map to ids by stripping .status / .turn-ended.
+# signal_crew_provably_working classifies whether every task referenced by a file
+# list is provably working. Files map to ids by stripping .status / .turn-ended.
+# This helper's own contract is tested independently from normal signal triage.
 test_signal_crew_provably_working_classifier() {
   local dir fakebin state
   dir=$(make_case signal-provably-working); fakebin="$dir/fakebin"; state="$dir/state"
@@ -602,9 +600,8 @@ test_provably_working_signal_absorbed() {
   dir=$(make_case provably-working-signal); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
   status_file="$state/task.status"
   printf 'working: compiling step 2\n' > "$status_file"
-  # The crew's pipeline is in an actively-running step: positive evidence it is
-  # still working, so a no-verb working: signal is absorbed (the original low-churn
-  # case during a long validation).
+  # An actively running pipeline is the original low-churn case; the notification
+  # is routine and remains silent without relying on that current-state evidence.
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
@@ -623,8 +620,8 @@ test_turn_ended_provably_working_absorbed() {
   local dir state fakebin out pid
   dir=$(make_case turn-ended-working); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
   : > "$state/task.turn-ended"
-  # A busy pane is the second form of positive evidence (covers a queued
-  # continuation right after the turn-end).
+  # A busy pane covers a queued continuation after turn end, while the bare
+  # transport notification remains silent independently of that evidence.
   export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
@@ -2542,8 +2539,8 @@ SH
   chmod +x "$fakebin/wc"
   status_file="$state/task.status"
   printf 'working: compiling step 2\n' > "$status_file"
-  # Provably working so the no-verb signal is absorbed (which is what writes the
-  # triage log line under test).
+  # The routine signal is absorbed and writes the triage log line under test;
+  # the current-state fixture must not affect that result.
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_WATCH_TRIAGE_LOG_MAX_BYTES=1 "$WATCH" > "$out" &
@@ -2924,9 +2921,9 @@ test_afk_present_reverts_watcher_to_one_shot() {
   status_file="$state/task.status"
   printf 'working: routine note\n' > "$status_file"
   date '+%s' > "$state/.afk"   # away mode: the supervise-daemon owns triage
-  # Set a PROVABLY-WORKING verdict: if afk failed to bypass the provably-working
-  # check, this no-verb signal would be absorbed (not surfaced). The test asserting
-  # a surface therefore also proves afk reverts to one-shot and skips the costly read.
+  # Set a provably-working verdict as a negative control: away mode must still
+  # revert to one-shot delivery for daemon triage rather than applying normal-mode
+  # routine-notification absorption.
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
