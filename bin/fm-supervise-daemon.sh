@@ -999,7 +999,7 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 housekeeping() {  # <state>
   local state=$1 now due f key task win marker age last max_defer oldest pause_secs
   local pause_max backoff_file backoff_sig backoff_streak recheck_window worker_status worker_condition
-  local pause_items= pause_records= pause_item
+  local pause_items='' pause_records='' pause_item
   now=$(_now)
   migrate_watcher_pause_markers "$state"
   fm_pause_publish_recover "$state" || return 1
@@ -1111,11 +1111,15 @@ housekeeping() {  # <state>
         if [ -n "$last" ] && status_is_captain_held "$last"; then
           pause_item="captain-held ${age}s (awaiting the captain, answer the held decision or release the hold): $win"
           pause_items="$pause_items$pause_item"$'\n'
-          pause_records="$pause_records"'R'$(printf '\t')"$backoff_file"$(printf '\t')"$(( backoff_streak + 1 ))"$(printf '\t')"$backoff_sig"$(printf '\t')"$worker_condition"$(printf '\t')"$marker"$(printf '\t')"$now"$'\n'
+          printf -v pause_records '%sR\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$pause_records" "$backoff_file" "$(( backoff_streak + 1 ))" "$backoff_sig" \
+            "$worker_condition" "$marker" "$now"
         elif [ -n "$last" ] && status_is_paused "$last"; then
           pause_item="paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
           pause_items="$pause_items$pause_item"$'\n'
-          pause_records="$pause_records"'R'$(printf '\t')"$backoff_file"$(printf '\t')"$(( backoff_streak + 1 ))"$(printf '\t')"$backoff_sig"$(printf '\t')"$worker_condition"$(printf '\t')"$marker"$(printf '\t')"$now"$'\n'
+          printf -v pause_records '%sR\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$pause_records" "$backoff_file" "$(( backoff_streak + 1 ))" "$backoff_sig" \
+            "$worker_condition" "$marker" "$now"
         else
           rm -f "$marker" "$backoff_file"
         fi

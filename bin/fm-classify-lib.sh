@@ -225,7 +225,7 @@ EOF
 
   while IFS= read -r row; do
     [ -n "$row" ] || continue
-    type=${row%%$(printf '\t')*}
+    type=${row%%"$(printf '\t')"*}
     case "$type" in
       Q)
         IFS=$(printf '\t') read -r type target kind key reason <<EOF
@@ -252,6 +252,7 @@ EOF
           if [ "$status" -eq 0 ]; then
             epoch=$(date +%s)
             printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$target" "$kind" "$key" "$reason" >> "$queue" || status=$?
+            # shellcheck disable=SC2034 # Consumed by fm-watch.sh after recovery.
             [ "$status" -ne 0 ] || FM_PAUSE_PUBLISH_RECOVERED_REASON=$reason
           fi
         fi
@@ -259,7 +260,7 @@ EOF
         [ "$status" -eq 0 ] || return "$status"
         ;;
       I)
-        item=${row#*$(printf '\t')}
+        item=${row#*"$(printf '\t')"}
         [ -n "$item" ] || return 1
         if ! grep -Fqx "$item" "$state/.subsuper-escalations" 2>/dev/null; then
           [ -s "$state/.subsuper-escalations" ] || date +%s > "$state/.subsuper-escalations.since" || return 1
@@ -272,7 +273,7 @@ EOF
   done < <(tail -n +2 "$journal")
 
   while IFS= read -r row; do
-    [ "${row%%$(printf '\t')*}" = R ] || continue
+    [ "${row%%"$(printf '\t')"*}" = R ] || continue
     IFS=$(printf '\t') read -r type file streak sig condition marker marker_epoch <<EOF
 $row
 EOF
@@ -288,7 +289,10 @@ EOF
       case "$marker" in "$state"/.subsuper-paused-*) ;; *) return 1 ;; esac
       case "${marker#"$state"/}" in */*) return 1 ;; esac
       tmp="$marker.tmp.$$"
-      printf '%s\n' "$marker_epoch" > "$tmp" && mv -f "$tmp" "$marker" || { rm -f "$tmp"; return 1; }
+      if ! printf '%s\n' "$marker_epoch" > "$tmp" || ! mv -f "$tmp" "$marker"; then
+        rm -f "$tmp"
+        return 1
+      fi
     fi
   done < <(tail -n +2 "$journal")
   rm -f "$journal"
@@ -354,17 +358,17 @@ fm_pause_publish_buffer() {  # <state> <items> <record-rows>
   fi
   batch="buffer.$(date +%s).$$.${RANDOM:-0}"
   tmp="$journal.tmp.$$"
-  {
+  if ! {
     printf 'pause-publish-v2\t%s\n' "$batch"
     while IFS= read -r item; do [ -z "$item" ] || printf 'I\t%s\n' "$item"; done <<EOF
 $items
 EOF
     [ -z "$records" ] || printf '%s\n' "$records"
-  } > "$tmp" && mv -f "$tmp" "$journal" || {
+  } > "$tmp" || ! mv -f "$tmp" "$journal"; then
     rm -f "$tmp"
     fm_lock_release "$publish_lock"
     return 1
-  }
+  fi
   _fm_pause_publish_recover "$state" || status=$?
   fm_lock_release "$publish_lock"
   return "$status"
