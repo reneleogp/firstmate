@@ -1,0 +1,255 @@
+FM_TEST_BEGIN 2026-08-27T18:12:51Z tests/fm-afk-launch.test.sh family=real-herdr-gated expected_gate_skip=herdr
+ok - clear-stale: removes escalations buffer, sidecar, and wedge marker
+ok - clear-stale: leaves the durable wake-queue intact (no pending work dropped)
+ok - launcher paths: relative home and state ignore CDPATH before daemon command construction
+ok - launcher paths: absolute symlink spellings are preserved
+ok - launcher paths: unresolved relative FM_HOME fails loudly
+ok - launcher paths: unresolved relative FM_STATE_OVERRIDE fails loudly
+ok - refresh: daemon already alive - stale artifacts preserved (current session's buffer kept)
+ok - stop-ordering: daemon SIGTERM'd while .afk still present (flush is not a no-op)
+ok - stop-ordering: .afk cleared last
+ok - stop-ordering: daemon-terminal record removed
+ok - stop identity: stale lock cannot signal an unrelated live process
+ok - failed start: away flag and delivery artifacts roll back
+ok - concurrent start: one serialized daemon terminal remains tracked
+ok - launcher lock: incomplete publication receives initialization grace
+ok - launcher signal: TERM exits and releases the lifecycle lock
+fm-afk-launch: daemon launched in non-visible herdr workspace ws-partial (pane lab:pane-exact), supervising lab:captain
+ok - herdr create: malformed response recovers durable exact ownership
+fm-afk-launch: herdr create failed after returning exact ids; closing lab:pane-exact
+fm-afk-launch: recorded terminal teardown is unconfirmed; preserving exact id
+ok - herdr create error: unconfirmed exact id is persisted for reconciliation
+fm-afk-launch: failed to run daemon in herdr pane lab:pane-exact; closing it
+fm-afk-launch: recorded terminal teardown is unconfirmed; preserving exact id
+ok - herdr run failure: unconfirmed exact id remains reconcilable
+fm-afk-launch: failed to persist daemon terminal record; closing tmux:exact-session
+ok - record failure: newly created terminal is closed by exact id
+fm-afk-launch: daemon did not become ready; closing tmux:exact-session
+ok - readiness failure: exact terminal and durable record roll back
+fm-afk-launch: daemon did not become ready; closing tmux:exact-session
+fm-afk-launch: recorded terminal teardown is unconfirmed; preserving exact id
+ok - readiness failure: unconfirmed terminal retains its reconciliation id
+ok - tmux absence: clean missing differs from transport probe failure
+ok - Pi handoff: fresh entry waits for a newly published standdown receipt
+ok - failed handoff: fm_afk_launch_start restores prior-absent live-daemon state
+ok - failed handoff: fm_afk_launch_start restores prior-present live-daemon state
+ok - failed handoff: fm_afk_launch_start_native restores prior-absent live-daemon state
+ok - failed handoff: fm_afk_launch_start_native restores prior-present live-daemon state
+ok - native lifecycle: launcher owns state with no terminal
+ok - native lifecycle: uniform stop clears state without closing a terminal
+ok - native entry: launcher-prepared lifecycle state is not rewritten
+fm-afk-launch: reconciling leaked daemon terminal tmux:exact-session
+fm-afk-launch: recorded terminal teardown is unconfirmed; preserving exact id
+ok - teardown failure: exact terminal record is preserved
+ok - record publication: failed atomic rename preserves the complete prior record
+fm-afk-launch: daemon terminal record is malformed; refusing to act on it
+ok - record read: malformed record fails closed without acting on a partial id
+fm-afk-launch: daemon terminal record is malformed; refusing to act on it
+fm-afk-launch: malformed daemon terminal record; refusing to stop away mode
+ok - stop: malformed terminal record preserves away state and fails closed
+fm-afk-launch: failed to create detached tmux daemon session 'fm-afk-daemon-1201962595-209635-4453-1787854405'
+ok - tmux launch: planned exact target is recorded before creation and removed on failure
+fm-afk-launch: failed to create detached tmux daemon session 'fm-afk-daemon-2262025988-209666-31725-1787854405'
+ok - tmux launch: unique names eliminate collision teardown
+ok - stop validation: malformed record causes no daemon or state side effects
+ok - launcher lock: incomplete metadata fails acquisition and releases lock
+fm-afk-launch: failed to clear away-mode flag
+fm-afk-launch: away mode stopped; terminal teardown remains recorded for retry
+ok - stop state: away-flag removal failure is surfaced
+fm-afk-launch: away-mode daemon did not exit after SIGTERM; preserving lifecycle state
+ok - stop liveness: captured live daemon preserves lifecycle state after lock release
+fm-afk-launch: daemon terminal record is malformed; refusing to act on it
+fm-afk-launch: daemon terminal record is malformed; refusing to act on it
+ok - refresh record: malformed terminal identity fails closed
+fm-afk-launch: failed to clear stale away-mode artifacts
+ok - clear failure: native entry aborts and restores prior state
+fm-afk-launch: reconciling leaked daemon terminal tmux:exact-session
+fm-afk-launch: terminal close command failed, but exact absence was confirmed
+ok - confirmed absence: cleanup succeeds and removes the stale record
+fm-afk-launch: rollback restoration incomplete; backup retained at /tmp/fm-afk-restore-fail.Jdmh3e/state/.afk-launch-backup.BYgabS
+ok - rollback restore: incomplete restoration retains its recovery backup
+ok - flag failure: lifecycle aborts without active state
+ok - herdr e2e: captain tab pane count unchanged after start (no split)
+ok - herdr e2e: daemon launched in a separate non-visible workspace
+ok - herdr e2e: daemon pane is NOT in the captain's tab
+ok - herdr e2e: daemon terminal scoped to the lab session
+ok - herdr e2e: captain tab pane count restored after stop
+ok - herdr e2e: daemon workspace removed by exact id on stop
+ok - herdr e2e: record + .afk cleared on stop
+ok - tmux e2e: captain window pane count unchanged after start (no split-window)
+ok - tmux e2e: daemon launched in a separate detached session
+ok - tmux e2e: captain window pane count unchanged after stop
+ok - tmux e2e: daemon session killed by exact id on stop
+ok - tmux e2e: record + .afk cleared on stop
+FM_TEST_END 2026-08-27T18:13:27Z tests/fm-afk-launch.test.sh exit=0 duration_ms=36335 gate_skip=false
+FM_TEST_BEGIN 2026-08-27T18:13:27Z tests/fm-pi-watch-extension.test.sh family=watcher-wake-lock expected_gate_skip=none
+ok - Pi extension reports external healthy watcher output
+ok - Pi custom tool exposes repair-only metadata and returns automatic-continuation guidance
+ok - Pi redundant tool call returns ownership guidance and spawns no second child
+ok - Pi scheduled retry remains extension-owned after another tool call
+ok - Pi acknowledged late close is absorbed before model invocation
+ok - Pi away takeover retires an in-flight ordinary cycle and return restores exactly one
+ok - Pi actionable close starts one successor before wake delivery settles
+ok - Pi refused handling handshake is classified and not swallowed
+ok - Pi hung successor falls back to one typed actionable wake
+ok - Pi unretired successor falls back without an overlapping retry
+ok - Pi late unretired closes resume classified supervision
+ok - Pi clean empty close triggers a bounded continuity retry
+ok - Pi established clean closes stop at the configured retry limit
+ok - Pi close handler verifies session-lock ownership before successor launch
+ok - Pi watcher arm distinguishes all session lock ownership states
+ok - Pi session transitions use a generation owner across /new /resume /fork, stale callbacks, and quit
+ok - Pi process-exit cleanup listener remains singular across session replacement
+ok - Pi process-exit cleanup stops the attached arm child
+ok - OpenCode plugins have an explicit ESM boundary even under a typeless parent package
+ok - OpenCode watcher plugin uses the effective FM_HOME state
+ok - OpenCode watcher plugin sources the effective config
+ok - OpenCode watcher plugin requires session lock ownership
+ok - OpenCode watcher coordinator respects primary scope
+ok - OpenCode watcher plugin starts one successor before wake prompt delivery settles
+ok - OpenCode pre-ready actionable close preserves its successor
+ok - OpenCode hung successor falls back to one typed actionable wake
+ok - OpenCode unretired successor falls back without an overlapping retry
+ok - OpenCode late unretired closes resume classified supervision
+ok - OpenCode clean empty close triggers a bounded continuity retry
+ok - OpenCode established clean closes stop at the configured retry limit
+ok - OpenCode close handler verifies session-lock ownership before successor launch
+ok - OpenCode session replacement rejects stale callbacks and preserves continuity
+ok - OpenCode session replacement retries a stale childless launch
+ok - OpenCode watcher plugin coordinates with the turn-end guard
+ok - OpenCode healthy arm output does not suppress the turn-end guard
+FM_TEST_END 2026-08-27T18:13:42Z tests/fm-pi-watch-extension.test.sh exit=0 duration_ms=14240 gate_skip=false
+FM_TEST_BEGIN 2026-08-27T18:13:42Z tests/fm-watch-arm.test.sh family=watcher-wake-lock expected_gate_skip=none
+ok - watch-arm: an attached arm reports the wake its cycle delivered instead of a false failure
+ok - watch-arm: a delivered wake consumed by the handling turn still closes the attached arm cleanly
+ok - watch-arm: a cycle that delivered no wake of its own still fails loudly
+/home/reneg/.no-mistakes/worktrees/8f72a9d39da6/01M12259DS71RTTVVD7ANF6X66/bin/fm-watch-arm.sh: line 679: 219404 Killed                     "$WATCH" > "$child_out"
+WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 2 --recovery-generation 220049.1787854439.Sz8ToK
+ok - watch-arm: re-arm surfaces every queued wake and an open remote decision after downtime
+watcher: recovery state could not be persisted; retaining stale lock evidence
+ok - watch-arm: marker publication failure retains stale-lock recovery evidence
+WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 2 --recovery-generation 228015.1787854453.pPP9g9
+WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 3 --recovery-generation 229128.1787854455.SQd92V
+ok - watch-arm: a wake queued after handling drain is recovered once at successor arm
+ok - watch-arm: interrupted handling leaves its wake durable for successor re-drain
+WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 0 --recovery-generation 236619.1787854467.ZqNFPD
+ok - watch-arm: malformed recovery state is quarantined without a successor loop
+WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 1 --recovery-generation 238524.1787854470.t0z89A
+ok - watch-arm: publication after recovery handoff is surfaced
+ok - watch-arm: restart publishes recovery before clearing a reused-pid watcher lock
+WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 7 --recovery-generation 240518.1787854475.ALw1aA
+ok - watch-arm: markerless legacy queues are adopted and recovered
+ok - watch-arm: a watcher close during handling keeps the printed acknowledgement valid
+ok - watch-arm: a moved recovery generation consumes handled rows and names its remedy
+ok - watch-arm: intentional away retirement is silent while an unintended close still re-surfaces
+ok - watch-arm: downtime marker publication does not follow symlinks
+FM_TEST_END 2026-08-27T18:14:58Z tests/fm-watch-arm.test.sh exit=0 duration_ms=76519 gate_skip=false
+FM_TEST_BEGIN 2026-08-27T18:14:58Z tests/fm-watch-triage.test.sh family=watcher-wake-lock expected_gate_skip=none
+ok - signal_reason_is_actionable: benign absorbed, captain verbs and coalesced batches surfaced
+ok - stale_is_terminal: terminal status surfaces, non-terminal and no-status are benign
+ok - scan_captain_relevant_statuses lists only captain-relevant statuses
+ok - classifier primitives: keyed decisions and activity phases, captain relevance, window-to-task, and overrides
+ok - crew_is_provably_working: only working+run-step/pane is provable; idle/finished/parked/failed/unknown surface
+ok - status_is_paused: only the leading paused verb matches, paused is not captain-relevant, and the two declared-wait verbs stay separable
+ok - crew_absorb_class: working/paused/none from one read; crew_is_paused and crew_is_provably_working agree
+ok - crew_worktree_written_since: real writes are evidence; no worktree, no anchor, quiet trees, .git churn and a mate's own home are not
+ok - an empty FM_WORKTREE_WRITE_PRUNE widens the probe to the whole depth-bounded tree instead of disabling it
+ok - an empty FM_WORKTREE_WRITE_PRUNE exported into the environment prunes nothing, widening the probe
+ok - the worktree write probe is wall-clock bounded, and hitting the bound reads as no write evidence
+ok - signal_crew_provably_working: benign only when every referenced crew is provably working
+ok - a secondmate's status signal is never absorbed as provably working; crewmates are unaffected
+ok - a no-verb signal whose crew is provably working is absorbed (no exit, no queue, suppressor advanced, beacon present)
+ok - a bare turn-end whose crew is provably working (busy pane) is absorbed
+ok - a bare turn-end with no new captain-relevant status is absorbed before model invocation
+ok - a routine working note with no captain-relevant outcome is absorbed before model invocation
+ok - a secondmate's status note surfaces even while its own agent is busy
+ok - a self-announced close never wakes its own home, and the next real note still does
+ok - an unread captain-relevant status is surfaced even when a routine note follows
+ok - a stale pane sitting on a terminal status is surfaced (queue + exit)
+ok - a stale terminal-looking status is overridden and absorbed while a run is actively working, then wedge-escalated
+ok - provably-working non-terminal stale is absorbed on first sight, then wedge-escalated past the threshold
+ok - consecutive wedge escalations on the same pane accumulate and demand deep inspection at the threshold
+ok - a pane becoming active again resets the consecutive wedge-escalation counter
+ok - a busy worker below the turn-age bound remains working with no escalation
+ok - a busy worker with a stable pane hash still escalates once its completed-turn age reaches the bound
+ok - a busy worker whose pane hash changes every poll still escalates once its completed-turn age reaches the bound
+ok - touching a busy worker's completed-turn marker resets the age and prevents an old-age escalation
+ok - repeated busy turn-age escalations reuse the existing escalation counter and demand deep inspection at the threshold
+ok - the production default busy-turn-age bound is 3600s (5min under does not wedge, 66min over does)
+ok - a busy pane under a declared pause is rechecked on the long cadence, and lifting the pause restores the wedge escalation
+ok - a not-provably-working non-terminal stale is surfaced immediately (never left to wait out the timer)
+ok - a declared pause is absorbed on first sight, then re-surfaced as a recheck past the threshold, never wedge-escalated
+ok - the shared recheck cadence doubles per unchanged recheck, caps, and resets on changed evidence
+ok - consecutive unchanged declared-wait rechecks back off to the configured cap instead of repeating on the base cadence
+ok - a changed wait resets the recheck cadence immediately and a finished wait retires its cadence state
+ok - sibling declared waits that come due together are batched into one wake naming each of them
+ok - an unrelated stopped crew wakes immediately while a due recheck waits for the next pass, with nothing half-published
+ok - an interrupted recheck publication is finished exactly once on restart, without re-delivering or losing the wait
+ok - an acknowledged recheck publication advances records without re-enqueueing
+ok - a failed recheck record application retains the publication journal
+ok - exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once
+ok - a declared paused secondmate re-surfaces on the bounded normal-mode cadence
+ok - a captain-held secondmate re-surfaces on the bounded normal-mode cadence
+ok - a non-paused secondmate retains normal stale suppression
+ok - a resumed secondmate clears pause and stale tracking before stale exemption
+ok - unchanged stale hashes reclassify when a crew enters or leaves pause
+ok - a declared pause is periodically rechecked against authoritative active-run state
+ok - a paused status overridden by authoritative working preserves its wedge timer and escalates
+ok - matching non-terminal stale suppressors repair missing or corrupt stale-since timers
+ok - a quiet pane writing its own worktree is deferred, while one writing nothing still wedge-escalates on the unchanged schedule
+ok - a write deferral re-surfaces once on the bounded pause cadence, so a churning worktree cannot stay invisible
+ok - a secondmate's own home supervision churn is not crew write evidence, so a pane recording that home keeps the unchanged escalation schedule
+ok - an idle-window timer repair drops a finished write-deferral chain, so the next deferral gets a fresh re-surface window
+ok - both first-sight paths through a captain-relevant status drop a finished write-deferral chain with the idle window
+ok - triage log capping handles wc byte counts with leading spaces
+ok - a captured process-event result wakes a healthy watcher proactively, with no manual drain
+ok - an unacknowledged process-event result re-drains until handling is acknowledged
+ok - complete process-event queue keys map to distinct seen markers
+WAKE_ACK_REQUIRED: after handling completes run bin/fm-wake-drain.sh --ack-through 1 --recovery-generation 366045.1787854748.mcHAyi
+ok - queue revalidation, proactive output, and marker commit serialize with drain
+/home/reneg/.no-mistakes/worktrees/8f72a9d39da6/01M12259DS71RTTVVD7ANF6X66/bin/fm-push-transition-lib.sh: line 136: echo: write error: Broken pipe
+tests/wake-helpers.sh: line 286: 368464 Killed                     PATH="$dir/fakebin:$PATH" FM_HOME="$dir" FM_PROCEVENT_CLAIM_ROOT="$dir/claims" FM_CREW_STATE_BIN="$dir/fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out"
+tests/wake-helpers.sh: line 286: 369404 Killed                     PATH="$dir/fakebin:$PATH" FM_HOME="$dir" FM_PROCEVENT_CLAIM_ROOT="$dir/claims" FM_CREW_STATE_BIN="$dir/fakebin/fm-crew-state.sh" FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out"
+ok - surfacing failures replay until post-handling acknowledgement
+ok - marker failure exits through the shared wake owner, releases its lock, and replays later
+ok - a heartbeat with no captain-relevant change is absorbed and backs off the cadence
+ok - heartbeat backstop fail-safe surfaces a captain-relevant status the per-wake path missed
+ok - the liveness beacon stays fresh while the watcher absorbs benign wakes (fm-guard never false-alarms)
+ok - with .afk present the watcher reverts to one-shot so the daemon owns triage (no double-triage)
+ok - AFK changed paused panes hand off plain stale identities for daemon-owned pause triage
+FM_TEST_END 2026-08-27T18:19:39Z tests/fm-watch-triage.test.sh exit=0 duration_ms=280559 gate_skip=false
+FM_TEST_BEGIN 2026-08-27T18:19:39Z tests/fm-telegram-mirror.test.py family=unclassified expected_gate_skip=none
+tests/fm-telegram-mirror.test.py: line 7: Focused acceptance tests for bin/fm-telegram.py, the WSL Telegram mirror bot.
+
+Each test drives the real bot process end to end: a fake Telegram Bot API over
+loopback HTTP, a fake Pi extension over the bot's own Unix socket, and a fake
+local Parakeet command. Nothing here inspects the bot's source.
+: No such file or directory
+tests/fm-telegram-mirror.test.py: line 9: from: command not found
+tests/fm-telegram-mirror.test.py: line 11: import: command not found
+tests/fm-telegram-mirror.test.py: line 12: import: command not found
+tests/fm-telegram-mirror.test.py: line 13: import: command not found
+tests/fm-telegram-mirror.test.py: line 14: import: command not found
+tests/fm-telegram-mirror.test.py: line 15: import: command not found
+tests/fm-telegram-mirror.test.py: line 16: import: command not found
+tests/fm-telegram-mirror.test.py: line 17: import: command not found
+tests/fm-telegram-mirror.test.py: line 18: import: command not found
+tests/fm-telegram-mirror.test.py: line 19: import: command not found
+tests/fm-telegram-mirror.test.py: line 20: import: command not found
+tests/fm-telegram-mirror.test.py: line 21: import: command not found
+tests/fm-telegram-mirror.test.py: line 22: import: command not found
+tests/fm-telegram-mirror.test.py: line 23: from: command not found
+tests/fm-telegram-mirror.test.py: line 24: from: command not found
+tests/fm-telegram-mirror.test.py: line 25: from: command not found
+tests/fm-telegram-mirror.test.py: line 27: syntax error near unexpected token `('
+tests/fm-telegram-mirror.test.py: line 27: `ROOT = Path(__file__).resolve().parents[1]'
+FM_TEST_END 2026-08-27T18:19:39Z tests/fm-telegram-mirror.test.py exit=2 duration_ms=27 gate_skip=false
+FM_TEST_SUMMARY total=5 failed=1 skipped_gate=0 duration_ms=407898
+FM_TEST_SUMMARY_FAMILY family=real-herdr-gated count=1 duration_ms=36335 failed=0
+FM_TEST_SUMMARY_FAMILY family=unclassified count=1 duration_ms=27 failed=1
+FM_TEST_SUMMARY_FAMILY family=watcher-wake-lock count=3 duration_ms=371318 failed=0
+FM_TEST_SLOWEST rank=1 script=tests/fm-watch-triage.test.sh duration_ms=280559
+FM_TEST_SLOWEST rank=2 script=tests/fm-watch-arm.test.sh duration_ms=76519
+FM_TEST_SLOWEST rank=3 script=tests/fm-afk-launch.test.sh duration_ms=36335
+FM_TEST_SLOWEST rank=4 script=tests/fm-pi-watch-extension.test.sh duration_ms=14240
+FM_TEST_SLOWEST rank=5 script=tests/fm-telegram-mirror.test.py duration_ms=27

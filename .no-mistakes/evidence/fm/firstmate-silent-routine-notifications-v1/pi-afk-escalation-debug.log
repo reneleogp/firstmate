@@ -1,0 +1,91 @@
+fm-afk-launch: daemon launched in non-visible herdr workspace w2 (pane fm-lab-fm-afk-pi-return-433555-15048:w2:p1), supervising fm-lab-fm-afk-pi-return-433555-15048:w1:p1
+ok - real Pi/Herdr pending composer refuses injection without forced submit and raises one observable fallback
+DEBUG agent: {"id":"cli:agent:get","result":{"agent":{"agent":"pi","agent_status":"idle","cwd":"/tmp/fm-afk-pi-return-e2e.GvEorc/project","focused":true,"foreground_cwd":"/tmp/fm-afk-pi-return-e2e.GvEorc/project","pane_id":"w1:p1","revision":2,"state_change_seq":1,"tab_id":"w1:t1","terminal_id":"term_65a0b6ff924c31","terminal_title":"π - project","terminal_title_stripped":"π - project","workspace_id":"w1"},"type":"agent_info"}}
+DEBUG pane: exec env PI_CODING_AGENT_DIR=/tmp/fm-afk-pi-return-e2
+e.GvEorc/pi-agent FM_HOME=/tmp/fm-afk-pi-return-e2e.G
+vEorc/home FM_PI_CAPTURE_PATH=/tmp/fm-afk-pi-return-e
+2e.GvEorc/pi-prompts.jsonl pi -e /tmp/fm-afk-pi-retur
+n-e2e.GvEorc/capture-extension.ts --no-context-files
+--no-session
+reneg@CPC-trene-ODMQU:/tmp/fm-afk-pi-return-e2e.GvEor
+c/project$ exec env PI_CODING_AGENT_DIR=/tmp/fm-afk-p
+i-return-e2e.GvEorc/pi-agent FM_HOME=/tmp/fm-afk-pi-r
+eturn-e2e.GvEorc/home FM_PI_CAPTURE_PATH=/tmp/fm-afk-
+pi-return-e2e.GvEorc/pi-prompts.jsonl pi -e /tmp/fm-a
+fk-pi-return-e2e.GvEorc/capture-extension.ts --no-con
+text-files --no-session
+
+ pi v0.84.3
+ escape interrupt · ctrl+c/ctrl+d clear/exit · /
+ commands · ! bash · ctrl+o more
+ Press ctrl+o to show full startup help and loaded
+ resources.
+
+ Pi can explain its own features and look up its
+ docs. Ask it how to use or extend Pi.
+
+[Skills]
+  ask-matt, domain-modeling, grill-with-docs,
+grilling, handoff, no-mistakes, prototype, research,
+setup-matt-pocock-skills, to-spec, to-tickets,
+wayfinder, wf-charting, wfdash
+
+[Extensions]
+  capture-extension.ts
+
+
+ Warning: No models available. Use /login to log
+ into a provider via OAuth or API key. See:
+
+ /home/reneg/.npm-global/lib/node_modules/@earendil-
+ works/pi-coding-agent/docs/providers.md
+
+ /home/reneg/.npm-global/lib/node_modules/@earendil-
+ works/pi-coding-agent/docs/models.md
+
+ Error: No API key found for the selected model.
+
+ Use /login to log into a provider via OAuth or API
+ key. See:
+
+ /home/reneg/.npm-global/lib/node_modules/@earendil-
+ works/pi-coding-agent/docs/providers.md
+
+ /home/reneg/.npm-global/lib/node_modules/@earendil-
+ works/pi-coding-agent/docs/models.md
+
+─────────────────────────────────────────────────────
+
+─────────────────────────────────────────────────────
+/tmp/fm-afk-pi-return-e2e.GvEorc/project
+0.0%/0 (auto)                                 unknown
+DEBUG daemon: reneg@CPC-trene-ODMQU:/tmp/fm-afk-pi-return-e2e.GvEorc
+/home$ exec env FM_HOME=/tmp/fm-afk-pi-return-e2e.GvEo
+rc/home FM_SUPERVISOR_TARGET=fm-lab-fm-afk-pi-return-4
+33555-15048:w1:p1 FM_SUPERVISOR_BACKEND=herdr /tmp/fm-
+afk-pi-return-e2e.GvEorc/daemon-entry
+afk: starting supervise daemon in foreground; keep thi
+s command as a tracked background session
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━
+●  WATCHER DOWN - SUPERVISION IS OFF
+●  1 task(s) in flight, but no live watcher process ho
+lds this home lock (last beat: 4s ago).
+●  Trust the emitted supervision protocol for this har
+ness; do not use shell & for watcher repair.
+●  This is a supervision warning only; the guarded ope
+ration WILL still run.
+●  Away mode owns watcher supervision; load /afk and e
+nsure the daemon is running instead of starting normal
+ supervision directly.
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━
+WARNING: queued wakes pending - drain them with bin/fm
+-wake-drain.sh before anything else.
+WARNING: watcher still down (same stale episode; last
+beat: 2s ago, grace 300s) - full banner already printe
+d this episode.
+WARNING: queued wakes pending - drain them with bin/fm
+-wake-drain.sh before anything else.
+DEBUG composer=empty buffer=
+not ok - real Pi did not receive the buffered escalation after becoming safely idle

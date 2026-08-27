@@ -1,0 +1,5 @@
+ok - real Pi/Herdr pending composer refuses injection without forced submit and raises one observable fallback
+ok - real idle Pi/Herdr accepts one marked escalation promptly, verifies submit, clears wedge state, and emits no duplicate alert
+ok - real unmarked Pi return opens catch-up and blocks Bearings before the unresolved blocker can be deferred
+ok - resolved return catch-up allows Bearings and a clean idempotent away re-entry
+evidence: herdr=herdr 0.8.0 pi=0.84.3 target=fm-lab-fm-afk-pi-return-533978-30777:w1:p1 inject-hex-prefix=e281a3 notifier-count=1

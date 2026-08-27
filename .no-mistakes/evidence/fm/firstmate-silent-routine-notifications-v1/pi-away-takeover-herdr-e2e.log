@@ -1,0 +1,3 @@
+ok - real Pi ordinary supervision retires before the away daemon becomes sole owner
+ok - real Pi away return restores exactly one ordinary cycle with no replayed turn
+evidence: herdr-session=fm-lab-firstmate-silent-380333-28437 pi=0.84.3 ordinary=380591 away=381437 returned=382044

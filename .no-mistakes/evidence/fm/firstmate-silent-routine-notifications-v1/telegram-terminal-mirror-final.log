@@ -1,0 +1,7 @@
+test_terminal_and_reply_mirroring_follows_mirror_mode (__main__.MirrorTestCase.test_terminal_and_reply_mirroring_follows_mirror_mode) ... ok
+test_a_second_session_cannot_take_over_or_leak_into_the_chat (__main__.MirrorTestCase.test_a_second_session_cannot_take_over_or_leak_into_the_chat) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 3.563s
+
+OK
