@@ -39,6 +39,10 @@
 # Supported backends: herdr, tmux. Others (zellij, orca, cmux) have no verified
 # non-visible-launch primitive here yet and refuse loudly.
 #
+# Pi ownership handoff: after state/.afk is written and before the daemon starts,
+# a live current Pi extension must publish state/.pi-watch-away-standdown after
+# retiring its ordinary arm child. A bounded missing receipt aborts launch and
+# rollback clears .afk, which lets the extension restore one ordinary cycle.
 # Test seam: FM_AFK_LAUNCH_ENTRY overrides the command run in the created
 # terminal (default bin/fm-afk-start.sh), so a topology test can run a harmless
 # placeholder instead of a real daemon. FM_SUPERVISOR_TARGET/FM_SUPERVISOR_BACKEND
@@ -88,6 +92,48 @@ FM_AFK_LAUNCH_WS_LABEL="firstmate-afk-daemon"
 set +e
 
 fm_afk_launch_log() { printf 'fm-afk-launch: %s\n' "$*" >&2; }
+
+FM_AFK_PI_HANDOFF_TIMEOUT=${FM_PI_AWAY_HANDOFF_TIMEOUT:-5}
+case "$FM_AFK_PI_HANDOFF_TIMEOUT" in ''|*[!0-9]*|0) FM_AFK_PI_HANDOFF_TIMEOUT=5 ;; esac
+
+fm_afk_launch_wait_pi_handoff() {
+  local receipt marker lock expected_version expected_pid marker_version marker_pid receipt_version receipt_pid receipt_generation deadline
+  receipt="$FM_AFK_LAUNCH_STATE/.pi-watch-away-standdown"
+  marker="$FM_AFK_LAUNCH_STATE/.pi-watch-extension-loaded"
+  lock="$FM_AFK_LAUNCH_STATE/.lock"
+  marker_version=$(sed -n '1p' "$marker" 2>/dev/null)
+  marker_pid=$(sed -n '2p' "$marker" 2>/dev/null)
+  expected_pid=$(sed -n '1p' "$lock" 2>/dev/null)
+  if ! command -v fm_pi_extension_owns_supervision >/dev/null 2>&1 \
+    || ! fm_pi_extension_owns_supervision "$FM_AFK_LAUNCH_STATE" "$FM_ROOT"; then
+    rm -f "$receipt" 2>/dev/null || true
+    if [ -n "$marker_pid" ] && [ "$marker_pid" = "$expected_pid" ] && fm_pid_alive "$marker_pid"; then
+      fm_afk_launch_log "live Pi session has an outdated or incomplete supervision extension; restart Pi before entering away mode"
+      return 1
+    fi
+    return 0
+  fi
+  expected_version=$marker_version
+  [ -n "$expected_version" ] && [ -n "$expected_pid" ] || return 1
+  deadline=$(( $(date +%s) + FM_AFK_PI_HANDOFF_TIMEOUT + 1 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    receipt_version=$(sed -n '1p' "$receipt" 2>/dev/null)
+    receipt_pid=$(sed -n '2p' "$receipt" 2>/dev/null)
+    receipt_generation=$(sed -n '3p' "$receipt" 2>/dev/null)
+    if [ "$receipt_version" = "$expected_version" ] \
+      && [ "$receipt_pid" = "$expected_pid" ] \
+      && [ -n "$receipt_generation" ]; then
+      return 0
+    fi
+    if ! fm_pid_alive "$expected_pid"; then
+      rm -f "$receipt" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.05
+  done
+  fm_afk_launch_log "live Pi extension did not confirm ordinary supervision standdown within ${FM_AFK_PI_HANDOFF_TIMEOUT}s"
+  return 1
+}
 
 fm_afk_launch_lock_owned() {
   local pid expected actual
@@ -478,6 +524,7 @@ fm_afk_launch_start() {
       fm_afk_launch_log "failed to refresh away-mode flag"
       return 1
     fi
+    fm_afk_launch_wait_pi_handoff || return 1
     fm_afk_launch_log "daemon already running; refreshed away-mode flag (no new terminal)"
     return 0
   fi
@@ -510,6 +557,10 @@ fm_afk_launch_start() {
   fi
 
   if [ "$result" -eq 0 ]; then
+    fm_afk_launch_wait_pi_handoff || result=1
+  fi
+
+  if [ "$result" -eq 0 ]; then
     case "$captain_backend" in
       herdr) fm_afk_launch_create_herdr "$captain_target" "$captain_backend"; result=$? ;;
       tmux)  fm_afk_launch_create_tmux "$captain_target" "$captain_backend"; result=$? ;;
@@ -537,6 +588,7 @@ fm_afk_launch_start_native() {
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
     fm_afk_launch_flag_write || return 1
+    fm_afk_launch_wait_pi_handoff || return 1
     fm_afk_launch_log "daemon already running; refreshed away-mode flag"
     return 0
   fi
@@ -558,6 +610,9 @@ fm_afk_launch_start_native() {
     elif ! fm_afk_launch_flag_write; then
       result=1
     fi
+  fi
+  if [ "$result" -eq 0 ]; then
+    fm_afk_launch_wait_pi_handoff || result=1
   fi
   if [ "$result" -eq 0 ]; then
     fm_afk_launch_record_write none - native || result=1

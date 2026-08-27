@@ -595,7 +595,7 @@ test_secondmate_status_signal_never_absorbed_classifier() {
   pass "a secondmate's status signal is never absorbed as provably working; crewmates are unaffected"
 }
 
-# --- benign wakes are absorbed ONLY when the crew is provably working ---------
+# --- no-action status and turn-completion notifications stay model-silent -----
 
 test_provably_working_signal_absorbed() {
   local dir state fakebin out status_file pid
@@ -637,46 +637,43 @@ test_turn_ended_provably_working_absorbed() {
   pass "a bare turn-end whose crew is provably working (busy pane) is absorbed"
 }
 
-# --- a no-verb signal whose crew is NOT provably working SURFACES -------------
-# This is the swallowed-finish fix: a crew that finished (or stopped and waits)
-# reports its final turn-end with no captain-relevant status and no running
-# pipeline, so the wake must surface instead of being absorbed.
+# A bare turn completion is only a transport notification.
+# Without newly unread captain-relevant status, it must not spend a model turn;
+# the independent stale-pane path still detects a worker that actually stopped.
 
-test_turn_ended_not_working_surfaced() {
-  local dir state fakebin out drain_out pid
-  dir=$(make_case turn-ended-stopped); state="$dir/state"; fakebin="$dir/fakebin"
-  out="$dir/watch.out"; drain_out="$dir/drain.out"
+test_turn_ended_not_working_absorbed() {
+  local dir state fakebin out pid
+  dir=$(make_case turn-ended-stopped); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
   : > "$state/task.turn-ended"
-  # No running pipeline, no busy pane: the crew has stopped (e.g. it finished via
-  # an interactive menu and wrote no done: status). Default unknown verdict.
   export FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
-  wait_for_exit "$pid" 100 || fail "watcher did not surface a turn-end whose crew is not provably working"
-  grep -F "signal: $state/task.turn-ended" "$out" >/dev/null || fail "watcher did not print the surfaced turn-end signal"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the surfaced turn-end failed"
-  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$state/task.turn-ended" >/dev/null || fail "surfaced turn-end was not queued"
-  pass "a bare turn-end whose crew is not provably working is surfaced (the swallowed-finish fix)"
+  if ! wait_poll_cycle "$state" "$pid"; then
+    reap "$pid"; fail "watcher exited for a turn-end with no new captain-relevant status: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "no-status turn-end printed a wake reason: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "no-status turn-end enqueued a durable wake record"
+  [ -s "$state/.seen-task_turn-ended" ] || fail "absorbed turn-end did not advance its exact suppressor"
+  reap "$pid"
+  pass "a bare turn-end with no new captain-relevant status is absorbed before model invocation"
 }
 
-test_working_note_not_working_surfaced() {
-  local dir state fakebin out drain_out status_file pid
-  dir=$(make_case working-note-stopped); state="$dir/state"; fakebin="$dir/fakebin"
-  out="$dir/watch.out"; drain_out="$dir/drain.out"
+test_working_note_not_working_absorbed() {
+  local dir state fakebin out status_file pid
+  dir=$(make_case working-note-stopped); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
   status_file="$state/task.status"
   printf 'working: compiling step 2\n' > "$status_file"
-  # A non-no-mistakes crew (no run) whose pane went idle: fm-crew-state falls back
-  # to the stale working: status-log line. That is NOT positive evidence, so the
-  # wake must surface - these users must never be left hanging.
   export FM_FAKE_CREW_STATE='state: working · source: status-log · working: compiling step 2'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
-  wait_for_exit "$pid" 100 || fail "watcher did not surface a working: note whose crew has no running pipeline and an idle pane"
-  grep -F "signal: $status_file" "$out" >/dev/null || fail "watcher did not print the surfaced working: signal"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the surfaced working: note failed"
-  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "surfaced working: note was not queued"
-  [ -s "$state/.seen-task_status" ] || fail "surfaced working: note did not advance its .seen-* suppressor"
-  pass "a no-verb working: note whose crew is idle with no running pipeline is surfaced"
+  if ! wait_poll_cycle "$state" "$pid"; then
+    reap "$pid"; fail "watcher exited for a routine working note with no captain-relevant outcome: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "routine working note printed a wake reason: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "routine working note enqueued a durable wake record"
+  [ -s "$state/.seen-task_status" ] || fail "absorbed working note did not advance its exact suppressor"
+  reap "$pid"
+  pass "a routine working note with no captain-relevant outcome is absorbed before model invocation"
 }
 
 test_secondmate_status_note_surfaced_despite_busy_agent() {
@@ -2993,8 +2990,8 @@ test_signal_crew_provably_working_classifier
 test_secondmate_status_signal_never_absorbed_classifier
 test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
-test_turn_ended_not_working_surfaced
-test_working_note_not_working_surfaced
+test_turn_ended_not_working_absorbed
+test_working_note_not_working_absorbed
 test_secondmate_status_note_surfaced_despite_busy_agent
 test_self_announced_close_does_not_rewake_but_next_note_does
 test_actionable_signal_surfaced

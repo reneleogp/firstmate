@@ -194,42 +194,44 @@ async function sendPrompt(paths, client, sessionID, text) {
   });
 }
 
-function confirmHandlingDelivery(paths, recovery) {
+function confirmHandlingDelivery(paths, recovery, reason) {
   try {
     const result = spawnSync(
       "bash",
-      [`${paths.root}/bin/fm-watch-arm.sh`, "--handling-delivered", recovery.generation, "--watcher-pid", recovery.watcherPid],
+      [`${paths.root}/bin/fm-watch-arm.sh`, "--handling-delivered", recovery.generation, "--watcher-pid", recovery.watcherPid, "--reason", reason],
       {
         cwd: paths.root,
         encoding: "utf8",
         env: { ...process.env, FM_HOME: paths.home, FM_STATE_OVERRIDE: paths.state, FM_ROOT_OVERRIDE: paths.root },
       },
     );
-    if (result.status === 0) return { ok: true, detail: "" };
+    if (result.status === 0) return { disposition: "pending", detail: "" };
+    if (result.status === 3) return { disposition: "superseded", detail: "" };
     const stderr = String(result.stderr || "").trim();
     return {
-      ok: false,
+      disposition: "failure",
       detail: `watcher: FAILED - handling delivery confirmation was rejected (status=${result.status ?? "none"} generation=${recovery.generation} watcherPid=${recovery.watcherPid})${stderr ? `\n${stderr}` : ""}`,
     };
   } catch (error) {
     return {
-      ok: false,
+      disposition: "failure",
       detail: `watcher: FAILED - handling delivery confirmation could not be executed (generation=${recovery.generation} watcherPid=${recovery.watcherPid})\n${String(error?.message ?? error)}`,
     };
   }
 }
 
-function confirmHandlingDeliveryWithRetry(paths, recovery) {
+function confirmHandlingDeliveryWithRetry(paths, recovery, reason) {
   const snapshot = () => armRecovery.get(child) ?? recovery;
-  const first = confirmHandlingDelivery(paths, snapshot());
-  if (first.ok) return first;
-  return confirmHandlingDelivery(paths, snapshot());
+  const first = confirmHandlingDelivery(paths, snapshot(), reason);
+  if (first.disposition !== "failure") return first;
+  return confirmHandlingDelivery(paths, snapshot(), reason);
 }
 
-async function deliverActionableWake(paths, client, sessionID, message, recovery) {
+async function deliverActionableWake(paths, client, sessionID, message, recovery, pendingReason = message) {
   if (recovery) {
-    const confirmed = confirmHandlingDeliveryWithRetry(paths, recovery);
-    if (!confirmed.ok) {
+    const confirmed = confirmHandlingDeliveryWithRetry(paths, recovery, pendingReason);
+    if (confirmed.disposition === "superseded") return;
+    if (confirmed.disposition === "failure") {
       if (recovery.watcherPid) {
         try {
           process.kill(Number(recovery.watcherPid), 0);
@@ -401,7 +403,7 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
       void restoration.then(async (result) => {
         try {
           const message = result.failure ? `${classification.message}\n\n${result.failure}` : classification.message;
-          await deliverActionableWake(paths, client, sessionID, message, result.recovery);
+          await deliverActionableWake(paths, client, sessionID, message, result.recovery, classification.message);
         } finally {
           if (restorationInFlight === restoration) restorationInFlight = null;
         }

@@ -53,7 +53,16 @@
 #
 # --restart: stop ONLY this FM_HOME's watcher (the pid recorded in THIS home's
 # state/.watch.lock) and own a fresh cycle, or attach if a verified live peer
-# wins the singleton while the duplicate child stands down. It
+# wins the singleton while the duplicate child stands down.
+# --handling-delivered confirms that the exact successor watcher and recovery
+# generation still own delivery and that a queue row with the exact reason is
+# still pending. Exit 3 means the row was already acknowledged, so a persistent
+# adapter must absorb the late callback without starting a model turn.
+# --retire-away is the authenticated Pi producer transition: only the current
+# extension process may mark and stop its exact healthy watcher while .afk exists.
+# The watcher's cleanup consumes that marker and releases its singleton without
+# publishing downtime, so intentional handoff cannot produce rearm-resurface.
+# It
 # resolves and signals exactly that pid, so it can never touch another home's
 # watcher. NEVER `pkill -f
 # bin/fm-watch.sh`: that pattern matches every firstmate home's watcher
@@ -385,6 +394,10 @@ handling_successor_generation() {
 mode=arm
 handling_generation=
 handling_watcher_pid=
+handling_reason=
+away_generation=
+away_extension_pid=
+away_arm_pid=
 case "${1:-}" in
   ''|arm|--arm) mode=arm ;;
   --restart) mode=restart ;;
@@ -393,18 +406,81 @@ case "${1:-}" in
     handling_generation=${2:-}
     [ "${3:-}" = --watcher-pid ] || { echo "watcher: invalid handling delivery confirmation" >&2; exit 2; }
     handling_watcher_pid=${4:-}
+    [ "${5:-}" = --reason ] || { echo "watcher: missing handling delivery reason" >&2; exit 2; }
+    handling_reason=${6:-}
     case "$handling_generation" in ''|*[!A-Za-z0-9._-]*) echo "watcher: invalid recovery generation" >&2; exit 2 ;; esac
     case "$handling_watcher_pid" in ''|*[!0-9]*) echo "watcher: invalid successor watcher pid" >&2; exit 2 ;; esac
-    [ "$#" -eq 4 ] || { echo "watcher: unexpected handling delivery arguments" >&2; exit 2; }
+    [ -n "$handling_reason" ] || { echo "watcher: empty handling delivery reason" >&2; exit 2; }
+    [ "$#" -eq 6 ] || { echo "watcher: unexpected handling delivery arguments" >&2; exit 2; }
     ;;
-  *) echo "usage: $(basename "$0") [--restart | --handling-delivered GENERATION --watcher-pid PID]" >&2; exit 2 ;;
+  --retire-away)
+    mode=retire-away
+    away_generation=${2:-}
+    [ "${3:-}" = --extension-pid ] || { echo "watcher: invalid away retirement extension identity" >&2; exit 2; }
+    away_extension_pid=${4:-}
+    [ "${5:-}" = --arm-pid ] || { echo "watcher: invalid away retirement arm identity" >&2; exit 2; }
+    away_arm_pid=${6:-}
+    case "$away_generation" in ''|*[!A-Za-z0-9._-]*) echo "watcher: invalid away retirement generation" >&2; exit 2 ;; esac
+    case "$away_extension_pid" in ''|*[!0-9]*) echo "watcher: invalid away retirement extension pid" >&2; exit 2 ;; esac
+    case "$away_arm_pid" in ''|*[!0-9]*) echo "watcher: invalid away retirement arm pid" >&2; exit 2 ;; esac
+    [ "$#" -eq 6 ] || { echo "watcher: unexpected away retirement arguments" >&2; exit 2; }
+    ;;
+  *) echo "usage: $(basename "$0") [--restart | --handling-delivered GENERATION --watcher-pid PID --reason REASON | --retire-away GENERATION --extension-pid PID --arm-pid PID]" >&2; exit 2 ;;
 esac
+
+if [ "$mode" = retire-away ]; then
+  away_marker="$STATE/.pi-watch-away-retire"
+  expected_version=$(fm_pi_extension_version "$FM_ROOT/.pi/extensions/fm-primary-pi-watch.ts") || exit 1
+  [ -e "$STATE/.afk" ] \
+    && fm_pi_extension_loaded "$STATE/.pi-watch-extension-loaded" "$expected_version" "$STATE/.lock" \
+    && [ "$(sed -n '1p' "$STATE/.lock" 2>/dev/null)" = "$away_extension_pid" ] \
+    && fm_pid_alive "$away_extension_pid" \
+    && fm_pid_alive "$away_arm_pid" \
+    || exit 1
+  if ! healthy_watcher; then
+    wait_for_healthy_successor || exit 1
+  fi
+  watcher_parent=$(ps -o ppid= -p "$HEALTHY_PID" 2>/dev/null | tr -d '[:space:]')
+  [ "$watcher_parent" = "$away_arm_pid" ] || exit 1
+  away_tmp=$(mktemp "$STATE/.pi-watch-away-retire.tmp.XXXXXX") || exit 1
+  if ! {
+    printf '%s\n' "$expected_version"
+    printf '%s\n' "$away_extension_pid"
+    printf '%s\n' "$away_generation"
+    printf '%s\n' "$HEALTHY_PID"
+  } > "$away_tmp" || ! mv -f -- "$away_tmp" "$away_marker"; then
+    rm -f "$away_tmp"
+    exit 1
+  fi
+  kill -TERM "$HEALTHY_PID" 2>/dev/null || { rm -f "$away_marker"; exit 1; }
+  away_deadline=$(( $(date +%s) + ${FM_PI_AWAY_RETIRE_TIMEOUT:-5} + 1 ))
+  while fm_pid_alive "$HEALTHY_PID"; do
+    if [ "$(date +%s)" -ge "$away_deadline" ]; then
+      rm -f "$away_marker"
+      exit 1
+    fi
+    sleep 0.05
+  done
+  rm -f "$away_marker" 2>/dev/null || true
+  exit 0
+fi
 
 if [ "$mode" = handling-delivered ]; then
   fm_pid_alive "$handling_watcher_pid" \
     && fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$handling_watcher_pid" "$FM_HOME" \
-    && fm_recovery_marker_begin_handling "$STATE/.watcher-down" "$handling_generation"
-  exit $?
+    || exit 1
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || exit 1
+  if ! FM_HANDLING_REASON=$handling_reason awk -F '\t' '
+      NF >= 5 && $5 == ENVIRON["FM_HANDLING_REASON"] { found=1; exit }
+      END { exit !found }
+    ' "$FM_WAKE_QUEUE" 2>/dev/null; then
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    exit 3
+  fi
+  fm_recovery_marker_begin_handling "$STATE/.watcher-down" "$handling_generation"
+  status=$?
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  exit "$status"
 fi
 
 if [ "$mode" = restart ]; then

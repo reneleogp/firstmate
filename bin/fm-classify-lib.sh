@@ -1645,6 +1645,24 @@ signal_crew_provably_working() {  # <file> ...
   return 0
 }
 
+# 0 when a changed signal set contains a secondmate status file.
+# A secondmate status stream is the parent-directed reply channel, so its newly
+# appended bytes remain actionable even when they use no captain-relevant verb.
+signal_has_parent_directed_status() {  # <file> ...
+  local f base dir task
+  for f in "$@"; do
+    base=${f##*/}
+    case "$base" in *.status) ;; *) continue ;; esac
+    dir=${f%/*}
+    [ "$dir" != "$f" ] || dir=.
+    task=${base%.status}
+    if [ "$(grep '^kind=' "$dir/$task.meta" 2>/dev/null | tail -1 | cut -d= -f2-)" = secondmate ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # 0 (terminal/actionable) if a stale window's last status line is
 # captain-relevant; 1 otherwise, including the no-status case. A 1 only means
 # "non-terminal"; the always-on watcher then applies crew_is_provably_working,

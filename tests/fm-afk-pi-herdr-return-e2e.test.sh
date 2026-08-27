@@ -64,6 +64,10 @@ trap cleanup EXIT
 
 mkdir -p "$HOME_DIR"/{state,data,config,projects} "$PROJECT" "$PI_DIR" "$FAKEBIN"
 printf '# Synthetic isolated Firstmate primary\n' > "$PROJECT/AGENTS.md"
+# Linux has no automatic OS alert channel. Select one explicit channel so the
+# FM_WEDGE_ALARM_EXEC recorder seam is exercised instead of correctly reporting
+# that only the durable marker is available; the seam prevents a real alert.
+printf 'herdr\n' > "$HOME_DIR/config/wedge-alarm"
 
 # A task-local extension grants session-only trust, captures exact prompt bytes,
 # and aborts before provider work. No production supervision extension is loaded

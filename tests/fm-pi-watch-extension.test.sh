@@ -319,6 +319,158 @@ EOF
   pass "Pi scheduled retry remains extension-owned after another tool call"
 }
 
+test_pi_away_takeover_retires_owned_cycle_and_restores_once() {
+  local repo home plugin log retired stop out status
+  repo="$TMP_ROOT/pi-away-takeover-root"
+  home="$TMP_ROOT/pi-away-takeover-home"
+  log="$TMP_ROOT/pi-away-takeover.log"
+  retired="$TMP_ROOT/pi-away-takeover.retired"
+  stop="$TMP_ROOT/pi-away-takeover.stop"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --retire-away ]; then
+  kill -TERM "$6"
+  exit 0
+fi
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+count=$(wc -l < "$FM_ARM_LOG" | tr -d '[:space:]')
+printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+if [ "$count" -eq 1 ]; then
+  trap 'printf "retired\n" > "$FM_RETIRED_FILE"; printf "signal: task.turn-ended\n"; exit 0' TERM INT
+else
+  trap 'exit 0' TERM INT
+fi
+while [ ! -e "$FM_STOP_FILE" ]; do sleep 0.02; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_RETIRED_FILE="$retired" FM_STOP_FILE="$stop" FM_PI_OWNERSHIP_POLL_MS=10 node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const prompts = [];
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendUserMessage: async (message) => {
+    prompts.push(message);
+  },
+  events: { on() {} },
+};
+const rows = () => existsSync(process.env.FM_ARM_LOG)
+  ? readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n").filter(Boolean)
+  : [];
+async function waitFor(predicate, label) {
+  for (let i = 0; i < 500; i += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timeout waiting for ${label}`);
+}
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("tool-call-away-takeover", {}, undefined, undefined, {});
+await waitFor(() => rows().length === 1, "initial ordinary arm");
+writeFileSync(`${process.env.FM_HOME}/state/.afk`, `${Date.now()}\n`);
+await waitFor(() => existsSync(process.env.FM_RETIRED_FILE), "ordinary arm retirement after away takeover");
+await waitFor(
+  () => existsSync(`${process.env.FM_HOME}/state/.pi-watch-away-standdown`),
+  "generation-bound away standdown receipt",
+);
+await new Promise((resolve) => setTimeout(resolve, 100));
+if (rows().length !== 1) throw new Error(`away takeover launched an ordinary successor: ${rows().join(" | ")}`);
+if (prompts.length !== 0) throw new Error(`away takeover delivered the retiring turn-end: ${prompts.join(" | ")}`);
+unlinkSync(`${process.env.FM_HOME}/state/.afk`);
+await waitFor(() => rows().length === 2, "single ordinary arm after away return");
+await new Promise((resolve) => setTimeout(resolve, 100));
+if (existsSync(`${process.env.FM_HOME}/state/.pi-watch-away-standdown`)) {
+  throw new Error("away return left the standdown receipt active");
+}
+if (rows().length !== 2) throw new Error(`away return launched ${rows().length - 1} ordinary successors`);
+if (prompts.length !== 0) throw new Error(`away return replayed a handled notification: ${prompts.join(" | ")}`);
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi away takeover must retire the ordinary owner and restore one cycle on return"
+  [ -z "$out" ] || fail "Pi away-takeover test printed output: $out"
+  pass "Pi away takeover retires an in-flight ordinary cycle and return restores exactly one"
+}
+
+test_pi_acknowledged_late_close_does_not_force_turn() {
+  local repo home plugin log stop out status
+  repo="$TMP_ROOT/pi-late-ack-root"
+  home="$TMP_ROOT/pi-late-ack-home"
+  log="$TMP_ROOT/pi-late-ack.log"
+  stop="$TMP_ROOT/pi-late-ack.stop"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --handling-delivered ]; then
+  : > "$FM_HOME/state/.wake-queue"
+  exit 3
+fi
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+count=$(grep -c '^arm=' "$FM_ARM_LOG")
+if [ "$count" -eq 1 ]; then
+  printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+  printf 'signal: task.turn-ended\n'
+  exit 0
+fi
+printf 'watcher: started pid=%s (beacon fresh) recovery-generation=fixture-generation\n' "$$"
+trap 'exit 0' TERM INT
+while [ ! -e "$FM_STOP_FILE" ]; do sleep 0.02; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const prompts = [];
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendUserMessage: async (message) => {
+    prompts.push(message);
+  },
+  events: { on() {} },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+writeFileSync(`${process.env.FM_HOME}/state/.wake-queue`, `1\t1\tsignal\ttask.turn-ended\tsignal: task.turn-ended\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("tool-call-late-ack", {}, undefined, undefined, {});
+for (let i = 0; i < 250; i += 1) {
+  const rows = existsSync(process.env.FM_ARM_LOG)
+    ? readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n")
+    : [];
+  if (rows.length >= 2) break;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+await new Promise((resolve) => setTimeout(resolve, 100));
+if (prompts.length !== 0) throw new Error(`acknowledged late close forced a follow-up: ${prompts.join(" | ")}`);
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi late close must revalidate durable pending work before follow-up delivery"
+  [ -z "$out" ] || fail "Pi late-ack test printed output: $out"
+  pass "Pi acknowledged late close is absorbed before model invocation"
+}
+
 test_pi_actionable_close_starts_single_successor_before_delivery() {
   local repo home plugin log stop out status
   repo="$TMP_ROOT/pi-continuous-rearm-root"
@@ -2229,6 +2381,8 @@ test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result
 test_pi_redundant_tool_call_is_owned_noop
 test_pi_scheduled_retry_call_is_owned_noop
+test_pi_acknowledged_late_close_does_not_force_turn
+test_pi_away_takeover_retires_owned_cycle_and_restores_once
 test_pi_actionable_close_starts_single_successor_before_delivery
 test_pi_handling_delivery_failure_is_typed_once
 test_pi_hung_successor_falls_back_to_typed_wake

@@ -10,7 +10,7 @@
 // callbacks from a prior generation are no-ops against the active replacement.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
@@ -51,9 +51,18 @@ type SessionGeneration = {
   stopping: boolean;
   child: ChildProcess | null;
   retryTimer: ReturnType<typeof setTimeout> | null;
+  ownershipTimer: ReturnType<typeof setTimeout> | null;
   retryFailures: number;
   restoring: boolean;
+  monitoringStarted: boolean;
+  resumeAfterAway: boolean;
+  awayOwned: boolean;
   seq: number;
+};
+
+type DeliveryConfirmation = {
+  disposition: "pending" | "superseded" | "failure";
+  detail: string;
 };
 
 function refreshWatchToolShell(
@@ -84,6 +93,7 @@ const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
 const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
 const armScript = `${fmRoot}/bin/fm-watch-arm.sh`;
 const marker = `${state}/.pi-watch-extension-loaded`;
+const awayStanddownReceipt = `${state}/.pi-watch-away-standdown`;
 const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(extensionFile)).digest("hex")}`;
 const retryBaseMs = positiveInteger("FM_WATCH_REARM_RETRY_BASE_MS", 250);
 const retryMaxMs = positiveInteger("FM_WATCH_REARM_RETRY_MAX_MS", 4000);
@@ -96,6 +106,7 @@ const armReadyTimeoutMs = positiveInteger(
   process.platform === "win32" ? 35000 : 12000,
 );
 const armRetireTimeoutMs = positiveInteger("FM_WATCH_ARM_RETIRE_TIMEOUT_MS", 1000);
+const ownershipPollMs = positiveInteger("FM_PI_OWNERSHIP_POLL_MS", 100);
 const repairOnlyHint = "call fm_watch_arm_pi again only after a later notification says the cycle is missing, failed, or unhealthy";
 const shuttingDownMessage = "watcher: not armed - Pi session is shutting down";
 
@@ -191,8 +202,12 @@ function createGeneration(): SessionGeneration {
     stopping: false,
     child: null,
     retryTimer: null,
+    ownershipTimer: null,
     retryFailures: 0,
     restoring: false,
+    monitoringStarted: false,
+    resumeAfterAway: false,
+    awayOwned: false,
     seq: 0,
   };
 }
@@ -205,12 +220,47 @@ function generationIsLive(generation: SessionGeneration): boolean {
   return activeGeneration === generation && !generation.stopping;
 }
 
+function awayModeActive(): boolean {
+  return existsSync(`${state}/.afk`);
+}
+
+function ordinaryGenerationIsLive(generation: SessionGeneration): boolean {
+  return generationIsLive(generation) && !generation.awayOwned && !awayModeActive();
+}
+
+function writeAwayStanddownReceipt(generation: SessionGeneration): void {
+  if (!generationIsLive(generation) || !awayModeActive()) return;
+  const pending = `${awayStanddownReceipt}.pending.${process.pid}.${generation.id}`;
+  try {
+    mkdirSync(state, { recursive: true });
+    writeFileSync(pending, `${extensionVersion}\n${process.pid}\n${generation.id}\n`, { flag: "wx" });
+    renameSync(pending, awayStanddownReceipt);
+  } catch {
+    try {
+      rmSync(pending);
+    } catch {
+      // The launcher waits for the receipt and stops safely if it cannot be written.
+    }
+  }
+}
+
+function clearAwayStanddownReceipt(): void {
+  try {
+    rmSync(awayStanddownReceipt);
+  } catch {
+    // Absence is already the desired ordinary-mode state.
+  }
+}
+
 function stopGeneration(generation: SessionGeneration): void {
   generation.stopping = true;
   if (generation.retryTimer) clearTimeout(generation.retryTimer);
+  if (generation.ownershipTimer) clearTimeout(generation.ownershipTimer);
   generation.retryTimer = null;
+  generation.ownershipTimer = null;
   if (generation.child) generation.child.kill("SIGTERM");
   generation.child = null;
+  clearAwayStanddownReceipt();
 }
 
 const cleanupOnProcessExit = () => {
@@ -242,7 +292,7 @@ export default function (pi: ExtensionAPI) {
     owner: SessionGeneration,
     message: string,
   ): Promise<void> {
-    if (!generationIsLive(owner)) return;
+    if (!ordinaryGenerationIsLive(owner)) return;
     const content = encodeFirstmateOperationalInput(
       "watcher",
       `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first and handle the queued wake. Watcher continuity is extension-owned.`,
@@ -250,30 +300,31 @@ export default function (pi: ExtensionAPI) {
     await pi.sendUserMessage(content, { deliverAs: "followUp" });
   }
 
-  function confirmHandlingDelivery(recovery: { generation: string; watcherPid: string }): {
-    ok: boolean;
-    detail: string;
-  } {
+  function confirmHandlingDelivery(
+    recovery: { generation: string; watcherPid: string },
+    reason: string,
+  ): DeliveryConfirmation {
     try {
       const result = spawnSync(
         "bash",
-        [armScript, "--handling-delivered", recovery.generation, "--watcher-pid", recovery.watcherPid],
+        [armScript, "--handling-delivered", recovery.generation, "--watcher-pid", recovery.watcherPid, "--reason", reason],
         {
           cwd: fmRoot,
           encoding: "utf8",
           env: { ...process.env, FM_HOME: fmHome, FM_STATE_OVERRIDE: state, FM_ROOT_OVERRIDE: fmRoot },
         },
       );
-      if (result.status === 0) return { ok: true, detail: "" };
+      if (result.status === 0) return { disposition: "pending", detail: "" };
+      if (result.status === 3) return { disposition: "superseded", detail: "" };
       const stderr = (result.stderr || "").trim();
       return {
-        ok: false,
+        disposition: "failure",
         detail: `watcher: FAILED - handling delivery confirmation was rejected (status=${result.status ?? "none"} generation=${recovery.generation} watcherPid=${recovery.watcherPid})${stderr ? `\n${stderr}` : ""}`,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
-        ok: false,
+        disposition: "failure",
         detail: `watcher: FAILED - handling delivery confirmation could not be executed (generation=${recovery.generation} watcherPid=${recovery.watcherPid})\n${message}`,
       };
     }
@@ -282,25 +333,28 @@ export default function (pi: ExtensionAPI) {
   function confirmHandlingDeliveryWithRetry(
     owner: SessionGeneration,
     recovery: { generation: string; watcherPid: string },
-  ): { ok: boolean; detail: string } {
+    reason: string,
+  ): DeliveryConfirmation {
     const snapshot = (): { generation: string; watcherPid: string } => {
       const current = owner.child ? armRecovery.get(owner.child) : undefined;
       return current ?? recovery;
     };
-    const first = confirmHandlingDelivery(snapshot());
-    if (first.ok) return first;
-    return confirmHandlingDelivery(snapshot());
+    const first = confirmHandlingDelivery(snapshot(), reason);
+    if (first.disposition !== "failure") return first;
+    return confirmHandlingDelivery(snapshot(), reason);
   }
 
   async function deliverActionableWake(
     owner: SessionGeneration,
     message: string,
     recovery?: { generation: string; watcherPid: string },
+    pendingReason = message,
   ): Promise<void> {
-    if (!generationIsLive(owner)) return;
+    if (!ordinaryGenerationIsLive(owner)) return;
     if (recovery) {
-      const confirmed = confirmHandlingDeliveryWithRetry(owner, recovery);
-      if (!confirmed.ok) {
+      const confirmed = confirmHandlingDeliveryWithRetry(owner, recovery, pendingReason);
+      if (confirmed.disposition === "superseded") return;
+      if (confirmed.disposition === "failure") {
         const watcherPid = recovery.watcherPid;
         if (!pidAlive(watcherPid)) {
           await retireArm(owner.child);
@@ -309,6 +363,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
     }
+    if (!ordinaryGenerationIsLive(owner)) return;
     await sendWake(owner, message);
   }
 
@@ -357,17 +412,89 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  function retireWatcherForAway(owner: SessionGeneration, armChild: ChildProcess): boolean {
+    try {
+      const result = spawnSync(
+        "bash",
+        [
+          armScript,
+          "--retire-away",
+          String(owner.id),
+          "--extension-pid",
+          String(process.pid),
+          "--arm-pid",
+          String(armChild.pid ?? ""),
+        ],
+        {
+          cwd: fmRoot,
+          encoding: "utf8",
+          env: { ...process.env, FM_HOME: fmHome, FM_STATE_OVERRIDE: state, FM_ROOT_OVERRIDE: fmRoot },
+        },
+      );
+      return result.status === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  async function enterAwayOwnership(owner: SessionGeneration): Promise<void> {
+    if (!generationIsLive(owner) || !awayModeActive()) return;
+    owner.awayOwned = true;
+    owner.resumeAfterAway = owner.resumeAfterAway || owner.monitoringStarted;
+    if (owner.retryTimer) clearTimeout(owner.retryTimer);
+    owner.retryTimer = null;
+    const child = owner.child;
+    if (child) {
+      if (!retireWatcherForAway(owner, child)) return;
+      await retireArm(child);
+    }
+    if (!generationIsLive(owner) || !awayModeActive()) return;
+    if (!owner.child && !owner.retryTimer && !owner.restoring) writeAwayStanddownReceipt(owner);
+  }
+
+  function scheduleOwnershipCheck(owner: SessionGeneration): void {
+    if (!generationIsLive(owner) || owner.ownershipTimer) return;
+    const timer = setTimeout(() => {
+      if (owner.ownershipTimer === timer) owner.ownershipTimer = null;
+      if (!generationIsLive(owner)) return;
+      void (async () => {
+        if (awayModeActive()) {
+          await enterAwayOwnership(owner);
+        } else if (owner.awayOwned) {
+          owner.awayOwned = false;
+          clearAwayStanddownReceipt();
+          if (owner.resumeAfterAway && !owner.child && !owner.retryTimer && !owner.restoring) {
+            owner.resumeAfterAway = false;
+            const result = startArm(owner);
+            if (!result.ok) surfaceFailure(owner, result.message);
+          }
+        }
+        scheduleOwnershipCheck(owner);
+      })();
+    }, ownershipPollMs);
+    timer.unref();
+    owner.ownershipTimer = timer;
+  }
+
   async function restoreAfterActionableClose(owner: SessionGeneration, predecessorArmPid: string): Promise<{
     failure: string;
     recovery?: { generation: string; watcherPid: string };
   }> {
     let failure = "";
     for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
-      if (!generationIsLive(owner)) return { failure: "" };
+      if (!ordinaryGenerationIsLive(owner)) return { failure: "" };
       const replacement = startArm(owner, predecessorArmPid);
       const successorChild = owner.child;
       if (replacement.ok && successorChild && await waitForReadiness(successorChild)) {
+        if (!ordinaryGenerationIsLive(owner)) {
+          await retireArm(successorChild);
+          return { failure: "" };
+        }
         return { failure: "", recovery: armRecovery.get(successorChild) };
+      }
+      if (!ordinaryGenerationIsLive(owner)) {
+        await retireArm(successorChild);
+        return { failure: "" };
       }
       if (replacement.ok) {
         failure = "watcher: FAILED - Pi extension could not verify a ready successor watcher";
@@ -389,7 +516,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function scheduleRetry(owner: SessionGeneration, message: string, predecessorArmPid: string): void {
-    if (!generationIsLive(owner) || owner.child || owner.retryTimer) return;
+    if (!ordinaryGenerationIsLive(owner) || owner.child || owner.retryTimer) return;
     const ownership = lockOwnership();
     if (ownership !== "owned") {
       surfaceFailure(owner, `watcher: FAILED - Pi extension cannot restore continuity because this session no longer owns the lock\n${message}`);
@@ -402,7 +529,7 @@ export default function (pi: ExtensionAPI) {
     }
     const timer = setTimeout(() => {
       if (owner.retryTimer === timer) owner.retryTimer = null;
-      if (!generationIsLive(owner)) return;
+      if (!ordinaryGenerationIsLive(owner)) return;
       const result = startArm(owner, predecessorArmPid);
       if (!result.ok) {
         surfaceFailure(owner, `watcher: FAILED - Pi extension could not launch a continuity retry\n${result.message}`);
@@ -414,6 +541,12 @@ export default function (pi: ExtensionAPI) {
 
   function startArm(owner: SessionGeneration, predecessorArmPid = ""): ArmResult {
     if (!generationIsLive(owner)) return { ok: false, message: shuttingDownMessage };
+    owner.monitoringStarted = true;
+    if (awayModeActive() || owner.awayOwned) {
+      owner.resumeAfterAway = true;
+      void enterAwayOwnership(owner);
+      return { ok: true, message: "watcher: unchanged - away mode owns supervision" };
+    }
     const ownership = lockOwnership();
     if (ownership === "other") return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
     if (ownership === "missing") {
@@ -495,6 +628,10 @@ export default function (pi: ExtensionAPI) {
       settleReadiness(false);
       releaseChild();
       if (!generationIsLive(owner)) return;
+      if (awayModeActive() || owner.awayOwned) {
+        void enterAwayOwnership(owner);
+        return;
+      }
       const classification = classifyClose(stdout, stderr, code, signal);
       const predecessor = String(armChild.pid ?? "");
       if (classification.kind === "actionable") {
@@ -506,7 +643,7 @@ export default function (pi: ExtensionAPI) {
             const restoration = await restoreAfterActionableClose(owner, predecessor);
             if (!generationIsLive(owner)) return;
             const message = restoration.failure ? `${classification.message}\n\n${restoration.failure}` : classification.message;
-            await deliverActionableWake(owner, message, restoration.recovery);
+            await deliverActionableWake(owner, message, restoration.recovery, classification.message);
           } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
             surfaceFailure(owner, `watcher: FAILED - Pi extension could not deliver an actionable wake\n${detail}`);
@@ -526,6 +663,10 @@ export default function (pi: ExtensionAPI) {
       settleReadiness(false);
       releaseChild();
       if (!generationIsLive(owner)) return;
+      if (awayModeActive() || owner.awayOwned) {
+        void enterAwayOwnership(owner);
+        return;
+      }
       if (owner.restoring) return;
       scheduleRetry(owner, `watcher: FAILED - Pi extension arm child ${id} failed: ${error.message}`, String(armChild.pid ?? ""));
     });
@@ -536,9 +677,15 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on?.("session_start", () => {
-    if (generation.stopping) generation = createGeneration();
+    const resumeMonitoring = generation.monitoringStarted || generation.resumeAfterAway;
+    if (generation.stopping) {
+      generation = createGeneration();
+      generation.monitoringStarted = resumeMonitoring;
+      generation.resumeAfterAway = resumeMonitoring;
+    }
     activateGeneration(generation);
     markLoaded();
+    scheduleOwnershipCheck(generation);
   });
   pi.on?.("session_shutdown", () => {
     stopGeneration(generation);
@@ -597,4 +744,5 @@ export default function (pi: ExtensionAPI) {
   });
 
   markLoaded();
+  scheduleOwnershipCheck(generation);
 }
