@@ -353,15 +353,20 @@ EOF
 # incarnation behind it. Any change here resets the backoff to the base cadence,
 # because the recheck the captain would read is no longer the one already answered.
 task_wait_signature() {  # <task> <detail>
-  local task=$1 detail=$2 meta win backend label tail40 verdict condition=unknown
+  local task=$1 detail=$2 meta win backend label tail40 verdict state_word condition=unknown kind
   meta="$STATE/$task.meta"
+  kind=$(grep '^kind=' "$meta" 2>/dev/null | cut -d= -f2- || true)
   win=$(fm_backend_target_of_meta "$meta" 2>/dev/null || true)
-  if [ -n "$win" ]; then
+  if [ "$kind" != secondmate ] && [ -n "$win" ]; then
     backend=$(fm_backend_of_meta "$meta")
     label="fm-$task"
     if tail40=$(fm_backend_capture "$backend" "$win" 40 "$label" 2>/dev/null); then
       verdict=$(fm_busy_classify_meta "$meta" "$task" "$STATE" "$tail40")
-      if [ "${verdict%% *}" = busy ]; then condition=busy; else condition=idle; fi
+      state_word=${verdict%% *}
+      case "$state_word" in
+        busy) condition=busy ;;
+        idle|dead) condition=idle ;;
+      esac
     fi
   fi
   printf '%s\t%s' "$(fm_pause_recheck_signature "$(printf '%s|%s|%s|%s|%s' "$task" "$detail" \
@@ -383,8 +388,7 @@ write_deferral_signature() {  # <task> <writing-since-file>
 # batching the successor watcher immediately delivered the next overdue sibling).
 # Nothing else is batched: an unrelated failure, decision, check result, or
 # stopped worker still wakes immediately through its own path.
-PAUSE_RECHECK_JOURNAL="$STATE/.paused-recheck-publish"
-PAUSE_RECHECK_RECOVERED_REASON=
+FM_PAUSE_PUBLISH_RECOVERED_REASON=
 pause_recheck_windows=
 pause_recheck_details=
 pause_recheck_records=
@@ -405,83 +409,12 @@ pause_recheck_register() {  # <window> <throttle-marker> <detail> <signature> <s
   pause_recheck_records="$pause_recheck_records$throttle$(printf '\t')$(( streak + 1 ))$(printf '\t')$sig$(printf '\t')$condition"$'\n'
 }
 
-pause_recheck_records_apply() {  # <journal> [<first-record-line>]
-  local journal=$1 first=${2:-} file streak sig condition
-  {
-    [ -z "$first" ] || printf '%s\n' "$first"
-    cat "$journal"
-  } | while IFS=$(printf '\t') read -r file streak sig condition; do
-    [ -n "$file" ] || continue
-    case "$file" in
-      "$STATE"/.paused-resurfaced-*|"$STATE"/.writing-resurfaced-*) ;;
-      *) continue ;;
-    esac
-    case "$streak" in ''|*[!0-9]*) continue ;; esac
-    fm_pause_recheck_record "$streak" "$sig" "${condition:-unknown}" > "$file" 2>/dev/null || true
-  done
-}
-
-pause_recheck_journal_apply() {
-  local header tag target kind key reason generation seq epoch tmp status=0 delivered=false marker_token
-  [ -s "$PAUSE_RECHECK_JOURNAL" ] || { rm -f "$PAUSE_RECHECK_JOURNAL"; return 0; }
-  IFS= read -r header < "$PAUSE_RECHECK_JOURNAL" || return 0
-  IFS=$(printf '\t') read -r tag target kind key reason generation <<EOF
-$header
-EOF
-  if [ "$tag" != pause-publish-v1 ]; then
-    pause_recheck_records_apply "$PAUSE_RECHECK_JOURNAL"
-    rm -f "$PAUSE_RECHECK_JOURNAL"
-    return 0
-  fi
-  case "$target" in ''|*[!0-9]*) return 0 ;; esac
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
-  if awk -F '\t' -v s="$target" -v k="$kind" -v key="$key" -v p="$reason" \
-      'NF >= 5 && $2 == s && $3 == k && $4 == key && $5 == p { found=1 } END { exit !found }' \
-      "$FM_WAKE_QUEUE" 2>/dev/null; then
-    delivered=true
-  elif [ -n "$generation" ] && fm_recovery_marker_snapshot "$STATE/.watcher-down"; then
-    marker_token=$FM_RECOVERY_MARKER_TOKEN
-    [ "$marker_token" = "acked:downtime:$generation" ] && delivered=true
-  fi
-  if [ "$delivered" = false ]; then
-    seq=$(cat "$STATE/.wake-queue.seq" 2>/dev/null || echo 0)
-    case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
-    if [ "$seq" -ge "$target" ]; then target=$(( seq + 1 )); fi
-    if [ "$seq" -lt "$target" ]; then
-      epoch=$(date +%s)
-      _fm_recovery_marker_publish "$STATE/.watcher-down" downtime || status=$?
-      if [ "$status" -eq 0 ]; then
-        fm_recovery_marker_snapshot "$STATE/.watcher-down" || status=$?
-        marker_token=$FM_RECOVERY_MARKER_TOKEN
-        generation=${marker_token##*:}
-      fi
-      if [ "$status" -eq 0 ]; then
-        tmp="$PAUSE_RECHECK_JOURNAL.identity.$$"
-        { printf 'pause-publish-v1\t%s\t%s\t%s\t%s\t%s\n' "$target" "$kind" "$key" "$reason" "$generation"; tail -n +2 "$PAUSE_RECHECK_JOURNAL"; } > "$tmp" \
-          && mv -f "$tmp" "$PAUSE_RECHECK_JOURNAL" || status=$?
-      fi
-      if [ "$status" -eq 0 ]; then
-        printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$target" "$kind" "$key" "$reason" >> "$FM_WAKE_QUEUE" || status=$?
-        [ "$status" -ne 0 ] || PAUSE_RECHECK_RECOVERED_REASON=$reason
-      fi
-      [ "$status" -ne 0 ] || printf '%s\n' "$target" > "$STATE/.wake-queue.seq" || status=$?
-    fi
-  fi
-  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
-  [ "$status" -eq 0 ] || return "$status"
-  tmp="$PAUSE_RECHECK_JOURNAL.records.$$"
-  tail -n +2 "$PAUSE_RECHECK_JOURNAL" > "$tmp" || { rm -f "$tmp"; return 1; }
-  pause_recheck_records_apply "$tmp"
-  rm -f "$tmp" "$PAUSE_RECHECK_JOURNAL"
-}
-
-# Deliver this poll's due rechecks as one wake. The durable queue is appended
-# first, exactly as every other actionable path does, so a recheck can never be
-# lost; then EVERY affected backoff record is advanced through one crash-safe
-# publication boundary (a single atomic journal rename, applied and removed),
-# never record by record.
+# Deliver this poll's due rechecks as one wake. A stable batch and reserved queue
+# identity are committed before delivery, then every affected backoff record is
+# advanced only after recovery establishes that delivery. The shared publication
+# owner finishes either supervision path before another batch can start.
 pause_recheck_flush() {
-  local count reason key win detail tmp seq target clean_key clean_reason
+  local count reason key win detail clean_key clean_reason records
   [ -n "$pause_recheck_details" ] || return 0
   count=$(printf '%s' "$pause_recheck_details" | grep -c '')
   if [ "$count" -eq 1 ]; then
@@ -503,19 +436,8 @@ EOF
   fi
   clean_key=$(printf '%s' "$key" | fm_wake_clean_field)
   clean_reason=$(printf '%s' "$reason" | fm_wake_clean_field)
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
-  seq=$(cat "$STATE/.wake-queue.seq" 2>/dev/null || echo 0)
-  case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
-  target=$(( seq + 1 ))
-  tmp="$PAUSE_RECHECK_JOURNAL.tmp.$$"
-  if ! { printf 'pause-publish-v1\t%s\tstale\t%s\t%s\n' "$target" "$clean_key" "$clean_reason"; printf '%s' "$pause_recheck_records"; } > "$tmp" 2>/dev/null \
-      || ! mv -f "$tmp" "$PAUSE_RECHECK_JOURNAL" 2>/dev/null; then
-    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
-    rm -f "$tmp"
-    exit 1
-  fi
-  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
-  pause_recheck_journal_apply || exit 1
+  records=$(printf '%s' "$pause_recheck_records" | awk -F '\t' 'NF { printf "R\t%s\t%s\t%s\t%s\t-\t-\n", $1, $2, $3, $4 }')
+  fm_pause_publish_queue "$STATE" stale "$clean_key" "$clean_reason" "$records" || exit 1
   pause_recheck_reset
   wake "$reason"
 }
@@ -1127,8 +1049,8 @@ printf '%s\n' "$FM_WATCH_DELIVERY_IDENTITY" > "$WATCH_LOCK/pid-identity" 2>/dev/
 # recheck publication and writing the records it names. Finish that one
 # publication before this cycle decides what is due, so the interrupted batch
 # neither re-delivers nor half-advances.
-pause_recheck_journal_apply || exit 1
-[ -z "$PAUSE_RECHECK_RECOVERED_REASON" ] || wake "$PAUSE_RECHECK_RECOVERED_REASON"
+fm_pause_publish_recover "$STATE" || exit 1
+[ -z "$FM_PAUSE_PUBLISH_RECOVERED_REASON" ] || wake "$FM_PAUSE_PUBLISH_RECOVERED_REASON"
 
 # A merged poll may have queued its terminal wake and then lost the process
 # between receipt publication and fixed-path removal.

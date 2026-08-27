@@ -407,6 +407,27 @@ test_housekeeping_pause_recheck_backs_off_when_unchanged() {
   pass "away-mode rechecks of an unchanged declared wait back off on the same shared cadence"
 }
 
+test_housekeeping_pause_probe_is_lazy() {
+  local dir state fakebin win pane key log
+  dir=$(make_supercase paused-probe-lazy)
+  state="$dir/state"; fakebin="$dir/fakebin"; win="sess:fm-lazy"; pane="$dir/pane.txt"; log="$dir/captures"
+  printf 'paused: awaiting the scheduled window\n' > "$state/lazy.status"
+  printf 'idle prompt $\n' > "$pane"
+  key=$(printf '%s' lazy | tr ':/.' '___')
+  echo $(( $(date +%s) - 30 )) > "$state/.subsuper-paused-$key"
+  mv "$fakebin/tmux" "$fakebin/tmux-real"
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" != capture-pane ] || printf 'capture\n' >> "$FM_CAPTURE_LOG"
+exec "$(dirname "$0")/tmux-real" "$@"
+SH
+  chmod +x "$fakebin/tmux"
+  PATH="$fakebin:$PATH" FM_CAPTURE_LOG="$log" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+  [ ! -e "$log" ] || fail "a fresh declared wait probed its backend before the base cadence"
+  pass "away-mode worker condition is read only after the base recheck cadence"
+}
+
 test_housekeeping_recovers_pause_batch_atomically() {
   local dir state now sig1 sig2
   dir=$(make_supercase paused-publication-recovery)
@@ -414,11 +435,11 @@ test_housekeeping_recovers_pause_batch_atomically() {
   now=$(date +%s)
   sig1=$(fm_pause_recheck_signature wait-one)
   sig2=$(fm_pause_recheck_signature wait-two)
-  printf 'pause-publish-v1\tdaemon\nI\tpaused 500s (awaiting external, recheck whether the wait still holds): sess:fm-one\nI\tpaused 500s (awaiting external, recheck whether the wait still holds): sess:fm-two\nR\t%s\t2\t%s\tidle\t%s\t%s\nR\t%s\t4\t%s\tidle\t%s\t%s\n' \
+  printf 'pause-publish-v2\ttest-daemon-recovery\nI\tpaused 500s (awaiting external, recheck whether the wait still holds): sess:fm-one\nI\tpaused 500s (awaiting external, recheck whether the wait still holds): sess:fm-two\nR\t%s\t2\t%s\tidle\t%s\t%s\nR\t%s\t4\t%s\tidle\t%s\t%s\n' \
     "$state/.subsuper-pause-backoff-one" "$sig1" "$state/.subsuper-paused-one" "$now" \
     "$state/.subsuper-pause-backoff-two" "$sig2" "$state/.subsuper-paused-two" "$now" \
     > "$state/.paused-recheck-publish"
-  FM_STATE_OVERRIDE="$state" pause_recheck_publish_recover "$state"
+  FM_STATE_OVERRIDE="$state" fm_pause_publish_recover "$state"
   [ "$(grep -c 'awaiting external' "$state/.subsuper-escalations")" -eq 2 ] \
     || fail "away-mode recovery did not restore both sibling rechecks exactly once"
   [ "$(fm_pause_recheck_streak "$state/.subsuper-pause-backoff-one" "$sig1" idle)" = 2 ] \
@@ -2009,6 +2030,7 @@ test_housekeeping_persistent_stale_escalates
 test_housekeeping_resumed_stale_cleared
 test_housekeeping_paused_resurfaces_and_resets
 test_housekeeping_pause_recheck_backs_off_when_unchanged
+test_housekeeping_pause_probe_is_lazy
 test_housekeeping_recovers_pause_batch_atomically
 test_housekeeping_captain_held_resurfaces_and_resets
 test_housekeeping_paused_resumed_cleared

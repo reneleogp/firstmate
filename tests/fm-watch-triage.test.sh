@@ -20,6 +20,8 @@ set -u
 # shellcheck source=tests/wake-helpers.sh
 . "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
 # shellcheck source=/dev/null
+. "$ROOT/bin/fm-wake-lib.sh"
+# shellcheck source=/dev/null
 . "$ROOT/bin/fm-classify-lib.sh"
 
 WATCH="$ROOT/bin/fm-watch.sh"
@@ -1305,7 +1307,7 @@ test_interrupted_recheck_publication_is_repaired_on_restart() {
   sig=$(fm_pause_recheck_signature 'interrupted-publication-evidence')
   record=$(fm_pause_recheck_record 3 "$sig" idle)
   target=$(( $(cat "$state/.wake-queue.seq" 2>/dev/null || echo 0) + 1 ))
-  printf 'pause-publish-v1\t%s\tstale\t%s\t%s\n%s\t3\t%s\tidle\n' \
+  printf 'pause-publish-v2\ttest-replay\nQ\t%s\tstale\t%s\t%s\nR\t%s\t3\t%s\tidle\t-\t-\n' \
     "$target" "$window" "stale: $window (awaiting external, recheck whether the wait still holds)" \
     "$state/.paused-resurfaced-$key" "$sig" > "$state/.paused-recheck-publish"
 
@@ -1328,6 +1330,44 @@ test_interrupted_recheck_publication_is_repaired_on_restart() {
     || fail "a repaired wait never came due again: $(cat "$out")"
   unset FM_FAKE_CREW_STATE
   pass "an interrupted recheck publication is finished exactly once on restart, without re-delivering or losing the wait"
+}
+
+test_acknowledged_recheck_publication_is_not_reenqueued() {
+  local dir state fakebin out capture window key sig reason target record
+  dir=$(make_case pause-recheck-acknowledged); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture="$dir/pane.txt"; window="test:fm-acked"
+  printf 'idle, awaiting the merge decision' > "$capture"
+  seed_declared_wait "$state" acked "$window" 'paused: awaiting the merge decision' 100000 'idle, awaiting the merge decision'
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  sig=$(fm_pause_recheck_signature acknowledged-evidence)
+  reason="stale: $window (paused, awaiting external)"
+  target=1
+  printf 'pause-publish-v2\ttest-acknowledged\nQ\t%s\tstale\t%s\t%s\nR\t%s\t2\t%s\tidle\t-\t-\n' \
+    "$target" "$window" "$reason" "$state/.paused-resurfaced-$key" "$sig" > "$state/.paused-recheck-publish"
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_wake_append stale "$2" "$3"' _ \
+    "$ROOT/bin/fm-wake-lib.sh" "$window" "$reason" || fail "could not seed the delivered recheck"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the delivered recheck"
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting the merge decision'
+  run_pause_watcher "$state" "$fakebin" "$window" "$capture" "$out" \
+    FM_PAUSE_RESURFACE_SECS=240 FM_PAUSE_RESURFACE_MAX_SECS=960 \
+    && fail "an already handled publication was enqueued again: $(cat "$out")"
+  record=$(fm_pause_recheck_record 2 "$sig" idle)
+  [ "$(cat "$state/.paused-resurfaced-$key")" = "$record" ] || fail "acknowledged publication did not finish its record"
+  [ "$(cat "$state/.wake-queue.seq")" = "$target" ] || fail "acknowledged publication allocated a second sequence"
+  [ ! -e "$state/.paused-recheck-publish" ] || fail "acknowledged publication journal was not retired"
+  unset FM_FAKE_CREW_STATE
+  pass "an acknowledged recheck publication advances records without re-enqueueing"
+}
+
+test_failed_recheck_record_application_retains_journal() {
+  local dir state
+  dir=$(make_case pause-recheck-record-failure); state="$dir/state"
+  printf 'pause-publish-v2\ttest-write-failure\nI\ttest buffered recheck\nR\t%s\t2\ttest-sig\tidle\t-\t-\n' \
+    "$state/.paused-resurfaced-missing/record" > "$state/.paused-recheck-publish"
+  FM_STATE_OVERRIDE="$state" fm_pause_publish_recover "$state" 2>/dev/null \
+    && fail "publication succeeded despite an unwritable record path"
+  [ -e "$state/.paused-recheck-publish" ] || fail "failed record application discarded its recovery journal"
+  pass "a failed recheck record application retains the publication journal"
 }
 
 # A captain-held crew can leave a stable backend endpoint after its agent exits.
@@ -2978,6 +3018,8 @@ test_pause_recheck_resets_and_retires
 test_sibling_pause_rechecks_batch_into_one_wake
 test_unrelated_stale_is_not_delayed_by_a_due_recheck
 test_interrupted_recheck_publication_is_repaired_on_restart
+test_acknowledged_recheck_publication_is_not_reenqueued
+test_failed_recheck_record_application_retains_journal
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_captain_held_resurfaces_in_normal_mode

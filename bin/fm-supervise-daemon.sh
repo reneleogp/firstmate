@@ -172,6 +172,11 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # shellcheck source=bin/fm-operational-input.sh
 . "$FM_DAEMON_DIR/fm-operational-input.sh"
 
+# Shared wake queue and portable lock helpers used by the publication owner in
+# the classifier below as well as the executed daemon loop.
+# shellcheck source=bin/fm-wake-lib.sh
+. "$FM_DAEMON_DIR/fm-wake-lib.sh"
+
 # Shared wake classifier (last_status_line, status_is_captain_relevant,
 # window_to_task, scan_captain_relevant_statuses). The SAME library backs the
 # always-on watcher's triage, so the captain-relevant verb set and the
@@ -644,20 +649,23 @@ task_window_harness() {  # <window> <state>
   grep '^harness=' "$meta" 2>/dev/null | cut -d= -f2- || true
 }
 
-# stale_window_is_busy: 0 when the task is PROVABLY working through the
-# semantic busy-state contract (bin/fm-busy-lib.sh), 1 when it is not, and 2
-# when the endpoint could not be read at all. Only an exact busy verdict is
-# working: unknown semantic state never becomes busy and never becomes a
-# silent idle, so a stale pane whose state cannot be proven surfaces.
+# stale_window_is_busy: 0 when the task is provably busy, 1 when it is
+# provably idle or dead, 2 when the endpoint cannot be read, and 3 when the
+# semantic classifier cannot decide.
 stale_window_is_busy() {  # <window> <state>
-  local win=$1 state=$2 backend harness label task tail40 verdict
+  local win=$1 state=$2 backend harness label task tail40 verdict state_word
   backend=$(task_window_backend "$win" "$state")
   harness=$(task_window_harness "$win" "$state")
   task=$(window_to_task "$win" "$state")
   label="fm-$task"
   tail40=$(fm_backend_capture "$backend" "$win" 40 "$label" 2>/dev/null) || return 2
   verdict=$(fm_busy_classify "$backend" "$win" "$harness" "$task" "$state" "$tail40")
-  [ "${verdict%% *}" = busy ]
+  state_word=${verdict%% *}
+  case "$state_word" in
+    busy) return 0 ;;
+    idle|dead) return 1 ;;
+    *) return 3 ;;
+  esac
 }
 
 escalate_add() {  # <state> <distilled-item>
@@ -665,51 +673,6 @@ escalate_add() {  # <state> <distilled-item>
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || _now > "${buf}.since"
   printf '%s\n' "$item" >> "$buf"
-}
-
-pause_recheck_publish_recover() {  # <state>
-  local state=$1 journal header tag mode row type item backoff streak sig condition marker epoch
-  journal="$state/.paused-recheck-publish"
-  [ -s "$journal" ] || return 0
-  IFS= read -r header < "$journal" || return 1
-  IFS=$(printf '\t') read -r tag mode <<EOF
-$header
-EOF
-  [ "$tag" = pause-publish-v1 ] && [ "$mode" = daemon ] || return 0
-  while IFS= read -r row; do
-    type=${row%%$(printf '\t')*}
-    case "$type" in
-      I)
-        item=${row#*$(printf '\t')}
-        grep -Fqx "$item" "$state/.subsuper-escalations" 2>/dev/null || escalate_add "$state" "$item"
-        ;;
-      R)
-        IFS=$(printf '\t') read -r type backoff streak sig condition marker epoch <<EOF
-$row
-EOF
-        case "$backoff" in "$state"/.subsuper-pause-backoff-*) ;; *) continue ;; esac
-        case "$marker" in "$state"/.subsuper-paused-*) ;; *) continue ;; esac
-        fm_pause_recheck_record "$streak" "$sig" "$condition" > "$backoff" || return 1
-        printf '%s\n' "$epoch" > "$marker" || return 1
-        ;;
-    esac
-  done < <(tail -n +2 "$journal")
-  rm -f "$journal"
-}
-
-pause_recheck_publish_daemon() {  # <state> <items> <records>
-  local state=$1 items=$2 records=$3 journal tmp item
-  [ -n "$items" ] || return 0
-  journal="$state/.paused-recheck-publish"
-  tmp="$journal.tmp.$$"
-  {
-    printf 'pause-publish-v1\tdaemon\n'
-    while IFS= read -r item; do [ -z "$item" ] || printf 'I\t%s\n' "$item"; done <<EOF
-$items
-EOF
-    printf '%s' "$records"
-  } > "$tmp" && mv -f "$tmp" "$journal" || { rm -f "$tmp"; return 1; }
-  pause_recheck_publish_recover "$state"
 }
 
 # Flush the escalation buffer as ONE batched, single-line digest to the
@@ -1039,7 +1002,7 @@ housekeeping() {  # <state>
   local pause_items= pause_records= pause_item
   now=$(_now)
   migrate_watcher_pause_markers "$state"
-  pause_recheck_publish_recover "$state" || return 1
+  fm_pause_publish_recover "$state" || return 1
 
   # (1) batch flush
   if [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ]; then
@@ -1127,6 +1090,7 @@ housekeeping() {  # <state>
       continue
     fi
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
+    [ "$age" -ge "$pause_secs" ] || continue
     backoff_file="$state/.subsuper-pause-backoff-$key"
     backoff_sig=$(pause_backoff_signature "$state" "$task")
     stale_window_is_busy "$win" "$state"
@@ -1159,7 +1123,7 @@ housekeeping() {  # <state>
         ;;
     esac
   done
-  pause_recheck_publish_daemon "$state" "$pause_items" "$pause_records" || return 1
+  fm_pause_publish_buffer "$state" "$pause_items" "$pause_records" || return 1
 
   # (3) heartbeat scan (catch-all for a captain-relevant status the per-wake
   #     classifier may have missed). Cheap: status files only, no tmux. The
@@ -1438,11 +1402,6 @@ fm_super_main() {
   local STATE
   STATE="$(_state_root)"
   mkdir -p "$STATE"
-
-  # Source the portable lock helpers (works on macOS where flock is absent).
-  # Export FM_STATE_OVERRIDE so the lib resolves the same state dir.
-  # shellcheck source=bin/fm-wake-lib.sh
-  FM_STATE_OVERRIDE="$STATE" . "$FM_DAEMON_DIR/fm-wake-lib.sh"
 
   local WATCH="$FM_DAEMON_DIR/fm-watch.sh"
   local LOG="$STATE/.supervise-daemon.log"
