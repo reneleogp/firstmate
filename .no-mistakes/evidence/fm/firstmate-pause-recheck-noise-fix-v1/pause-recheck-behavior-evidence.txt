@@ -1,0 +1,17 @@
+Attended watcher (real bin/fm-watch.sh subprocess):
+ok - the shared recheck cadence doubles per unchanged recheck, caps, and resets on changed evidence
+ok - consecutive unchanged declared-wait rechecks back off to the configured cap instead of repeating on the base cadence
+ok - a changed wait resets the recheck cadence immediately and a finished wait retires its cadence state
+ok - sibling declared waits that come due together are batched into one wake naming each of them
+ok - an unrelated stopped crew wakes immediately while a due recheck waits for the next pass, with nothing half-published
+ok - an interrupted recheck publication is finished exactly once on restart, without re-delivering or losing the wait
+ok - an acknowledged recheck publication advances records without re-enqueueing
+ok - a failed recheck record application retains the publication journal
+ok - exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once
+
+Away-mode daemon (shared cadence and publication behavior):
+ok - housekeeping re-surfaces a stale declared pause on the long cadence and resets its window
+ok - away-mode rechecks of an unchanged declared wait back off on the same shared cadence
+ok - away-mode worker condition is read only after the base recheck cadence
+ok - away-mode rechecks remain bounded when worker state is unreadable
+ok - away-mode recovery publishes one buffered sibling batch and advances every record together

@@ -1,0 +1,7 @@
+Durable actionable wake produced by the real bin/fm-watch.sh subprocess and read through bin/fm-wake-drain.sh:
+1787793746	1	stale	test:fm-sib1,test:fm-sib2,test:fm-sib3	stale: 3 declared waits came due for a recheck together, batched into one wake, none a wedge: test:fm-sib1 (paused 100001s, awaiting external - declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds); test:fm-sib2 (paused 100002s, awaiting external - declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds); test:fm-sib3 (captain-held 100003s, awaiting the captain - verified hold transfer, rechecked on a long cadence not a wedge; answer the held decision or release the hold)
+
+Cadence records published for all three siblings in the same cycle:
+.paused-resurfaced-test_fm-sib1: pause-recheck-v1	1	3575662695_101	unknown
+.paused-resurfaced-test_fm-sib2: pause-recheck-v1	1	539895589_97	unknown
+.paused-resurfaced-test_fm-sib3: pause-recheck-v1	1	1136306468_118	unknown
