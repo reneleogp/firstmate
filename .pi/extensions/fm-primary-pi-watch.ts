@@ -34,6 +34,7 @@ type CloseClassification = {
   kind: "actionable" | "failure";
   message: string;
   sequence?: string;
+  payload?: string;
 };
 
 type WatchToolShellState = {
@@ -170,7 +171,8 @@ function classifyClose(stdout: string, stderr: string, code: number | null, sign
   const combined = `${stdout}\n${stderr}`.trim();
   const reason = actionableLine(combined);
   const sequence = combined.match(/^watcher: delivery-sequence=([0-9]+)$/m)?.[1];
-  if (reason) return { kind: "actionable", message: reason, sequence };
+  const payload = combined.match(/^watcher: delivery-payload=(.*)$/m)?.[1];
+  if (reason) return { kind: "actionable", message: reason, sequence, payload };
   const healthy = combined.split(/\r?\n/).find((line) => /^watcher: healthy\b/.test(line));
   if (healthy) {
     return {
@@ -651,7 +653,7 @@ export default function (pi: ExtensionAPI) {
             const restoration = await restoreAfterActionableClose(owner, predecessor);
             if (!generationIsLive(owner)) return;
             const message = restoration.failure ? `${classification.message}\n\n${restoration.failure}` : classification.message;
-            await deliverActionableWake(owner, message, restoration.recovery, classification.message, classification.sequence);
+            await deliverActionableWake(owner, message, restoration.recovery, classification.payload ?? classification.message, classification.sequence);
           } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
             surfaceFailure(owner, `watcher: FAILED - Pi extension could not deliver an actionable wake\n${detail}`);

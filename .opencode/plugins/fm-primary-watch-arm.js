@@ -23,6 +23,7 @@ let restorationInFlight = null;
 let armClose = new WeakMap();
 let armReadiness = new WeakMap();
 let armRecovery = new WeakMap();
+let armOwner = new WeakMap();
 let activeSessionID = "";
 let activeSessionGeneration = 0;
 
@@ -136,7 +137,8 @@ function classifyArmClose(stdout, stderr, code, signal) {
   const combined = `${stdout}\n${stderr}`;
   const reason = combined.split(/\r?\n/).find((line) => /^(signal:|stale:|check:|heartbeat($|:))/.test(line));
   const sequence = combined.match(/^watcher: delivery-sequence=([0-9]+)$/m)?.[1] ?? "";
-  if (reason) return { kind: "actionable", message: reason, sequence };
+  const payload = combined.match(/^watcher: delivery-payload=(.*)$/m)?.[1];
+  if (reason) return { kind: "actionable", message: reason, sequence, payload };
   const healthy = combined.split(/\r?\n/).find((line) => /^watcher: healthy\b/.test(line));
   if (healthy) {
     return {
@@ -191,6 +193,10 @@ function activateSession(sessionID) {
   if (activeSessionID !== sessionID) {
     activeSessionID = sessionID;
     activeSessionGeneration += 1;
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
   }
   return activeSessionGeneration;
 }
@@ -254,13 +260,7 @@ function confirmHandlingDeliveryWithRetry(paths, recovery, reason, sequence) {
 
 async function deliverActionableWake(paths, client, sessionID, sessionGeneration, message, recovery, pendingReason = message, pendingSequence = "") {
   const encoded = await encodePrompt(paths, wakePrompt(message));
-  let targetSessionID = sessionID;
-  let targetSessionGeneration = sessionGeneration;
-  if (!sessionIsCurrent(targetSessionID, targetSessionGeneration)) {
-    targetSessionID = activeSessionID;
-    targetSessionGeneration = activeSessionGeneration;
-  }
-  if (!targetSessionID || !sessionIsCurrent(targetSessionID, targetSessionGeneration) || !(await sessionOwnsLock(paths))) return;
+  if (!sessionIsCurrent(sessionID, sessionGeneration) || !(await sessionOwnsLock(paths))) return;
   if (recovery && pendingSequence) {
     const confirmed = confirmHandlingDeliveryWithRetry(paths, recovery, pendingReason, pendingSequence);
     if (confirmed.disposition === "superseded") return;
@@ -272,16 +272,16 @@ async function deliverActionableWake(paths, client, sessionID, sessionGeneration
           await retireArm(child);
         }
       }
-      await sendPrompt(paths, client, targetSessionID, targetSessionGeneration, wakePrompt(`${message}\n\n${confirmed.detail}`));
+      await sendPrompt(paths, client, sessionID, sessionGeneration, wakePrompt(`${message}\n\n${confirmed.detail}`));
       return;
     }
   } else if (recovery) {
-    await sendPrompt(paths, client, targetSessionID, targetSessionGeneration, wakePrompt(`${message}\n\nwatcher: FAILED - actionable wake had no durable queue sequence`));
+    await sendPrompt(paths, client, sessionID, sessionGeneration, wakePrompt(`${message}\n\nwatcher: FAILED - actionable wake had no durable queue sequence`));
     return;
   }
-  if (!sessionIsCurrent(targetSessionID, targetSessionGeneration)) return;
+  if (!sessionIsCurrent(sessionID, sessionGeneration)) return;
   await client.session.promptAsync({
-    path: { id: targetSessionID },
+    path: { id: sessionID },
     body: { parts: [{ type: "text", text: encoded }] },
   });
 }
@@ -351,7 +351,7 @@ async function restoreAfterActionableClose(paths, sessionID, sessionGeneration, 
 }
 
 async function scheduleRetry(paths, sessionID, sessionGeneration, client, reason, predecessorArmPid) {
-  if (child || retryTimer) return;
+  if (!sessionIsCurrent(sessionID, sessionGeneration) || child || retryTimer) return;
   if (!(await sessionOwnsLock(paths))) {
     setArmStatus("failed");
     surfaceFailure(paths, client, sessionID, sessionGeneration, `watcher: FAILED - OpenCode cannot restore continuity because this session no longer owns the lock\n${reason}`);
@@ -390,6 +390,7 @@ function spawnArm(paths, sessionID, sessionGeneration, client, predecessorArmPid
     stdio: ["ignore", "pipe", "pipe"],
   });
   child = armChild;
+  armOwner.set(armChild, { sessionID, sessionGeneration });
   let stdout = "";
   let stderr = "";
   let settled = false;
@@ -443,7 +444,7 @@ function spawnArm(paths, sessionID, sessionGeneration, client, predecessorArmPid
       void restoration.then(async (result) => {
         try {
           const message = result.failure ? `${classification.message}\n\n${result.failure}` : classification.message;
-          await deliverActionableWake(paths, client, sessionID, sessionGeneration, message, result.recovery, classification.message, classification.sequence);
+          await deliverActionableWake(paths, client, sessionID, sessionGeneration, message, result.recovery, classification.payload ?? classification.message, classification.sequence);
         } finally {
           if (restorationInFlight === restoration) restorationInFlight = null;
         }
@@ -493,7 +494,14 @@ async function beginArm(paths, sessionID, sessionGeneration, client, predecessor
   if (!sessionIsCurrent(sessionID, sessionGeneration)) return { status: "skipped", armChild: null };
   if (!(await sessionOwnsLock(paths))) return { status: "read-only", armChild: null };
   if (!sessionIsCurrent(sessionID, sessionGeneration)) return { status: "skipped", armChild: null };
-  if (child) return { status: "existing", armChild: child };
+  if (child) {
+    const owner = armOwner.get(child);
+    if (owner?.sessionID === sessionID && owner?.sessionGeneration === sessionGeneration) {
+      return { status: "existing", armChild: child };
+    }
+    if (!(await retireArm(child))) return { status: "failed", armChild: null };
+    if (!sessionIsCurrent(sessionID, sessionGeneration)) return { status: "skipped", armChild: null };
+  }
   if (retryTimer) return { status: "retrying", armChild: null };
   if (!shouldArm(paths)) return { status: "not-needed", armChild: null };
   return { status: "spawned", armChild: spawnArm(paths, sessionID, sessionGeneration, client, predecessorArmPid) };
@@ -504,6 +512,7 @@ function armAttempt(status, armChild, includeArmChild) {
 }
 
 async function ensureArm(paths, sessionID, sessionGeneration, client, predecessorArmPid = "", includeArmChild = false) {
+  if (!sessionIsCurrent(sessionID, sessionGeneration)) return armAttempt("skipped", null, includeArmChild);
   let launchResult = null;
   if (!launchInFlight) {
     const launch = beginArm(paths, sessionID, sessionGeneration, client, predecessorArmPid);
@@ -516,10 +525,15 @@ async function ensureArm(paths, sessionID, sessionGeneration, client, predecesso
   } else {
     launchResult = await launchInFlight;
   }
-  const armChild = launchResult.armChild;
-  if (!armChild) {
-    return armAttempt(launchResult.status, null, includeArmChild);
+  if (!sessionIsCurrent(sessionID, sessionGeneration)) return armAttempt("skipped", null, includeArmChild);
+  let armChild = launchResult.armChild;
+  const owner = armChild ? armOwner.get(armChild) : undefined;
+  if (armChild && (owner?.sessionID !== sessionID || owner?.sessionGeneration !== sessionGeneration)) {
+    if (!(await retireArm(armChild))) return armAttempt("failed", null, includeArmChild);
+    launchResult = await beginArm(paths, sessionID, sessionGeneration, client, predecessorArmPid);
+    armChild = launchResult.armChild;
   }
+  if (!armChild) return armAttempt(launchResult.status, null, includeArmChild);
   return armAttempt(await waitForArmReady(armChild), armChild, includeArmChild);
 }
 

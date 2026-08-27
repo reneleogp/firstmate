@@ -1655,14 +1655,15 @@ test_opencode_primary_watch_plugin_rearms_after_wake() {
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = --handling-delivered ]; then
-  printf 'confirmed generation=%s watcher=%s\n' "$2" "$4" >> "${FM_ARM_LOG:?}"
+  printf 'confirmed generation=%s watcher=%s payload=%s sequence=%s\n' "$2" "$4" "$6" "$8" >> "${FM_ARM_LOG:?}"
+  [ "$6" = 'signal: durable queued wake' ] && [ "$8" = 1 ] || exit 3
   exit 0
 fi
 printf 'arm=%s predecessor=%s\n' "$$" "${FM_WATCH_PREDECESSOR_ARM_PID:-none}" >> "${FM_ARM_LOG:?}"
 count=$(grep -c '^arm=' "$FM_ARM_LOG")
 if [ "$count" -eq 1 ]; then
   printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
-  printf 'signal: synthetic wake\nwatcher: delivery-sequence=1\n'
+  printf 'signal: synthetic wake\nwatcher: delivery-sequence=1\nwatcher: delivery-payload=signal: durable queued wake\n'
   exit 0
 fi
 printf 'watcher: started pid=%s (beacon fresh) recovery-generation=fixture-generation\n' "$$"
@@ -1731,6 +1732,8 @@ EOF
   status=$?
   [ "$status" -eq 0 ] || fail "OpenCode watch plugin must start one successor before wake prompt delivery settles: $out"
   [ -z "$out" ] || fail "OpenCode rearm test printed output: $out"
+  grep -Eq '^confirmed generation=fixture-generation watcher=[0-9]+ payload=signal: durable queued wake sequence=1$' "$log" \
+    || fail "OpenCode confirmation did not bind the synthetic wake to its durable payload: $(cat "$log")"
   pass "OpenCode watcher plugin starts one successor before wake prompt delivery settles"
 }
 
@@ -2383,7 +2386,7 @@ EOF
   pass "OpenCode healthy arm output does not suppress the turn-end guard"
 }
 
-test_opencode_late_close_targets_current_session_generation() {
+test_opencode_session_generation_replaces_stale_cycle() {
   local plugin repo home log release stop out status
   plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
   repo="$TMP_ROOT/opencode-session-generation-root"
@@ -2415,7 +2418,7 @@ while [ ! -e "$FM_STOP_FILE" ]; do sleep 0.02; done
 SH
   chmod +x "$repo/bin/fm-operational-input.sh" "$repo/bin/fm-watch-arm.sh"
   out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_RELEASE_FILE="$release" FM_STOP_FILE="$stop" node 2>&1 <<'EOF'
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -2429,19 +2432,22 @@ for (let i = 0; i < 250 && !existsSync(process.env.FM_ARM_LOG); i += 1) {
 }
 await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-b" } } });
 writeFileSync(process.env.FM_RELEASE_FILE, "release\n");
-for (let i = 0; i < 500 && targets.length === 0; i += 1) {
+for (let i = 0; i < 500; i += 1) {
+  const rows = readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n");
+  if (rows.length >= 2) break;
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
-if (targets.length !== 1 || targets[0] !== "session-b") {
-  throw new Error(`delayed wake targeted stale session generation: ${targets.join(" | ")}`);
-}
+await new Promise((resolve) => setTimeout(resolve, 100));
+const rows = readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n");
+if (rows.length !== 2) throw new Error(`current generation did not replace the stale cycle: ${rows.join(" | ")}`);
+if (targets.length !== 0) throw new Error(`stale callback forced a monitoring follow-up: ${targets.join(" | ")}`);
 writeFileSync(process.env.FM_STOP_FILE, "stop\n");
 EOF
   )
   status=$?
-  expect_code 0 "$status" "OpenCode delayed closes must target only the current session generation"
+  expect_code 0 "$status" "OpenCode session replacement must reject stale callbacks and preserve continuity"
   [ -z "$out" ] || fail "OpenCode session-generation test printed output: $out"
-  pass "OpenCode delayed close targets the current session generation"
+  pass "OpenCode session replacement rejects stale callbacks and preserves continuity"
 }
 
 test_pi_extension_reports_external_healthy_watcher
@@ -2475,6 +2481,6 @@ test_opencode_late_unretired_close_resumes_supervision
 test_opencode_empty_close_retries_instead_of_disappearing
 test_opencode_established_empty_close_honors_retry_limit
 test_opencode_actionable_close_rechecks_session_lock
-test_opencode_late_close_targets_current_session_generation
+test_opencode_session_generation_replaces_stale_cycle
 test_opencode_watch_arm_coordinates_with_turnend_guard
 test_opencode_healthy_arm_output_does_not_suppress_guard

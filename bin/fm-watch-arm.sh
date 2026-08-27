@@ -56,8 +56,9 @@
 # wins the singleton while the duplicate child stands down.
 # --handling-delivered confirms that the exact successor watcher and recovery
 # generation still own delivery and that the exact queue sequence captured for
-# the delivered wake is still pending with the same reason. Exit 3 means the row was already acknowledged, so a persistent
-# adapter must absorb the late callback without starting a model turn.
+# the delivered wake is still pending with its durable payload. Exit 3 means the
+# row was already acknowledged, so a persistent adapter must absorb the late
+# callback without starting a model turn.
 # --retire-away is the authenticated Pi producer transition: only the current
 # extension process may mark and stop its exact healthy watcher while .afk exists.
 # The watcher's cleanup consumes that marker and releases its singleton without
@@ -285,23 +286,30 @@ fail_unexplained_cycle() {
 
 # Close a cycle whose reason line this arm could not read against the bounded
 # terminal-delivery ledger the watcher publishes before releasing its lock.
-print_cycle_delivery_sequence() {
-  local clean_identity record_pid record_identity record_reason record_sequence sequence=
+print_cycle_delivery_identity() {
+  local clean_identity record_pid record_identity record_reason record_sequence record_payload sequence= payload=
   clean_identity=$(printf '%s' "$cycle_watcher_identity" | tr '\t\r\n' '   ')
   fm_lock_acquire_wait "$WATCH_DELIVERY_LOCK" || return 0
   if [ -f "$WATCH_DELIVERY_LOG" ]; then
-    while IFS=$'\t' read -r record_pid record_identity record_reason record_sequence; do
+    while IFS=$'\t' read -r record_pid record_identity record_reason record_sequence record_payload; do
       if [ "$record_pid" = "$cycle_watcher_pid" ] && [ "$record_identity" = "$clean_identity" ]; then
         sequence=$record_sequence
+        payload=$record_payload
       fi
     done < "$WATCH_DELIVERY_LOG"
   fi
   fm_lock_release "$WATCH_DELIVERY_LOCK"
-  case "$sequence" in ''|*[!0-9]*) ;; *) printf 'watcher: delivery-sequence=%s\n' "$sequence" ;; esac
+  case "$sequence" in
+    ''|*[!0-9]*) ;;
+    *)
+      printf 'watcher: delivery-sequence=%s\n' "$sequence"
+      printf 'watcher: delivery-payload=%s\n' "$payload"
+      ;;
+  esac
 }
 
 close_unobserved_cycle() {
-  local i reason sequence clean_identity record_pid record_identity record_reason record_sequence
+  local i reason sequence payload clean_identity record_pid record_identity record_reason record_sequence record_payload
   clean_identity=$(printf '%s' "$cycle_watcher_identity" | tr '\t\r\n' '   ')
   i=0
   while ! fm_lock_try_acquire "$WATCH_DELIVERY_LOCK"; do
@@ -314,17 +322,24 @@ close_unobserved_cycle() {
   done
   reason=
   if [ -f "$WATCH_DELIVERY_LOG" ]; then
-    while IFS=$'\t' read -r record_pid record_identity record_reason record_sequence; do
+    while IFS=$'\t' read -r record_pid record_identity record_reason record_sequence record_payload; do
       if [ "$record_pid" = "$cycle_watcher_pid" ] && [ "$record_identity" = "$clean_identity" ]; then
         reason=$record_reason
         sequence=$record_sequence
+        payload=$record_payload
       fi
     done < "$WATCH_DELIVERY_LOG"
   fi
   fm_lock_release "$WATCH_DELIVERY_LOCK"
   if [ -n "$reason" ]; then
     printf '%s\n' "$reason"
-    case "$sequence" in ''|*[!0-9]*) ;; *) printf 'watcher: delivery-sequence=%s\n' "$sequence" ;; esac
+    case "$sequence" in
+      ''|*[!0-9]*) ;;
+      *)
+        printf 'watcher: delivery-sequence=%s\n' "$sequence"
+        printf 'watcher: delivery-payload=%s\n' "$payload"
+        ;;
+    esac
     return 0
   fi
   fail_unexplained_cycle
@@ -591,7 +606,7 @@ owned_child_finished() {
     reason_type=$(watch_output_reason_type "$child_out")
     cycle_log_append "$rc" "$signal" "$reason_type" none
     print_watch_output "$child_out"
-    print_cycle_delivery_sequence
+    print_cycle_delivery_identity
     rm -f "$child_out" 2>/dev/null || true
     child=
     child_out=

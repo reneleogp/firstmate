@@ -297,6 +297,8 @@ test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
   expect_code 0 "$status" "re-arm re-surface wake must close successfully"
   grep -F 'check: rearm-resurface' "$armout" >/dev/null \
     || fail "re-arm did not report the durable recovery wake: $(cat "$armout")"
+  grep -F 'watcher: delivery-payload=check: startup-network' "$armout" >/dev/null \
+    || fail "re-arm did not bind its presentation reason to the selected durable payload: $(cat "$armout")"
 
   # The normal wake-handling drain is the one owner of both queue consumption
   # and the cursor-backed fold. It must expose every queued record and the
