@@ -92,10 +92,19 @@ triage_log() {
 
 FM_WATCH_DELIVERY_SEQUENCE=
 FM_WATCH_DELIVERY_PAYLOAD=
+FM_WATCH_DELIVERY_PRESELECTED=
+watch_delivery_preselect() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  FM_WATCH_DELIVERY_SEQUENCE=$1
+  FM_WATCH_DELIVERY_PAYLOAD=$2
+  FM_WATCH_DELIVERY_PRESELECTED=1
+}
+
 watch_delivery_select() {
   local requested=${FM_WAKE_APPENDED_SEQUENCE:-} selected
   FM_WATCH_DELIVERY_SEQUENCE=
   FM_WATCH_DELIVERY_PAYLOAD=
+  FM_WATCH_DELIVERY_PRESELECTED=
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return 1
   if [ -n "$requested" ]; then
     selected=$(awk -F '\t' -v sequence="$requested" 'NF >= 5 && $2 == sequence { print $2 "\t" $5; exit }' "$FM_WAKE_QUEUE" 2>/dev/null)
@@ -121,7 +130,9 @@ wake() {
   esac
   trap '' HUP INT TERM
   [ -z "$FM_WAKE_POST_OUTPUT_ACTION" ] || trap '' PIPE
-  watch_delivery_select || true
+  if [ "$FM_WATCH_DELIVERY_PRESELECTED" != 1 ]; then
+    watch_delivery_select || true
+  fi
   if echo "$1"; then
     output_status=0
     watch_delivery_publish "$1" "$FM_WATCH_DELIVERY_SEQUENCE" "$FM_WATCH_DELIVERY_PAYLOAD" || true

@@ -512,29 +512,36 @@ function armAttempt(status, armChild, includeArmChild) {
 }
 
 async function ensureArm(paths, sessionID, sessionGeneration, client, predecessorArmPid = "", includeArmChild = false) {
-  if (!sessionIsCurrent(sessionID, sessionGeneration)) return armAttempt("skipped", null, includeArmChild);
-  let launchResult = null;
-  if (!launchInFlight) {
-    const launch = beginArm(paths, sessionID, sessionGeneration, client, predecessorArmPid);
-    launchInFlight = launch;
+  for (;;) {
+    if (!sessionIsCurrent(sessionID, sessionGeneration)) return armAttempt("skipped", null, includeArmChild);
+    let launch = launchInFlight;
+    if (!launch) {
+      launch = {
+        sessionID,
+        sessionGeneration,
+        promise: beginArm(paths, sessionID, sessionGeneration, client, predecessorArmPid),
+      };
+      launchInFlight = launch;
+    }
+    let launchResult;
     try {
-      launchResult = await launch;
+      launchResult = await launch.promise;
     } finally {
       if (launchInFlight === launch) launchInFlight = null;
     }
-  } else {
-    launchResult = await launchInFlight;
+    if (!sessionIsCurrent(sessionID, sessionGeneration)) return armAttempt("skipped", null, includeArmChild);
+    const armChild = launchResult.armChild;
+    const owner = armChild ? armOwner.get(armChild) : undefined;
+    if (
+      launch.sessionID !== sessionID
+      || launch.sessionGeneration !== sessionGeneration
+      || (armChild && (owner?.sessionID !== sessionID || owner?.sessionGeneration !== sessionGeneration))
+    ) {
+      continue;
+    }
+    if (!armChild) return armAttempt(launchResult.status, null, includeArmChild);
+    return armAttempt(await waitForArmReady(armChild), armChild, includeArmChild);
   }
-  if (!sessionIsCurrent(sessionID, sessionGeneration)) return armAttempt("skipped", null, includeArmChild);
-  let armChild = launchResult.armChild;
-  const owner = armChild ? armOwner.get(armChild) : undefined;
-  if (armChild && (owner?.sessionID !== sessionID || owner?.sessionGeneration !== sessionGeneration)) {
-    if (!(await retireArm(armChild))) return armAttempt("failed", null, includeArmChild);
-    launchResult = await beginArm(paths, sessionID, sessionGeneration, client, predecessorArmPid);
-    armChild = launchResult.armChild;
-  }
-  if (!armChild) return armAttempt(launchResult.status, null, includeArmChild);
-  return armAttempt(await waitForArmReady(armChild), armChild, includeArmChild);
 }
 
 export const FmPrimaryWatchArm = async ({ client, directory, worktree }) => {

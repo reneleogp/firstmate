@@ -782,20 +782,37 @@ procevent_surface_after_output() {
 }
 
 procevent_surface_queued() {
-  local key reason
+  local sequence key payload reason selected_sequence= selected_payload=
   PROCEVENT_SURFACED=
   [ -s "$FM_WAKE_QUEUE" ] || return 0
   fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
-  while IFS= read -r key; do
-    case "$key" in procevent:*) ;; *) continue ;; esac
+  while IFS=$(printf '\t') read -r sequence key payload; do
+    [ -n "$key" ] || continue
     [ -e "$(procevent_surfaced_marker "$key")" ] && continue
     PROCEVENT_SURFACED="$PROCEVENT_SURFACED $key"
-  done < <(fm_wake_queued_keys_locked check)
+    if [ -z "$selected_sequence" ] || [ "$sequence" -gt "$selected_sequence" ]; then
+      selected_sequence=$sequence
+      selected_payload=$payload
+    fi
+  done < <(awk -F '\t' '
+    NF >= 5 && $2 ~ /^[0-9]+$/ && $3 == "check" && $4 ~ /^procevent:/ {
+      if (!seen[$4]++) order[++count]=$4
+      sequence[$4]=$2
+      payload[$4]=$5
+    }
+    END {
+      for (i=1; i<=count; i++) print sequence[order[i]] "\t" order[i] "\t" payload[order[i]]
+    }
+  ' "$FM_WAKE_QUEUE" 2>/dev/null)
   if [ -z "$PROCEVENT_SURFACED" ]; then
     fm_lock_release "$FM_WAKE_QUEUE_LOCK"
     return 0
   fi
   reason="check: process-event result captured:$PROCEVENT_SURFACED"
+  watch_delivery_preselect "$selected_sequence" "$selected_payload" || {
+    fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+    return 1
+  }
   # shellcheck disable=SC2034 # Consumed by wake() in the separately linted transition owner.
   FM_WAKE_POST_OUTPUT_ACTION=procevent_surface_after_output
   wake "$reason"
