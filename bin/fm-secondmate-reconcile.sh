@@ -37,9 +37,15 @@
 #
 # Lock acquisition is non-blocking. A busy reconcile, lifecycle-control, or
 # metadata lock skips that home without starting its cooldown, so a later recap
-# can retry. The sampled spawn generation is revalidated before delivery and
-# before the cooldown commit so a retired endpoint is never nudged or allowed to
-# silence its replacement.
+# can retry. The sampled endpoint identity is revalidated before delivery, by
+# fm-send under its final route lock, and before the cooldown commit so a retired
+# endpoint is never nudged or allowed to silence its replacement.
+#
+# A persistent REMOTE secondmate's parent-side metadata intentionally has no
+# spawn_gen (docs/remote-secondmates.md). Such a row is legitimate and markerless
+# by construction, not corrupt, so it uses its sampled remote_host as the separate
+# identity guard. The current metadata must still have no spawn_gen and must still
+# name that host. A row with neither identity fails loudly.
 #
 # Exit status: 0 when no delivery or cooldown-recording failure is known,
 # including when a home was skipped for lock contention or a stale endpoint;
@@ -103,8 +109,43 @@ nudge_path() {  # <mate-id>
   printf '%s/%s.reconcile-nudged\n' "$STATE" "$1"
 }
 
+meta_field() {  # <meta-file> <key>
+  grep "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
 meta_spawn_gen() {
-  grep '^spawn_gen=' "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true
+  meta_field "$1" spawn_gen
+}
+
+meta_remote_host() {
+  meta_field "$1" remote_host
+}
+
+# revalidate_identity <meta> <sampled_spawn_gen> <sampled_host>
+# Confirms the row's sampled identity still matches the mate's current
+# metadata. When a spawn generation was sampled, that generation alone is the
+# identity, exactly as before. When none was sampled - the only legitimate
+# case is a persistent remote secondmate, whose parent metadata never carries
+# one - the sampled host substitutes, and the metadata must still carry no
+# spawn_gen of its own or the row's assumed identity model no longer holds.
+# Sets REVALIDATE_REASON to "no-identity" (nothing here can be safely
+# identified; report failed) or "stale" (identified, but changed; report
+# stale) on any non-zero return.
+revalidate_identity() {  # <meta> <sampled_spawn_gen> <sampled_host>
+  local meta=$1 sampled_gen=$2 sampled_host=$3 cur_gen='' cur_host=''
+  if [ -f "$meta" ] && [ ! -L "$meta" ]; then
+    cur_gen=$(meta_spawn_gen "$meta")
+    cur_host=$(meta_remote_host "$meta")
+  fi
+  if [ -n "$sampled_gen" ]; then
+    if [ -z "$cur_gen" ]; then REVALIDATE_REASON=no-identity; return 1; fi
+    if [ "$cur_gen" != "$sampled_gen" ]; then REVALIDATE_REASON=stale; return 1; fi
+    return 0
+  fi
+  if [ -z "$sampled_host" ]; then REVALIDATE_REASON=no-identity; return 1; fi
+  if [ -n "$cur_gen" ]; then REVALIDATE_REASON=stale; return 1; fi
+  if [ -z "$cur_host" ] || [ "$cur_host" != "$sampled_host" ]; then REVALIDATE_REASON=stale; return 1; fi
+  return 0
 }
 
 cmd_nudged() {
@@ -143,7 +184,7 @@ EOF
 }
 
 cmd_notify() {
-  local snapshot_src="" snapshot rows rc=0 now
+  local snapshot_src="" snapshot rows rc=0 now row_sep
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --snapshot) [ "$#" -ge 2 ] || fail "--snapshot needs a value"; snapshot_src=$2; shift 2 ;;
@@ -167,24 +208,38 @@ cmd_notify() {
 
   # Only a real inventory mismatch is a books problem the mate can fix; every
   # other invalidity is either unreadable state or nothing to reconcile.
-  rows=$(printf '%s' "$snapshot" | jq -r '
+  # spawn_gen is empty only for a persistent remote secondmate, whose parent
+  # metadata never carries one (bin/fm-spawn.sh's spawn_remote_secondmate());
+  # host is its substitute identity there and is otherwise unused. Both are
+  # still character-restricted so a malformed sample cannot masquerade as
+  # either a live incarnation token or a live host.
+  #
+  # Rows join on ASCII unit separator (0x1F), not @tsv: bash's IFS-whitespace
+  # `read` collapses consecutive tabs, which would silently drop a
+  # legitimately empty spawn_gen or host field instead of preserving it. 0x1F
+  # is a control character, so the host filter below already excludes it from
+  # every field; it is passed in via --arg rather than written literally so no
+  # raw control byte sits in this source file.
+  row_sep=$(printf '\037')
+  rows=$(printf '%s' "$snapshot" | jq -r --arg sep "$row_sep" '
     (if .schema == "fm-bearings.v1" then
        (.secondmate_reconcile // [])[]
-       | {id, spawn_gen:(.spawn_gen // ""), kind:(.kind // ""), ids:(.ids // [])}
+       | {id, spawn_gen:(.spawn_gen // ""), host:(.host // ""), kind:(.kind // ""), ids:(.ids // [])}
      else
        (.secondmate_current.records // [])[]
        | select(.reconcile_inventory != null)
-       | {id, spawn_gen:(.spawn_gen // ""), kind:(.reconcile_inventory.kind // ""), ids:(.reconcile_inventory.ids // [])}
+       | {id, spawn_gen:(.spawn_gen // ""), host:(.host // ""), kind:(.reconcile_inventory.kind // ""), ids:(.reconcile_inventory.ids // [])}
      end)
     | select((.id | type) == "string" and (.id | test("^[A-Za-z0-9._-]+$")))
-    | select((.spawn_gen | type) == "string" and (.spawn_gen | test("^[A-Za-z0-9._-]+$")))
+    | select((.spawn_gen | type) == "string" and (.spawn_gen | test("^[A-Za-z0-9._-]*$")))
+    | select((.host | type) == "string" and (.host | test("[[:cntrl:]]") | not))
     | .kind as $kind
     | select(["orphan_in_flight","unowned_current","terminal_in_flight"] | index($kind))
-    | [.id, .spawn_gen, $kind]
-    | @tsv')
+    | [.id, .spawn_gen, .host, $kind]
+    | join($sep)')
 
-  local id sampled_spawn_gen kind path last age now delivered_at reconcile_lock control_lock meta meta_lock current_spawn_gen did send_rc
-  while IFS=$'\t' read -r id sampled_spawn_gen kind; do
+  local id sampled_spawn_gen sampled_host expected_remote_host kind path last age now delivered_at reconcile_lock control_lock meta meta_lock did send_rc
+  while IFS=$'\037' read -r id sampled_spawn_gen sampled_host kind; do
     [ -n "${id:-}" ] || continue
     path=$(nudge_path "$id")
     reconcile_lock="$STATE/.$id.reconcile.lock"
@@ -225,18 +280,13 @@ cmd_notify() {
       continue
     fi
     ACTIVE_META_LOCK=$meta_lock
-    current_spawn_gen=
-    if [ -f "$meta" ] && [ ! -L "$meta" ]; then
-      current_spawn_gen=$(meta_spawn_gen "$meta")
-    fi
-    if [ -z "$current_spawn_gen" ]; then
-      printf 'failed: %s %s\n' "$id" "$kind"
-      rc=1
-      release_active_locks
-      continue
-    fi
-    if [ "$current_spawn_gen" != "$sampled_spawn_gen" ]; then
-      printf 'stale: %s %s\n' "$id" "$kind"
+    if ! revalidate_identity "$meta" "$sampled_spawn_gen" "$sampled_host"; then
+      if [ "$REVALIDATE_REASON" = stale ]; then
+        printf 'stale: %s %s\n' "$id" "$kind"
+      else
+        printf 'failed: %s %s\n' "$id" "$kind"
+        rc=1
+      fi
       release_active_locks
       continue
     fi
@@ -246,9 +296,12 @@ cmd_notify() {
       release_active_locks
       continue
     }
+    expected_remote_host=
+    [ -n "$sampled_spawn_gen" ] || expected_remote_host=$sampled_host
     release_active_locks
     send_rc=0
     FM_TASK_INBOX_LOCK_WAIT_SECS=0 FM_SEND_EXPECTED_SPAWN_GEN="$sampled_spawn_gen" \
+      FM_SEND_EXPECTED_REMOTE_HOST="$expected_remote_host" \
       "$SCRIPT_DIR/fm-send.sh" "$id" --fire-and-forget "$did" \
       "$(reconcile_text)" >/dev/null 2>&1 || send_rc=$?
     # exit 3 is "typed but unconfirmed": the mate may already hold the ask, so
@@ -279,15 +332,11 @@ cmd_notify() {
       continue
     fi
     ACTIVE_META_LOCK=$meta_lock
-    current_spawn_gen=
-    if [ -f "$meta" ] && [ ! -L "$meta" ]; then
-      current_spawn_gen=$(meta_spawn_gen "$meta")
-    fi
     last=
     if [ -f "$path" ] && [ ! -L "$path" ]; then last=$(cat "$path" 2>/dev/null || true); fi
     case "$last" in ''|*[!0-9]*) last= ;; esac
     if [ -n "$last" ] && [ "$last" -gt "$delivered_at" ]; then delivered_at=$last; fi
-    if [ "$current_spawn_gen" = "$sampled_spawn_gen" ] \
+    if revalidate_identity "$meta" "$sampled_spawn_gen" "$sampled_host" \
       && (umask 077; printf '%s\n' "$delivered_at" > "$path.tmp") \
       && mv -f -- "$path.tmp" "$path"; then
       printf 'sent: %s %s\n' "$id" "$kind"

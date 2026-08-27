@@ -162,6 +162,9 @@ Backends that already refuse secondmate launch, currently Orca and cmux, remain 
 
 Startup liveness recovery relaunches a dead or missing remote second mate through this same command, so recovery passes the same readiness gate rather than a weaker one.
 
+A persistent remote route's parent metadata intentionally has no local spawn-generation marker and identifies the route by its recorded host instead.
+The Bearings inventory-reconcile hook therefore accepts these markerless routes, revalidates the sampled host at delivery, and refuses a route that changed hosts; [`fm-secondmate-reconcile.sh`](../bin/fm-secondmate-reconcile.sh) owns the exact cooldown, identity, and reporting contract.
+
 Send routed requests normally:
 
 ```sh
@@ -243,6 +246,7 @@ The lifecycle test covers seeding a registered project that this machine has nev
 ```sh
 bin/fm-test-run.sh tests/fm-on.test.sh
 bin/fm-test-run.sh tests/fm-send-remote-delivery.test.sh
+bin/fm-test-run.sh tests/fm-secondmate-reconcile.test.sh
 bin/fm-test-run.sh tests/fm-peek-remote.test.sh
 bin/fm-test-run.sh tests/fm-crew-state.test.sh
 bin/fm-test-run.sh tests/fm-remote-job.test.sh

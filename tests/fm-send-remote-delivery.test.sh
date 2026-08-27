@@ -459,6 +459,36 @@ test_remote_send_revalidates_parent_route_after_retirement_lock() {
   pass "fm-send remote: enqueue revalidates the parent route under its metadata lock"
 }
 
+test_remote_expected_host_revalidates_final_route() {
+  local dir fb ssh_log home rhome rc err count
+  dir="$TMP_ROOT/remote-expected-host"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); ssh_log="$dir/ssh.log"; : > "$ssh_log"
+  rhome=$(setup_remote_secondmate_home remote-expected-host)
+  home=$(setup_remote_parent_home remote-expected-host "$rhome")
+
+  rc=0
+  send_env "$fb" "$home" "$ssh_log" \
+    FM_SEND_EXPECTED_SPAWN_GEN="" FM_SEND_EXPECTED_REMOTE_HOST=remote-mac \
+    "$SEND" rsm --fire-and-forget 1111111111111111 "matching expected host" \
+    >"$dir/match.out" 2>"$dir/match.err" || rc=$?
+  expect_code 0 "$rc" "a matching expected remote host must allow delivery"
+  count=$(remote_inbox_records "$rhome" | grep -c . || true)
+  [ "$count" = 1 ] || fail "a matching expected remote host did not deliver exactly once"
+
+  rc=0
+  send_env "$fb" "$home" "$ssh_log" \
+    FM_SEND_EXPECTED_SPAWN_GEN="" FM_SEND_EXPECTED_REMOTE_HOST=retired-mac \
+    "$SEND" rsm --fire-and-forget 2222222222222222 "stale expected host" \
+    >"$dir/mismatch.out" 2>"$dir/mismatch.err" || rc=$?
+  [ "$rc" -ne 0 ] || fail "a mismatched expected remote host reported delivery"
+  err=$(cat "$dir/mismatch.err")
+  assert_contains "$err" "retired or changed route" \
+    "a mismatched expected remote host did not report the route replacement: $err"
+  count=$(remote_inbox_records "$rhome" | grep -c . || true)
+  [ "$count" = 1 ] || fail "a mismatched expected remote host reached the remote inbox"
+  pass "fm-send remote: expected host is enforced by final route validation"
+}
+
 test_remote_resolve_key_closes_at_enqueue() {
   local dir fb ssh_log home rhome rc out
   dir="$TMP_ROOT/remote-key"; mkdir -p "$dir"
@@ -657,6 +687,7 @@ test_remote_retry_failure_preserves_ambiguous_expectation
 test_remote_fire_and_forget_never_arms_reply_recovery
 test_remote_send_revalidates_after_retirement_lock
 test_remote_send_revalidates_parent_route_after_retirement_lock
+test_remote_expected_host_revalidates_final_route
 test_remote_resolve_key_closes_at_enqueue
 test_remote_slash_rides_inbox
 test_remote_real_failure_still_fails

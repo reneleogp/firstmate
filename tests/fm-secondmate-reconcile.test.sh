@@ -52,6 +52,111 @@ write_snapshot() {  # <path> <mate-id> <invalidity-json> [state]
       provenance:{selected:"structured-home", trust:"partial-structured"}}]}}' > "$1"
 }
 
+# The same shape, but for a persistent REMOTE secondmate: no spawn_gen (its
+# parent metadata never carries one), host instead.
+write_remote_snapshot() {  # <path> <mate-id> <host> <invalidity-json> [state]
+  jq -n --arg id "$2" --arg host "$3" --argjson inv "$4" --arg state "${5:-captain_decision}" '{
+    schema:"fm-fleet-snapshot.v1", generated:"2026-08-26T00:00:00Z",
+    secondmate_current:{records:[{
+      id:$id, home:("/tmp/" + $id), host:$host, spawn_gen:null,
+      current:{state:$state, reason:null},
+      invalidity:$inv, reconcile_inventory:($inv // {kind:null,ids:[]}),
+      provenance:{selected:"structured-home", trust:"partial-structured"}}]}}' > "$1"
+}
+
+# A fake ssh that decodes fm-on.sh's base64 remote-home/argv payload and
+# EXECUTES the real host-local leg (fm-remote-secondmate-control.sh) against a
+# genuinely seeded remote-home fixture, exactly like the ssh stub proven in
+# tests/fm-send-remote-delivery.test.sh.
+make_remote_ssh_stub() {  # <dir> -> echoes fakebin dir
+  local dir=$1 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/fake-ssh" <<'SH'
+#!/usr/bin/env bash
+set -u
+cat > /dev/null
+while [ "$#" -gt 0 ]; do
+  case "$1" in -o) shift 2 ;; --) shift; break ;; *) exit 90 ;; esac
+done
+shift 2  # host, fm-remote-entrypoint.sh
+home_b64=$3
+argv_b64=$4
+remote_home=$(perl -MMIME::Base64=decode_base64 -e 'print decode_base64($ARGV[0])' "$home_b64")
+rargs=()
+while IFS= read -r -d '' a; do rargs+=("$a"); done \
+  < <(perl -MMIME::Base64=decode_base64 -e 'print decode_base64($ARGV[0])' "$argv_b64")
+cmd=${rargs[0]}
+rc=0
+env FM_HOME="$remote_home" FM_ROOT_OVERRIDE="$FM_REMOTE_CODE_ROOT" \
+  "$FM_REMOTE_CODE_ROOT/bin/$cmd" "${rargs[@]:1}" || rc=$?
+exit "$rc"
+SH
+  chmod +x "$fb/fake-ssh"
+  printf '%s\n' "$fb"
+}
+
+# A seeded remote secondmate home the real host-local leg validates and writes
+# into (identity marker, Firstmate-checkout shape, parent-route endpoint meta).
+make_remote_secondmate_home() {  # <name> -> echoes remote home dir
+  local rh="$TMP_ROOT/$1-rhome"
+  mkdir -p "$rh/state/parent-route" "$rh/bin"
+  printf '%s\n' "$1" > "$rh/.fm-secondmate-home"
+  printf '# remote secondmate home fixture\n' > "$rh/AGENTS.md"
+  cat > "$rh/state/parent-route/$1.meta" <<META
+window=fm-remote:p1
+worktree=-
+project=-
+backend=herdr
+endpoint_task_id=$1
+harness=claude
+herdr_session=fm-remote
+herdr_workspace_id=w1
+herdr_tab_id=t1
+herdr_pane_id=p1
+META
+  printf '%s\n' "$rh"
+}
+
+# A parent home whose secondmate is a persistent REMOTE route (as
+# spawn_remote_secondmate() writes it: no spawn_gen, remote_host instead).
+make_remote_parent_home() {  # <name> <mate-id> <remote-home> <host> -> echoes home dir
+  local home="$TMP_ROOT/$1" id=$2 rhome host=$4
+  mkdir -p "$home/data" "$home/state"
+  # Canonicalize: fm-on.sh's registry route parser rejects an empty path
+  # component, and $TMP_ROOT can carry one (a raw mktemp base under a
+  # trailing-slash TMPDIR), same as make_main_home's $abs above.
+  rhome=$(cd "$3" && pwd -P)
+  cat > "$home/state/$id.meta" <<META
+window=remote:$id
+endpoint_task_id=$id
+harness=claude
+kind=secondmate
+mode=secondmate
+yolo=off
+remote_host=$host
+remote_root=/remote/root
+remote_backend=herdr
+remote_herdr_session=fm-remote
+remote_target=fm-remote:p1
+META
+  cat > "$home/data/secondmates.md" <<EOF
+- $id - remote fixture domain (host: $host; root: /remote/root; home: $rhome; scope: remote fixture; projects: sample; added 2026-08-26)
+EOF
+  printf '%s\n' "$home"
+}
+
+remote_inbox_records() {  # <remote-home> <mate-id>
+  find "$1/state/parent-route/$2.inbox" -maxdepth 1 -type f -name '*.msg' 2>/dev/null
+}
+
+run_remote_notify() {  # <home> <fakebin> <snapshot>
+  local home=$1 fakebin=$2 snap=$3
+  FM_SSH_BIN="$fakebin/fake-ssh" FM_REMOTE_CODE_ROOT="$ROOT" \
+    PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$home/state" \
+    "$RECONCILE" notify --snapshot "$snap"
+}
+
 # Age the home's cooldown record so the next run sees the window as elapsed.
 age_cooldown() {  # <state-dir> <mate-id> <seconds-ago>
   printf '%s\n' "$(( $(date +%s) - $3 ))" > "$1/$2.reconcile-nudged"
@@ -453,6 +558,150 @@ META
   pass "teardown retires the cooldown before a replacement can inherit it"
 }
 
+# A persistent REMOTE secondmate's parent metadata never carries spawn_gen
+# (bin/fm-spawn.sh's spawn_remote_secondmate() never writes one). This is the
+# proven marker-bearing path's counterpart: same durable fire-and-forget
+# delivery and cooldown behavior, driven end to end through the real remote
+# transport, for a mate that legitimately has no generation marker at all.
+test_a_markerless_remote_secondmate_is_nudged_once_per_window() {
+  local home rhome fakebin snap out
+  fakebin=$(make_remote_ssh_stub "$TMP_ROOT/remote-once")
+  rhome=$(make_remote_secondmate_home remote-once-mate)
+  home=$(make_remote_parent_home remote-once remote-once-mate "$rhome" remote-once-host)
+  snap="$home/snapshot.json"
+  write_remote_snapshot "$snap" remote-once-mate remote-once-host \
+    '{"kind":"orphan_in_flight","ids":["stale-scout"]}'
+
+  out=$(run_remote_notify "$home" "$fakebin" "$snap") \
+    || fail "the first markerless reconcile ask failed: $out"
+  assert_contains "$out" "sent: remote-once-mate orphan_in_flight" \
+    "a legitimately markerless remote mate got no ask: $out"
+  [ -n "$(remote_inbox_records "$rhome" remote-once-mate)" ] \
+    || fail "the ask did not land as a durable record in the remote steering inbox"
+  [ -f "$home/state/remote-once-mate.reconcile-nudged" ] \
+    || fail "a successful markerless ask did not start the cooldown"
+
+  out=$(run_remote_notify "$home" "$fakebin" "$snap") \
+    || fail "the repeat markerless run failed: $out"
+  assert_contains "$out" "cooldown: remote-once-mate" \
+    "a repeated markerless snapshot did not report the cooldown: $out"
+  [ "$(remote_inbox_records "$rhome" remote-once-mate | grep -c . || true)" -eq 1 ] \
+    || fail "repeated markerless snapshots asked the mate more than once inside the cooldown"
+  pass "a legitimately markerless persistent remote secondmate is nudged once per window"
+}
+
+# The safety boundary the spawn_gen check protects for local mates has a
+# host-keyed counterpart for markerless remote mates: a snapshot sampled
+# before the route moved to a different host must never reach the new host's
+# mate or arm its cooldown.
+test_a_stale_remote_route_is_refused() {
+  local home rhome fakebin snap out
+  fakebin=$(make_remote_ssh_stub "$TMP_ROOT/remote-stale")
+  rhome=$(make_remote_secondmate_home remote-stale-mate)
+  home=$(make_remote_parent_home remote-stale remote-stale-mate "$rhome" old-host)
+  snap="$home/snapshot.json"
+  write_remote_snapshot "$snap" remote-stale-mate old-host \
+    '{"kind":"orphan_in_flight","ids":["old-ghost"]}'
+  # The route was re-seeded to a different host since the snapshot was taken.
+  sed -i.bak 's/^remote_host=.*/remote_host=new-host/' "$home/state/remote-stale-mate.meta" \
+    && rm -f "$home/state/remote-stale-mate.meta.bak"
+
+  out=$(run_remote_notify "$home" "$fakebin" "$snap") \
+    || fail "a stale remote-route snapshot made reconcile fail: $out"
+  assert_contains "$out" "stale: remote-stale-mate orphan_in_flight" \
+    "a snapshot sampled from a retired remote route was not identified: $out"
+  [ -z "$(remote_inbox_records "$rhome" remote-stale-mate)" ] \
+    || fail "a replacement remote route received its predecessor's reconcile ask"
+  assert_absent "$home/state/remote-stale-mate.reconcile-nudged" \
+    "a replacement remote route inherited cooldown from a stale snapshot"
+  pass "a stale remote-route snapshot cannot ask or silence a replacement mate"
+}
+
+test_route_replacement_during_send_is_refused() {
+  local home rhome fakebin snap signal release out rc notify_pid
+  fakebin=$(make_remote_ssh_stub "$TMP_ROOT/remote-send-race")
+  rhome=$(make_remote_secondmate_home remote-send-race-mate)
+  home=$(make_remote_parent_home remote-send-race remote-send-race-mate "$rhome" old-host)
+  snap="$home/snapshot.json"
+  signal="$home/fm-send-started"
+  release="$home/release-fm-send"
+  write_remote_snapshot "$snap" remote-send-race-mate old-host \
+    '{"kind":"orphan_in_flight","ids":["old-ghost"]}'
+  cat > "$fakebin/dirname" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  */fm-send.sh)
+    : > "$FM_RECONCILE_RACE_SIGNAL"
+    while [ ! -f "$FM_RECONCILE_RACE_RELEASE" ]; do sleep 0.01; done
+    ;;
+esac
+case "${1:-}" in
+  */*) printf '%s\n' "${1%/*}" ;;
+  *) printf '.\n' ;;
+esac
+SH
+  chmod +x "$fakebin/dirname"
+
+  rc=0
+  FM_RECONCILE_RACE_SIGNAL="$signal" FM_RECONCILE_RACE_RELEASE="$release" \
+    run_remote_notify "$home" "$fakebin" "$snap" > "$home/notify.out" 2>&1 &
+  notify_pid=$!
+  while [ ! -f "$signal" ]; do
+    kill -0 "$notify_pid" 2>/dev/null || fail "reconcile exited before entering fm-send"
+    sleep 0.01
+  done
+
+  . "$ROOT/bin/fm-wake-lib.sh"
+  fm_lock_acquire_wait "$home/state/.control-remote-send-race-mate.lock"
+  fm_lock_acquire_wait "$home/state/.meta-remote-send-race-mate.lock"
+  sed 's/^remote_host=.*/remote_host=new-host/' \
+    "$home/state/remote-send-race-mate.meta" > "$home/state/remote-send-race-mate.meta.tmp"
+  mv "$home/state/remote-send-race-mate.meta.tmp" "$home/state/remote-send-race-mate.meta"
+  sed 's/host: old-host/host: new-host/' \
+    "$home/data/secondmates.md" > "$home/data/secondmates.md.tmp"
+  mv "$home/data/secondmates.md.tmp" "$home/data/secondmates.md"
+  fm_lock_release "$home/state/.meta-remote-send-race-mate.lock"
+  fm_lock_release "$home/state/.control-remote-send-race-mate.lock"
+  : > "$release"
+  wait "$notify_pid" || rc=$?
+  out=$(cat "$home/notify.out")
+
+  [ "$rc" -ne 0 ] || fail "a route replacement during send reported success: $out"
+  assert_contains "$out" "failed: remote-send-race-mate orphan_in_flight" \
+    "a route replacement during send was not refused: $out"
+  [ -z "$(remote_inbox_records "$rhome" remote-send-race-mate)" ] \
+    || fail "a replacement route received its predecessor's reconcile ask"
+  assert_absent "$home/state/remote-send-race-mate.reconcile-nudged" \
+    "a refused route replacement started the cooldown"
+  pass "a route replacement between reconcile and fm-send cannot receive a stale ask"
+}
+
+# A row with neither a spawn generation nor a host carries no safe identity at
+# all - the markerless path must not swallow that case the way the original
+# bug swallowed every markerless row.
+test_a_row_with_no_identity_at_all_fails_loudly() {
+  local home rhome fakebin snap out
+  fakebin=$(make_remote_ssh_stub "$TMP_ROOT/remote-noid")
+  rhome=$(make_remote_secondmate_home remote-noid-mate)
+  home=$(make_remote_parent_home remote-noid remote-noid-mate "$rhome" remote-noid-host)
+  snap="$home/snapshot.json"
+  write_remote_snapshot "$snap" remote-noid-mate "" \
+    '{"kind":"orphan_in_flight","ids":["ghost"]}'
+
+  set +e
+  out=$(run_remote_notify "$home" "$fakebin" "$snap"); rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "a row with no sampled identity at all reported success: $out"
+  assert_contains "$out" "failed: remote-noid-mate orphan_in_flight" \
+    "an unidentifiable row was not reported as failed: $out"
+  [ -z "$(remote_inbox_records "$rhome" remote-noid-mate)" ] \
+    || fail "an unidentifiable row still received a reconcile ask"
+  assert_absent "$home/state/remote-noid-mate.reconcile-nudged" \
+    "an unidentifiable row started a cooldown"
+  pass "a row with neither a spawn generation nor a host fails loudly instead of vanishing"
+}
+
 test_an_inventory_mismatch_asks_the_mate_once_per_window
 test_a_mismatch_still_there_after_the_window_earns_one_more_nudge
 test_the_cooldown_starts_when_delivery_finishes
@@ -467,3 +716,7 @@ test_concurrent_recaps_send_one_instruction
 test_a_delayed_snapshot_never_prescribes_a_stale_repair
 test_a_stale_snapshot_never_targets_a_replacement_mate
 test_teardown_cannot_leave_its_replacement_in_cooldown
+test_a_markerless_remote_secondmate_is_nudged_once_per_window
+test_a_stale_remote_route_is_refused
+test_route_replacement_during_send_is_refused
+test_a_row_with_no_identity_at_all_fails_loudly
