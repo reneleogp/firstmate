@@ -1106,7 +1106,6 @@ housekeeping() {  # <state>
     [ "$age" -ge "$recheck_window" ] || continue
     case "$worker_status" in
       0) rm -f "$marker" "$backoff_file" ;;
-      2) ;;
       *)
         last=$(last_status_line "$state/$task.status")
         if [ -n "$last" ] && status_is_captain_held "$last"; then

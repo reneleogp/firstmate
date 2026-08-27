@@ -428,6 +428,33 @@ SH
   pass "away-mode worker condition is read only after the base recheck cadence"
 }
 
+test_housekeeping_unreadable_pause_still_resurfaces() {
+  local dir state fakebin win key age
+  dir=$(make_supercase paused-unreadable)
+  state="$dir/state"; fakebin="$dir/fakebin"; win="sess:fm-unreadable"
+  printf 'paused: awaiting an external service\n' > "$state/unreadable.status"
+  key=$(printf '%s' unreadable | tr ':/.' '___')
+  echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+  mv "$fakebin/tmux" "$fakebin/tmux-real"
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" != capture-pane ] || exit 1
+exec "$(dirname "$0")/tmux-real" "$@"
+SH
+  chmod +x "$fakebin/tmux"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_STATE_OVERRIDE="$state" \
+    FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+
+  grep -F "awaiting external" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    || fail "an unreadable declared wait remained overdue instead of re-surfacing"
+  grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    && fail "an unreadable declared wait was mislabeled a possible wedge"
+  age=$(( $(date +%s) - $(cat "$state/.subsuper-paused-$key" 2>/dev/null || echo 0) ))
+  [ "$age" -lt 60 ] || fail "an unreadable declared wait did not advance its bounded recheck cadence"
+  pass "away-mode rechecks remain bounded when worker state is unreadable"
+}
+
 test_housekeeping_recovers_pause_batch_atomically() {
   local dir state now sig1 sig2
   dir=$(make_supercase paused-publication-recovery)
@@ -2031,6 +2058,7 @@ test_housekeeping_resumed_stale_cleared
 test_housekeeping_paused_resurfaces_and_resets
 test_housekeeping_pause_recheck_backs_off_when_unchanged
 test_housekeeping_pause_probe_is_lazy
+test_housekeeping_unreadable_pause_still_resurfaces
 test_housekeeping_recovers_pause_batch_atomically
 test_housekeeping_captain_held_resurfaces_and_resets
 test_housekeeping_paused_resumed_cleared
