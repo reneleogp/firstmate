@@ -33,6 +33,7 @@ type LockOwnership = "owned" | "missing" | "other";
 type CloseClassification = {
   kind: "actionable" | "failure";
   message: string;
+  sequence?: string;
 };
 
 type WatchToolShellState = {
@@ -168,7 +169,8 @@ function actionableLine(output: string): string {
 function classifyClose(stdout: string, stderr: string, code: number | null, signal: NodeJS.Signals | null): CloseClassification {
   const combined = `${stdout}\n${stderr}`.trim();
   const reason = actionableLine(combined);
-  if (reason) return { kind: "actionable", message: reason };
+  const sequence = combined.match(/^watcher: delivery-sequence=([0-9]+)$/m)?.[1];
+  if (reason) return { kind: "actionable", message: reason, sequence };
   const healthy = combined.split(/\r?\n/).find((line) => /^watcher: healthy\b/.test(line));
   if (healthy) {
     return {
@@ -288,26 +290,27 @@ export default function (pi: ExtensionAPI) {
     !calmPresentation.stockExportRendering &&
     !calmTranscriptClassIsVisible(itemClass);
 
-  async function sendWake(
-    owner: SessionGeneration,
-    message: string,
-  ): Promise<void> {
-    if (!ordinaryGenerationIsLive(owner)) return;
-    const content = encodeFirstmateOperationalInput(
+  function wakeContent(message: string): string {
+    return encodeFirstmateOperationalInput(
       "watcher",
       `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first and handle the queued wake. Watcher continuity is extension-owned.`,
     );
+  }
+
+  async function sendWake(owner: SessionGeneration, content: string): Promise<void> {
+    if (!ordinaryGenerationIsLive(owner)) return;
     await pi.sendUserMessage(content, { deliverAs: "followUp" });
   }
 
   function confirmHandlingDelivery(
     recovery: { generation: string; watcherPid: string },
     reason: string,
+    sequence: string,
   ): DeliveryConfirmation {
     try {
       const result = spawnSync(
         "bash",
-        [armScript, "--handling-delivered", recovery.generation, "--watcher-pid", recovery.watcherPid, "--reason", reason],
+        [armScript, "--handling-delivered", recovery.generation, "--watcher-pid", recovery.watcherPid, "--reason", reason, "--sequence", sequence],
         {
           cwd: fmRoot,
           encoding: "utf8",
@@ -334,14 +337,15 @@ export default function (pi: ExtensionAPI) {
     owner: SessionGeneration,
     recovery: { generation: string; watcherPid: string },
     reason: string,
+    sequence: string,
   ): DeliveryConfirmation {
     const snapshot = (): { generation: string; watcherPid: string } => {
       const current = owner.child ? armRecovery.get(owner.child) : undefined;
       return current ?? recovery;
     };
-    const first = confirmHandlingDelivery(snapshot(), reason);
+    const first = confirmHandlingDelivery(snapshot(), reason, sequence);
     if (first.disposition !== "failure") return first;
-    return confirmHandlingDelivery(snapshot(), reason);
+    return confirmHandlingDelivery(snapshot(), reason, sequence);
   }
 
   async function deliverActionableWake(
@@ -349,26 +353,30 @@ export default function (pi: ExtensionAPI) {
     message: string,
     recovery?: { generation: string; watcherPid: string },
     pendingReason = message,
+    pendingSequence?: string,
   ): Promise<void> {
     if (!ordinaryGenerationIsLive(owner)) return;
-    if (recovery) {
-      const confirmed = confirmHandlingDeliveryWithRetry(owner, recovery, pendingReason);
+    const content = wakeContent(message);
+    if (recovery && pendingSequence) {
+      const confirmed = confirmHandlingDeliveryWithRetry(owner, recovery, pendingReason, pendingSequence);
       if (confirmed.disposition === "superseded") return;
       if (confirmed.disposition === "failure") {
         const watcherPid = recovery.watcherPid;
         if (!pidAlive(watcherPid)) {
           await retireArm(owner.child);
         }
-        await sendWake(owner, `${message}\n\n${confirmed.detail}`);
+        await sendWake(owner, wakeContent(`${message}\n\n${confirmed.detail}`));
         return;
       }
+    } else if (recovery) {
+      await sendWake(owner, wakeContent(`${message}\n\nwatcher: FAILED - actionable wake had no durable queue sequence`));
+      return;
     }
-    if (!ordinaryGenerationIsLive(owner)) return;
-    await sendWake(owner, message);
+    await sendWake(owner, content);
   }
 
   function surfaceFailure(owner: SessionGeneration, message: string): void {
-    void sendWake(owner, message).catch(() => {
+    void sendWake(owner, wakeContent(message)).catch(() => {
       // Pi owns delivery errors; continuity restoration never waits on prompting.
     });
   }
@@ -643,7 +651,7 @@ export default function (pi: ExtensionAPI) {
             const restoration = await restoreAfterActionableClose(owner, predecessor);
             if (!generationIsLive(owner)) return;
             const message = restoration.failure ? `${classification.message}\n\n${restoration.failure}` : classification.message;
-            await deliverActionableWake(owner, message, restoration.recovery, classification.message);
+            await deliverActionableWake(owner, message, restoration.recovery, classification.message, classification.sequence);
           } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
             surfaceFailure(owner, `watcher: FAILED - Pi extension could not deliver an actionable wake\n${detail}`);

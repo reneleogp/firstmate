@@ -71,7 +71,7 @@ A zero/empty child return rechecks the home lock and beacon, attaches to a verif
 An attached arm follows verified identity-matched successors and resolves the same way when that chain ends without one, because it holds no handle on the watcher's stdout and cannot read the reason line itself.
 Before releasing its singleton lock after printing an actionable reason, the watcher records that reason with its PID and process identity in `state/.watch-deliveries.log`.
 A matching PID and identity lets an attached arm report the delivered reason and exit zero even after its durable wake was handled and acknowledged, while an unrelated queue producer or a recycled PID cannot satisfy the match.
-Persistent adapters must then call `--handling-delivered` with that exact reason; the arm layer verifies the live successor and recovery generation under the queue lock, returns 0 only while the reason remains queued, and returns 3 after acknowledgement.
+Persistent adapters must then call `--handling-delivered` with that reason and the exact queue sequence captured by the delivering watcher; the arm layer verifies the live successor and recovery generation under the queue lock, returns 0 only while that sequence remains queued with the same reason, and returns 3 after acknowledgement.
 Only a cycle with no matching delivery record emits `watcher: FAILED - cycle ended without an actionable reason` and exits nonzero.
 
 The arm layer appends one tab-separated record per observed cycle to `state/.watch-cycle-exits.log`.

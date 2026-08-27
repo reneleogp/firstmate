@@ -254,6 +254,8 @@ EOF
             printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$target" "$kind" "$key" "$reason" >> "$queue" || status=$?
             # shellcheck disable=SC2034 # Consumed by fm-watch.sh after recovery.
             [ "$status" -ne 0 ] || FM_PAUSE_PUBLISH_RECOVERED_REASON=$reason
+            # shellcheck disable=SC2034 # Consumed by wake() in the watcher transition owner.
+            [ "$status" -ne 0 ] || FM_WAKE_APPENDED_SEQUENCE=$target
           fi
         fi
         fm_lock_release "$lock"
@@ -342,6 +344,7 @@ fm_pause_publish_queue() {  # <state> <kind> <key> <reason> <record-rows>
   fi
   fm_lock_release "$lock"
   _fm_pause_publish_recover "$state" || status=$?
+  [ "$status" -ne 0 ] || FM_WAKE_APPENDED_SEQUENCE=$target
   fm_lock_release "$publish_lock"
   return "$status"
 }

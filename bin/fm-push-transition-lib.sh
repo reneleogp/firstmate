@@ -41,7 +41,7 @@ watch_delivery_clean_reason() {
 }
 
 watch_delivery_publish() {
-  local reason=$1 i size tmp raw
+  local reason=$1 sequence=$2 i size tmp raw
   [ -n "$FM_WATCH_DELIVERY_PID" ] || return 0
   [ -n "$FM_WATCH_DELIVERY_IDENTITY" ] || return 0
   i=0
@@ -50,10 +50,11 @@ watch_delivery_publish() {
     sleep 0.02
     i=$((i + 1))
   done
-  printf '%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\n' \
     "$FM_WATCH_DELIVERY_PID" \
     "$(watch_delivery_clean_identity "$FM_WATCH_DELIVERY_IDENTITY")" \
-    "$(watch_delivery_clean_reason "$reason")" >> "$WATCH_DELIVERY_LOG" 2>/dev/null || true
+    "$(watch_delivery_clean_reason "$reason")" \
+    "$sequence" >> "$WATCH_DELIVERY_LOG" 2>/dev/null || true
   size=$(wc -c < "$WATCH_DELIVERY_LOG" 2>/dev/null | tr -d '[:space:]')
   case "$size" in
     ''|*[!0-9]*) ;;
@@ -84,18 +85,32 @@ triage_log() {
   fi
 }
 
+watch_delivery_sequence() {
+  local sequence=${FM_WAKE_APPENDED_SEQUENCE:-}
+  case "$sequence" in
+    ''|*[!0-9]*)
+      fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return 1
+      sequence=$(awk -F '\t' 'NF >= 5 && $2 ~ /^[0-9]+$/ { value=$2 } END { print value }' "$FM_WAKE_QUEUE" 2>/dev/null)
+      fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+      ;;
+  esac
+  case "$sequence" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$sequence"
+}
+
 # Exit after reporting one actionable wake. Tests override this callback.
 wake() {
-  local output_status=0
+  local output_status=0 delivery_sequence
   case "$1" in
     heartbeat*) echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak" ;;
     *) echo 0 > "$STATE/.heartbeat-streak" ;;
   esac
   trap '' HUP INT TERM
   [ -z "$FM_WAKE_POST_OUTPUT_ACTION" ] || trap '' PIPE
+  delivery_sequence=$(watch_delivery_sequence) || delivery_sequence=
   if echo "$1"; then
     output_status=0
-    watch_delivery_publish "$1" || true
+    watch_delivery_publish "$1" "$delivery_sequence" || true
     # shellcheck disable=SC2034 # Read by bin/fm-watch.sh's EXIT cleanup.
     FM_WATCH_DELIVERED_REASON=$1
   else

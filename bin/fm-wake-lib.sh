@@ -1121,6 +1121,7 @@ fm_wake_clean_field() {
   LC_ALL=C tr '\t\r\n' '   '
 }
 
+FM_WAKE_APPENDED_SEQUENCE=
 fm_wake_append() {
   local kind=$1 key=$2 payload=$3 clean_key clean_payload epoch seq seq_file status
   local recovery_marker
@@ -1148,6 +1149,7 @@ fm_wake_append() {
   fi
   if [ "$status" -eq 0 ]; then
     printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$seq" "$kind" "$clean_key" "$clean_payload" >> "$FM_WAKE_QUEUE" || status=$?
+    [ "$status" -ne 0 ] || FM_WAKE_APPENDED_SEQUENCE=$seq
   fi
   fm_lock_release "$FM_WAKE_QUEUE_LOCK"
   return "$status"

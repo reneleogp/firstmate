@@ -405,33 +405,41 @@ EOF
 }
 
 test_pi_acknowledged_late_close_does_not_force_turn() {
-  local repo home plugin log stop out status
+  local repo home plugin log stop encoder out status
   repo="$TMP_ROOT/pi-late-ack-root"
   home="$TMP_ROOT/pi-late-ack-home"
   log="$TMP_ROOT/pi-late-ack.log"
   stop="$TMP_ROOT/pi-late-ack.stop"
+  encoder="$repo/bin/fm-operational-input-fixture.sh"
   mkdir -p "$repo/bin" "$home/state" "$home/config"
   install_pi_watch_extension_fixture "$repo"
   plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = --handling-delivered ]; then
-  : > "$FM_HOME/state/.wake-queue"
-  exit 3
+  awk -F '\t' -v sequence="$8" -v reason="$6" '$2 == sequence && $5 == reason { found=1 } END { exit !found }' \
+    "$FM_HOME/state/.wake-queue" 2>/dev/null || exit 3
+  exit 0
 fi
 printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
 count=$(grep -c '^arm=' "$FM_ARM_LOG")
 if [ "$count" -eq 1 ]; then
   printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
-  printf 'signal: task.turn-ended\n'
+  printf 'signal: task.turn-ended\nwatcher: delivery-sequence=1\n'
   exit 0
 fi
 printf 'watcher: started pid=%s (beacon fresh) recovery-generation=fixture-generation\n' "$$"
 trap 'exit 0' TERM INT
 while [ ! -e "$FM_STOP_FILE" ]; do sleep 0.02; done
 SH
-  chmod +x "$repo/bin/fm-watch-arm.sh"
-  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" node --input-type=module 2>&1 <<'EOF'
+  cat > "$encoder" <<'SH'
+#!/usr/bin/env bash
+input=$(cat)
+: > "$FM_HOME/state/.wake-queue"
+printf '%s' "$input"
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh" "$encoder"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" FM_OPERATIONAL_INPUT_SCRIPT="$encoder" node --input-type=module 2>&1 <<'EOF'
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
@@ -490,7 +498,7 @@ printf 'arm=%s predecessor=%s\n' "$$" "${FM_WATCH_PREDECESSOR_ARM_PID:-none}" >>
 count=$(grep -c '^arm=' "$FM_ARM_LOG")
 if [ "$count" -eq 1 ]; then
   printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
-  printf 'signal: synthetic actionable close\n'
+  printf 'signal: synthetic actionable close\nwatcher: delivery-sequence=1\n'
   exit 0
 fi
 printf 'watcher: started pid=%s (beacon fresh) recovery-generation=fixture-generation\n' "$$"
@@ -581,7 +589,7 @@ printf 'arm=%s predecessor=%s\n' "$$" "${FM_WATCH_PREDECESSOR_ARM_PID:-none}" >>
 count=$(grep -c '^arm=' "$FM_ARM_LOG")
 if [ "$count" -eq 1 ]; then
   printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
-  printf 'signal: synthetic actionable close\n'
+  printf 'signal: synthetic actionable close\nwatcher: delivery-sequence=1\n'
   exit 0
 fi
 printf 'watcher: started pid=%s (beacon fresh) recovery-generation=fixture-generation\n' "$$"
@@ -1654,7 +1662,7 @@ printf 'arm=%s predecessor=%s\n' "$$" "${FM_WATCH_PREDECESSOR_ARM_PID:-none}" >>
 count=$(grep -c '^arm=' "$FM_ARM_LOG")
 if [ "$count" -eq 1 ]; then
   printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
-  printf 'signal: synthetic wake\n'
+  printf 'signal: synthetic wake\nwatcher: delivery-sequence=1\n'
   exit 0
 fi
 printf 'watcher: started pid=%s (beacon fresh) recovery-generation=fixture-generation\n' "$$"
@@ -2210,12 +2218,10 @@ try {
   writeFileSync(lock, `${other.pid}\n`);
   writeFileSync(process.env.FM_RELEASE_FILE, "release\n");
   await eventPromise;
-  for (let i = 0; i < 250 && !prompt.includes("no longer owns the lock"); i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  await new Promise((resolve) => setTimeout(resolve, 100));
   const rows = readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n");
   if (rows.length !== 1) throw new Error(`successor launched after lock loss: ${rows.join(" | ")}`);
-  if (!prompt.includes("no longer owns the lock")) throw new Error(`missing lock-loss failure: ${prompt}`);
+  if (prompt) throw new Error(`stale lock owner received a monitoring follow-up: ${prompt}`);
 } finally {
   other.kill("SIGTERM");
 }
@@ -2377,6 +2383,67 @@ EOF
   pass "OpenCode healthy arm output does not suppress the turn-end guard"
 }
 
+test_opencode_late_close_targets_current_session_generation() {
+  local plugin repo home log release stop out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  repo="$TMP_ROOT/opencode-session-generation-root"
+  home="$TMP_ROOT/opencode-session-generation-home"
+  log="$TMP_ROOT/opencode-session-generation.log"
+  release="$TMP_ROOT/opencode-session-generation.release"
+  stop="$TMP_ROOT/opencode-session-generation.stop"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  : > "$home/state/task.meta"
+  cat > "$repo/bin/fm-operational-input.sh" <<'SH'
+#!/usr/bin/env bash
+cat
+SH
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --handling-delivered ]; then exit 0; fi
+printf 'arm=%s\n' "$$" >> "$FM_ARM_LOG"
+count=$(wc -l < "$FM_ARM_LOG" | tr -d '[:space:]')
+if [ "$count" -eq 1 ]; then
+  printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+  while [ ! -e "$FM_RELEASE_FILE" ]; do sleep 0.02; done
+  printf 'signal: delayed wake\nwatcher: delivery-sequence=1\n'
+  exit 0
+fi
+printf 'watcher: started pid=%s (beacon fresh) recovery-generation=fixture-generation\n' "$$"
+while [ ! -e "$FM_STOP_FILE" ]; do sleep 0.02; done
+SH
+  chmod +x "$repo/bin/fm-operational-input.sh" "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_RELEASE_FILE="$release" FM_STOP_FILE="$stop" node 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const targets = [];
+const client = { session: { promptAsync: async (request) => targets.push(request.path.id) } };
+const hooks = await mod.FmPrimaryWatchArm({ client, directory: process.env.WORKTREE, worktree: process.env.WORKTREE });
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-a" } } });
+for (let i = 0; i < 250 && !existsSync(process.env.FM_ARM_LOG); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-b" } } });
+writeFileSync(process.env.FM_RELEASE_FILE, "release\n");
+for (let i = 0; i < 500 && targets.length === 0; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+if (targets.length !== 1 || targets[0] !== "session-b") {
+  throw new Error(`delayed wake targeted stale session generation: ${targets.join(" | ")}`);
+}
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "OpenCode delayed closes must target only the current session generation"
+  [ -z "$out" ] || fail "OpenCode session-generation test printed output: $out"
+  pass "OpenCode delayed close targets the current session generation"
+}
+
 test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result
 test_pi_redundant_tool_call_is_owned_noop
@@ -2408,5 +2475,6 @@ test_opencode_late_unretired_close_resumes_supervision
 test_opencode_empty_close_retries_instead_of_disappearing
 test_opencode_established_empty_close_honors_retry_limit
 test_opencode_actionable_close_rechecks_session_lock
+test_opencode_late_close_targets_current_session_generation
 test_opencode_watch_arm_coordinates_with_turnend_guard
 test_opencode_healthy_arm_output_does_not_suppress_guard

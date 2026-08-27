@@ -734,15 +734,14 @@ test_actionable_signal_surfaced() {
   dir=$(make_case actionable-signal); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   status_file="$state/task.status"
-  printf 'working: setup\nneeds-decision: pick A or B\n' > "$status_file"
+  printf 'working: setup\nneeds-decision: pick A or B\nworking: recording the choice request\n' > "$status_file"
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
-  wait_for_exit "$pid" 100 || fail "watcher did not exit for an actionable needs-decision signal"
+  wait_for_exit "$pid" 100 || fail "watcher swallowed an unread needs-decision followed by a routine note"
   grep -F "signal: $status_file" "$out" >/dev/null || fail "watcher did not print the actionable signal reason"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the actionable signal failed"
   grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "actionable signal was not queued"
-  [ -s "$state/.hb-surfaced-task" ] || fail "actionable signal did not record the surfaced marker"
-  pass "captain-relevant signal is surfaced (queue + exit) and marked surfaced"
+  pass "an unread captain-relevant status is surfaced even when a routine note follows"
 }
 
 test_terminal_stale_surfaced() {

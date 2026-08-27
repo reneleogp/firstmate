@@ -436,7 +436,7 @@ test_delivery_gap_wake_is_recovered_once() {
 }
 
 test_interrupted_handling_is_redrained_on_rearm() {
-  local dir home state fakebin first_arm recovery_arm sequence generation handling_watcher_pid handling_generation generation_replay
+  local dir home state fakebin first_arm recovery_arm sequence generation handling_watcher_pid handling_generation handling_sequence generation_replay
   dir=$(make_case interrupted-handling-redrain)
   home="$dir/home"
   state="$dir/state"
@@ -485,8 +485,21 @@ test_interrupted_handling_is_redrained_on_rearm() {
   esac
   handling_generation=$(recovery_marker_generation "$state/.watcher-down")
   handling_watcher_pid=$(sed -n 's/^watcher: started pid=\([0-9][0-9]*\).* recovery-generation=.*$/\1/p' "$dir/handling-successor-arm.out")
+  handling_sequence=$(awk -F '\t' -v reason="signal: $state/interrupted.status" '$5 == reason { print $2; exit }' "$state/.wake-queue")
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_wake_append signal interrupted.status "$2"' _ \
+    "$ROOT/bin/fm-wake-lib.sh" "signal: $state/interrupted.status" \
+    || fail "could not append the same-reason successor row"
+  awk -F '\t' -v sequence="$handling_sequence" '$2 != sequence' "$state/.wake-queue" > "$state/.wake-queue.tmp"
+  mv "$state/.wake-queue.tmp" "$state/.wake-queue"
+  if FM_HOME="$home" FM_STATE_OVERRIDE="$state" "$WATCH_ARM" --handling-delivered "$handling_generation" \
+    --watcher-pid "$handling_watcher_pid" --reason "signal: $state/interrupted.status" --sequence "$handling_sequence"; then
+    fail "an acknowledged row was confused with a later row carrying the same reason"
+  else
+    [ "$?" -eq 3 ] || fail "an acknowledged exact row was not classified as superseded"
+  fi
+  handling_sequence=$(awk -F '\t' -v reason="signal: $state/interrupted.status" '$5 == reason { print $2; exit }' "$state/.wake-queue")
   FM_HOME="$home" FM_STATE_OVERRIDE="$state" "$WATCH_ARM" --handling-delivered "$handling_generation" \
-    --watcher-pid "$handling_watcher_pid" --reason "signal: $state/interrupted.status" \
+    --watcher-pid "$handling_watcher_pid" --reason "signal: $state/interrupted.status" --sequence "$handling_sequence" \
     || fail "confirmed prompt delivery did not begin handling"
   case "$(cat "$state/.watcher-down" 2>/dev/null || true)" in
     pending:handling:"$handling_generation"|announced:handling:"$handling_generation") ;;

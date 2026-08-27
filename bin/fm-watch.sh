@@ -701,22 +701,54 @@ age_of() {  # seconds since file mtime; "due immediately" if missing
 # compared against a persisted size:mtime signature (.seen-*) rather than
 # mtime-vs-a-startup-touch, so signals that land while no watcher is running
 # are caught by the next one, and same-second writes cannot slip through a
-# strict -nt comparison. Pure read: prints one "<seen-file>\t<sig>\t<file>"
-# line per changed file. .seen-* is updated only after the wake is either
+# strict -nt comparison. Pure read: prints one
+# "<seen-file>\t<sig>\t<file>\t<prior-sig>" line per changed file. .seen-* is updated only after the wake is either
 # surfaced or intentionally absorbed, so a watcher killed mid-cycle never
 # swallows a signal.
 scan_signals() {
-  local f sig sf
+  local f sig sf seen
   for f in "$STATE"/*.status "$STATE"/*.turn-ended; do
     [ -e "$f" ] || continue
     sig=$(fm_wake_signal_sig "$f") || continue
     [ -n "$sig" ] || continue
     sf=$(fm_wake_signal_seen_path "$STATE" "$f")
-    if [ "$sig" != "$(cat "$sf" 2>/dev/null)" ]; then
-      printf '%s\t%s\t%s\n' "$sf" "$sig" "$f"
+    seen=$(cat "$sf" 2>/dev/null || true)
+    if [ "$sig" != "$seen" ]; then
+      printf '%s\t%s\t%s\t%s\n' "$sf" "$sig" "$f" "$seen"
     fi
   done
   return 0
+}
+
+status_unread_range_is_actionable() {  # <file> <seen-signature> <captured-signature>
+  local f=$1 seen=$2 captured=$3 start=0 end unread line
+  end=${captured%%:*}
+  case "$end" in ''|*[!0-9]*) return 0 ;; esac
+  if [ -n "$seen" ]; then
+    start=${seen%%:*}
+    case "$start" in ''|*[!0-9]*) start=0 ;; esac
+    [ "$end" -ge "$start" ] || start=0
+  fi
+  if [ "$end" -eq "$start" ]; then
+    start=0
+  fi
+  unread=$(dd if="$f" bs=1 skip="$start" count="$((end - start))" 2>/dev/null) || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    status_is_captain_relevant "$line" && return 0
+  done <<EOF
+$unread
+EOF
+  return 1
+}
+
+pending_signal_is_actionable() {  # stdin: scan_signals rows
+  local sf sig f seen
+  while IFS=$(printf '\t') read -r sf sig f seen; do
+    [ -n "$sf" ] || continue
+    case "$f" in *.status) ;; *) continue ;; esac
+    status_unread_range_is_actionable "$f" "$seen" "$sig" && return 0
+  done
+  return 1
 }
 
 # Deliver a durably queued process-event result to firstmate. Publication is
@@ -1264,7 +1296,7 @@ while :; do
     sleep "$SIGNAL_GRACE"
     pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
     files=""
-    while IFS=$(printf '\t') read -r sf sig f; do
+    while IFS=$(printf '\t') read -r sf sig f seen; do
       [ -n "$sf" ] || continue
       case " $files " in *" $f "*) ;; *) files="$files $f" ;; esac
     done <<EOF
@@ -1276,15 +1308,26 @@ EOF
     # status stream. Bare turn completion and routine working notes advance their
     # exact suppressors and stay silent. They are notifications, not current-state
     # evidence; stopped-worker detection remains with the independent stale path.
+    actionable=0
+    if afk_present; then
+      actionable=1
+    elif pending_signal_is_actionable <<EOF
+$pending
+EOF
+    then
+      actionable=1
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
-    if afk_present || signal_reason_is_actionable $files || signal_has_parent_directed_status $files; then
-      while IFS=$(printf '\t') read -r sf sig f; do
+    elif signal_has_parent_directed_status $files; then
+      actionable=1
+    fi
+    if [ "$actionable" -eq 1 ]; then
+      while IFS=$(printf '\t') read -r sf sig f seen; do
         [ -n "$sf" ] || continue
         fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
       done <<EOF
 $pending
 EOF
-      while IFS=$(printf '\t') read -r sf sig f; do
+      while IFS=$(printf '\t') read -r sf sig f seen; do
         [ -n "$sf" ] || continue
         printf '%s' "$sig" > "$sf"
         mark_surfaced "$f"
@@ -1293,7 +1336,7 @@ $pending
 EOF
       wake "$reason"
     else
-      while IFS=$(printf '\t') read -r sf sig f; do
+      while IFS=$(printf '\t') read -r sf sig f seen; do
         [ -n "$sf" ] || continue
         printf '%s' "$sig" > "$sf"
       done <<EOF
