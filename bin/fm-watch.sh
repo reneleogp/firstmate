@@ -45,9 +45,9 @@
 #                          worktree was written during the quiet window is
 #                          deferred rather than escalated (wedge_defer_writing),
 #                          because files appearing there are liveness the pane and
-#                          the run step cannot show; that deferral still
-#                          re-surfaces once per PAUSE_RESURFACE_SECS, and a pane
-#                          that writes nothing keeps the unchanged schedule.
+#                          the run step cannot show; that deferral re-surfaces on
+#                          the shared capped backoff cadence, and a pane that
+#                          writes nothing keeps the unchanged schedule.
 #                          A genuinely busy pane
 #                          (window_is_busy true) is exempt from the above, but
 #                          only up to BUSY_TURN_MAX_SECS with no completed turn
@@ -381,10 +381,11 @@ write_deferral_signature() {  # <task> <writing-since-file>
   task_wait_signature "$1" "writing:$(cat "$2" 2>/dev/null || true)"
 }
 
-# --- batched declared-wait rechecks ----------------------------------------
-# Every recheck that comes due in one poll is delivered as ONE actionable wake
-# naming every affected wait, so three sibling waits blocked on the same thing
-# cost one model turn instead of three (each wake() exits the cycle, so before
+# --- batched bounded rechecks ----------------------------------------------
+# When no unrelated actionable wake ends the poll first, every bounded recheck
+# collected in that poll is delivered as ONE wake naming every affected window, so
+# three sibling waits blocked on the same thing cost one model turn instead of three
+# (each wake() exits the cycle, so before
 # batching the successor watcher immediately delivered the next overdue sibling).
 # Nothing else is batched: an unrelated failure, decision, check result, or
 # stopped worker still wakes immediately through its own path.
@@ -449,9 +450,9 @@ EOF
 # fake, so the escalation is deferred rather than fired. Deliberately a DEFERRAL,
 # not a cancellation: the idle timer restarts, so the next window probes again,
 # and a .writing-since-<key> marker ages the whole deferral chain so the pane
-# still re-surfaces once every PAUSE_RESURFACE_SECS through the shared
-# resurface_absorbed above - literally the same bounded cadence a declared pause
-# uses, throttled by its own .writing-resurfaced-<key> marker - and a crew whose
+# still re-surfaces through the shared capped backoff in resurface_absorbed above
+# - literally the same bounded cadence a declared pause uses, throttled by its own
+# .writing-resurfaced-<key> marker - and a crew whose
 # worktree churns without real progress cannot stay invisible. The escalation
 # counter is left alone: it is neither advanced (this is not an escalation) nor
 # reset (a later genuine escalation must still carry the demand-deep-inspection
@@ -534,8 +535,8 @@ busy_turn_over_age() {  # <task>
 }
 
 # Absorb a stale pane under a declared external-wait pause (paused:) or a
-# dead-agent captain-held transfer, and re-surface it once every
-# PAUSE_RESURFACE_SECS for a recheck so it cannot rot invisibly. Called on any
+# dead-agent captain-held transfer, and re-surface it on the capped pause recheck
+# cadence so it cannot rot invisibly. Called on any
 # stale poll once pause_state_class permits the bounded cadence, so it must be
 # cheap: it NEVER re-reads crew state. The re-surface age is anchored on the
 # status file mtime, not a per-hash marker, so a churny idle pane (a ticking
@@ -583,7 +584,7 @@ handle_paused_stale() {  # <window> <task> <hash>
 # the expected external wait. The caller has already confirmed liveness through
 # the busy verdict, so this exception does not suppress undeclared wedges or
 # alter the separate non-busy classification. handle_paused_stale keeps the
-# exception bounded by re-surfacing it once per PAUSE_RESURFACE_SECS. Away mode
+# exception bounded by re-surfacing it on the capped pause cadence. Away mode
 # remains daemon-owned and receives the undecorated wake identity for its own
 # classification.
 busy_turn_bound_check() {  # <window> <task> <hash> <since-file> <escalation-file>
@@ -1256,8 +1257,8 @@ EOF
   # Layer 1 backbone: pane staleness. Two consecutive identical hashes with no busy
   # signature means the crewmate finished, is waiting, or is wedged. Each distinct
   # stale hash is surfaced, absorbed, or timed toward escalation once (.stale-*
-  # remembers the hash already classified). Declared-wait rechecks that come due in
-  # this pass are collected rather than delivered inline, and flushed as one wake
+  # remembers the hash already classified). Bounded absorbed rechecks that come due
+  # in this pass are collected rather than delivered inline, and flushed as one wake
   # below; every other actionable classification still wakes on the spot.
   pause_recheck_reset
   while IFS= read -r w; do
@@ -1441,7 +1442,7 @@ EOF
     fi
   done < <(recorded_windows)
 
-  # One wake for every declared wait this pass found due, naming each of them.
+  # One wake for every bounded recheck this pass found due, naming each window.
   pause_recheck_flush
 
   # Heartbeat: the watcher runs a cheap fleet-scan at a regular cadence no matter
