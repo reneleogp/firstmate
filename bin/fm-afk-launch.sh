@@ -423,6 +423,32 @@ fm_afk_launch_restore_backup() {  # <backup> <had-afk>
   return "$result"
 }
 
+fm_afk_launch_refresh_live_daemon() {
+  local backup artifact had_afk=0 result=0
+  backup=$(mktemp -d "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.XXXXXX") || return 1
+  if [ -f "$FM_AFK_LAUNCH_STATE/.afk" ]; then
+    had_afk=1
+    cp -p "$FM_AFK_LAUNCH_STATE/.afk" "$backup/.afk" || { rm -rf "$backup"; return 1; }
+  fi
+  for artifact in .subsuper-escalations .subsuper-escalations.since .subsuper-inject-wedged; do
+    if [ -e "$FM_AFK_LAUNCH_STATE/$artifact" ]; then
+      cp -p "$FM_AFK_LAUNCH_STATE/$artifact" "$backup/$artifact" || { rm -rf "$backup"; return 1; }
+    fi
+  done
+  if ! fm_afk_launch_flag_write; then
+    fm_afk_launch_log "failed to refresh away-mode flag"
+    result=1
+  elif ! fm_afk_launch_wait_pi_handoff; then
+    result=1
+  fi
+  if [ "$result" -ne 0 ]; then
+    fm_afk_launch_restore_backup "$backup" "$had_afk" || result=1
+  else
+    rm -rf "$backup" || result=1
+  fi
+  return "$result"
+}
+
 # Launch the daemon in a non-visible herdr terminal in the CAPTAIN's session
 # (so the daemon can inject into the captain pane, which lives there). A
 # dedicated background workspace (--no-focus) holds exactly one tab/pane; it
@@ -520,11 +546,7 @@ fm_afk_launch_start() {
 
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
-    if ! fm_afk_launch_flag_write; then
-      fm_afk_launch_log "failed to refresh away-mode flag"
-      return 1
-    fi
-    fm_afk_launch_wait_pi_handoff || return 1
+    fm_afk_launch_refresh_live_daemon || return 1
     fm_afk_launch_log "daemon already running; refreshed away-mode flag (no new terminal)"
     return 0
   fi
@@ -587,8 +609,7 @@ fm_afk_launch_start_native() {
   fi
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
-    fm_afk_launch_flag_write || return 1
-    fm_afk_launch_wait_pi_handoff || return 1
+    fm_afk_launch_refresh_live_daemon || return 1
     fm_afk_launch_log "daemon already running; refreshed away-mode flag"
     return 0
   fi
