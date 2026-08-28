@@ -11,7 +11,8 @@
 #   - at most 64 characters and 96 UTF-8 bytes;
 #   - printable ASCII plus U+00B7 MIDDLE DOT only;
 #   - no path separators, parent-path token, shell/metadata delimiters, URL form,
-#     or common credential-value form.
+#     common credential form, version, task or branch slug, delivery mechanic,
+#     or random or secret-like suffix.
 # The narrow character set rejects control and invisible transport characters by
 # construction while retaining the documented "Project · Outcome" form.
 #

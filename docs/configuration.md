@@ -27,7 +27,8 @@ Ordinary dead-direct-report recovery is owned by `stuck-crewmate-recovery`, whil
 ## Task display names
 
 Every new task metadata record carries one `display_name=` for concise human presentation, normally shaped like `Backend · CRM Core`, `CRM · Dashboard`, `Planning · CRM Scope`, or `Firstmate · Quiet Alerts`.
-Pass it with `fm-spawn.sh --display-name`; the script's help and [`fm-display-name-lib.sh`](../bin/fm-display-name-lib.sh) own the exact validation, fallback, and metadata mechanics.
+Prefer short noun labels shaped like `<Project> · <Outcome>` rather than versions, random suffixes, full task slugs, branch names, or delivery mechanics.
+Pass it with `fm-spawn.sh --display-name`; the script's help owns spawn and relaunch persistence mechanics, while [`fm-display-name-lib.sh`](../bin/fm-display-name-lib.sh) owns exact validation and fallback.
 The immutable task id remains unchanged and is the only identity used for selectors, routing, endpoint ownership, recovery, relaunch, merge, cleanup, worktree binding, and incarnation tracking.
 Duplicate display names are harmless because no control operation resolves through them.
 Legacy metadata is rendered through a safe readable fallback without an eager migration.

@@ -391,7 +391,8 @@ spawn_task() {  # <id> <home> <project> [spawn-args...]
 
 relaunch_task() {  # <id> <home> <display-name>
   FM_GATE_REFUSE_BYPASS=1 FM_SPAWN_NO_GUARD=1 FM_HOME="$2" FM_ROOT_OVERRIDE="$ROOT" \
-    "$ROOT/bin/fm-spawn.sh" "$1" --relaunch --display-name "$3"
+    "$ROOT/bin/fm-spawn.sh" "$1" --relaunch --display-name "$3" \
+      --harness "sh -c 'sleep 120'"
 }
 
 finish_concurrent_spawn() {  # <id> <status> <stdout> <stderr>
@@ -1249,6 +1250,18 @@ for RESTART_ID in fm-hibit-resume-r1 wheelhouse-healing-r1; do
     PATH="$HERDR_ORIGINAL_PATH" "$HERDR_LAB_HELPER" provision "$HERDR_LAB_SESSION" \
       || fail "could not reprovision the isolated session for explicit relaunch"
     RELAUNCH_PANE=$NEW_RESTART_PANE
+    lab pane send-text "$RELAUNCH_PANE" "cd '$NEW_RESTART_WT'" >/dev/null \
+      || fail "could not restore the relaunched pane to its recorded worktree"
+    lab pane send-keys "$RELAUNCH_PANE" enter >/dev/null \
+      || fail "could not submit the recorded-worktree restore command"
+    RELAUNCH_CWD=
+    for _ in {1..50}; do
+      RELAUNCH_CWD=$(lab pane get "$RELAUNCH_PANE" | jq -r '.result.pane.foreground_cwd // empty')
+      [ "$RELAUNCH_CWD" != "$NEW_RESTART_WT" ] || break
+      sleep 0.1
+    done
+    [ "$RELAUNCH_CWD" = "$NEW_RESTART_WT" ] \
+      || fail "reprovisioned relaunch pane did not return to its recorded worktree"
     relaunch_task "$RESTART_ID" "$HOME_DIR" 'Hi Bit · Relaunch' > "$TMP_ROOT/$RESTART_ID-explicit-relaunch.out" 2> "$TMP_ROOT/$RESTART_ID-explicit-relaunch.err" \
       || fail "$RESTART_ID explicit relaunch failed: $(cat "$TMP_ROOT/$RESTART_ID-explicit-relaunch.err")"
     [ "$(grep '^herdr_pane_id=' "$RESTART_META" | cut -d= -f2-)" = "$RELAUNCH_PANE" ] \
@@ -1259,10 +1272,23 @@ for RESTART_ID in fm-hibit-resume-r1 wheelhouse-healing-r1; do
       || fail "$RESTART_ID explicit relaunch left a stale presentation journal"
   fi
 
+  # shellcheck source=/dev/null
+  . "$ROOT/bin/backends/herdr.sh"
+  RESTART_SESSION=$(grep '^herdr_session=' "$RESTART_META" | cut -d= -f2-)
+  RESTART_WORKSPACE=$(grep '^herdr_workspace_id=' "$RESTART_META" | cut -d= -f2-)
+  RESTART_META_PANE=$(grep '^herdr_pane_id=' "$RESTART_META" | cut -d= -f2-)
+  RESTART_TARGET=$(grep '^window=' "$RESTART_META" | cut -d= -f2-)
+  [ "$RESTART_TARGET" = "$RESTART_SESSION:$RESTART_META_PANE" ] \
+    || fail "$RESTART_ID relaunch changed its exact machine target: $RESTART_TARGET != $RESTART_SESSION:$RESTART_META_PANE"
+  if ! FM_HOME="$HOME_DIR" fm_backend_herdr_projection_endpoint_matches_journal \
+      "$RESTART_SESSION" "$RESTART_WORKSPACE" \
+      "$HOME_DIR/state/$RESTART_ID.herdr-presentation" "$RESTART_ID"; then
+    fail "$RESTART_ID display relaunch left an endpoint that its exact cleanup correlator cannot verify"
+  fi
   teardown_task "$RESTART_ID" "$HOME_DIR" > "$TMP_ROOT/$RESTART_ID-teardown.out" 2> "$TMP_ROOT/$RESTART_ID-teardown.err" \
     || fail "$RESTART_ID teardown after reclaim failed: $(cat "$TMP_ROOT/$RESTART_ID-teardown.err")"
   [ ! -e "$HOME_DIR/state/$RESTART_ID.herdr-presentation" ] \
-    || fail "$RESTART_ID exact reclaimed teardown did not retire its journal"
+    || fail "$RESTART_ID exact reclaimed teardown did not retire its journal: $(cat "$TMP_ROOT/$RESTART_ID-teardown.err")"
   "$REAL_TREEHOUSE" return --force "$OLD_RESTART_WT" >/dev/null 2>&1 || true
   "$REAL_TREEHOUSE" return --force "$NEW_RESTART_WT" >/dev/null 2>&1 || true
 done
