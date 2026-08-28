@@ -65,7 +65,7 @@ fm_display_name_validate() {  # <value>
   fi
   lower=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
   case "$lower" in
-    *'://'*|file:*|ssh:*|*'-----begin '*|bearer\ *|*' bearer '*|*akia[0-9a-z]*|*xox[baprs]-*|*aiza[0-9a-z_-]*|*eyj[0-9a-z_-]*|ghp_*|github_pat_*|*glpat-[a-z0-9_-]*|sk-[a-z0-9]*|*'password:'*|*'secret:'*|*'token:'*|*'api key:'*|*'api-key:'*)
+    *'://'*|file:*|ssh:*|*'-----begin '*|bearer\ *|*' bearer '*|*akia[0-9a-z]*|*asia[0-9a-z]*|*xox[baprs]-*|*aiza[0-9a-z_-]*|*eyj[0-9a-z_-]*|ghp_*|github_pat_*|*glpat-[a-z0-9_-]*|sk-[a-z0-9]*|*'password:'*|*'secret:'*|*'token:'*|*'api key:'*|*'api-key:'*)
       fm_display_name_error 'must not contain a URL, path, or credential-like value'; return 1 ;;
   esac
   if printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])(v([ ]*|ersion[ ]*)[0-9]+([.][0-9]+)*|[0-9]+[.][0-9]+)([ _-]|$)'; then
@@ -103,7 +103,7 @@ fm_display_name_fallback() {  # <task-id>
       ;;
   esac
   if printf '%s' "$ascii" | LC_ALL=C grep -q '[^ -~]' \
-     || printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[^a-z0-9])(file:|ssh:|https?://|bearer |akia[0-9a-z]*|xox[baprs]-|aiza[0-9a-z_-]*|eyj[0-9a-z_-]*|ghp_|github_pat_|glpat-|sk-[a-z0-9]{16,}|password:|secret:|token:|api[ _-]?key:)'; then
+     || printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[^a-z0-9])(file:|ssh:|https?://|bearer |(akia|asia)[0-9a-z]*|xox[baprs]-|aiza[0-9a-z_-]*|eyj[0-9a-z_-]*|ghp_|github_pat_|glpat-|sk-[a-z0-9]{16,}|password:|secret:|token:|api[ _-]?key:)'; then
     printf 'Task'
     return 0
   fi

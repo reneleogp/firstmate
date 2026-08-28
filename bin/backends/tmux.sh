@@ -84,6 +84,7 @@ fm_backend_tmux_container_ensure() {
 #   - PIN the window name by disabling automatic-rename and allow-rename on the
 #     new window: the captain's tmux may rename the window away from fm-<id> once
 #     treehouse cd's into the worktree, which would break name-based targeting.
+#   - Disable application title changes so the human pane title remains durable.
 # The returned window id lets callers target the window even if its name is ever
 # lost, so worktree discovery cannot fall back to the active client's window.
 fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> -> prints window id
@@ -95,6 +96,7 @@ fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> -> prints 
   wid=$(tmux new-window -dP -F '#{window_id}' -t "$ses:" -n "$wname" -c "$proj_abs") || return 1
   tmux set-window-option -t "$wid" automatic-rename off 2>/dev/null || true
   tmux set-window-option -t "$wid" allow-rename off 2>/dev/null || true
+  tmux set-window-option -t "$wid" allow-set-title off 2>/dev/null || true
   printf '%s\n' "$wid"
 }
 

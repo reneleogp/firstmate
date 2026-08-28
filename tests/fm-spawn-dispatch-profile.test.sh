@@ -869,7 +869,8 @@ test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_ba
     "CRM · a1b2c3d" "fix-auth-bug" "feature-auth" \
     "CRM · feature-auth" "Backend · fix-auth-bug" \
     "main" "develop" "CRM · main" "Backend · develop" "Platform · master" "Core · trunk" \
-    "open-pr" "CRM · Dashboard q7" "sk-abcdefghijklmnopqrstuvwx" "GitLab · glpat-abc123"; do
+    "open-pr" "CRM · Dashboard q7" "sk-abcdefghijklmnopqrstuvwx" "GitLab · glpat-abc123" \
+    "ASIA1234567890ABCDEF · Dashboard"; do
     out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
       display-invalid "$PROJ_DIR" --display-name "$input")
     status=$?
