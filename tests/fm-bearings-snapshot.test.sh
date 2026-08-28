@@ -536,7 +536,7 @@ test_secondmate_and_child_bounds_are_disclosed() {
   local home fakebin id mate child json expanded canonical i
   home=$(make_home secondmate-bounds)
   : > "$home/data/secondmates.md"
-  for id in a b c; do
+  for id in a home-assistant z; do
     mate="$TMP_ROOT/bounds-$id"
     make_valid_secondmate_home "$id" "$mate"
     append_secondmate_registry "$home" "$id" "$mate"
@@ -567,7 +567,8 @@ test_secondmate_and_child_bounds_are_disclosed() {
       and (.secondmate_current.records[] | select(.id == "a")
         | .counts.active_children == 3 and (.active_children | length) == 2
           and (.omitted | any(.surface == "active_children" and .count == 1)))
-      and (.secondmate_current.records | any(.id == "b" and .current.state == "no_active_work"))
+      and (.secondmate_current.records | any(.id == "home-assistant"
+        and .display_name == "Home · Assistant" and .current.state == "no_active_work"))
   ' >/dev/null || fail "canonical secondmate or child bounds were not enforced: $canonical"
   json=$(FM_SNAPSHOT_SECONDMATES=2 FM_SNAPSHOT_SECONDMATE_CHILDREN=2 FM_BEARINGS_SECONDMATES=1 \
     run "$home" "$fakebin" --json)
@@ -580,6 +581,7 @@ test_secondmate_and_child_bounds_are_disclosed() {
     run "$home" "$fakebin" --json --all-secondmates)
   printf '%s' "$expanded" | jq -e '
     (.secondmates | length) == 3
+      and (.secondmates | any(.id == "home-assistant" and .display_name == "Home · Assistant"))
       and ([.omitted[].surface] | any(test("secondmates showing|registered secondmates omitted")) | not)
   ' >/dev/null || fail "--all-secondmates did not expand the canonical and bearings bounds: $expanded"
   pass "secondmate and per-home child counts are bounded, disclosed, and explicitly expandable"

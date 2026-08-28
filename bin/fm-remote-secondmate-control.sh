@@ -30,8 +30,9 @@
 # The optional launch traceparent is the per-task W3C trace-context carrier the
 # PARENT home resolved for this secondmate; this host only delivers it to the
 # pane, and fm-spawn validates it (bin/fm-trace-context-lib.sh). The optional
-# display name is the parent's validated presentation value and fm-spawn remains
-# its validation owner. print_route echoes the values the endpoint actually
+# display name is the parent's validated presentation value. This boundary
+# validates it before endpoint access, and fm-spawn validates it again at intake.
+# print_route echoes the values the endpoint actually
 # holds, including for an already-alive endpoint that was not relaunched, so the
 # parent records endpoint state rather than launch intent.
 set -eu
@@ -142,6 +143,7 @@ cmd_launch() {
   [ "$traceparent" != - ] || traceparent=
 
   validate_id "$id"
+  [ -z "$display_name" ] || fm_display_name_validate "$display_name" || exit 1
   validate_home "$id"
   case "$harness" in
     claude|codex|opencode|pi|pi-signed|grok|kimi|cursor) ;;

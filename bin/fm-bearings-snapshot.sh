@@ -351,9 +351,8 @@ MODEL=$(printf '%s' "$SNAP" | jq \
        | ([$secondmate.decisions_open[]? | select(.source == "backlog" and .verb == "captain-hold"
             and .deferred_marker != true)]) as $captain_holds
        | ([$secondmate.holds[]? | select(.source == "backlog")]) as $backlog_holds
-       | ([.tasks[] | select(.id == $secondmate.id)][0].display_name // $secondmate.id) as $display_name
        | $secondmate + {
-           display_name:$display_name,
+           display_name:$secondmate.display_name,
            bearings_captain_holds:$captain_holds,
            bearings_holds:(if $secondmate.current.state == "captain_decision" then $backlog_holds else $secondmate.holds end),
            bearings_state:(
