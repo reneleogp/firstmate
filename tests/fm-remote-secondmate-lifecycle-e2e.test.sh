@@ -706,6 +706,7 @@ launches_after_inherit=0
 assert_absent "$PARENT/state/ios.meta" "failed remote inheritance published launch metadata"
 out=$(remote_env "$ROOT/bin/fm-spawn.sh" ios --secondmate)
 assert_contains "$out" 'remote=remote-mac backend=herdr' "remote spawn did not report separate host and backend dimensions"
+assert_grep 'display_name=IOS' "$PARENT/state/ios.meta" "remote secondmate metadata omitted the shared fallback display name"
 assert_grep 'remote_host=remote-mac' "$PARENT/state/ios.meta" "parent metadata omitted the remote host"
 assert_grep 'remote_backend=herdr' "$PARENT/state/ios.meta" "parent metadata omitted the remote-local backend"
 assert_grep 'remote_herdr_session=fm-remote' "$PARENT/state/ios.meta" "parent metadata omitted the pinned remote Herdr session"

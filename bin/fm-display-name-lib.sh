@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# fm-display-name-lib.sh - single owner of task display-name validation and fallback.
+#
+# A display name is presentation only.
+# Immutable task ids, state/<id>.meta filenames, backend targets, endpoint task
+# bindings, incarnation tokens, worktrees, routing, control, recovery, and cleanup
+# never resolve through this value.
+#
+# Contract:
+#   - one non-empty line, with no leading or trailing whitespace;
+#   - at most 64 characters and 96 UTF-8 bytes;
+#   - printable ASCII plus U+00B7 MIDDLE DOT only;
+#   - no path separators, parent-path token, shell/metadata delimiters, URL form,
+#     or common credential-value form.
+# The narrow character set rejects control and invisible transport characters by
+# construction while retaining the documented "Project · Outcome" form.
+#
+# fm_display_name_validate <value> returns 0 when valid and otherwise prints one
+# concise diagnostic to stderr.
+# fm_display_name_fallback <task-id> derives a bounded readable presentation for
+# legacy metadata. It strips a trailing v<number>, converts separators to words,
+# title-cases ordinary words, preserves common technical acronyms, and inserts a
+# middle dot after the first word. It never mutates or replaces the task id.
+# fm_display_name_for_meta <meta> <task-id> returns the one valid display_name=
+# value when present, otherwise the safe fallback. Missing, duplicated, or
+# malformed historical values are read compatibly and are not migrated in place.
+
+FM_DISPLAY_NAME_MAX_CHARS=64
+FM_DISPLAY_NAME_MAX_BYTES=96
+
+fm_display_name_error() {
+  printf 'error: invalid display name: %s\n' "$1" >&2
+  return 1
+}
+
+fm_display_name_validate() {  # <value>
+  local value=${1-} ascii bytes chars lower
+  [ -n "$value" ] || fm_display_name_error 'must not be empty' || return 1
+  case "$value" in
+    *$'\n'*|*$'\r'*|*$'\t'*) fm_display_name_error 'must be a single line without control characters'; return 1 ;;
+    ' '*|*' ') fm_display_name_error 'must be trimmed'; return 1 ;;
+  esac
+
+  bytes=$(printf '%s' "$value" | LC_ALL=C wc -c | tr -d '[:space:]')
+  chars=${#value}
+  [ "$bytes" -le "$FM_DISPLAY_NAME_MAX_BYTES" ] 2>/dev/null \
+    && [ "$chars" -le "$FM_DISPLAY_NAME_MAX_CHARS" ] 2>/dev/null \
+    || { fm_display_name_error "must be at most $FM_DISPLAY_NAME_MAX_CHARS characters and $FM_DISPLAY_NAME_MAX_BYTES UTF-8 bytes"; return 1; }
+
+  ascii=${value//·/}
+  if printf '%s' "$ascii" | LC_ALL=C grep -q '[^ -~]'; then
+    fm_display_name_error 'allows printable ASCII and the middle dot only'
+    return 1
+  fi
+  case "$value" in
+    */*|*\\*|*'..'*|~*|.*) fm_display_name_error 'must not contain a path-like value'; return 1 ;;
+    *'='*|*'$'*|*'`'*|*'{'*|*'}'*|*'['*|*']'*|*'<'*|*'>'*|*'|'*|*';'*)
+      fm_display_name_error 'contains a transport or shell delimiter'; return 1 ;;
+  esac
+  lower=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+  case "$lower" in
+    *'://'*|file:*|ssh:*|*'-----begin '*|bearer\ *|*' bearer '*|*akia[0-9a-z]*|*xox[baprs]-*|*aiza[0-9a-z_-]*|*eyj[0-9a-z_-]*|ghp_*|github_pat_*|sk-[a-z0-9]*|*'password:'*|*'secret:'*|*'token:'*|*'api key:'*|*'api-key:'*|*' v'[0-9]|*' v'[0-9][0-9])
+      fm_display_name_error 'must not contain a version suffix, URL, path, or credential-like value'; return 1 ;;
+  esac
+  if printf '%s' "$value" | LC_ALL=C grep -Eq '[A-Za-z0-9_-]{24,}'; then
+    fm_display_name_error 'must not contain a long secret-like token'
+    return 1
+  fi
+  return 0
+}
+
+fm_display_name_fallback() {  # <task-id>
+  local id=${1-} out word low pretty first rest
+  local -a words
+  id=${id#fm-}
+  id=$(printf '%s' "$id" | sed -E 's/[-_.]v[0-9]+$//; s/[-_.]+/ /g; s/[^A-Za-z0-9 ]+/ /g; s/^[ ]+//; s/[ ]+$//')
+  out=
+  IFS=' ' read -r -a words <<< "$id"
+  set -- "${words[@]}"
+  while [ "$#" -gt 0 ]; do
+    word=$1
+    shift
+    low=$(printf '%s' "$word" | tr '[:upper:]' '[:lower:]')
+    case "$low" in
+      api|ci|cli|cpu|crm|css|db|dns|gpu|html|http|https|id|ios|ip|json|jwt|macos|pr|qa|sdk|sql|ssh|tls|tui|ui|url|ux|xml)
+        pretty=$(printf '%s' "$low" | tr '[:lower:]' '[:upper:]')
+        ;;
+      *)
+        first=$(printf '%s' "$low" | cut -c1 | tr '[:lower:]' '[:upper:]')
+        rest=$(printf '%s' "$low" | cut -c2-)
+        pretty=$first$rest
+        ;;
+    esac
+    if [ -z "$out" ]; then
+      out=$pretty
+      [ "$#" -eq 0 ] || out="$out ·"
+    else
+      out="$out $pretty"
+    fi
+  done
+  [ -n "$out" ] || out=Task
+  if [ "${#out}" -gt "$FM_DISPLAY_NAME_MAX_CHARS" ]; then
+    out="${out:0:61}..."
+  fi
+  fm_display_name_validate "$out" >/dev/null 2>&1 || out=Task
+  printf '%s' "$out"
+}
+
+fm_display_name_for_meta() {  # <meta-file> <task-id>
+  local meta=$1 id=$2 count value
+  count=$(grep -c '^display_name=' "$meta" 2>/dev/null || true)
+  if [ "$count" -eq 1 ]; then
+    value=$(grep '^display_name=' "$meta" | cut -d= -f2-)
+    if fm_display_name_validate "$value" >/dev/null 2>&1; then
+      printf '%s' "$value"
+      return 0
+    fi
+  fi
+  fm_display_name_fallback "$id"
+}

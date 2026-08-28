@@ -71,6 +71,8 @@
 FM_BACKEND_HERDR_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_BACKEND_HERDR_ROOT}}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+# shellcheck source=bin/fm-display-name-lib.sh
+. "$FM_BACKEND_HERDR_ROOT/bin/fm-display-name-lib.sh"
 
 # Shared composer-content classifier (empty|pending|unknown, and the fleet-wide
 # dead-shell-vs-agent-composer rule). Owned by bin/fm-composer-lib.sh, reused by
@@ -494,7 +496,7 @@ fm_backend_herdr_projection_journal_field() {  # <journal> <key>
 # journal or a version 2 exact projection binding without sourcing shell code.
 # Version 2 sets FM_BACKEND_HERDR_JOURNAL_* globals for same-process callers.
 fm_backend_herdr_projection_journal_snapshot() {  # <journal> <task-id>
-  local journal=$1 id=$2 lines expected_label expected_task_label exact
+  local journal=$1 id=$2 lines expected_label expected_task_label display_name exact
   FM_BACKEND_HERDR_JOURNAL_VERSION=""
   FM_BACKEND_HERDR_JOURNAL_TASK_ID=""
   FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID=""
@@ -548,7 +550,18 @@ fm_backend_herdr_projection_journal_snapshot() {  # <journal> <task-id>
   [ -n "$FM_BACKEND_HERDR_JOURNAL_PARENT_LABEL" ] \
     && [ -n "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL" ] \
     && [ -n "$FM_BACKEND_HERDR_JOURNAL_TASK_LABEL" ] || return 1
-  expected_label=$(fm_backend_herdr_projection_workspace_label "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID")
+  case "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL" in
+    "└ "*" · p:$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID")
+      display_name=${FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL#"└ "}
+      display_name=${display_name%" · p:$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID"}
+      ;;
+    *) return 1 ;;
+  esac
+  if ! fm_display_name_validate "$display_name" >/dev/null 2>&1 \
+     && [ "$display_name" != "$(fm_backend_herdr_projection_concise_task_label "$id")" ]; then
+    return 1
+  fi
+  expected_label="└ $display_name · p:$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID"
   expected_task_label="fm-$id"
   [ "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL" = "$expected_label" ] \
     && [ "$FM_BACKEND_HERDR_JOURNAL_TASK_LABEL" = "$expected_task_label" ]
@@ -643,10 +656,20 @@ fm_backend_herdr_projection_concise_task_label() {  # <task-id>
 
 # fm_backend_herdr_projection_workspace_label: presentation-only child label.
 # Format is literal U+2514 BOX DRAWINGS LIGHT UP AND RIGHT, one space, the
-# concise task label, then the unchanged · p:<full-22-char-token> suffix.
-# Labels and tokens remain non-authoritative correlators only.
-fm_backend_herdr_projection_workspace_label() {  # <task-id> <projection-id>
-  printf '└ %s · p:%s' "$(fm_backend_herdr_projection_concise_task_label "$1")" "$2"
+# shared validated display name, then the unchanged · p:<full-22-char-token>
+# suffix. The optional third argument is the shared display name. A two-argument
+# legacy caller retains the historical concise-id rendering, while every current
+# spawn passes its validated explicit or fallback display. Labels and tokens
+# remain non-authoritative correlators only.
+fm_backend_herdr_projection_workspace_label() {  # <task-id> <projection-id> [<display-name>]
+  local task_id=$1 projection_id=$2 display_name
+  if [ "$#" -ge 3 ]; then
+    display_name=$3
+    fm_display_name_validate "$display_name" >/dev/null 2>&1 || return 1
+  else
+    display_name=$(fm_backend_herdr_projection_concise_task_label "$task_id")
+  fi
+  printf '└ %s · p:%s' "$display_name" "$projection_id"
 }
 
 # fm_backend_herdr_presentation_session_lock_path: one machine-private lock

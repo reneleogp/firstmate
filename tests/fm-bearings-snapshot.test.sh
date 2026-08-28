@@ -123,6 +123,7 @@ EOF
   printf '# Scout X\n' > "$home/data/scout-x/report.md"
   fm_write_meta "$home/state/ship-task.meta" \
     "window=firstmate:fm-ship-task" \
+    "display_name=CRM · Dashboard" \
     "worktree=$home/projects/ship-wt" \
     "project=firstmate" \
     "harness=claude" \
@@ -896,8 +897,12 @@ test_default_is_bounded_and_local_only() {
   # Definitive not-requested PR state, never a silent omission.
   assert_contains "$toon" 'prs: "not_requested' "default must state PR checks were not requested"
   assert_contains "$toon" "live PR discovery + checks,\"--include-prs\"" "omitted must mark the dropped live-PR surface"
-  # Valid JSON, correct schema.
-  printf '%s' "$json" | jq -e '.schema == "fm-bearings.v1"' >/dev/null || fail "json schema wrong"
+  # Valid JSON, correct schema, and human display plus exact id.
+  printf '%s' "$json" | jq -e '
+    .schema == "fm-bearings.v1"
+      and (.in_flight | any(.[]; .id == "ship-task" and .display_name == "CRM · Dashboard"))
+      and (.in_flight | any(.[]; .id == "external-wait" and .display_name == "External · Wait"))
+  ' >/dev/null || fail "json schema or task display names wrong"
   pass "default output is bounded, local-only, and marks omitted surfaces"
 }
 

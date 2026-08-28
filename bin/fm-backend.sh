@@ -53,6 +53,8 @@ FM_BACKEND_DEFAULT_ROOT="$(cd "$FM_BACKEND_LIB_DIR/.." && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_BACKEND_DEFAULT_ROOT}}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+# shellcheck source=bin/fm-display-name-lib.sh
+. "$FM_BACKEND_LIB_DIR/fm-display-name-lib.sh"
 
 # Verified backend adapters. Extend only after a backend gets its own
 # bin/backends/<name>.sh and empirical verification, mirroring AGENTS.md
@@ -690,6 +692,26 @@ fm_backend_resolve_selector() {  # <raw-target> <state-dir>
 # rather than hand-writing `case "$backend" in tmux) fm_backend_tmux_x ;; esac`
 # at every call site. Each verified backend adds its own arm here, without
 # changing call sites.
+
+# fm_backend_present_task: best-effort human presentation after a task endpoint
+# is already created and bound by machine identity. The shared display-name
+# library validates the one cross-backend contract; adapters only render it and
+# never participate in selector resolution, ownership, recovery, or cleanup.
+# Tmux has an independent pane-title field and can render safely. Herdr renders
+# the name at projected-workspace creation time because that title is journaled;
+# its ordinary task tab stays machine-labeled. Zellij and cmux titles currently
+# participate in endpoint verification, while Orca names its worktree/terminal
+# at creation, so those adapters deliberately keep machine labels and no-op.
+fm_backend_present_task() {  # <backend> <target> <display-name> [expected-machine-label]
+  local backend=$1 target=$2 display_name=$3
+  fm_display_name_validate "$display_name" >/dev/null 2>&1 || return 1
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    tmux) fm_backend_tmux_present_task "$target" "$display_name" ;;
+    herdr|zellij|orca|cmux) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 # fm_backend_capture: bounded plain-text session capture.
 fm_backend_capture() {  # <backend> <target> <lines> [expected-label]

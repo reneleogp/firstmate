@@ -2197,7 +2197,7 @@ test_projection_seeded_prune_refuses_active_tab() {
 }
 
 test_projection_label_builder_uses_corner_and_strips_owner_prefixes() {
-  local primary secondmate token
+  local primary secondmate explicit token
   token='AbCdEfGhIjKlMnOpQrStUv'
   [ "${#token}" -eq 22 ] || fail "fixture token must be 22 characters"
   primary=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_projection_workspace_label task-p2 '"$token" "$ROOT")
@@ -2215,8 +2215,11 @@ test_projection_label_builder_uses_corner_and_strips_owner_prefixes() {
   primary=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_projection_workspace_label fm-task-p2 '"$token" "$ROOT")
   [ "$primary" = "└ task-p2 · p:$token" ] \
     || fail "presentation fm- owner prefix was not stripped: $primary"
+  explicit=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_projection_workspace_label task-p2 '"$token"' "Backend · CRM Core"' "$ROOT")
+  [ "$explicit" = "└ Backend · CRM Core · p:$token" ] \
+    || fail "explicit human display name was not rendered independently of task identity: $explicit"
   case "$primary" in $'└ '*) ;; *) fail "label must start with U+2514 and one space" ;; esac
-  pass "herdr presentation labels: └ concise-task · p:<full-token> for primary and secondmate children"
+  pass "herdr presentation labels: explicit human names and legacy concise ids retain the full non-authoritative token"
 }
 
 test_projection_order_moves_only_exact_new_workspace_and_preserves_relative_order() {

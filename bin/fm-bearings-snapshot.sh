@@ -9,7 +9,9 @@
 # format per the AXI standard, and TOON/JSON are parity representations of the same
 # projected model. The projection is view-specific: it DROPS fields from the bearings
 # output, it never removes them from - or otherwise weakens - the canonical snapshot,
-# which stays complete.
+# which stays complete and carries both immutable task id and shared display_name.
+# Bearings keeps both so summaries can lead with readable labels while detailed and
+# debug routing can still name the exact id.
 #
 # LOCAL-ONLY by default: a normal invocation makes ZERO GitHub/network/auth calls.
 # It MAY surface PR URLs already recorded locally in task meta (recorded_prs), but it
@@ -111,7 +113,7 @@ usage: fm-bearings-snapshot.sh [--json] [--include-prs] [--fields <list>]
 Compact bearings projection over fm-fleet-snapshot.sh. TOON by default.
 Default is LOCAL-ONLY (no network); --include-prs is the only path that fetches.
 
-Default fields: schema, home, generated, prs, in_flight{id,kind,state,doing},
+Default fields: schema, home, generated, prs, in_flight{id,display_name,kind,state,doing},
   secondmates{id,state,doing,provenance,freshness,age_seconds,contradiction,reason},
   decisions_open{id,key,verb,summary,owner}, landed{id,what,artifact,owner},
   gates{id,title,blocked_by,reason,owner}, reports{id,path}, recorded_prs{id,url},
@@ -383,14 +385,14 @@ MODEL=$(printf '%s' "$SNAP" | jq \
        | select(.kind != "secondmate")
        | select(.backlog.current_role != "program")
        | select(.backlog.current_role != "held" or .current_state.state == "working")
-       | {id, kind,
+       | {id, display_name, kind,
         state: .current_state.state,
         doing: ((.current_state.detail // "") as $d
                 | (if $d != "" then $d else (.hints.last_event_text // "") end) | trunc(90))
       } ]
      + [ $secondmate_views[]
          | select(.bearings_state == "active_child_work")
-         | {id,kind:"secondmate",state:.bearings_state,
+         | {id,display_name:.id,kind:"secondmate",state:.bearings_state,
             doing:([.active_children[] | .id + ": " + (.doing // .state)] | join("; ") | trunc(90))} ]) as $in_flight_all
   | ([ .backlog.records[]
          | select(.structured and .captain_actionable == true)

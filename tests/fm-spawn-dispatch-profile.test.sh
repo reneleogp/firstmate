@@ -43,6 +43,10 @@ case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   list-windows) exit 0 ;;
   has-session|new-session|new-window|kill-window) exit 0 ;;
+  select-pane)
+    [ -z "${FM_FAKE_PRESENTATION_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_PRESENTATION_LOG"
+    exit 0
+    ;;
   send-keys)
     if [ -n "${FM_FAKE_LAUNCH_LOG:-}" ]; then
       prev=
@@ -126,7 +130,8 @@ run_spawn() {
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     CLAUDE_CONFIG_DIR="${FM_TEST_CLAUDE_CONFIG_DIR:-}" \
-    FM_FAKE_LAUNCH_LOG="$launchlog" FM_FAKE_PI_VERSION="${FM_TEST_PI_VERSION:-0.84.0}" \
+    FM_FAKE_LAUNCH_LOG="$launchlog" FM_FAKE_PRESENTATION_LOG="$launchlog.presentation" \
+    FM_FAKE_PI_VERSION="${FM_TEST_PI_VERSION:-0.84.0}" \
     FM_FAKE_CURSOR_MODELS="${FM_TEST_CURSOR_MODELS:-}" \
     FM_FAKE_CURSOR_LIST_STATUS="${FM_TEST_CURSOR_LIST_STATUS:-0}" \
     GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
@@ -808,6 +813,57 @@ test_non_claude_harness_ignores_config_dir() {
   pass "non-claude harnesses do not receive the claude CLAUDE_CONFIG_DIR prefix"
 }
 
+test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_batch_spawns() {
+  local rec out status meta input
+  rec=$(make_spawn_case profile-display-labels codex display-explicit display-fallback display-invalid display-batch-a display-batch-b)
+  read_case_record "$rec"
+
+  : > "$LAUNCH_LOG.presentation"
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    display-explicit "$PROJ_DIR" --display-name "Backend · CRM Core")
+  status=$?
+  expect_code 0 "$status" "explicit display-name spawn should succeed"
+  meta="$HOME_DIR/state/display-explicit.meta"
+  [ "$(grep -c '^display_name=' "$meta")" = 1 ] || fail "explicit spawn must persist one display_name"
+  assert_grep "display_name=Backend · CRM Core" "$meta" "explicit display name missing from metadata"
+  assert_grep "window=firstmate:fm-display-explicit" "$meta" "display name changed the machine endpoint"
+  assert_grep "endpoint_task_id=display-explicit" "$meta" "display name changed endpoint ownership"
+  assert_grep "select-pane -t firstmate:fm-display-explicit -T Backend · CRM Core" "$LAUNCH_LOG.presentation" \
+    "tmux did not render the display name through its independent pane title"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" display-fallback "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "fallback display-name spawn should succeed"
+  assert_grep "display_name=Display · Fallback" "$HOME_DIR/state/display-fallback.meta" \
+    "spawn did not persist the shared readable fallback"
+
+  for input in " padded" "bad/path" "bad⁣transport" "token: abc123" \
+    "CRM · Dashboard v1" "sk-abcdefghijklmnopqrstuvwx"; do
+    out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+      display-invalid "$PROJ_DIR" --display-name "$input")
+    status=$?
+    [ "$status" -ne 0 ] || fail "invalid display name unexpectedly spawned: $input"
+    [ ! -e "$HOME_DIR/state/display-invalid.meta" ] || fail "invalid display name published task metadata"
+  done
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "display-batch-a=$PROJ_DIR" "display-batch-b=$PROJ_DIR" --display-name "CRM · Dashboard")
+  status=$?
+  expect_code 0 "$status" "batch with duplicate display names should succeed"
+  for meta in "$HOME_DIR/state/display-batch-a.meta" "$HOME_DIR/state/display-batch-b.meta"; do
+    assert_grep "display_name=CRM · Dashboard" "$meta" "batch child lost shared display name"
+  done
+  assert_grep "endpoint_task_id=display-batch-a" "$HOME_DIR/state/display-batch-a.meta" \
+    "batch display collision changed task A ownership"
+  assert_grep "endpoint_task_id=display-batch-b" "$HOME_DIR/state/display-batch-b.meta" \
+    "batch display collision changed task B ownership"
+  assert_grep "window=firstmate:fm-display-batch-a" "$HOME_DIR/state/display-batch-a.meta" \
+    "batch display collision changed task A routing"
+  assert_grep "window=firstmate:fm-display-batch-b" "$HOME_DIR/state/display-batch-b.meta" \
+    "batch display collision changed task B routing"
+  pass "display names validate strictly, fall back readably, render in tmux, and never replace batch task identity"
+}
+
 test_active_dispatch_profile_does_not_block_secondmate_launch() {
   local rec id sm out status
   id=profile-secondmate-z16
@@ -823,6 +879,8 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   assert_contains "$out" "spawned $id harness=codex kind=secondmate" "secondmate launch did not use secondmate harness resolution"
   assert_grep "kind=secondmate" "$HOME_DIR/state/$id.meta" "secondmate meta missing kind=secondmate"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex default default
+  assert_grep "display_name=Profile · Secondmate Z16" "$HOME_DIR/state/$id.meta" \
+    "secondmate spawn did not preserve shared fallback display metadata"
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 
@@ -856,6 +914,7 @@ test_batch_forwards_shared_profile_flags
 test_claude_forwards_firstmate_config_dir_when_set
 test_claude_omits_config_dir_prefix_when_unset
 test_non_claude_harness_ignores_config_dir
+test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_batch_spawns
 test_active_dispatch_profile_does_not_block_secondmate_launch
 
 echo "# all fm-spawn-dispatch-profile tests passed"

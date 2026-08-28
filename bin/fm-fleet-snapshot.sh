@@ -30,7 +30,9 @@
 #     body carries an explicit SUPERSEDED / NOT REQUIRED / DEFERRED marker.
 #     It never changes captain_actionable; renderers may use it to keep
 #     prose-deferred rows out of default views.
-#   tasks[]: one row per state/<id>.meta, sorted by id.
+#   tasks[]: one row per state/<id>.meta, sorted by id. Each row carries the
+#     immutable id plus display_name from the shared presentation contract;
+#     legacy metadata receives a read-only fallback and is never migrated.
 #     current_state is parsed from bin/fm-crew-state.sh <id> and preserves
 #     state, source, detail, and raw line separately.
 #     paths.status_log.last_event is historical wake-event data only, never
@@ -146,6 +148,9 @@ validate_positive_bound FM_SNAPSHOT_REGISTRY_TIMEOUT "$FM_SNAPSHOT_REGISTRY_TIME
 # shellcheck source=bin/fm-backend.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-display-name-lib.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/fm-display-name-lib.sh"
 # shellcheck source=bin/fm-classify-lib.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-classify-lib.sh"
@@ -425,7 +430,7 @@ backlog_json() {  # [<backlog-path>] - defaults to this home's $BACKLOG
 }
 
 task_json_lines() {
-  local meta id kind harness mode yolo project worktree home projects backend target status_log report_path
+  local meta id display_name kind harness mode yolo project worktree home projects backend target status_log report_path
   local remote_host remote_root remote_state remote_rc remote_home_present
   local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json
   local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
@@ -434,6 +439,7 @@ task_json_lines() {
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
     id=$(basename "$meta" .meta)
+    display_name=$(fm_display_name_for_meta "$meta" "$id")
     kind=$(meta_value "$meta" kind)
     [ -n "$kind" ] || kind=ship
     harness=$(meta_value "$meta" harness)
@@ -554,6 +560,7 @@ task_json_lines() {
 
     jq -n \
       --arg id "$id" \
+      --arg display_name "$display_name" \
       --arg kind "$kind" \
       --arg harness "$harness" \
       --arg mode "$mode" \
@@ -584,6 +591,7 @@ task_json_lines() {
       --argjson report_present "$(bool_json "$report_present")" \
       '{
         id:$id,
+        display_name:$display_name,
         kind:$kind,
         harness:($harness // ""),
         mode:($mode // ""),

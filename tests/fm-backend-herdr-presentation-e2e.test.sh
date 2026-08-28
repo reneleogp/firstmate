@@ -262,7 +262,7 @@ export FM_BACKEND_HERDR_WORKSPACE_MOVER="$FAKEBIN/herdr-workspace-mover"
 herdr_forget_inherited_pane
 
 HERDR_LAB_SESSION=$(PATH="$HERDR_ORIGINAL_PATH" \
-  "$HERDR_LAB_HELPER" name fm-herdr-presentation-projection)
+  "$HERDR_LAB_HELPER" name firstmate-readable-worker-labels-v1)
 export HERDR_SESSION="$HERDR_LAB_SESSION" HERDR_LAB_SESSION
 LAB_READY=0
 RECORDED_WORKTREES=""
@@ -382,10 +382,11 @@ make_project() {  # <dir>
   git -C "$dir" remote add origin "file://$dir.origin.git"
 }
 
-spawn_task() {  # <id> <home> <project>
+spawn_task() {  # <id> <home> <project> [spawn-args...]
   local id=$1 home=$2 project=$3
+  shift 3
   FM_GATE_REFUSE_BYPASS=1 FM_SPAWN_NO_GUARD=1 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
-    "$ROOT/bin/fm-spawn.sh" "$id" "$project" "sh -c 'sleep 120'" --mode no-mistakes --yolo off --backend herdr
+    "$ROOT/bin/fm-spawn.sh" "$id" "$project" "sh -c 'sleep 120'" --mode no-mistakes --yolo off --backend herdr "$@"
 }
 
 finish_concurrent_spawn() {  # <id> <status> <stdout> <stderr>
@@ -520,7 +521,7 @@ FIRSTMATE_WSID=$(grep '^herdr_workspace_id=' "$ANCHOR_META" | cut -d= -f2-)
 : > "$TREEHOUSE_CALL_LOG"
 OFF_HERDR_START=$(log_line_count)
 OFF_MOVE_START=$(wc -l < "$MOVE_CALL_LOG" | tr -d '[:space:]')
-spawn_task shape "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/off.out" 2> "$TMP_ROOT/off.err" \
+spawn_task shape "$HOME_DIR" "$PROJECT_DIR" --display-name "Backend · CRM Core" > "$TMP_ROOT/off.out" 2> "$TMP_ROOT/off.err" \
   || fail "opted-out spawn failed: $(cat "$TMP_ROOT/off.err")"
 OFF_HERDR_END=$(log_line_count)
 OFF_META="$TMP_ROOT/off.meta"
@@ -607,7 +608,7 @@ assert_focus_is "$CAPTAIN_FOCUS" "focused secondmate fixture"
 # so no home that had already enabled the projection is turned off by the default.
 : > "$HOME_DIR/config/herdr-presentation-spaces"
 SHAPE_FOCUS_AUDIT_START=$(focus_audit_line_count)
-spawn_task shape "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/on.out" 2> "$TMP_ROOT/on.err" \
+spawn_task shape "$HOME_DIR" "$PROJECT_DIR" --display-name "Backend · CRM Core" > "$TMP_ROOT/on.out" 2> "$TMP_ROOT/on.err" \
   || fail "projected spawn failed: $(cat "$TMP_ROOT/on.err")"
 assert_focus_is "$CAPTAIN_FOCUS" "projected spawn"
 assert_raw_presentation_mutations_preserved_since "$SHAPE_FOCUS_AUDIT_START" "projected spawn"
@@ -625,8 +626,9 @@ PROJECTED_TAB=$(grep '^herdr_tab_id=' "$ON_META" | cut -d= -f2-)
 PROJECTED_PANE=$(grep '^herdr_pane_id=' "$ON_META" | cut -d= -f2-)
 PROJECTED_INFO=$(lab workspace get "$PROJECTED_WSID") || fail "could not inspect the projected workspace"
 PROJECTED_LABEL=$(printf '%s' "$PROJECTED_INFO" | jq -r '.result.workspace.label // empty')
-[ "$PROJECTED_LABEL" = "└ shape · p:$TOKEN" ] \
-  || fail "projected workspace label did not use the corner format with full token: $PROJECTED_LABEL"
+[ "$PROJECTED_LABEL" = "└ Backend · CRM Core · p:$TOKEN" ] \
+  || fail "projected workspace label did not use the explicit display name with full token: $PROJECTED_LABEL"
+pass "real Herdr lab: an explicit human display name renders while the task tab and endpoint stay machine-bound"
 PROJECTED_TABS=$(lab tab list --workspace "$PROJECTED_WSID")
 PROJECTED_PANES=$(lab pane list --workspace "$PROJECTED_WSID")
 [ "$(printf '%s' "$PROJECTED_TABS" | jq -r '.result.tabs | length')" = 1 ] \
