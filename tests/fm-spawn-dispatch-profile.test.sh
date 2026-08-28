@@ -877,8 +877,8 @@ test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_ba
     "$HOME_DIR/state/customer-relationship-management-dashboard-observability-improve.meta" \
     "long fallback should remain task-specific after bounded truncation"
 
-  for input in " padded" "bad/path" "Windows · C:tmp" "bad⁣transport" "token: abc123" \
-    "CRM · Dashboard v1" "CRM · Dashboard v 2" "CRM · Dashboard 2.0" \
+  for input in " padded" "bad/path" "Windows · C:tmp" "CRM · file:tmp" "CRM · ssh:host" \
+    "bad⁣transport" "token: abc123" "CRM · Dashboard v1" "CRM · Dashboard v 2" "CRM · Dashboard 2.0" \
     "CRM · a1b2c3d" "fix-auth-bug" "feature-auth" \
     "CRM · feature-auth" "Backend · fix-auth-bug" \
     "main" "develop" "CRM · main" "Backend · develop" "Platform · master" "Core · trunk" \

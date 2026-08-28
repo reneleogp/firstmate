@@ -72,8 +72,12 @@ fm_display_name_validate() {  # <value>
     return 1
   fi
   lower=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+  if printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])(file|ssh):'; then
+    fm_display_name_error 'must not contain a URL, path, or credential-like value'
+    return 1
+  fi
   case "$lower" in
-    *'://'*|file:*|ssh:*|*'-----begin '*|bearer\ *|*' bearer '*|*xox[baprs]-*|*aiza[0-9a-z_-]*|*eyj[0-9a-z_-]*|ghp_*|github_pat_*|*glpat-[a-z0-9_-]*|sk-[a-z0-9]*|*'password:'*|*'secret:'*|*'token:'*|*'api key:'*|*'api-key:'*)
+    *'://'*|*'-----begin '*|bearer\ *|*' bearer '*|*xox[baprs]-*|*aiza[0-9a-z_-]*|*eyj[0-9a-z_-]*|ghp_*|github_pat_*|*glpat-[a-z0-9_-]*|sk-[a-z0-9]*|*'password:'*|*'secret:'*|*'token:'*|*'api key:'*|*'api-key:'*)
       fm_display_name_error 'must not contain a URL, path, or credential-like value'; return 1 ;;
   esac
   if printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])(v([ ]*|ersion[ ]*)[0-9]+([.][0-9]+)*|[0-9]+[.][0-9]+)([ _-]|$)'; then

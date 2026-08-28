@@ -1171,7 +1171,11 @@ pass "real Herdr lab: session lock contention from a secondmate home falls back 
 # Exercise both the leading fm- identity style seen in Hi Bit work and the
 # project-name identity style used by Wheelhouse work.
 for RESTART_ID in fm-hibit-resume-r1 wheelhouse-healing-r1; do
-  spawn_task "$RESTART_ID" "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/$RESTART_ID-first.out" 2> "$TMP_ROOT/$RESTART_ID-first.err" \
+  RESTART_DISPLAY_ARGS=()
+  if [ "$RESTART_ID" = fm-hibit-resume-r1 ]; then
+    RESTART_DISPLAY_ARGS=(--display-name 'Hi Bit · Resume')
+  fi
+  spawn_task "$RESTART_ID" "$HOME_DIR" "$PROJECT_DIR" "${RESTART_DISPLAY_ARGS[@]}" > "$TMP_ROOT/$RESTART_ID-first.out" 2> "$TMP_ROOT/$RESTART_ID-first.err" \
     || fail "$RESTART_ID fixture's projected spawn failed: $(cat "$TMP_ROOT/$RESTART_ID-first.err")"
   RESTART_META="$HOME_DIR/state/$RESTART_ID.meta"
   OLD_RESTART_WT=$(remember_meta_worktree "$RESTART_META")
@@ -1180,14 +1184,10 @@ for RESTART_ID in fm-hibit-resume-r1 wheelhouse-healing-r1; do
   OLD_RESTART_LABEL=$(lab workspace get "$OLD_RESTART_WSID" | jq -r '.result.workspace.label')
   [ "$(grep '^version=' "$HOME_DIR/state/$RESTART_ID.herdr-presentation")" = version=2 ] \
     || fail "$RESTART_ID fresh projection did not publish an exact restart binding"
-  EXPECTED_DISPLAY=$(bash -c '. "$0/bin/fm-display-name-lib.sh"; fm_display_name_fallback "$1"' "$ROOT" "$RESTART_ID")
+  EXPECTED_DISPLAY=$(grep '^display_name=' "$RESTART_META" | cut -d= -f2-)
   case "$OLD_RESTART_LABEL" in
     "└ $EXPECTED_DISPLAY · p:"*) ;;
-    *) fail "$RESTART_ID fresh projection label did not use its readable fallback: $OLD_RESTART_LABEL" ;;
-  esac
-  case "$RESTART_ID" in
-    fm-hibit-resume-r1) RELAUNCH_DISPLAY='Hi Bit · Resume' ;;
-    *) RELAUNCH_DISPLAY='Wheelhouse · Healing' ;;
+    *) fail "$RESTART_ID fresh projection label did not use its persisted display name: $OLD_RESTART_LABEL" ;;
   esac
   PATH="$HERDR_ORIGINAL_PATH" \
     "$HERDR_LAB_HELPER" stop "$HERDR_LAB_SESSION" >/dev/null \
@@ -1201,7 +1201,7 @@ for RESTART_ID in fm-hibit-resume-r1 wheelhouse-healing-r1; do
     fail "$RESTART_ID restart fixture unexpectedly retained a registered agent"
   fi
   RECLAIM_FOCUS=$(focus_snapshot)
-  spawn_task "$RESTART_ID" "$HOME_DIR" "$PROJECT_DIR" --display-name "$RELAUNCH_DISPLAY" > "$TMP_ROOT/$RESTART_ID-reclaim.out" 2> "$TMP_ROOT/$RESTART_ID-reclaim.err" \
+  spawn_task "$RESTART_ID" "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/$RESTART_ID-reclaim.out" 2> "$TMP_ROOT/$RESTART_ID-reclaim.err" \
     || fail "$RESTART_ID same-identity reclaim failed: $(cat "$TMP_ROOT/$RESTART_ID-reclaim.err")"
   NEW_RESTART_WT=$(remember_meta_worktree "$RESTART_META")
   NEW_RESTART_WSID=$(grep '^herdr_workspace_id=' "$RESTART_META" | cut -d= -f2-)
@@ -1212,9 +1212,11 @@ for RESTART_ID in fm-hibit-resume-r1 wheelhouse-healing-r1; do
     || fail "$RESTART_ID reclaim reused the old husk pane"
   NEW_RESTART_LABEL=$(lab workspace get "$NEW_RESTART_WSID" | jq -r '.result.workspace.label')
   case "$NEW_RESTART_LABEL" in
-    "└ $RELAUNCH_DISPLAY · p:"*) ;;
-    *) fail "$RESTART_ID relaunch did not update the exact projected workspace label: $NEW_RESTART_LABEL" ;;
+    "└ $EXPECTED_DISPLAY · p:"*) ;;
+    *) fail "$RESTART_ID restart did not preserve the exact projected workspace label: $NEW_RESTART_LABEL" ;;
   esac
+  [ "$(grep '^display_name=' "$RESTART_META" | cut -d= -f2-)" = "$EXPECTED_DISPLAY" ] \
+    || fail "$RESTART_ID restart did not preserve its persisted display name"
   [ "$(grep '^workspace_label=' "$HOME_DIR/state/$RESTART_ID.herdr-presentation" | cut -d= -f2-)" = "$NEW_RESTART_LABEL" ] \
     || fail "$RESTART_ID relaunch did not update the exact projection journal label"
   if lab pane get "$OLD_RESTART_PANE" >/dev/null 2>&1; then
@@ -1231,7 +1233,7 @@ for RESTART_ID in fm-hibit-resume-r1 wheelhouse-healing-r1; do
       || fail "could not reprovision the isolated session for idempotent reclaim"
     PRIOR_RESTART_WT=$NEW_RESTART_WT
     PRIOR_RESTART_PANE=$NEW_RESTART_PANE
-    spawn_task "$RESTART_ID" "$HOME_DIR" "$PROJECT_DIR" --display-name "$RELAUNCH_DISPLAY" > "$TMP_ROOT/$RESTART_ID-idempotent.out" 2> "$TMP_ROOT/$RESTART_ID-idempotent.err" \
+    spawn_task "$RESTART_ID" "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/$RESTART_ID-idempotent.out" 2> "$TMP_ROOT/$RESTART_ID-idempotent.err" \
       || fail "$RESTART_ID repeated reclaim failed: $(cat "$TMP_ROOT/$RESTART_ID-idempotent.err")"
     NEW_RESTART_WT=$(remember_meta_worktree "$RESTART_META")
     NEW_RESTART_WSID=$(grep '^herdr_workspace_id=' "$RESTART_META" | cut -d= -f2-)
