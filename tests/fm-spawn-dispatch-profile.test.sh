@@ -815,7 +815,7 @@ test_non_claude_harness_ignores_config_dir() {
 
 test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_batch_spawns() {
   local rec out status meta input
-  rec=$(make_spawn_case profile-display-labels codex display-explicit display-fallback customer-relationship-management-dashboard-observability-improve display-invalid display-batch-a display-batch-b)
+  rec=$(make_spawn_case profile-display-labels codex display-explicit display-fallback fix-auth-bug improve-deploy-safety customer-relationship-management-dashboard-observability-improve display-invalid display-batch-a display-batch-b)
   read_case_record "$rec"
 
   : > "$LAUNCH_LOG.presentation"
@@ -836,6 +836,18 @@ test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_ba
   expect_code 0 "$status" "fallback display-name spawn should succeed"
   assert_grep "display_name=Display · Fallback" "$HOME_DIR/state/display-fallback.meta" \
     "spawn did not persist the shared readable fallback"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" fix-auth-bug "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "task-slug fallback display-name spawn should succeed"
+  assert_grep "display_name=Auth · Bug" "$HOME_DIR/state/fix-auth-bug.meta" \
+    "task-slug fallback discarded its domain nouns"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" improve-deploy-safety "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "delivery-mechanics fallback display-name spawn should succeed"
+  assert_grep "display_name=Improve · Safety" "$HOME_DIR/state/improve-deploy-safety.meta" \
+    "delivery-mechanics fallback discarded its task-specific outcome"
 
   out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
     customer-relationship-management-dashboard-observability-improve "$PROJ_DIR")

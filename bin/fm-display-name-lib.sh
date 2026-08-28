@@ -18,9 +18,11 @@
 # fm_display_name_validate <value> returns 0 when valid and otherwise prints one
 # concise diagnostic to stderr.
 # fm_display_name_fallback <task-id> derives a bounded readable presentation for
-# legacy metadata. It strips a trailing v<number>, converts separators to words,
-# title-cases ordinary words, preserves common technical acronyms, and inserts a
-# middle dot after the first word. It never mutates or replaces the task id.
+# legacy metadata. It rejects unsafe source values, removes version, random,
+# branch, task-shape, and delivery-mechanics tokens, converts separators to
+# words, title-cases ordinary words, preserves common technical acronyms, and
+# inserts a middle dot after the first word. It never mutates or replaces the
+# task id.
 # fm_display_name_for_meta <meta> <task-id> returns the one valid display_name=
 # value when present, otherwise the safe fallback. Missing, duplicated, or
 # malformed historical values are read compatibly and are not migrated in place.
@@ -85,11 +87,24 @@ fm_display_name_validate() {  # <value>
 }
 
 fm_display_name_fallback() {  # <task-id>
-  local id=${1-} out word low pretty first rest
-  local -a words
-  id=${id#fm-}
-  id=$(printf '%s' "$id" | sed -E 's/[-_.]v[0-9]+$//; s/[-_.][a-z][0-9]{1,3}$//; s/[-_.]+/ /g; s/[^A-Za-z0-9 ]+/ /g; s/^[ ]+//; s/[ ]+$//')
-  out=
+  local raw=${1-} id out word low pretty first rest lower ascii
+  local -a words clean
+  raw=${raw#fm-}
+  lower=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+  ascii=${raw//·/}
+  case "$raw" in
+    ''|*$'\n'*|*$'\r'*|*$'\t'*|*/*|*\\*|*'..'*|~*|.*|*'='*|*'$'*|*'`'*|*'{'*|*'}'*|*'['*|*']'*|*'<'*|*'>'*|*'|'*|*';'*)
+      printf 'Task'
+      return 0
+      ;;
+  esac
+  if printf '%s' "$ascii" | LC_ALL=C grep -q '[^ -~]' \
+     || printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[^a-z0-9])(file:|ssh:|https?://|bearer |akia[0-9a-z]*|xox[baprs]-|aiza[0-9a-z_-]*|eyj[0-9a-z_-]*|ghp_|github_pat_|glpat-|sk-[a-z0-9]{16,}|password:|secret:|token:|api[ _-]?key:)'; then
+    printf 'Task'
+    return 0
+  fi
+
+  id=$(printf '%s' "$raw" | sed -E 's/[-_.]+/ /g; s/[^A-Za-z0-9 ]+/ /g; s/^[ ]+//; s/[ ]+$//')
   IFS=' ' read -r -a words <<< "$id"
   set -- "${words[@]}"
   while [ "$#" -gt 0 ]; do
@@ -97,7 +112,32 @@ fm_display_name_fallback() {  # <task-id>
     shift
     low=$(printf '%s' "$word" | tr '[:upper:]' '[:lower:]')
     case "$low" in
-      api|ci|cli|cpu|crm|css|db|dns|gpu|html|http|https|id|ios|ip|json|jwt|macos|pr|qa|sdk|sql|ssh|tls|tui|ui|url|ux|xml)
+      feature|fix|bugfix|hotfix|chore|refactor|release|main|master|trunk|develop|development|open|pull|request|direct|pr|merge|deploy|deployment|ship|shipping)
+        continue
+        ;;
+      v|version)
+        if [ "$#" -gt 0 ] && printf '%s' "$1" | LC_ALL=C grep -Eq '^[0-9]+([.][0-9]+)*$'; then
+          shift
+          continue
+        fi
+        ;;
+    esac
+    if printf '%s' "$low" | LC_ALL=C grep -Eq '^v[0-9]+([.][0-9]+)*$|^[0-9]+[.][0-9]+$'; then
+      continue
+    fi
+    if [ "$#" -eq 0 ] && printf '%s' "$low" | LC_ALL=C grep -Eq '^([a-z][0-9]{1,3}|[a-z][a-z0-9]*[0-9][a-z0-9]{5,}|[0-9][a-z0-9]*[a-z][a-z0-9]{5,})$'; then
+      continue
+    fi
+    clean+=("$low")
+  done
+
+  out=
+  set -- "${clean[@]}"
+  while [ "$#" -gt 0 ]; do
+    low=$1
+    shift
+    case "$low" in
+      api|ci|cli|cpu|crm|css|db|dns|gpu|html|http|https|id|ios|ip|json|jwt|macos|qa|sdk|sql|ssh|tls|tui|ui|url|ux|xml)
         pretty=$(printf '%s' "$low" | tr '[:lower:]' '[:upper:]')
         ;;
       *)
