@@ -838,7 +838,8 @@ test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_ba
     "spawn did not persist the shared readable fallback"
 
   for input in " padded" "bad/path" "bad⁣transport" "token: abc123" \
-    "CRM · Dashboard v1" "sk-abcdefghijklmnopqrstuvwx"; do
+    "CRM · Dashboard v1" "CRM · Dashboard 2.0" "fix-auth-bug" "feature-auth" \
+    "open-pr" "CRM · Dashboard q7" "sk-abcdefghijklmnopqrstuvwx"; do
     out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
       display-invalid "$PROJ_DIR" --display-name "$input")
     status=$?
@@ -879,8 +880,8 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   assert_contains "$out" "spawned $id harness=codex kind=secondmate" "secondmate launch did not use secondmate harness resolution"
   assert_grep "kind=secondmate" "$HOME_DIR/state/$id.meta" "secondmate meta missing kind=secondmate"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex default default
-  assert_grep "display_name=Profile · Secondmate Z16" "$HOME_DIR/state/$id.meta" \
-    "secondmate spawn did not preserve shared fallback display metadata"
+  assert_grep "display_name=Profile · Secondmate" "$HOME_DIR/state/$id.meta" \
+    "secondmate spawn did not remove the task suffix from fallback display metadata"
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 

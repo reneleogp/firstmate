@@ -1999,13 +1999,8 @@ case "$BACKEND" in
             spawn_herdr_presentation_order_lock_release
           else
             HERDR_PROJECTION_ID=$(fm_backend_herdr_projection_journal_create "$STATE" "$ID") || exit 1
-            if [ "$DISPLAY_NAME_SET" -eq 1 ]; then
-              HERDR_PROJECTION_LABEL=$(fm_backend_herdr_projection_workspace_label "$ID" "$HERDR_PROJECTION_ID" "$DISPLAY_NAME")
-            else
-              # Omitted labels retain the historical projection title while
-              # metadata and fleet summaries receive the shared safe fallback.
-              HERDR_PROJECTION_LABEL=$(fm_backend_herdr_projection_workspace_label "$ID" "$HERDR_PROJECTION_ID")
-            fi
+            HERDR_PROJECTION_LABEL=$(fm_backend_herdr_projection_workspace_label \
+              "$ID" "$HERDR_PROJECTION_ID" "$DISPLAY_NAME")
             if ! FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_projection_create_task \
               "$PROJ_ABS" "$HERDR_PROJECTION_LABEL" "$W"; then
               if [ "${FM_BACKEND_HERDR_PROJECTION_CLEANUP_SAFE:-0}" = 1 ]; then

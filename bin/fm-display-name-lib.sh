@@ -59,11 +59,25 @@ fm_display_name_validate() {  # <value>
   esac
   lower=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
   case "$lower" in
-    *'://'*|file:*|ssh:*|*'-----begin '*|bearer\ *|*' bearer '*|*akia[0-9a-z]*|*xox[baprs]-*|*aiza[0-9a-z_-]*|*eyj[0-9a-z_-]*|ghp_*|github_pat_*|sk-[a-z0-9]*|*'password:'*|*'secret:'*|*'token:'*|*'api key:'*|*'api-key:'*|*' v'[0-9]|*' v'[0-9][0-9])
-      fm_display_name_error 'must not contain a version suffix, URL, path, or credential-like value'; return 1 ;;
+    *'://'*|file:*|ssh:*|*'-----begin '*|bearer\ *|*' bearer '*|*akia[0-9a-z]*|*xox[baprs]-*|*aiza[0-9a-z_-]*|*eyj[0-9a-z_-]*|ghp_*|github_pat_*|sk-[a-z0-9]*|*'password:'*|*'secret:'*|*'token:'*|*'api key:'*|*'api-key:'*)
+      fm_display_name_error 'must not contain a URL, path, or credential-like value'; return 1 ;;
   esac
-  if printf '%s' "$value" | LC_ALL=C grep -Eq '[A-Za-z0-9_-]{24,}'; then
-    fm_display_name_error 'must not contain a long secret-like token'
+  if printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])(v(ersion[ ]*)?[0-9]+([.][0-9]+)*|[0-9]+[.][0-9]+)([ _-]|$)'; then
+    fm_display_name_error 'must not contain a version'
+    return 1
+  fi
+  if printf '%s' "$value" | LC_ALL=C grep -Eq '^[a-z0-9]+([_-][a-z0-9]+)+$' \
+     || printf '%s' "$lower" | LC_ALL=C grep -Eq '^(feature|fix|bugfix|hotfix|chore|refactor|release)([ :_-]|$)'; then
+    fm_display_name_error 'must not be a task slug or branch name'
+    return 1
+  fi
+  if printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])(open[ ·_-]+pr|pull[ ·_-]+request|direct[ ·_-]+pr|merge|deploy|deployment|release|ship|shipping)([ ·_-]|$)'; then
+    fm_display_name_error 'must not describe delivery mechanics'
+    return 1
+  fi
+  if printf '%s' "$value" | LC_ALL=C grep -Eq '[A-Za-z0-9_-]{24,}' \
+     || printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])([a-z][0-9]{1,3}|[a-z][a-z0-9]*[0-9][a-z0-9]{6,}|[0-9][a-z0-9]*[a-z][a-z0-9]{6,})([ ]*)$'; then
+    fm_display_name_error 'must not contain a random or secret-like suffix'
     return 1
   fi
   return 0
@@ -73,7 +87,7 @@ fm_display_name_fallback() {  # <task-id>
   local id=${1-} out word low pretty first rest
   local -a words
   id=${id#fm-}
-  id=$(printf '%s' "$id" | sed -E 's/[-_.]v[0-9]+$//; s/[-_.]+/ /g; s/[^A-Za-z0-9 ]+/ /g; s/^[ ]+//; s/[ ]+$//')
+  id=$(printf '%s' "$id" | sed -E 's/[-_.]v[0-9]+$//; s/[-_.][a-z][0-9]{1,3}$//; s/[-_.]+/ /g; s/[^A-Za-z0-9 ]+/ /g; s/^[ ]+//; s/[ ]+$//')
   out=
   IFS=' ' read -r -a words <<< "$id"
   set -- "${words[@]}"

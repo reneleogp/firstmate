@@ -698,9 +698,9 @@ fm_backend_resolve_selector() {  # <raw-target> <state-dir>
 # library validates the one cross-backend contract; adapters only render it and
 # never participate in selector resolution, ownership, recovery, or cleanup.
 # Tmux has an independent pane-title field and can render safely. Herdr renders
-# the name at projected-workspace creation time because that title is journaled;
-# its ordinary task tab stays machine-labeled. Zellij and cmux titles currently
-# participate in endpoint verification, while Orca names its worktree/terminal
+# the name in an exact-ID-bound projected workspace and updates its private
+# projection journal; its ordinary task tab stays machine-labeled. Zellij and
+# cmux titles currently participate in endpoint verification, while Orca names its worktree/terminal
 # at creation, so those adapters deliberately keep machine labels and no-op.
 fm_backend_present_task() {  # <backend> <target> <display-name> [expected-machine-label]
   local backend=$1 target=$2 display_name=$3
@@ -708,7 +708,8 @@ fm_backend_present_task() {  # <backend> <target> <display-name> [expected-machi
   fm_backend_source "$backend" || return 1
   case "$backend" in
     tmux) fm_backend_tmux_present_task "$target" "$display_name" ;;
-    herdr|zellij|orca|cmux) return 0 ;;
+    herdr) fm_backend_herdr_present_task "$target" "$display_name" "${4:-}" ;;
+    zellij|orca|cmux) return 0 ;;
     *) return 1 ;;
   esac
 }

@@ -637,6 +637,19 @@ fm_backend_herdr_projection_journal_replace_endpoint() {  # <journal> <task-id> 
     "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL" "$FM_BACKEND_HERDR_JOURNAL_TASK_LABEL"
 }
 
+fm_backend_herdr_projection_journal_replace_workspace_label() {  # <journal> <task-id> <old-label> <new-label>
+  local journal=$1 id=$2 old_label=$3 new_label=$4
+  fm_backend_herdr_projection_journal_snapshot "$journal" "$id" || return 1
+  [ "$FM_BACKEND_HERDR_JOURNAL_VERSION" = 2 ] \
+    && [ "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL" = "$old_label" ] || return 1
+  fm_backend_herdr_projection_journal_write_v2 \
+    "$journal" "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID" \
+    "$FM_BACKEND_HERDR_JOURNAL_HOME" "$FM_BACKEND_HERDR_JOURNAL_SESSION" \
+    "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID" "$FM_BACKEND_HERDR_JOURNAL_TAB_ID" \
+    "$FM_BACKEND_HERDR_JOURNAL_PANE_ID" "$FM_BACKEND_HERDR_JOURNAL_PARENT_WORKSPACE_ID" \
+    "$FM_BACKEND_HERDR_JOURNAL_PARENT_LABEL" "$new_label" "$FM_BACKEND_HERDR_JOURNAL_TASK_LABEL"
+}
+
 # fm_backend_herdr_projection_concise_task_label: strip redundant owner
 # prefixes from a task id used only in the presentation workspace label.
 # Removes firstmate/, 2ndmate-<id>/, and a presentation-level fm- owner
@@ -2533,6 +2546,66 @@ fm_backend_herdr_parse_target() {  # <target>
 fm_backend_herdr_target_ready() {  # <target>
   fm_backend_herdr_parse_target "$1" || return 1
   fm_backend_herdr_server_ensure "$FM_BACKEND_HERDR_SESSION" || return 1
+}
+
+fm_backend_herdr_present_task() {  # <target> <display-name> <expected-task-label>
+  local target=$1 display_name=$2 task_label=$3 id state journal session pane lock_path
+  local attempt=0 old_label new_label info status=0
+  fm_display_name_validate "$display_name" >/dev/null 2>&1 || return 1
+  case "$task_label" in fm-*) id=${task_label#fm-} ;; *) return 1 ;; esac
+  fm_backend_herdr_parse_target "$target" || return 1
+  session=$FM_BACKEND_HERDR_SESSION
+  pane=$FM_BACKEND_HERDR_PANE
+  state=${FM_STATE_OVERRIDE:-$FM_HOME/state}
+  journal=$(fm_backend_herdr_projection_journal_path "$state" "$id")
+  [ -e "$journal" ] || return 0
+  if ! declare -F fm_lock_try_acquire >/dev/null 2>&1; then
+    . "$FM_BACKEND_HERDR_ROOT/bin/fm-wake-lib.sh"
+  fi
+  lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 1
+  while [ "$attempt" -lt 50 ]; do
+    fm_lock_try_acquire "$lock_path" && break
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  [ "$attempt" -lt 50 ] || return 1
+  if ! fm_backend_herdr_projection_journal_snapshot "$journal" "$id" \
+     || [ "$FM_BACKEND_HERDR_JOURNAL_VERSION" != 2 ] \
+     || [ "$FM_BACKEND_HERDR_JOURNAL_SESSION" != "$session" ] \
+     || [ "$FM_BACKEND_HERDR_JOURNAL_PANE_ID" != "$pane" ] \
+     || [ "$FM_BACKEND_HERDR_JOURNAL_TASK_LABEL" != "$task_label" ]; then
+    status=1
+  else
+    old_label=$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL
+    new_label=$(fm_backend_herdr_projection_workspace_label \
+      "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID" "$display_name") || status=1
+    if [ "$status" -eq 0 ] && [ "$new_label" != "$old_label" ]; then
+      if ! fm_backend_herdr_projection_live_binding_matches \
+          "$session" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID" \
+          "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID" "$FM_BACKEND_HERDR_JOURNAL_TAB_ID" \
+          "$pane" "$FM_BACKEND_HERDR_JOURNAL_PARENT_WORKSPACE_ID" \
+          "$FM_BACKEND_HERDR_JOURNAL_PARENT_LABEL" "$old_label" "$task_label" \
+        || ! fm_backend_herdr_cli "$session" workspace rename \
+          "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID" "$new_label" >/dev/null 2>&1; then
+        status=1
+      else
+        info=$(fm_backend_herdr_cli "$session" workspace get \
+          "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID" 2>/dev/null) || info=
+        if ! printf '%s' "$info" | jq -e \
+            --arg workspace "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID" --arg label "$new_label" \
+            '.result.workspace.workspace_id == $workspace and .result.workspace.label == $label' \
+            >/dev/null 2>&1 \
+          || ! fm_backend_herdr_projection_journal_replace_workspace_label \
+            "$journal" "$id" "$old_label" "$new_label"; then
+          fm_backend_herdr_cli "$session" workspace rename \
+            "$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_ID" "$old_label" >/dev/null 2>&1 || true
+          status=1
+        fi
+      fi
+    fi
+  fi
+  fm_lock_release "$lock_path" || status=1
+  return "$status"
 }
 
 # fm_backend_herdr_current_path: the live FOREGROUND process's cwd, or empty on
