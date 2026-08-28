@@ -33,12 +33,12 @@ Duplicate display names are harmless because no control operation resolves throu
 Legacy metadata is rendered through a safe readable fallback without an eager migration.
 An explicit relaunch label updates only the single metadata presentation field and supported presentation surfaces; it never creates, adopts, renames, or destroys an endpoint.
 
-The human fleet view, Bearings projection, and session-start fleet summary expose the display name while retaining the exact id.
+The human fleet view, Bearings projection, session-start fleet summary, and normal supervision wakes expose the display name while retaining the exact id or endpoint.
 Tmux renders it in the independent pane-title field while keeping the unique `fm-<id>` window name.
-Herdr's optional projected workspace renders the validated explicit or readable fallback display name beside the existing random presentation token while its ordinary task tab, exact pane binding, and restart journal remain machine-owned.
+Herdr renders the validated explicit or readable fallback name as display-only metadata on the exact pane, including flat and secondmate endpoints, and also in an optional projected workspace beside its random presentation token while the ordinary task tab, exact pane binding, and restart journal remain machine-owned.
 Zellij and cmux retain machine-scoped visible titles because those titles currently participate in endpoint verification.
 Orca retains machine labels because its creation name binds its worktree and terminal.
-Secondmate container and remote endpoint labels remain unchanged, while their metadata can carry the shared human field for fleet summaries.
+Secondmate container and remote endpoint identities remain unchanged while their exact panes and fleet summaries expose the shared human field.
 Every verified worker harness receives the same backend-neutral metadata contract; no harness owns, parses, or resolves the display name.
 These adapter choices are presentation capabilities only; [`fm-backend.sh`](../bin/fm-backend.sh) owns the shared rendering dispatch and adapters never own naming rules.
 

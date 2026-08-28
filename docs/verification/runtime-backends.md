@@ -432,7 +432,7 @@ The projected spawn in that run used the historical empty opt-in file, so a home
 The shared task display-name contract and machine-identity separation were verified on 2026-08-28 against Herdr 0.8.0 in the generated non-default `firstmate-readable-worker-labels-v1-*` lab:
 
 ```sh
-HERDR_LAB_HELPER='/home/reneg/kun-agent-workspace/bin/fm-herdr-lab.sh' \
+HERDR_LAB_HELPER=bin/fm-herdr-lab.sh \
   bash tests/fm-backend-herdr-presentation-e2e.test.sh
 ```
 

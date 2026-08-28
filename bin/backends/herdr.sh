@@ -26,6 +26,7 @@
 # focus, and agent-absence checks all agree under the session lock.
 # Every ambiguous recovered launch uses the default flat home workspace when
 # duplicate-agent risk is independently absent.
+# Every exact task pane receives the validated task display name through Herdr's display-only metadata, with an exact-ID pane-label fallback for older supported servers, while projected workspaces also carry that display name beside their random token.
 # Target resolution stays parallel to the tmux adapter in both layouts.
 # Projected create, move, and cleanup operations capture the named session's
 # exact active workspace and tab. On Herdr 0.7.5, an explicit close that
@@ -2550,15 +2551,20 @@ fm_backend_herdr_target_ready() {  # <target>
 
 fm_backend_herdr_present_task() {  # <target> <display-name> <expected-task-label>
   local target=$1 display_name=$2 task_label=$3 id state journal session pane lock_path
-  local attempt=0 old_label new_label info status=0
+  local attempt=0 old_label new_label info status=0 pane_status=0
   fm_display_name_validate "$display_name" >/dev/null 2>&1 || return 1
   case "$task_label" in fm-*) id=${task_label#fm-} ;; *) return 1 ;; esac
   fm_backend_herdr_parse_target "$target" || return 1
   session=$FM_BACKEND_HERDR_SESSION
   pane=$FM_BACKEND_HERDR_PANE
+  if ! fm_backend_herdr_cli "$session" pane report-metadata \
+      --source firstmate-display-name --title "$display_name" "$pane" >/dev/null 2>&1 \
+    && ! fm_backend_herdr_cli "$session" pane rename "$pane" "$display_name" >/dev/null 2>&1; then
+    pane_status=1
+  fi
   state=${FM_STATE_OVERRIDE:-$FM_HOME/state}
   journal=$(fm_backend_herdr_projection_journal_path "$state" "$id")
-  [ -e "$journal" ] || return 0
+  [ -e "$journal" ] || return "$pane_status"
   if ! declare -F fm_lock_try_acquire >/dev/null 2>&1; then
     . "$FM_BACKEND_HERDR_ROOT/bin/fm-wake-lib.sh"
   fi

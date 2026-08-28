@@ -697,9 +697,10 @@ fm_backend_resolve_selector() {  # <raw-target> <state-dir>
 # is already created and bound by machine identity. The shared display-name
 # library validates the one cross-backend contract; adapters only render it and
 # never participate in selector resolution, ownership, recovery, or cleanup.
-# Tmux has an independent pane-title field and can render safely. Herdr renders
-# the name in an exact-ID-bound projected workspace and updates its private
-# projection journal; its ordinary task tab stays machine-labeled. Zellij and
+# Tmux has an independent pane-title field and can render safely. Herdr reports
+# display-only metadata on the exact pane and, when projected, renders the name
+# in its exact-ID-bound workspace and updates its private projection journal;
+# its ordinary task tab stays machine-labeled. Zellij and
 # cmux titles currently participate in endpoint verification, while Orca names its worktree/terminal
 # at creation, so those adapters deliberately keep machine labels and no-op.
 fm_backend_present_task() {  # <backend> <target> <display-name> [expected-machine-label]
