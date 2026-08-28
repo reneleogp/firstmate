@@ -1403,6 +1403,12 @@ lab tab get "$FLAT_TAB_ID" >/dev/null 2>&1 \
   || fail "correction removed the seeded flat secondmate child tab"
 pass "real Herdr lab: legacy projection labels and flat secondmate tabs are left unmigrated"
 
+# The restart/recovery fixtures above may restore any persisted tab as active.
+# Re-establish the captain fixture so this cleanup test deterministically starts with every worker non-focused.
+lab tab focus "$SECOND_TWO_TAB" >/dev/null \
+  || fail "could not restore the captain tab before multi-home teardown"
+assert_focus_is "$CAPTAIN_FOCUS" "multi-home teardown setup"
+
 # Teardown multi-home projected tasks by exact pane only.
 for META_HOME_PAIR in \
   "p1:$HOME_DIR" "p2:$HOME_DIR" "pcw:$HOME_DIR" "post-legacy:$HOME_DIR" \
