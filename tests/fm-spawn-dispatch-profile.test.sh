@@ -815,7 +815,7 @@ test_non_claude_harness_ignores_config_dir() {
 
 test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_batch_spawns() {
   local rec out status meta input
-  rec=$(make_spawn_case profile-display-labels codex display-explicit display-explicit-slug-like display-fallback fix-auth-bug improve-deploy-safety customer-relationship-management-dashboard-observability-improve display-invalid display-batch-a display-batch-b)
+  rec=$(make_spawn_case profile-display-labels codex display-explicit display-explicit-slug-like display-asia-readable asian-markets-dashboard display-fallback fix-auth-bug improve-deploy-safety customer-relationship-management-dashboard-observability-improve display-invalid display-batch-a display-batch-b)
   read_case_record "$rec"
 
   : > "$LAUNCH_LOG.presentation"
@@ -837,6 +837,19 @@ test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_ba
   expect_code 0 "$status" "safe explicit display name with hyphenated outcome should succeed"
   assert_grep "display_name=CRM · improve-auth-safety" "$HOME_DIR/state/display-explicit-slug-like.meta" \
     "safe explicit display name was treated as a generated task-id fallback"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    display-asia-readable "$PROJ_DIR" --display-name "AsiaNet · Dashboard")
+  status=$?
+  expect_code 0 "$status" "ordinary Asia display-name words should succeed"
+  assert_grep "display_name=AsiaNet · Dashboard" "$HOME_DIR/state/display-asia-readable.meta" \
+    "ordinary Asia display-name words were treated as AWS credentials"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" asian-markets-dashboard "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "Asia task-id fallback should succeed"
+  assert_grep "display_name=Asian · Markets Dashboard" "$HOME_DIR/state/asian-markets-dashboard.meta" \
+    "Asia task-id fallback was treated as an AWS credential"
 
   out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" display-fallback "$PROJ_DIR")
   status=$?

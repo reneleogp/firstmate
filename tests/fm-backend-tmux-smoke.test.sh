@@ -94,8 +94,14 @@ done
 
 # --- durable human presentation ---------------------------------------------
 
+tmux set-window-option -t "$WID" allow-set-title on \
+  || fail "real tmux: could not model an adopted legacy window"
+[ "$(tmux show-window-options -v -t "$WID" allow-set-title)" = on ] \
+  || fail "real tmux: adopted legacy window did not allow application titles"
 fm_backend_tmux_present_task "$WID" "$DISPLAY_NAME" \
   || fail "fm_backend_tmux_present_task failed to set the pane title"
+[ "$(tmux show-window-options -v -t "$WID" allow-set-title)" = off ] \
+  || fail "real tmux: presentation did not disable application titles on the adopted window"
 before=$(tmux display-message -p -t "$WID" '#{pane_title}|#{window_id}|#{pane_id}') \
   || fail "real tmux: could not read the presented pane identity"
 case "$before" in
