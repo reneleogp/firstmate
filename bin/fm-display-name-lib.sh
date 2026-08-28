@@ -39,6 +39,10 @@ fm_display_name_contains_aws_access_key() {
   printf '%s' "${1-}" | LC_ALL=C grep -Eq '(^|[^A-Z0-9])(AKIA|ASIA)[A-Z0-9]{16}([^A-Z0-9]|$)'
 }
 
+fm_display_name_contains_scp_path() {
+  printf '%s' "${1-}" | LC_ALL=C grep -Eq '(^|[^A-Za-z0-9._-])[-A-Za-z0-9._]+@[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?:[-A-Za-z0-9._~]+([^A-Za-z0-9._~-]|$)'
+}
+
 fm_display_name_validate() {  # <value>
   local value=${1-} ascii bytes chars lower
   [ -n "$value" ] || fm_display_name_error 'must not be empty' || return 1
@@ -67,7 +71,8 @@ fm_display_name_validate() {  # <value>
     fm_display_name_error 'must not contain a path-like value'
     return 1
   fi
-  if fm_display_name_contains_aws_access_key "$value"; then
+  if fm_display_name_contains_aws_access_key "$value" \
+     || fm_display_name_contains_scp_path "$value"; then
     fm_display_name_error 'must not contain a URL, path, or credential-like value'
     return 1
   fi
@@ -116,6 +121,7 @@ fm_display_name_fallback() {  # <task-id>
   esac
   if printf '%s' "$ascii" | LC_ALL=C grep -q '[^ -~]' \
      || fm_display_name_contains_aws_access_key "$raw" \
+     || fm_display_name_contains_scp_path "$raw" \
      || printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[^a-z0-9])(file:|ssh:|https?://|bearer |xox[baprs]-|aiza[0-9a-z_-]*|eyj[0-9a-z_-]*|ghp_|github_pat_|glpat-|sk-[a-z0-9]{16,}|password:|secret:|token:|api[ _-]?key:)'; then
     printf 'Task'
     return 0

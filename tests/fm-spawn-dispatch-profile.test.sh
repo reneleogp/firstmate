@@ -815,7 +815,7 @@ test_non_claude_harness_ignores_config_dir() {
 
 test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_batch_spawns() {
   local rec out status meta input
-  rec=$(make_spawn_case profile-display-labels codex display-explicit display-explicit-slug-like display-asia-readable asian-markets-dashboard display-fallback fix-auth-bug improve-deploy-safety customer-relationship-management-dashboard-observability-improve display-invalid display-batch-a display-batch-b)
+  rec=$(make_spawn_case profile-display-labels codex display-explicit display-explicit-slug-like display-asia-readable display-email-readable display-colon-readable asian-markets-dashboard display-fallback fix-auth-bug improve-deploy-safety customer-relationship-management-dashboard-observability-improve display-invalid display-batch-a display-batch-b)
   read_case_record "$rec"
 
   : > "$LAUNCH_LOG.presentation"
@@ -844,6 +844,20 @@ test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_ba
   expect_code 0 "$status" "ordinary Asia display-name words should succeed"
   assert_grep "display_name=AsiaNet · Dashboard" "$HOME_DIR/state/display-asia-readable.meta" \
     "ordinary Asia display-name words were treated as AWS credentials"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    display-email-readable "$PROJ_DIR" --display-name "Support · admin@example.com")
+  status=$?
+  expect_code 0 "$status" "ordinary email-like display-name text should succeed"
+  assert_grep "display_name=Support · admin@example.com" "$HOME_DIR/state/display-email-readable.meta" \
+    "ordinary email-like display-name text was treated as an SCP path"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    display-colon-readable "$PROJ_DIR" --display-name "CRM: Dashboard")
+  status=$?
+  expect_code 0 "$status" "ordinary colon display-name text should succeed"
+  assert_grep "display_name=CRM: Dashboard" "$HOME_DIR/state/display-colon-readable.meta" \
+    "ordinary colon display-name text was treated as an SCP path"
 
   out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" asian-markets-dashboard "$PROJ_DIR")
   status=$?
@@ -878,7 +892,7 @@ test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_ba
     "long fallback should remain task-specific after bounded truncation"
 
   for input in " padded" "bad/path" "Windows · C:tmp" "CRM · file:tmp" "CRM · ssh:host" \
-    "bad⁣transport" "token: abc123" "CRM · Dashboard v1" "CRM · Dashboard v 2" "CRM · Dashboard 2.0" \
+    "CRM · git@example.com:repo" "bad⁣transport" "token: abc123" "CRM · Dashboard v1" "CRM · Dashboard v 2" "CRM · Dashboard 2.0" \
     "CRM · a1b2c3d" "fix-auth-bug" "feature-auth" \
     "CRM · feature-auth" "Backend · fix-auth-bug" \
     "main" "develop" "CRM · main" "Backend · develop" "Platform · master" "Core · trunk" \
