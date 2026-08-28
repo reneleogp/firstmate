@@ -815,7 +815,7 @@ test_non_claude_harness_ignores_config_dir() {
 
 test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_batch_spawns() {
   local rec out status meta input
-  rec=$(make_spawn_case profile-display-labels codex display-explicit display-fallback display-invalid display-batch-a display-batch-b)
+  rec=$(make_spawn_case profile-display-labels codex display-explicit display-fallback customer-relationship-management-dashboard-observability-improve display-invalid display-batch-a display-batch-b)
   read_case_record "$rec"
 
   : > "$LAUNCH_LOG.presentation"
@@ -837,8 +837,17 @@ test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_ba
   assert_grep "display_name=Display · Fallback" "$HOME_DIR/state/display-fallback.meta" \
     "spawn did not persist the shared readable fallback"
 
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    customer-relationship-management-dashboard-observability-improve "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "long fallback display-name spawn should succeed"
+  assert_grep "display_name=Customer · Relationship Management Dashboard Observability Impro" \
+    "$HOME_DIR/state/customer-relationship-management-dashboard-observability-improve.meta" \
+    "long fallback should remain task-specific after bounded truncation"
+
   for input in " padded" "bad/path" "bad⁣transport" "token: abc123" \
-    "CRM · Dashboard v1" "CRM · Dashboard 2.0" "fix-auth-bug" "feature-auth" \
+    "CRM · Dashboard v1" "CRM · Dashboard v 2" "CRM · Dashboard 2.0" \
+    "CRM · a1b2c3d" "fix-auth-bug" "feature-auth" \
     "CRM · feature-auth" "Backend · fix-auth-bug" \
     "main" "develop" "CRM · main" "Backend · develop" "Platform · master" "Core · trunk" \
     "open-pr" "CRM · Dashboard q7" "sk-abcdefghijklmnopqrstuvwx" "GitLab · glpat-abc123"; do

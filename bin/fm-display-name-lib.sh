@@ -62,7 +62,7 @@ fm_display_name_validate() {  # <value>
     *'://'*|file:*|ssh:*|*'-----begin '*|bearer\ *|*' bearer '*|*akia[0-9a-z]*|*xox[baprs]-*|*aiza[0-9a-z_-]*|*eyj[0-9a-z_-]*|ghp_*|github_pat_*|*glpat-[a-z0-9_-]*|sk-[a-z0-9]*|*'password:'*|*'secret:'*|*'token:'*|*'api key:'*|*'api-key:'*)
       fm_display_name_error 'must not contain a URL, path, or credential-like value'; return 1 ;;
   esac
-  if printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])(v(ersion[ ]*)?[0-9]+([.][0-9]+)*|[0-9]+[.][0-9]+)([ _-]|$)'; then
+  if printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])(v([ ]*|ersion[ ]*)[0-9]+([.][0-9]+)*|[0-9]+[.][0-9]+)([ _-]|$)'; then
     fm_display_name_error 'must not contain a version'
     return 1
   fi
@@ -77,7 +77,7 @@ fm_display_name_validate() {  # <value>
     return 1
   fi
   if printf '%s' "$value" | LC_ALL=C grep -Eq '[A-Za-z0-9_-]{24,}' \
-     || printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])([a-z][0-9]{1,3}|[a-z][a-z0-9]*[0-9][a-z0-9]{6,}|[0-9][a-z0-9]*[a-z][a-z0-9]{6,})([ ]*)$'; then
+     || printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])([a-z][0-9]{1,3}|[a-z][a-z0-9]*[0-9][a-z0-9]{5,}|[0-9][a-z0-9]*[a-z][a-z0-9]{5,})([ ]*)$'; then
     fm_display_name_error 'must not contain a random or secret-like suffix'
     return 1
   fi
@@ -115,7 +115,8 @@ fm_display_name_fallback() {  # <task-id>
   done
   [ -n "$out" ] || out=Task
   if [ "${#out}" -gt "$FM_DISPLAY_NAME_MAX_CHARS" ]; then
-    out="${out:0:61}..."
+    out=${out:0:$FM_DISPLAY_NAME_MAX_CHARS}
+    out=${out%"${out##*[! ]}"}
   fi
   fm_display_name_validate "$out" >/dev/null 2>&1 || out=Task
   printf '%s' "$out"
