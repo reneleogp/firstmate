@@ -1,0 +1,3 @@
+Two workers share one human label while retaining distinct machine routes:
+machine-window=fm-backend-crm-a human-title=Backend · CRM Core endpoint=%0
+machine-window=fm-backend-crm-b human-title=Backend · CRM Core endpoint=%1

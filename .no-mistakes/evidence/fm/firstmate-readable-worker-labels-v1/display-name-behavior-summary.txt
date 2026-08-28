@@ -1,0 +1,17 @@
+Focused observable behavior:
+ok - away escalation surfaces show display names with immutable task identities
+ok - display names validate strictly, fall back readably, render in tmux, and never replace batch task identity
+ok - fleet view renders secondmate agent liveness
+ok - fleet view renders the snapshot without secondmate peek guidance
+ok - fm-control relaunch: a same-harness relaunch keeps the profile axes it was running with
+ok - fm-control relaunch: a same-harness relaunch updates presentation while reusing the same endpoint and worktree
+ok - fm_backend_resolve_selector: exact ids remain authoritative and duplicate display names are ignored
+ok - real tmux: display names survive application title updates without changing machine identity
+ok - remote spawn launches on the remote-local backend and rejects invalid labels before endpoint access
+
+Live provider behavior:
+ok - real Herdr lab: an explicit human display name renders while the task tab and endpoint stay machine-bound
+ok - real Herdr lab: Hi Bit and Wheelhouse-style same-identity restarts reclaim one nested space with exact focus and idempotence
+ok - real Herdr lab: legacy projection labels and flat secondmate tabs are left unmigrated
+ok - real Herdr lab: multi-home exact-pane teardowns restore captain focus without workspace close authority
+ok - real Herdr lab: missing, renamed, and duplicate tokens trigger zero destructive or adoptive calls, and live duplicate risk refuses launch
