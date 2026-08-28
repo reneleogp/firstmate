@@ -59,6 +59,10 @@ fm_display_name_validate() {  # <value>
     *'='*|*'$'*|*'`'*|*'{'*|*'}'*|*'['*|*']'*|*'<'*|*'>'*|*'|'*|*';'*)
       fm_display_name_error 'contains a transport or shell delimiter'; return 1 ;;
   esac
+  if printf '%s' "$value" | LC_ALL=C grep -Eq '(^|[ ·_-])[A-Za-z]:([^ ]|$)'; then
+    fm_display_name_error 'must not contain a path-like value'
+    return 1
+  fi
   lower=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
   case "$lower" in
     *'://'*|file:*|ssh:*|*'-----begin '*|bearer\ *|*' bearer '*|*akia[0-9a-z]*|*xox[baprs]-*|*aiza[0-9a-z_-]*|*eyj[0-9a-z_-]*|ghp_*|github_pat_*|*glpat-[a-z0-9_-]*|sk-[a-z0-9]*|*'password:'*|*'secret:'*|*'token:'*|*'api key:'*|*'api-key:'*)

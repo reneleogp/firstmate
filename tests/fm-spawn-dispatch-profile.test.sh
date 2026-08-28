@@ -815,7 +815,7 @@ test_non_claude_harness_ignores_config_dir() {
 
 test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_batch_spawns() {
   local rec out status meta input
-  rec=$(make_spawn_case profile-display-labels codex display-explicit display-fallback fix-auth-bug improve-deploy-safety customer-relationship-management-dashboard-observability-improve display-invalid display-batch-a display-batch-b)
+  rec=$(make_spawn_case profile-display-labels codex display-explicit display-explicit-slug-like display-fallback fix-auth-bug improve-deploy-safety customer-relationship-management-dashboard-observability-improve display-invalid display-batch-a display-batch-b)
   read_case_record "$rec"
 
   : > "$LAUNCH_LOG.presentation"
@@ -830,6 +830,13 @@ test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_ba
   assert_grep "endpoint_task_id=display-explicit" "$meta" "display name changed endpoint ownership"
   assert_grep "select-pane -t firstmate:fm-display-explicit -T Backend · CRM Core" "$LAUNCH_LOG.presentation" \
     "tmux did not render the display name through its independent pane title"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    display-explicit-slug-like "$PROJ_DIR" --display-name "CRM · improve-auth-safety")
+  status=$?
+  expect_code 0 "$status" "safe explicit display name with hyphenated outcome should succeed"
+  assert_grep "display_name=CRM · improve-auth-safety" "$HOME_DIR/state/display-explicit-slug-like.meta" \
+    "safe explicit display name was treated as a generated task-id fallback"
 
   out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" display-fallback "$PROJ_DIR")
   status=$?
@@ -857,7 +864,7 @@ test_display_names_are_presentation_only_across_explicit_fallback_invalid_and_ba
     "$HOME_DIR/state/customer-relationship-management-dashboard-observability-improve.meta" \
     "long fallback should remain task-specific after bounded truncation"
 
-  for input in " padded" "bad/path" "bad⁣transport" "token: abc123" \
+  for input in " padded" "bad/path" "Windows · C:tmp" "bad⁣transport" "token: abc123" \
     "CRM · Dashboard v1" "CRM · Dashboard v 2" "CRM · Dashboard 2.0" \
     "CRM · a1b2c3d" "fix-auth-bug" "feature-auth" \
     "CRM · feature-auth" "Backend · fix-auth-bug" \
