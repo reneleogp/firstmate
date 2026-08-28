@@ -897,15 +897,24 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   sm="$CASE_DIR/secondmate-home"
   make_seeded_secondmate_home "$sm" "$id"
 
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" \
+    --secondmate --display-name "Platform · Stewardship")
   status=$?
   expect_code 0 "$status" "secondmate spawn should be exempt from the dispatch-profile explicit harness requirement"
   assert_contains "$out" "spawned $id harness=codex kind=secondmate" "secondmate launch did not use secondmate harness resolution"
   assert_grep "kind=secondmate" "$HOME_DIR/state/$id.meta" "secondmate meta missing kind=secondmate"
   assert_meta_profile "$HOME_DIR/state/$id.meta" codex default default
-  assert_grep "display_name=Profile · Secondmate" "$HOME_DIR/state/$id.meta" \
-    "secondmate spawn did not remove the task suffix from fallback display metadata"
-  pass "active crew-dispatch profile does not block secondmate launches"
+  assert_grep "display_name=Platform · Stewardship" "$HOME_DIR/state/$id.meta" \
+    "secondmate spawn did not persist its explicit display name"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
+  status=$?
+  expect_code 0 "$status" "secondmate recovery spawn without a display name should succeed"
+  assert_grep "display_name=Platform · Stewardship" "$HOME_DIR/state/$id.meta" \
+    "secondmate recovery spawn replaced its persisted display name"
+  [ "$(grep -c '^display_name=' "$HOME_DIR/state/$id.meta")" = 1 ] \
+    || fail "secondmate recovery spawn must persist exactly one display name"
+  pass "active crew-dispatch profile preserves secondmate display names across recovery spawns"
 }
 
 test_no_profile_keeps_claude_profile_defaults

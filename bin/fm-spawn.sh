@@ -910,6 +910,12 @@ ID=${POS[0]}
 fm_task_id_creation_valid "$ID" || { echo "error: invalid task id" >&2; exit 2; }
 if [ "$RELAUNCH" -eq 0 ] && [ "$DISPLAY_NAME_SET" -eq 0 ]; then
   DISPLAY_NAME=$(fm_display_name_fallback "$ID")
+  PRIOR_META="$STATE/$ID.meta"
+  if [ "$KIND" = secondmate ] && [ -f "$PRIOR_META" ] && [ ! -L "$PRIOR_META" ] \
+    && [ "$(fm_backend_meta_exact_value "$PRIOR_META" endpoint_task_id 2>/dev/null || true)" = "$ID" ] \
+    && [ "$(fm_backend_meta_exact_value "$PRIOR_META" kind 2>/dev/null || true)" = secondmate ]; then
+    DISPLAY_NAME=$(fm_display_name_for_meta "$PRIOR_META" "$ID")
+  fi
 fi
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_CONTROL_LOCK="$STATE/.control-$ID.lock"
