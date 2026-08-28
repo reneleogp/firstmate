@@ -59,7 +59,7 @@ fm_display_name_validate() {  # <value>
   esac
   lower=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
   case "$lower" in
-    *'://'*|file:*|ssh:*|*'-----begin '*|bearer\ *|*' bearer '*|*akia[0-9a-z]*|*xox[baprs]-*|*aiza[0-9a-z_-]*|*eyj[0-9a-z_-]*|ghp_*|github_pat_*|sk-[a-z0-9]*|*'password:'*|*'secret:'*|*'token:'*|*'api key:'*|*'api-key:'*)
+    *'://'*|file:*|ssh:*|*'-----begin '*|bearer\ *|*' bearer '*|*akia[0-9a-z]*|*xox[baprs]-*|*aiza[0-9a-z_-]*|*eyj[0-9a-z_-]*|ghp_*|github_pat_*|*glpat-[a-z0-9_-]*|sk-[a-z0-9]*|*'password:'*|*'secret:'*|*'token:'*|*'api key:'*|*'api-key:'*)
       fm_display_name_error 'must not contain a URL, path, or credential-like value'; return 1 ;;
   esac
   if printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])(v(ersion[ ]*)?[0-9]+([.][0-9]+)*|[0-9]+[.][0-9]+)([ _-]|$)'; then
@@ -67,7 +67,7 @@ fm_display_name_validate() {  # <value>
     return 1
   fi
   if printf '%s' "$value" | LC_ALL=C grep -Eq '^[a-z0-9]+([_-][a-z0-9]+)+$' \
-     || printf '%s' "$lower" | LC_ALL=C grep -Eq '^(feature|fix|bugfix|hotfix|chore|refactor|release)([ :_-]|$)' \
+     || printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])(feature|fix|bugfix|hotfix|chore|refactor|release)([ :_-]|$)' \
      || printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])(main|master|trunk|develop|development)([ ·_-]|$)'; then
     fm_display_name_error 'must not be a task slug or branch name'
     return 1
