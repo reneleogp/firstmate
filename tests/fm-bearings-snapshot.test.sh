@@ -148,6 +148,7 @@ EOF
     "harness=codex" \
     "kind=secondmate" \
     "mode=secondmate" \
+    "display_name=Platform · Stewardship" \
     "home=$mate" \
     "projects=firstmate"
   printf 'needs-decision [key=race]: pick subscribe order\n' > "$home/state/mate.status"
@@ -902,6 +903,9 @@ test_default_is_bounded_and_local_only() {
     .schema == "fm-bearings.v1"
       and (.in_flight | any(.[]; .id == "ship-task" and .display_name == "CRM · Dashboard"))
       and (.in_flight | any(.[]; .id == "external-wait" and .display_name == "External · Wait"))
+      and (.secondmates | any(.[]; .id == "mate"
+        and .display_name == "Platform · Stewardship"
+        and .state == "captain_decision"))
   ' >/dev/null || fail "json schema or task display names wrong"
   pass "default output is bounded, local-only, and marks omitted surfaces"
 }
@@ -1739,6 +1743,8 @@ EOF
   printf '%s' "$json" | jq -e '
     ([.in_flight[].id] | sort) == ["hibit", "home-assistant", "wheel"]
       and (.in_flight | any(.id == "hibit" and .display_name == "Platform · Progress"))
+      and (.secondmates | any(.id == "hibit" and .display_name == "Platform · Progress"
+        and .state == "active_child_work"))
       and (.decisions_open | any(.id == "sshhip/reviewer-decision"))
       and (.decisions_open | any(.id == "home-assistant/captain-run") | not)
       and (.gates | any(.id == "production-observation" and .owner == "wheel"

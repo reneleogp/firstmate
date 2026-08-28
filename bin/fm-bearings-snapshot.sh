@@ -114,7 +114,7 @@ Compact bearings projection over fm-fleet-snapshot.sh. TOON by default.
 Default is LOCAL-ONLY (no network); --include-prs is the only path that fetches.
 
 Default fields: schema, home, generated, prs, in_flight{id,display_name,kind,state,doing},
-  secondmates{id,state,doing,provenance,freshness,age_seconds,contradiction,reason},
+  secondmates{id,display_name,state,doing,provenance,freshness,age_seconds,contradiction,reason},
   decisions_open{id,key,verb,summary,owner}, landed{id,what,artifact,owner},
   gates{id,title,blocked_by,reason,owner}, reports{id,path}, recorded_prs{id,url},
   unhealthy_endpoints{...} (only when non-empty), omitted{surface,reveal}.
@@ -347,29 +347,31 @@ MODEL=$(printf '%s' "$SNAP" | jq \
      + [ (.secondmate_current.records // [])[] as $m | $m.endpoints[]?
          | select(.endpoint.exists == false or .endpoint.agent_alive == "dead")
          | {id:($m.id + "/" + .id),backend:"secondmate-home",target:(.endpoint.target // "-"),exists:.endpoint.exists,agent:.endpoint.agent_alive} ]) as $unhealthy_all
-  | ([ (.secondmate_current.records // [])[]
-       | ([.decisions_open[]? | select(.source == "backlog" and .verb == "captain-hold"
+  | ([ (.secondmate_current.records // [])[] as $secondmate
+       | ([$secondmate.decisions_open[]? | select(.source == "backlog" and .verb == "captain-hold"
             and .deferred_marker != true)]) as $captain_holds
-       | ([.holds[]? | select(.source == "backlog")]) as $backlog_holds
-       | . + {
+       | ([$secondmate.holds[]? | select(.source == "backlog")]) as $backlog_holds
+       | ([.tasks[] | select(.id == $secondmate.id)][0].display_name // $secondmate.id) as $display_name
+       | $secondmate + {
+           display_name:$display_name,
            bearings_captain_holds:$captain_holds,
-           bearings_holds:(if .current.state == "captain_decision" then $backlog_holds else .holds end),
+           bearings_holds:(if $secondmate.current.state == "captain_decision" then $backlog_holds else $secondmate.holds end),
            bearings_state:(
-             if .current.state == "captain_decision" then
+             if $secondmate.current.state == "captain_decision" then
                if ($captain_holds | length) > 0 then "captain_decision"
-               elif (.active_children | length) > 0 then "active_child_work"
+               elif ($secondmate.active_children | length) > 0 then "active_child_work"
                elif ($backlog_holds | length) > 0 then "externally_held"
                else "unknown" end
-             else .current.state end)
+             else $secondmate.current.state end)
          } ]) as $secondmate_views
   | ([ if .secondmate_current.registry.available == false then
-         {id:"(registry)",state:"unknown",doing:(.secondmate_current.registry.reason // "Registered secondmate table unavailable"),
+         {id:"(registry)",display_name:"Secondmate registry",state:"unknown",doing:(.secondmate_current.registry.reason // "Registered secondmate table unavailable"),
           provenance:(.secondmate_current.registry.provenance // "registered-table"),
           freshness:(.secondmate_current.registry.freshness.status // "unavailable"),
           age_seconds:null,contradiction:false,reason:(.secondmate_current.registry.reason // "Registered secondmate table unavailable")}
        else empty end ]
      + [ $secondmate_views[]
-       | {id,state:.bearings_state,
+       | {id,display_name,state:.bearings_state,
           doing:((if .bearings_state == "active_child_work" then
                     ([.active_children[] | .id + ": " + (.doing // .state)] | join("; "))
                   elif .bearings_state == "captain_decision" then
@@ -392,8 +394,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
       } ]
      + [ $secondmate_views[] as $secondmate
          | select($secondmate.bearings_state == "active_child_work")
-         | ([.tasks[] | select(.id == $secondmate.id)][0].display_name // $secondmate.id) as $display_name
-         | {id:$secondmate.id,display_name:$display_name,kind:"secondmate",state:$secondmate.bearings_state,
+         | {id:$secondmate.id,display_name:$secondmate.display_name,kind:"secondmate",state:$secondmate.bearings_state,
             doing:([$secondmate.active_children[] | .id + ": " + (.doing // .state)] | join("; ") | trunc(90))} ]) as $in_flight_all
   | ([ .backlog.records[]
          | select(.structured and .captain_actionable == true)
