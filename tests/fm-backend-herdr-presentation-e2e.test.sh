@@ -386,13 +386,13 @@ spawn_task() {  # <id> <home> <project> [spawn-args...]
   local id=$1 home=$2 project=$3
   shift 3
   FM_GATE_REFUSE_BYPASS=1 FM_SPAWN_NO_GUARD=1 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
-    "$ROOT/bin/fm-spawn.sh" "$id" "$project" "sh -c 'sleep 120'" --mode no-mistakes --yolo off --backend herdr "$@"
+    "$ROOT/bin/fm-spawn.sh" "$id" "$project" "sh -c 'sleep 900'" --mode no-mistakes --yolo off --backend herdr "$@"
 }
 
 relaunch_task() {  # <id> <home> <display-name>
   FM_GATE_REFUSE_BYPASS=1 FM_SPAWN_NO_GUARD=1 FM_HOME="$2" FM_ROOT_OVERRIDE="$ROOT" \
     "$ROOT/bin/fm-spawn.sh" "$1" --relaunch --display-name "$3" \
-      --harness "sh -c 'sleep 120'"
+      --harness "sh -c 'sleep 900'"
 }
 
 finish_concurrent_spawn() {  # <id> <status> <stdout> <stderr>

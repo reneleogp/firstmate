@@ -105,7 +105,10 @@ fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> -> prints 
 # that machine target, and every operation continues to address the recorded
 # endpoint. Duplicate pane titles therefore cannot affect routing or cleanup.
 fm_backend_tmux_present_task() {  # <target> <display-name>
-  tmux set-window-option -t "$1" allow-set-title off
+  # allow-set-title was added after tmux versions still supported by the
+  # portable CI matrix. Disable application title replacement where available,
+  # but do not withhold the pane's human title on older tmux releases.
+  tmux set-window-option -t "$1" allow-set-title off 2>/dev/null || true
   tmux select-pane -t "$1" -T "$2"
 }
 

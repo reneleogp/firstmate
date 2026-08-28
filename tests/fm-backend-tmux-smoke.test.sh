@@ -94,29 +94,33 @@ done
 
 # --- durable human presentation ---------------------------------------------
 
-tmux set-window-option -t "$WID" allow-set-title on \
-  || fail "real tmux: could not model an adopted legacy window"
-[ "$(tmux show-window-options -v -t "$WID" allow-set-title)" = on ] \
-  || fail "real tmux: adopted legacy window did not allow application titles"
+ALLOW_SET_TITLE=false
+if tmux show-window-options -v -t "$WID" allow-set-title >/dev/null 2>&1; then
+  ALLOW_SET_TITLE=true
+  tmux set-window-option -t "$WID" allow-set-title on \
+    || fail "real tmux: could not model an adopted legacy window"
+fi
 fm_backend_tmux_present_task "$WID" "$DISPLAY_NAME" \
   || fail "fm_backend_tmux_present_task failed to set the pane title"
-[ "$(tmux show-window-options -v -t "$WID" allow-set-title)" = off ] \
-  || fail "real tmux: presentation did not disable application titles on the adopted window"
 before=$(tmux display-message -p -t "$WID" '#{pane_title}|#{window_id}|#{pane_id}') \
   || fail "real tmux: could not read the presented pane identity"
 case "$before" in
   "$DISPLAY_NAME|$WID|"*) : ;;
   *) fail "real tmux: presentation changed machine identity or omitted the display name: $before" ;;
 esac
-tmux send-keys -t "$WID" -l "printf '\\033]2;Application Title\\033\\\\application-title-attempted\\n'"
-tmux send-keys -t "$WID" Enter
-wait_for_capture_text "$WID" "application-title-attempted" \
-  || fail "real tmux: the application title update command did not execute"
-after=$(tmux display-message -p -t "$WID" '#{pane_title}|#{window_id}|#{pane_id}') \
-  || fail "real tmux: could not read pane identity after the application title update"
-[ "$after" = "$before" ] \
-  || fail "real tmux: an application replaced the display name or machine identity: $before -> $after"
-pass "real tmux: display names survive application title updates without changing machine identity"
+if [ "$ALLOW_SET_TITLE" = true ]; then
+  [ "$(tmux show-window-options -v -t "$WID" allow-set-title)" = off ] \
+    || fail "real tmux: presentation did not disable application titles on the adopted window"
+  tmux send-keys -t "$WID" -l "printf '\\033]2;Application Title\\033\\\\application-title-attempted\\n'"
+  tmux send-keys -t "$WID" Enter
+  wait_for_capture_text "$WID" "application-title-attempted" \
+    || fail "real tmux: the application title update command did not execute"
+  after=$(tmux display-message -p -t "$WID" '#{pane_title}|#{window_id}|#{pane_id}') \
+    || fail "real tmux: could not read pane identity after the application title update"
+  [ "$after" = "$before" ] \
+    || fail "real tmux: an application replaced the display name or machine identity: $before -> $after"
+fi
+pass "real tmux: display names render without changing machine identity and are durable when supported"
 
 tmux send-keys -t "$TARGET" "cd /tmp && PS1='smoke\$ ' && clear && printf 'setup-%s\\n' ready" Enter
 wait_for_capture_text "$TARGET" "setup-ready" || fail "the tmux task shell did not complete setup"
