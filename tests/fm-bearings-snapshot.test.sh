@@ -1629,6 +1629,8 @@ test_mixed_secondmate_roles_partial_state_and_captain_readiness() {
   append_secondmate_registry "$home" wheel "$wheel"
   append_secondmate_registry "$home" sshhip "$sshhip"
   append_secondmate_registry "$home" home-assistant "$ha"
+  fm_write_secondmate_meta "$home/state/hibit.meta" "$hibit" "firstmate:fm-hibit" hibit
+  printf 'display_name=Platform · Progress\n' >> "$home/state/hibit.meta"
 
   mkdir -p "$hibit/projects/worker" "$wheel/projects/worker" "$sshhip/projects/child" "$ha/projects/prep"
   cat > "$hibit/data/backlog.md" <<'EOF'
@@ -1736,6 +1738,7 @@ EOF
   json=$(run "$home" "$fakebin" --json --fields bodies --all-landed)
   printf '%s' "$json" | jq -e '
     ([.in_flight[].id] | sort) == ["hibit", "home-assistant", "wheel"]
+      and (.in_flight | any(.id == "hibit" and .display_name == "Platform · Progress"))
       and (.decisions_open | any(.id == "sshhip/reviewer-decision"))
       and (.decisions_open | any(.id == "home-assistant/captain-run") | not)
       and (.gates | any(.id == "production-observation" and .owner == "wheel"

@@ -390,10 +390,11 @@ MODEL=$(printf '%s' "$SNAP" | jq \
         doing: ((.current_state.detail // "") as $d
                 | (if $d != "" then $d else (.hints.last_event_text // "") end) | trunc(90))
       } ]
-     + [ $secondmate_views[]
-         | select(.bearings_state == "active_child_work")
-         | {id,display_name:.id,kind:"secondmate",state:.bearings_state,
-            doing:([.active_children[] | .id + ": " + (.doing // .state)] | join("; ") | trunc(90))} ]) as $in_flight_all
+     + [ $secondmate_views[] as $secondmate
+         | select($secondmate.bearings_state == "active_child_work")
+         | ([.tasks[] | select(.id == $secondmate.id)][0].display_name // $secondmate.id) as $display_name
+         | {id:$secondmate.id,display_name:$display_name,kind:"secondmate",state:$secondmate.bearings_state,
+            doing:([$secondmate.active_children[] | .id + ": " + (.doing // .state)] | join("; ") | trunc(90))} ]) as $in_flight_all
   | ([ .backlog.records[]
          | select(.structured and .captain_actionable == true)
          | select(($all_decisions == 1) or (.deferred_marker != true))

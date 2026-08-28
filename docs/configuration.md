@@ -35,7 +35,7 @@ An explicit relaunch label updates only the single metadata presentation field a
 
 The human fleet view, Bearings projection, and session-start fleet summary expose the display name while retaining the exact id.
 Tmux renders it in the independent pane-title field while keeping the unique `fm-<id>` window name.
-Herdr's optional projected workspace renders an explicit display name beside the existing random presentation token while its ordinary task tab, exact pane binding, and restart journal remain machine-owned; omitted names keep the historical projection title for compatibility.
+Herdr's optional projected workspace renders the validated explicit or readable fallback display name beside the existing random presentation token while its ordinary task tab, exact pane binding, and restart journal remain machine-owned.
 Zellij and cmux retain machine-scoped visible titles because those titles currently participate in endpoint verification.
 Orca retains machine labels because its creation name binds its worktree and terminal.
 Secondmate container and remote endpoint labels remain unchanged, while their metadata can carry the shared human field for fleet summaries.

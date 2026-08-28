@@ -76,8 +76,12 @@ fm_herdr_cleanup_journal_matches() { # <title> <session> <home-real>
       [ "$journal_home" = "$home_real" ] \
         && [ "$FM_BACKEND_HERDR_JOURNAL_SESSION" = "$session" ] || continue
     fi
-    expected=$(fm_backend_herdr_projection_workspace_label \
-      "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID")
+    if [ "$FM_BACKEND_HERDR_JOURNAL_VERSION" = 2 ]; then
+      expected=$FM_BACKEND_HERDR_JOURNAL_WORKSPACE_LABEL
+    else
+      expected=$(fm_backend_herdr_projection_workspace_label \
+        "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID")
+    fi
     [ "$expected" = "$title" ] || continue
     printf '%s\t%s\t%s\n' "$journal" "$id" "$FM_BACKEND_HERDR_JOURNAL_PROJECTION_ID"
   done

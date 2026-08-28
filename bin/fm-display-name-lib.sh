@@ -67,7 +67,8 @@ fm_display_name_validate() {  # <value>
     return 1
   fi
   if printf '%s' "$value" | LC_ALL=C grep -Eq '^[a-z0-9]+([_-][a-z0-9]+)+$' \
-     || printf '%s' "$lower" | LC_ALL=C grep -Eq '^(feature|fix|bugfix|hotfix|chore|refactor|release)([ :_-]|$)'; then
+     || printf '%s' "$lower" | LC_ALL=C grep -Eq '^(feature|fix|bugfix|hotfix|chore|refactor|release)([ :_-]|$)' \
+     || printf '%s' "$lower" | LC_ALL=C grep -Eq '(^|[ ·_-])(main|master|trunk|develop|development)([ ·_-]|$)'; then
     fm_display_name_error 'must not be a task slug or branch name'
     return 1
   fi
