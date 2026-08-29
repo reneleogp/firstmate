@@ -139,11 +139,19 @@ fm_test_reap_orphans() {
     mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || continue
     [ $((now - mtime)) -ge "$FM_TEST_ORPHAN_MAX_AGE_SECONDS" ] || continue
     dir=$(dirname "$marker")
+    if [ -d "$dir" ] && [ ! -L "$dir" ]; then
+      find "$dir" -type d -exec chmod u+rwx {} + 2>/dev/null || true
+    fi
     rm -rf "$dir"
   done
 }
 
-fm_test_reap_orphans
+# A parent coordinator can reap once before it starts isolated child sections.
+# Those children use their own EXIT cleanup and must not spend their bounded
+# execution window repeating the same global stale-fixture scan.
+if [ "${FM_TEST_SKIP_ORPHAN_REAP:-0}" != 1 ]; then
+  fm_test_reap_orphans
+fi
 
 # --- fakebin / PATH shims ---------------------------------------------------
 #
