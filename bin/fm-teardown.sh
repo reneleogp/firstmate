@@ -661,6 +661,7 @@ remote_secondmate_teardown_locked() {
 }
 
 if remote_secondmate_teardown_locked; then
+  "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
   exit 0
 else
   remote_teardown_rc=$?
@@ -2833,6 +2834,11 @@ fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
+fi
+# A secondmate retirement may remove the home containing an overridden control
+# state directory. Do not let the side-band refresh recreate that retired home.
+if [ -d "$STATE" ]; then
+  "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
 fi
 echo "teardown $ID complete (window $T, worktree $WT)"
 backlog_refresh_reminder
