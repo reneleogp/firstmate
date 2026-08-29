@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared wake classifier: the common source of truth for captain-relevant status
-# tests, declared-external-wait vocabulary, and the working/paused current-state
-# classification used when stale-pane wakes may be safe to absorb.
+# tests, declared-external-wait vocabulary, and the working/paused absorb
+# classification that makes no-verb signal and stale-pane wakes safe to absorb.
 # Sourced by BOTH the always-on watcher
 # (bin/fm-watch.sh) and the away-mode daemon (bin/fm-supervise-daemon.sh) so the
 # overlapping triage policy lives in one place instead of two copies that can
@@ -12,14 +12,28 @@
 # FM_CAPTAIN_RE override. Consumers layer their own dedup/marker state on top (the
 # daemon keeps its escalation-digest seen-markers; the watcher keeps its .seen-*
 # signatures).
+# Status-span classification captures one file endpoint and reports every
+# actionable event through that endpoint before the endpoint may be committed.
+# An absent status file is a successful empty span, while an existing status
+# object that cannot be read or identified is a classification failure with no
+# committable endpoint.
+# A presentation marker independently stores the last reported file signature
+# and the last successfully classified position.
+# Successful classification advances both facts through the captured endpoint;
+# after a failure is reported, only the reported signature advances, so the same
+# observed state alarms once while every unclassified byte remains for recovery.
+# The reported signature includes path type, mode, symlink target, and observable
+# failure kind, so a readability change is a new state that triggers another read.
+# A missing, malformed, identity-mismatched, or past-end classified position reads
+# from byte 0, preferring a bounded duplicate over a lost event.
 #
 # There are three documented exceptions. The absorb classification
 # (crew_absorb_class and its working/paused wrappers) is NOT a pure status-file
 # read: it reuses bin/fm-crew-state.sh, which may make a bounded no-mistakes call,
-# to decide whether a stale crew is working, deliberately paused, or neither.
-# Production callers run it only on stale-state paths, never on routine transport
-# notifications or every wake, so the per-wake triage stays cheap.
-# status_open_decisions_incremental (see "incremental (cursor-backed)
+# to decide whether a crew that just stopped its turn or went stale is working,
+# deliberately paused, or neither. Callers run it ONLY on no-verb signal handling
+# and first sighting of a stale hash, never on every wake, so the per-wake triage
+# stays cheap. status_open_decisions_incremental (see "incremental (cursor-backed)
 # open-decisions fold" below) also writes: it persists a per-status-file byte
 # cursor and folded open-set as a side effect, so a per-drain fleet-wide scan
 # stays bounded by new appends instead of re-reading each task's whole lifetime
@@ -50,12 +64,11 @@ case $- in *u*) _fm_classify_nounset=on ;; *) _fm_classify_nounset=off ;; esac
 [ "$_fm_classify_nounset" = on ] || set +u
 unset _fm_classify_nounset
 
-# Captain-relevant status verbs. A newly unread status line carrying any of these
-# is work firstmate must see. Lines without these verbs remain routine in normal
-# mode unless they belong to a secondmate's parent-directed status stream; the
-# daemon applies its separate away-mode classification. FM_CAPTAIN_RE overrides
-# the whole set when a home needs a custom verb vocabulary; absent, this default
-# applies.
+# Captain-relevant status verbs. A status line carrying any of these is work
+# firstmate must see. Lines without these verbs are no-verb signals: the watcher
+# absorbs them only with positive provably-working evidence, while the daemon uses
+# its away-mode classification. FM_CAPTAIN_RE overrides the whole set when a home
+# needs a custom verb vocabulary; absent, this default applies.
 #
 # Free-text tokens (PR ready, checks green, ready in branch, merged) exist only for
 # legacy lines that lack a standard terminal verb. status_is_captain_relevant is
@@ -77,315 +90,14 @@ FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|
 # drift between the two consumers. FM_CLASSIFY_PAUSED_VERB overrides it.
 FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 
-# Bounded re-surface cadence for a declared external pause.
+# Bounded re-surface cadence for a declared pause or a verified captain hold.
 # Far longer than the wedge threshold (FM_STALE_ESCALATE_SECS, default 240s), it
-# avoids nagging a deliberate external wait while still checking a dependency
-# that may clear on its own. Human-owned waits have no timed cadence and are
-# governed by bin/fm-human-notify-lib.sh instead. One hour is the first external
-# recheck and the floor later windows derive from; both supervisors read this
-# default so the cadence has one owner.
+# avoids nagging a deliberate wait while ensuring a forgotten hold cannot rot
+# invisibly - it re-surfaces once for a recheck every window. One hour by default;
+# both consumers read FM_PAUSE_RESURFACE_SECS with this default so the cadence has
+# one owner.
 # shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
 FM_PAUSE_RESURFACE_SECS_DEFAULT=3600
-
-# Capped exponential backoff for consecutive unchanged rechecks of the same external wait,
-# the same shape the watcher's heartbeat already uses (FM_HEARTBEAT/FM_HEARTBEAT_MAX):
-# the first recheck still lands on the base cadence above, and each recheck that
-# finds the monitored evidence unchanged doubles the next window until this cap.
-# At the defaults the windows run 1h, 2h, 4h, 8h, then 12h forever, so a mature
-# unchanged wait costs about two rechecks a day instead of twenty-four while a
-# forgotten wait still cannot rot invisibly. Both consumers read
-# FM_PAUSE_RESURFACE_MAX_SECS with this default, so the cadence keeps ONE owner.
-# shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
-FM_PAUSE_RESURFACE_MAX_SECS_DEFAULT=43200
-
-# Tag of the one-line backoff record both consumers publish beside their own
-# recheck marker: "<tag>\t<consecutive-unchanged-rechecks>\t<evidence-signature>".
-# Any other content (a legacy epoch marker, a truncated write) reads as no record
-# at all, which resets the backoff rather than inflating it.
-FM_PAUSE_RECHECK_RECORD_TAG='pause-recheck-v1'
-
-# Seconds until the next recheck of a wait that has already been rechecked
-# <streak> times with no change in its monitored evidence.
-fm_pause_recheck_interval() {  # <streak> <base-secs> <cap-secs>
-  local streak=$1 base=$2 cap=$3 interval
-  case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
-  case "$base" in ''|*[!0-9]*|0) base=$FM_PAUSE_RESURFACE_SECS_DEFAULT ;; esac
-  case "$cap" in ''|*[!0-9]*|0) cap=$FM_PAUSE_RESURFACE_MAX_SECS_DEFAULT ;; esac
-  [ "$cap" -ge "$base" ] || cap=$base
-  [ "$streak" -le 30 ] || streak=30
-  interval=$(( base * (1 << streak) ))
-  [ "$interval" -gt 0 ] || interval=$cap
-  [ "$interval" -le "$cap" ] || interval=$cap
-  printf '%s' "$interval"
-}
-
-# Stable short signature of the evidence a wait is being rechecked against. The
-# caller decides WHICH evidence counts (the wait's own reason line, the status
-# file's mtime, the task incarnation, ...); this only turns it into a comparable
-# token that carries no tab or newline.
-fm_pause_recheck_signature() {  # <evidence-text>
-  printf '%s' "$1" | cksum | awk '{ printf "%s_%s", $1, $2 }'
-}
-
-# Consecutive unchanged rechecks already delivered for THIS evidence. Zero when
-# no record exists, the record is foreign or malformed, or the recorded evidence
-# differs - which is how a changed wait reason, status line, worker condition, or
-# task incarnation resets the backoff to the base cadence.
-fm_pause_recheck_condition() {  # <record-file> <current-condition>
-  local file=$1 current=$2 line tag streak recorded previous
-  case "$current" in busy|idle) printf '%s' "$current"; return 0 ;; esac
-  line=$(head -n 1 "$file" 2>/dev/null || true)
-  tag=; streak=; recorded=; previous=
-  IFS=$(printf '\t') read -r tag streak recorded previous <<EOF
-$line
-EOF
-  if [ "$tag" = "$FM_PAUSE_RECHECK_RECORD_TAG" ]; then
-    case "$previous" in busy|idle) printf '%s' "$previous"; return 0 ;; esac
-  fi
-  printf 'unknown'
-}
-
-fm_pause_recheck_streak() {  # <record-file> <evidence-signature> [<worker-condition>]
-  local file=$1 sig=$2 current=${3:-unknown} line tag streak recorded previous
-  line=$(head -n 1 "$file" 2>/dev/null || true)
-  tag=; streak=; recorded=; previous=
-  IFS=$(printf '\t') read -r tag streak recorded previous <<EOF
-$line
-EOF
-  if [ "$tag" != "$FM_PAUSE_RECHECK_RECORD_TAG" ] || [ "$recorded" != "$sig" ]; then
-    printf '0'
-    return 0
-  fi
-  if [ "$current" != unknown ] && [ "$previous" != "$current" ]; then
-    printf '0'
-    return 0
-  fi
-  case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
-  printf '%s' "$streak"
-}
-
-# The one-line record a consumer publishes after delivering a recheck.
-fm_pause_recheck_record() {  # <streak> <evidence-signature> [<worker-condition>]
-  printf '%s\t%s\t%s\t%s\n' "$FM_PAUSE_RECHECK_RECORD_TAG" "$1" "$2" "${3:-unknown}"
-}
-
-# The wake drain advances this monotonic receipt before removing acknowledged
-# queue rows. A publication whose row has already been handled can therefore
-# distinguish that fact from a row that was never appended.
-fm_pause_ack_contains() {  # <state> <sequence>
-  grep -Fqx "$2" "$1/.wake-queue.acknowledged" 2>/dev/null
-}
-
-fm_pause_ack_write() {  # <state> <sequence> <queue>
-  local state=$1 sequence=$2 queue=$3 receipt journal target tmp
-  receipt="$state/.wake-queue.acknowledged"
-  journal="$state/.paused-recheck-publish"
-  [ -s "$journal" ] || return 0
-  target=$(awk -F '\t' '$1 == "Q" && $2 ~ /^[0-9]+$/ { print $2; exit }' "$journal")
-  [ -n "$target" ] && [ "$target" -le "$sequence" ] || return 0
-  awk -F '\t' -v target="$target" 'NF >= 5 && $2 == target { found=1 } END { exit !found }' "$queue" || return 0
-  tmp="$receipt.tmp.$$"
-  printf '%s\n' "$target" > "$tmp" && mv -f "$tmp" "$receipt"
-}
-
-# Remove rows whose acknowledgement receipt survived an interrupted drain.
-# The caller holds the wake-queue lock.
-fm_pause_ack_prune() {  # <state> <queue>
-  local state=$1 queue=$2 receipt tmp
-  receipt="$state/.wake-queue.acknowledged"
-  [ -s "$receipt" ] || return 0
-  tmp="$queue.ack-prune.$$"
-  awk -F '\t' 'NR == FNR { ack[$1]=1; next } NF < 5 || !($2 in ack) { print }' \
-    "$receipt" "$queue" > "$tmp" && mv -f "$tmp" "$queue"
-}
-
-_fm_pause_atomic_record() {  # <file> <streak> <signature> <condition>
-  local file=$1 streak=$2 sig=$3 condition=$4 tmp
-  tmp="$file.tmp.$$"
-  fm_pause_recheck_record "$streak" "$sig" "$condition" > "$tmp" \
-    && mv -f "$tmp" "$file"
-}
-
-# One bounded publication journal is shared by attended and away supervision.
-# Its rows are Q (wake queue delivery), I (away digest-buffer item), and R
-# (backoff record plus an optional away pause marker). Recovery establishes every
-# delivery before applying any records and retires the journal only after every
-# write succeeds.
-_fm_pause_publish_recover() {  # <state>
-  local state=$1 journal header tag batch row type target kind key reason queue lock seq epoch status=0
-  local item file streak sig condition marker marker_epoch tmp delivered
-  journal="$state/.paused-recheck-publish"
-  [ -s "$journal" ] || { rm -f "$journal" 2>/dev/null || true; return 0; }
-  IFS= read -r header < "$journal" || return 1
-  IFS=$(printf '\t') read -r tag batch <<EOF
-$header
-EOF
-  [ "$tag" = pause-publish-v2 ] && [ -n "$batch" ] || return 1
-  queue="$state/.wake-queue"
-  lock="$state/.wake-queue.lock"
-
-  while IFS= read -r row; do
-    [ -n "$row" ] || continue
-    type=${row%%"$(printf '\t')"*}
-    case "$type" in
-      Q)
-        IFS=$(printf '\t') read -r type target kind key reason <<EOF
-$row
-EOF
-        case "$target" in ''|*[!0-9]*) return 1 ;; esac
-        fm_lock_acquire_wait "$lock" || return 1
-        delivered=false
-        if awk -F '\t' -v s="$target" -v k="$kind" -v key="$key" -v p="$reason" \
-            'NF >= 5 && $2 == s && $3 == k && $4 == key && $5 == p { found=1 } END { exit !found }' \
-            "$queue" 2>/dev/null; then
-          delivered=true
-        elif fm_pause_ack_contains "$state" "$target"; then
-          delivered=true
-        fi
-        if [ "$delivered" = false ]; then
-          seq=$(cat "$state/.wake-queue.seq" 2>/dev/null || echo 0)
-          case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
-          if [ "$seq" -lt "$target" ]; then
-            tmp="$state/.wake-queue.seq.tmp.$$"
-            printf '%s\n' "$target" > "$tmp" && mv -f "$tmp" "$state/.wake-queue.seq" || status=$?
-          fi
-          [ "$status" -ne 0 ] || _fm_recovery_marker_publish "$state/.watcher-down" downtime || status=$?
-          if [ "$status" -eq 0 ]; then
-            epoch=$(date +%s)
-            printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$target" "$kind" "$key" "$reason" >> "$queue" || status=$?
-            # shellcheck disable=SC2034 # Consumed by fm-watch.sh after recovery.
-            [ "$status" -ne 0 ] || FM_PAUSE_PUBLISH_RECOVERED_REASON=$reason
-            if [ "$status" -eq 0 ]; then
-              # shellcheck disable=SC2034 # Consumed by wake() in the watcher transition owner.
-              FM_WAKE_APPENDED_SEQUENCE=$target
-              # shellcheck disable=SC2034 # Consumed by wake() in the watcher transition owner.
-              FM_WAKE_APPENDED_PAYLOAD=$reason
-            fi
-          fi
-        fi
-        fm_lock_release "$lock"
-        [ "$status" -eq 0 ] || return "$status"
-        ;;
-      I)
-        item=${row#*"$(printf '\t')"}
-        [ -n "$item" ] || return 1
-        if ! grep -Fqx "$item" "$state/.subsuper-escalations" 2>/dev/null; then
-          [ -s "$state/.subsuper-escalations" ] || date +%s > "$state/.subsuper-escalations.since" || return 1
-          printf '%s\n' "$item" >> "$state/.subsuper-escalations" || return 1
-        fi
-        ;;
-      R) ;;
-      *) return 1 ;;
-    esac
-  done < <(tail -n +2 "$journal")
-
-  while IFS= read -r row; do
-    [ "${row%%"$(printf '\t')"*}" = R ] || continue
-    IFS=$(printf '\t') read -r type file streak sig condition marker marker_epoch <<EOF
-$row
-EOF
-    case "$file" in
-      "$state"/.paused-resurfaced-*|"$state"/.writing-resurfaced-*|"$state"/.subsuper-pause-backoff-*) ;;
-      *) return 1 ;;
-    esac
-    case "${file#"$state"/}" in */*) return 1 ;; esac
-    case "$streak" in ''|*[!0-9]*) return 1 ;; esac
-    case "$condition" in busy|idle|unknown) ;; *) return 1 ;; esac
-    _fm_pause_atomic_record "$file" "$streak" "$sig" "$condition" || return 1
-    if [ -n "$marker" ] && [ "$marker" != - ]; then
-      case "$marker" in "$state"/.subsuper-paused-*) ;; *) return 1 ;; esac
-      case "${marker#"$state"/}" in */*) return 1 ;; esac
-      tmp="$marker.tmp.$$"
-      if ! printf '%s\n' "$marker_epoch" > "$tmp" || ! mv -f "$tmp" "$marker"; then
-        rm -f "$tmp"
-        return 1
-      fi
-    fi
-  done < <(tail -n +2 "$journal")
-  rm -f "$journal"
-}
-
-fm_pause_publish_recover() {  # <state>
-  local state=$1 publish_lock status=0
-  publish_lock="$state/.paused-recheck-publish.lock"
-  fm_lock_acquire_wait "$publish_lock" || return 1
-  _fm_pause_publish_recover "$state" || status=$?
-  fm_lock_release "$publish_lock"
-  return "$status"
-}
-
-fm_pause_publish_queue() {  # <state> <kind> <key> <reason> <record-rows>
-  local state=$1 kind=$2 key=$3 reason=$4 records=$5 journal lock publish_lock seq target tmp batch status=0
-  journal="$state/.paused-recheck-publish"
-  publish_lock="$state/.paused-recheck-publish.lock"
-  fm_lock_acquire_wait "$publish_lock" || return 1
-  if ! _fm_pause_publish_recover "$state"; then
-    fm_lock_release "$publish_lock"
-    return 1
-  fi
-  lock="$state/.wake-queue.lock"
-  if ! fm_lock_acquire_wait "$lock"; then
-    fm_lock_release "$publish_lock"
-    return 1
-  fi
-  seq=$(cat "$state/.wake-queue.seq" 2>/dev/null || echo 0)
-  case "$seq" in ''|*[!0-9]*) seq=0 ;; esac
-  target=$(( seq + 1 ))
-  batch="queue.$target.$$.${RANDOM:-0}"
-  tmp="$journal.tmp.$$"
-  if ! { printf 'pause-publish-v2\t%s\nQ\t%s\t%s\t%s\t%s\n' "$batch" "$target" "$kind" "$key" "$reason"; [ -z "$records" ] || printf '%s\n' "$records"; } > "$tmp" \
-      || ! mv -f "$tmp" "$journal"; then
-    fm_lock_release "$lock"
-    fm_lock_release "$publish_lock"
-    rm -f "$tmp"
-    return 1
-  fi
-  tmp="$state/.wake-queue.seq.tmp.$$"
-  if ! printf '%s\n' "$target" > "$tmp" || ! mv -f "$tmp" "$state/.wake-queue.seq"; then
-    fm_lock_release "$lock"
-    fm_lock_release "$publish_lock"
-    rm -f "$tmp"
-    return 1
-  fi
-  fm_lock_release "$lock"
-  _fm_pause_publish_recover "$state" || status=$?
-  if [ "$status" -eq 0 ]; then
-    # shellcheck disable=SC2034 # Consumed by wake() in the watcher transition owner.
-    FM_WAKE_APPENDED_SEQUENCE=$target
-    # shellcheck disable=SC2034 # Consumed by wake() in the watcher transition owner.
-    FM_WAKE_APPENDED_PAYLOAD=$reason
-  fi
-  fm_lock_release "$publish_lock"
-  return "$status"
-}
-
-fm_pause_publish_buffer() {  # <state> <items> <record-rows>
-  local state=$1 items=$2 records=$3 journal tmp batch item publish_lock status=0
-  [ -n "$items" ] || return 0
-  journal="$state/.paused-recheck-publish"
-  publish_lock="$state/.paused-recheck-publish.lock"
-  fm_lock_acquire_wait "$publish_lock" || return 1
-  if ! _fm_pause_publish_recover "$state"; then
-    fm_lock_release "$publish_lock"
-    return 1
-  fi
-  batch="buffer.$(date +%s).$$.${RANDOM:-0}"
-  tmp="$journal.tmp.$$"
-  if ! {
-    printf 'pause-publish-v2\t%s\n' "$batch"
-    while IFS= read -r item; do [ -z "$item" ] || printf 'I\t%s\n' "$item"; done <<EOF
-$items
-EOF
-    [ -z "$records" ] || printf '%s\n' "$records"
-  } > "$tmp" || ! mv -f "$tmp" "$journal"; then
-    rm -f "$tmp"
-    fm_lock_release "$publish_lock"
-    return 1
-  fi
-  _fm_pause_publish_recover "$state" || status=$?
-  fm_lock_release "$publish_lock"
-  return "$status"
-}
 
 # The resolution verb and durable-backlog-transfer verb that CLOSE a keyed
 # status decision opened by needs-decision or blocked. See status_open_decisions
@@ -435,11 +147,6 @@ status_is_captain_relevant() {
     esac
   fi
   printf '%s' "$line" | grep -qiE "${FM_CAPTAIN_RE:-$FM_CLASSIFY_CAPTAIN_RE_DEFAULT}"
-}
-
-status_captain_relevant_is_current() {  # <status-file> <status-line>
-  [ "$(last_status_line "$1")" = "$2" ] || return 1
-  status_is_captain_relevant "$2"
 }
 
 # 0 if a status line's leading verb is the pause verb (paused: <reason>). A pure
@@ -669,10 +376,8 @@ EOF
   printf '%s' "$out"
 }
 # Fold ONE status line into an existing "<key>\t<verb>\t<note>\n"-per-line open
-# set, applying the same needs-decision/blocked-opens and keyed explicit-close
-# rules status_open_decisions documents above. An unkeyed working line also closes
-# an unkeyed blocker because it is the durable recovered transition; keyed waits
-# still require their matching explicit close. Pure text transform, no file I/O.
+# set, applying the same needs-decision/blocked-opens, resolved/captain-held-closes
+# rule status_open_decisions documents above. Pure text transform, no file I/O.
 # This is the ONE place the per-line open/resolved rule is written; both the
 # whole-file fold (status_open_decisions) and the incremental cursor-backed fold
 # (status_open_decisions_incremental) below call this instead of re-deriving the
@@ -738,12 +443,6 @@ _fm_decision_fold_line() {  # <open-set> <status-line> <resolve-verb> <held-verb
     "$resolve"|"$held")
       open=$(_fm_decision_drop "$open" "$key")
       [ -n "$open" ] && open="${open}"$'\n'
-      ;;
-    working)
-      if [ "$key" = default ] && [ "$(_fm_open_set_verb "$open" "$key")" = blocked ]; then
-        open=$(_fm_decision_drop "$open" "$key")
-        [ -n "$open" ] && open="${open}"$'\n'
-      fi
       ;;
   esac
   printf '%s' "$open"
@@ -880,11 +579,11 @@ EOF
 # is open. Cost is bounded by NEW appends since the last drain, not by the
 # status file's total lifetime size.
 #
-# Correctness invariant (unchanged from the whole-file fold): an open keyed
-# decision is dropped only by an explicit resolved/captain-held line for its exact
-# key. An unkeyed blocker also closes on an unkeyed working recovery. Cursor
-# advancement, age, and unrelated appends never close anything, so the persisted
-# open-set carries every still-open condition forward across calls.
+# Correctness invariant (unchanged from the whole-file fold): an open decision
+# is dropped ONLY by an explicit resolved/captain-held line for its exact key,
+# never by cursor advancement, age, or being buried under later appends - the
+# persisted open-set carries every still-open key forward across calls
+# regardless of how much new unrelated log content has since been folded in.
 #
 # The cursor format is `version`, `offset`, `ident`, then the folded open set.
 # FM_OPEN_DECISIONS_FOLD_VERSION must be bumped whenever
@@ -938,13 +637,23 @@ _fm_open_decisions_cursor_path() {  # <status-file>
 FM_OPEN_DECISIONS_FOLD_VERSION=5
 
 # Portable device:inode identity for the rotation/recreation check below.
-_fm_open_decisions_file_ident() {  # <file> -> "dev:inode", empty on I/O failure
-  local f=$1
-  if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
-    LC_ALL=C stat -f '%d:%i' "$f" 2>/dev/null
-  else
-    LC_ALL=C stat -c '%d:%i' "$f" 2>/dev/null
+_fm_open_decisions_file_ident() {  # <file> -> strongest available identity
+  local f=$1 epoch birth ident
+  if [ -n "${FM_STATUS_IDENTITY_READER:-}" ]; then
+    "$FM_STATUS_IDENTITY_READER" "$f"
+    return
   fi
+  if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
+    ident=$(LC_ALL=C stat -f '%d:%i' "$f" 2>/dev/null) || return 1
+    epoch=$(LC_ALL=C stat -f '%B' "$f" 2>/dev/null) || epoch=0
+    if [ "$epoch" != 0 ]; then birth=$(LC_ALL=C stat -f '%FB' "$f" 2>/dev/null) || birth=''; else birth=''; fi
+  else
+    ident=$(LC_ALL=C stat -c '%d:%i' "$f" 2>/dev/null) || return 1
+    epoch=$(LC_ALL=C stat -c '%W' "$f" 2>/dev/null) || epoch=0
+    if [ "$epoch" != 0 ]; then birth=$(LC_ALL=C stat -c '%w' "$f" 2>/dev/null) || birth=''; else birth=''; fi
+  fi
+  case "$ident$birth" in *$'\t'*|*$'\n'*|'') return 1 ;; esac
+  if [ -n "$birth" ]; then printf 'strong:%s:%s' "$ident" "$birth"; else printf 'weak:%s' "$ident"; fi
 }
 
 _fm_status_file_size() {  # <status-file>
@@ -953,7 +662,19 @@ _fm_status_file_size() {  # <status-file>
     "$FM_STATUS_SIZE_READER" "$f"
     return
   fi
-  LC_ALL=C wc -c < "$f" 2>/dev/null
+  if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
+    LC_ALL=C stat -f '%z' "$f" 2>/dev/null
+  else
+    LC_ALL=C stat -c '%s' "$f" 2>/dev/null
+  fi
+}
+
+# Private scratch path for a one-shot span read, alongside the status file the
+# same way the cursor above is, and PID-scoped so concurrent readers of one log
+# (the watcher and the away-mode daemon both classify the same stream) never
+# truncate each other's chunk.
+_fm_status_span_scratch() {  # <status-file>
+  printf '%s.span.%s' "$(_fm_open_decisions_cursor_path "$1")" "$$"
 }
 
 _fm_status_read_span() {  # <status-file> <start-offset> <byte-length>
@@ -1171,11 +892,147 @@ EOF
   printf '%s' "$offset"
 }
 
+status_signal_seen_marker_path() {  # <state> <task-id>
+  printf '%s/.seen-%s' "$1" "$(printf '%s.status' "$2" | tr '.' '_')"
+}
+
+status_heartbeat_seen_marker_path() {  # <state> <task-id>
+  printf '%s/.hb-surfaced-%s' "$1" "$(printf '%s' "$2" | tr ':/.' '___')"
+}
+
+status_daemon_seen_marker_path() {  # <state> <task-id>
+  printf '%s/.subsuper-seen-status-%s' "$1" "$(printf '%s' "$2" | tr ':/.' '___')"
+}
+
+_status_presentation_signature_valid() {
+  local value=$1 size ident encoded
+  [ "$value" = unverifiable ] && return 0
+  case "$value" in
+    r1:*)
+      encoded=${value#r1:}
+      case "$encoded" in ''|*[!0-9a-f]*) return 1 ;; esac
+      return 0
+      ;;
+  esac
+  case "$value" in *@*) size=${value%%@*}; ident=${value#*@} ;; *) return 1 ;; esac
+  case "$size" in ''|*[!0-9]*) return 1 ;; esac
+  case "$ident" in ''|*$'\t'*|*$'\n'*) return 1 ;; esac
+}
+
+STATUS_PRESENTATION_REPORTED=
+STATUS_PRESENTATION_CLASSIFIED=
+status_presentation_marker_parse() {
+  local raw=$1 rest reported classified
+  STATUS_PRESENTATION_REPORTED=
+  STATUS_PRESENTATION_CLASSIFIED=
+  case "$raw" in
+    v2$'\t'*)
+      rest=${raw#v2$'\t'}
+      case "$rest" in *$'\t'*) reported=${rest%%$'\t'*}; classified=${rest#*$'\t'} ;; *) return 1 ;; esac
+      case "$classified" in *$'\t'*) return 1 ;; esac
+      _status_presentation_signature_valid "$reported" || return 1
+      if [ "$classified" != - ]; then
+        _status_presentation_signature_valid "$classified" || return 1
+        case "$classified" in unverifiable|r1:*) return 1 ;; esac
+      fi
+      ;;
+    *)
+      _status_presentation_signature_valid "$raw" || return 1
+      case "$raw" in unverifiable|r1:*) return 1 ;; esac
+      reported=$raw
+      classified=$raw
+      ;;
+  esac
+  STATUS_PRESENTATION_REPORTED=$reported
+  STATUS_PRESENTATION_CLASSIFIED=$classified
+}
+
+_status_observed_path_state() {
+  if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
+    LC_ALL=C stat -f '%HT:%p' "$1" 2>/dev/null
+  else
+    LC_ALL=C stat -c '%F:%f' "$1" 2>/dev/null
+  fi
+}
+
+status_observed_signature() {
+  local f=$1 size=${2-} ident=${3-} path_state link_target=- access kind encoded
+  path_state=$(_status_observed_path_state "$f") || path_state=stat-error
+  if [ -L "$f" ]; then
+    link_target=$(readlink "$f" 2>/dev/null) || link_target=readlink-error
+    kind=symlink
+  elif [ ! -e "$f" ]; then
+    kind=absent
+  elif [ ! -f "$f" ]; then
+    kind=nonregular
+  elif [ -r "$f" ]; then
+    kind=readable
+  else
+    kind=unreadable
+  fi
+  if [ -z "$size" ]; then
+    size=$(_fm_status_file_size "$f") || size='size-error'
+    size=${size//[[:space:]]/}
+    case "$size" in ''|*[!0-9]*) size='size-error' ;; esac
+  fi
+  if [ -z "$ident" ]; then
+    ident=$(_fm_open_decisions_file_ident "$f") || ident=identity-error
+    [ -n "$ident" ] || ident=identity-error
+  fi
+  if [ -r "$f" ]; then access=readable; else access=unreadable; fi
+  encoded=$(printf '%s\0%s\0%s\0%s\0%s\0%s' \
+    "$size" "$ident" "$path_state" "$link_target" "$access" "$kind" \
+    | LC_ALL=C od -An -v -tx1 | tr -d ' \n') || return 1
+  printf 'r1:%s' "$encoded"
+}
+
+status_presentation_marker_reported_matches() {
+  local raw
+  raw=$(cat "$1" 2>/dev/null) || return 1
+  status_presentation_marker_parse "$raw" || return 1
+  [ "$STATUS_PRESENTATION_REPORTED" = "$2" ]
+}
+
+status_presentation_marker_offset() {
+  local raw classified offset ident current
+  raw=$(cat "$1" 2>/dev/null) || { printf '0'; return 0; }
+  status_presentation_marker_parse "$raw" || { printf '0'; return 0; }
+  classified=$STATUS_PRESENTATION_CLASSIFIED
+  [ "$classified" != - ] || { printf '0'; return 0; }
+  offset=${classified%%@*}; ident=${classified#*@}
+  current=$(_fm_open_decisions_file_ident "$2") || { printf '0'; return 0; }
+  [ "$ident" = "$current" ] || { printf '0'; return 0; }
+  printf '%s' "$offset"
+}
+
+status_presentation_marker_report() {
+  local marker=$1 reported=$2 raw classified=-
+  _status_presentation_signature_valid "$reported" || return 1
+  if raw=$(cat "$marker" 2>/dev/null) && status_presentation_marker_parse "$raw"; then
+    classified=$STATUS_PRESENTATION_CLASSIFIED
+  fi
+  printf 'v2\t%s\t%s' "$reported" "$classified" > "$marker"
+}
+
+status_presentation_marker_commit() {
+  local marker=$1 file=$2 endpoint=$3 ident=$4 current reported classified
+  case "$endpoint" in ''|*[!0-9]*) return 1 ;; esac
+  current=$(_fm_open_decisions_file_ident "$file") || return 1
+  [ -n "$ident" ] && [ "$ident" = "$current" ] || return 1
+  reported=$(status_observed_signature "$file" "$endpoint" "$ident") || return 1
+  classified="${endpoint}@${ident}"
+  printf 'v2\t%s\t%s' "$reported" "$classified" > "$marker"
+}
+
 status_retire_presentation_task() {  # <state> <task-id>
   local state=$1 task=$2 lock manifest tmp data row_task ident offset extra rc=0 found=0
+  local signal_marker heartbeat_marker daemon_marker
   lock="$state/.status-presentation-lock"
   manifest="$state/.status-presentation-cursor"
   tmp="$manifest.tmp.$$"
+  signal_marker=$(status_signal_seen_marker_path "$state" "$task")
+  heartbeat_marker=$(status_heartbeat_seen_marker_path "$state" "$task")
+  daemon_marker=$(status_daemon_seen_marker_path "$state" "$task")
 
   # A remote-home teardown can legitimately retire an endpoint ID that has no
   # status log in that home. Do not contend with that home's unrelated status
@@ -1184,7 +1041,10 @@ status_retire_presentation_task() {  # <state> <task-id>
   # durable proof that there is nothing to retire.
   if [ ! -e "$state/$task.status" ] && [ ! -L "$state/$task.status" ] \
     && [ ! -e "$state/.$task.open-decisions-cursor" ] \
-    && [ ! -L "$state/.$task.open-decisions-cursor" ]; then
+    && [ ! -L "$state/.$task.open-decisions-cursor" ] \
+    && [ ! -e "$signal_marker" ] && [ ! -L "$signal_marker" ] \
+    && [ ! -e "$heartbeat_marker" ] && [ ! -L "$heartbeat_marker" ] \
+    && [ ! -e "$daemon_marker" ] && [ ! -L "$daemon_marker" ]; then
     if [ ! -e "$manifest" ] && [ ! -L "$manifest" ]; then
       return 0
     fi
@@ -1228,7 +1088,8 @@ EOF
     fi
   fi
   if [ "$rc" -eq 0 ]; then
-    rm -f -- "$state/$task.status" "$state/.$task.open-decisions-cursor" || rc=1
+    rm -f -- "$state/$task.status" "$state/.$task.open-decisions-cursor" \
+      "$signal_marker" "$heartbeat_marker" "$daemon_marker" || rc=1
   fi
   fm_lock_release "$lock" || rc=1
   return "$rc"
@@ -1568,20 +1429,155 @@ window_to_task() {
   t="${w##*:}"; t="${t#fm-}"; printf '%s' "$t"
 }
 
-# 0 if ANY listed status file carries a captain-relevant last line; 1 otherwise.
-# Pass a space-separated status/turn-ended file list. Non-.status arguments are
-# skipped. The normal watcher instead checks only newly unread status bytes, so an
-# old captain-relevant line cannot make a routine transport notification current.
-signal_reason_is_actionable() {  # <file> ...
-  local f last
-  for f in "$@"; do
-    [ -e "$f" ] || continue
-    case "$f" in *.status) ;; *) continue ;; esac
-    last=$(last_status_line "$f")
-    [ -n "$last" ] || continue
-    status_is_captain_relevant "$last" && return 0
-  done
-  return 1
+# Capture the bytes of an append-only status log at or after <start-offset> under
+# one size-and-identity snapshot.
+# The record form prints `<endpoint>\t<identity>\t<events>` and returns 0 when
+# the span has actionable events, joining every such event in source order with
+# ` ; ` so callers report the complete captured span before committing it.
+# It returns 1 after a successful classification with no actionable event; an
+# existing log still prints its committable endpoint and identity, while an absent
+# log is the ordinary empty case and prints no record.
+# It returns 2 with no committable endpoint when an existing status object cannot
+# be classified.
+# The simpler wrapper prints only the event field, and the predicate discards the
+# record; all three inherit the library-header contract above.
+#
+# A keyed `needs-decision` or `blocked` transition accepted by the whole-file
+# fold is included only when that fold still names the exact opening as live.
+# A transition rejected by the reserved-key vocabulary is surfaced instead as a
+# reconciliation signal and never treated here as an open decision.
+# status_open_decisions remains the single owner of open/closed semantics,
+# including same-key reopening and reserved-key handling.
+# Every other captain-relevant event is terminal and always actionable.
+_fm_decision_origin_drop() {  # <origins> <key>
+  local origin
+  while IFS= read -r origin; do
+    case "$origin" in "$2"$'\t'*) ;; *) [ -n "$origin" ] && printf '%s\n' "$origin" ;; esac
+  done <<EOF
+$1
+EOF
+}
+
+_fm_status_open_decision_origins() {  # <status-file>
+  local f=$1 line open='' after key verb note number=0 origins=''
+  local resolve held
+  resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
+  held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
+  while IFS= read -r line || [ -n "$line" ]; do
+    number=$((number + 1))
+    after=$(_fm_decision_fold_line "$open" "$line" "$resolve" "$held")
+    key=$(_fm_decision_key "$line") || { open=$after; continue; }
+    verb=$(status_line_verb "$line")
+    note=$(status_line_note "$line")
+    case "$verb" in
+      needs-decision|blocked)
+        if _fm_open_set_has "$after" "$key" \
+          && [ "$(_fm_open_set_verb "$after" "$key")" = "$verb" ]; then
+          case "$after" in
+            "$key"$'\t'"$verb"$'\t'"$note"|*$'\n'"$key"$'\t'"$verb"$'\t'"$note")
+              origins=$(_fm_decision_origin_drop "$origins" "$key")
+              [ -n "$origins" ] && origins="${origins}"$'\n'
+              origins="${origins}${key}"$'\t'"${number}"
+              ;;
+          esac
+        fi
+        ;;
+      "$resolve"|"$held")
+        _fm_open_set_has "$after" "$key" || origins=$(_fm_decision_origin_drop "$origins" "$key")
+        ;;
+    esac
+    open=$after
+  done < "$f"
+  printf '%s' "$origins"
+}
+
+status_span_first_actionable_record() {  # <status-file> <start-offset>
+  local f=$1 start=${2:-0} size ident cur_ident scratch chunk_file full_file prefix_file
+  local line verb key origins='' folded=0 rc=1 failed=0 prefix_lines=0 line_number=0 live_line='' events='' _line _key
+  [ -e "$f" ] || { [ -L "$f" ] && return 2; return 1; }
+  [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 2
+  ident=$(_fm_open_decisions_file_ident "$f") || return 2
+  size=$(_fm_status_file_size "$f") || return 2
+  size=${size//[[:space:]]/}
+  case "$size" in ''|*[!0-9]*) return 2 ;; esac
+  case "$start" in ''|*[!0-9]*) start=0 ;; esac
+  [ "$start" -le "$size" ] || start=0
+  [ "$start" -lt "$size" ] || { printf '%s\t%s' "$size" "$ident"; return 1; }
+  scratch=$(_fm_status_span_scratch "$f") || return 2
+  chunk_file="${scratch}.span"; full_file="${scratch}.full"; prefix_file="${scratch}.prefix"
+  _fm_status_read_span "$f" "$start" "$((size - start))" > "$chunk_file" 2>/dev/null \
+    || { rm -f "$chunk_file" "$full_file" "$prefix_file"; return 2; }
+  cur_ident=$(_fm_open_decisions_file_ident "$f") || {
+    rm -f "$chunk_file" "$full_file" "$prefix_file"; return 2;
+  }
+  [ "$cur_ident" = "$ident" ] || { rm -f "$chunk_file" "$full_file" "$prefix_file"; return 2; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_number=$((line_number + 1))
+    case "$line" in *[![:space:]]*) ;; *) continue ;; esac
+    status_is_captain_relevant "$line" || continue
+    verb=$(status_line_verb "$line")
+    case "$verb" in
+      needs-decision|blocked)
+        key=$(_fm_decision_key "$line") || {
+          [ -n "$events" ] && events="${events} ; "
+          events="${events}${line}"
+          rc=0
+          continue
+        }
+        _fm_decision_key_transition_allowed "$key" "$(status_line_note "$line")" || {
+          [ -n "$events" ] && events="${events} ; "
+          events="${events}reconciliation-required: ${line}"
+          rc=0
+          continue
+        }
+        if [ "$folded" -eq 0 ]; then
+          _fm_status_read_span "$f" 0 "$size" > "$full_file" 2>/dev/null \
+            || { failed=1; break; }
+          if [ "$start" -gt 0 ]; then
+            _fm_status_read_span "$full_file" 0 "$start" > "$prefix_file" 2>/dev/null \
+              || { failed=1; break; }
+            while IFS= read -r _line || [ -n "$_line" ]; do prefix_lines=$((prefix_lines + 1)); done < "$prefix_file"
+          fi
+          origins=$(_fm_status_open_decision_origins "$full_file") || { failed=1; break; }
+          folded=1
+        fi
+        live_line=$(while IFS=$(printf '\t') read -r _key _line; do
+          [ "$_key" = "$key" ] && { printf '%s' "$_line"; break; }
+        done <<EOF
+$origins
+EOF
+)
+        [ -n "$live_line" ] && [ "$((prefix_lines + line_number))" -eq "$live_line" ] || continue
+        [ -n "$events" ] && events="${events} ; "
+        events="${events}${line}"
+        rc=0
+        ;;
+      *)
+        [ -n "$events" ] && events="${events} ; "
+        events="${events}${line}"
+        rc=0
+        ;;
+    esac
+  done < "$chunk_file"
+  rm -f "$chunk_file" "$full_file" "$prefix_file"
+  [ "$failed" -eq 0 ] || return 2
+  if [ "$rc" -eq 0 ]; then printf '%s\t%s\t%s' "$size" "$ident" "$events"; else printf '%s\t%s' "$size" "$ident"; fi
+  return "$rc"
+}
+
+status_span_first_actionable() {  # <status-file> <start-offset>
+  local record rc rest
+  record=$(status_span_first_actionable_record "$1" "${2:-0}")
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    rest=${record#*$'\t'}
+    printf '%s' "${rest#*$'\t'}"
+  fi
+  return "$rc"
+}
+
+status_span_has_actionable() {  # <status-file> <start-offset>
+  status_span_first_actionable_record "$1" "${2:-0}" > /dev/null
 }
 
 # Classify WHY an idle/stale crew MIGHT be safely absorbed instead of surfaced,
@@ -1597,9 +1593,9 @@ signal_reason_is_actionable() {  # <file> ...
 # One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
 # authoritatively (not the status log) is what keeps run-step precedence: a crew
 # that appended paused: but then STARTED a run reports working, never paused.
-# NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so
-# production callers run it only on stale-state paths, never routine transport
-# notifications or every wake. FM_CREW_STATE_BIN lets tests stub the verdict.
+# NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so callers
+# run it only on no-verb signal and first-sighting stale paths, never every wake.
+# FM_CREW_STATE_BIN lets tests stub the verdict.
 crew_absorb_class() {  # <id>
   local id=$1 line state src
   [ -n "$id" ] || { printf 'none'; return; }
@@ -1615,10 +1611,12 @@ crew_absorb_class() {  # <id>
 }
 
 # 0 if crew <id> shows POSITIVE evidence it is still working (crew_absorb_class
-# reports `working`). The stale path checks this before trusting the status log,
-# so a pre-validation captain-relevant line does not override an active run.
-# Routine status and turn-completion notifications do not use current-state proof.
-# See crew_absorb_class for the exact working/paused/none decision.
+# reports `working`). This is the "provably working" predicate at the heart of
+# absorb-only-when-provably-working: a no-verb turn-end or stale wake is absorbed
+# ONLY when this returns 0, and SURFACED otherwise (the crew may be done, waiting
+# on a decision, or wedged). For stale panes it is checked before trusting the
+# status log so a pre-validation captain-relevant line does not override an active
+# run. See crew_absorb_class for the exact working/paused/none decision.
 crew_is_provably_working() {  # <id>
   [ "$(crew_absorb_class "$1")" = working ]
 }
@@ -1719,13 +1717,18 @@ crew_worktree_written_since() {  # <id> <state> <anchor-file>
   [ -n "$hit" ]
 }
 
-# 0 if EVERY task referenced by a status/turn-ended file list is provably working;
-# 1 if any is not, or no task can be resolved. Files are mapped to task ids by
-# stripping the .status / .turn-ended suffix. This current-state helper is not the
-# normal signal policy: routine transport notifications are absorbed without it.
-# A kind=secondmate task's .status file returns 1 regardless of busy evidence
-# because that stream is the mate's parent-directed reply channel; a mate's bare
-# turn-ended marker has no parent-directed content.
+# 0 (benign/absorb) if EVERY task referenced by a no-verb "signal:" wake is provably
+# working; 1 (actionable/surface) if any is not, or no task can be resolved. Pass the
+# same space-separated file list the caller classified with the span read above.
+# Files are mapped to task ids by stripping the .status / .turn-ended suffix;
+# a no-verb wake with nothing
+# provably working must surface, so an empty/unresolvable list returns 1.
+# A kind=secondmate task's .status signal is never absorbable here regardless of
+# busy evidence: that stream is the mate's routed-reply channel, so every append
+# is parent-directed content the supervisor must read (a routed reply, a newly
+# raised decision, a mirrored remote line), and a busy mate agent makes its note
+# more current, not less deliverable. Scoped to .status files - a mate's bare
+# turn-ended ping still uses the ordinary provably-working absorb.
 signal_crew_provably_working() {  # <file> ...
   local f base dir task seen=""
   for f in "$@"; do
@@ -1753,24 +1756,6 @@ signal_crew_provably_working() {  # <file> ...
   return 0
 }
 
-# 0 when a changed signal set contains a secondmate status file.
-# A secondmate status stream is the parent-directed reply channel, so its newly
-# appended bytes remain actionable even when they use no captain-relevant verb.
-signal_has_parent_directed_status() {  # <file> ...
-  local f base dir task
-  for f in "$@"; do
-    base=${f##*/}
-    case "$base" in *.status) ;; *) continue ;; esac
-    dir=${f%/*}
-    [ "$dir" != "$f" ] || dir=.
-    task=${base%.status}
-    if [ "$(grep '^kind=' "$dir/$task.meta" 2>/dev/null | tail -1 | cut -d= -f2-)" = secondmate ]; then
-      return 0
-    fi
-  done
-  return 1
-}
-
 # 0 (terminal/actionable) if a stale window's last status line is
 # captain-relevant; 1 otherwise, including the no-status case. A 1 only means
 # "non-terminal"; the always-on watcher then applies crew_is_provably_working,
@@ -1779,21 +1764,4 @@ stale_is_terminal() {  # <window> <state>
   local win=$1 state=$2 last
   last=$(last_status_line "$state/$(window_to_task "$win" "$state").status")
   [ -n "$last" ] && status_is_captain_relevant "$last"
-}
-
-# Print "<file>\t<task>\t<last-line>" for every state/*.status whose last line is
-# captain-relevant. This is the cheap fleet-scan both supervisors run as a
-# catch-all backstop for a captain-relevant status the per-wake path might miss.
-# No dedup is applied here: each consumer dedupes against its own seen-state (the
-# daemon against .subsuper-seen-status-*, the watcher against .seen-* signatures).
-scan_captain_relevant_statuses() {  # <state>
-  local state=$1 f last task
-  for f in "$state"/*.status; do
-    [ -e "$f" ] || continue
-    last=$(last_status_line "$f")
-    status_is_captain_relevant "$last" || continue
-    task=$(basename "$f"); task="${task%.status}"
-    printf '%s\t%s\t%s\n' "$f" "$task" "$last"
-  done
-  return 0
 }
