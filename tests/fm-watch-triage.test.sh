@@ -2518,7 +2518,10 @@ test_timer_repair_drops_a_finished_write_deferral_chain() {
     FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_numeric_file "$state/.stale-since-$key" 30 \
+  # Watcher startup performs bounded recovery scans before its first stale poll;
+  # give this positive marker assertion the same loaded-runner budget as the
+  # suite's other startup-sensitive waits instead of failing after only 3s.
+  wait_numeric_file "$state/.stale-since-$key" 100 \
     || { reap "$pid"; fail "the corrupt idle-window timer was not repaired"; }
   [ ! -e "$state/.writing-since-$key" ] \
     || { reap "$pid"; fail "an idle-window timer repair kept a finished write-deferral chain"; }
