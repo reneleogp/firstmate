@@ -234,13 +234,6 @@ fm_backlog_row_probe() {  # <data-dir> <id>
   return 0
 }
 
-# Echo "<state> <held> <blocked>" for one row, e.g. "queued no no".
-# Returns 1 when the row does not exist or cannot be read.
-fm_backlog_row_state() {  # <data-dir> <id>
-  fm_backlog_row_probe "$1" "$2" || return 1
-  printf '%s\n' "$FM_BACKLOG_ROW_STATE"
-}
-
 # Run one tasks-axi mutation against <home>'s backlog, capturing its first
 # output line in FM_BACKLOG_TRANSITION_ERROR on failure.
 fm_backlog_mutate() {  # <data-dir> <verb> <id> [flag...]
@@ -463,7 +456,6 @@ fm_backlog_atomic_transition() {
   shift
   case "$operation" in
     publish) fm_backlog_record_publish "$@" ;;
-    verify-published) fm_backlog_record_present "$@" ;;
     remove) fm_backlog_record_remove "$@" ;;
     dispatch) fm_backlog_dispatch_transition "$@" ;;
     rollback) fm_backlog_dispatch_rollback "$@" ;;
