@@ -459,63 +459,7 @@ grok 0.2.103 (89c3d36fb6f1) [stable]
 
 Pi 0.81.1 repeated the continuity and clean-exit lifecycle on 2026-07-23 after the Calm presentation changes.
 
-Pi 0.84.3 human-notification suppression was verified on 2026-08-28 against a real interactive primary using `github-copilot/gpt-5.6-sol` at medium reasoning in a guarded Herdr 0.7.3 named non-default lab.
-The first decision transition reached Pi once, its durable wake was handled, and an identical replay stayed in bash with the successor watcher live and no second prompt.
-
-```sh
-export HERDR_LAB_HELPER=/home/reneg/kun-agent-workspace/bin/fm-herdr-lab.sh
-export HERDR_LAB_SESSION=$("$HERDR_LAB_HELPER" name firstmate-one-shot-human-waits-v1)
-FM_HUMAN_NOTIFY_HERDR_E2E=1 tests/fm-human-notifications-herdr-e2e.test.sh
-```
-
-Observed output:
-
-```text
-ok - real Pi absorbs an unchanged human-owned decision before model invocation
-evidence: herdr-session=fm-lab-firstmate-one-sh-834395-4610 pi=0.84.3 model=github-copilot/gpt-5.6-sol prompts=1 unchanged-replay=0
-```
-
-Pi 0.84.3 away takeover and return were verified on 2026-08-27 against a real interactive primary in a guarded Herdr 0.7.3 named non-default lab.
-The ordinary watcher was live before entry, the launcher waited for the extension's generation-bound standdown receipt, the daemon then held the only watcher, and return restored one ordinary watcher without a direct watcher follow-up.
-A redundant arm command preserved that returned singleton.
-
-```sh
-export HERDR_LAB_HELPER=/home/reneg/kun-agent-workspace/bin/fm-herdr-lab.sh
-export HERDR_LAB_SESSION=$("$HERDR_LAB_HELPER" name firstmate-silent-routine-notifications-v1)
-FM_PI_AWAY_TAKEOVER_HERDR_E2E=1 tests/fm-pi-away-takeover-herdr-e2e.test.sh
-```
-
-Observed output:
-
-```text
-ok - real Pi ordinary supervision retires before the away daemon becomes sole owner
-ok - real Pi away return restores exactly one ordinary cycle with no replayed turn
-evidence: herdr-session=fm-lab-firstmate-silent-3156876-7501 pi=0.84.3 ordinary=3157217 away=3158062 returned=3158629
-```
-
-Portable A/B coverage on the same date proved the intentional producer transition suppresses only its own recovery publication, while an unmarked close still emits `check: rearm-resurface`.
-The Pi and OpenCode persistent adapters both pass the exact pending reason to the shared delivery confirmation, so a consumed late callback returns the dedicated superseded result without a model turn.
-Plain Pi and pi-signed share the tracked extension.
-Claude and Cursor retain their existing `.afk` checks before committing a turn-end continuation, Codex has no detached extension child, and Grok retains its native background-task protocol; the watcher-side no-action signal absorption applies to every harness and tmux or Herdr session provider.
-
-```sh
-bin/fm-test-run.sh tests/fm-pi-watch-extension.test.sh tests/fm-watch-arm.test.sh tests/fm-daemon.test.sh tests/fm-afk-launch.test.sh tests/fm-afk-return.test.sh tests/fm-wake-queue.test.sh
-bin/fm-test-run.sh tests/fm-watch-triage.test.sh
-bin/fm-test-run.sh tests/fm-watcher-lock.test.sh tests/fm-watch-recovery-loop.test.sh
-bin/fm-test-run.sh tests/fm-turnend-guard.test.sh tests/fm-claude-stop-autoarm.test.sh tests/fm-cursor-primary.test.sh
-```
-
-Observed guarantees:
-
-```text
-ok - Pi acknowledged late close is absorbed before model invocation
-ok - Pi away takeover retires an in-flight ordinary cycle and return restores exactly one
-ok - watch-arm: intentional away retirement is silent while an unintended close still re-surfaces
-ok - a bare turn-end with no new captain-relevant status is absorbed before model invocation
-ok - a routine working note with no captain-relevant outcome is absorbed before model invocation
-```
-
-Pi same-process session-transition ownership was verified on 2026-07-27 against the tracked extension with a faithful in-process factory rebind (module cache retained, real arm children):
+Pi same-process session-transition ownership was verified on 2026-09-01 against the tracked extension with provider-free public lifecycle events, retained and fresh extension-module rebinds, and real arm children:
 
 ```sh
 pi --version
@@ -523,8 +467,10 @@ tests/fm-pi-watch-extension.test.sh
 tests/fm-pi-primary-types.test.sh
 ```
 
-Observed guarantee: after ordinary `session_shutdown` for `/new`, `/resume`, and `/fork`, plus same-instance shutdown-plus-start, the replacement generation armed again without a Pi restart and without the `watcher: not armed - Pi session is shutting down` refusal.
+Observed guarantee: after ordinary `session_shutdown` for `/new`, `/resume`, `/fork`, and reload, plus same-instance shutdown-plus-start, an owning `session_start` armed the replacement generation before any model turn and without the `watcher: not armed - Pi session is shutting down` refusal.
+A fresh module rebind also received exactly once the actionable close whose first delivery was still in flight at shutdown, while retaining one live successor.
 Stale prior-generation tool callbacks could not mutate the active child, repeated transitions kept exactly one live arm cycle, and terminal `quit` still refused late rearm.
+The strict no-emit check used the installed Pi SDK declarations to hold the lifecycle event contract.
 Plain Pi and pi-signed share the same tracked `.pi/extensions/fm-primary-pi-watch.ts` path, so both inherit the generation owner; other primary harnesses are not applicable because they do not use this Pi extension lifecycle.
 
 The once-per-generation recovery bound and immediate handling-successor poll were verified on 2026-08-21 with the tracked Pi extension, real watcher processes, and an isolated home.
