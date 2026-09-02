@@ -712,6 +712,31 @@ test_portable_serial_shards_partition_the_serial_lane() {
   pass "portable serial shards are a deterministic disjoint cover of the serial lane"
 }
 
+test_portable_serial_hint_coverage_is_reported_and_bounded() {
+  local out serial unhinted
+  # Shards are packed from measured duration hints, so an unmeasured script is
+  # placed on a guess. Enough of them and the partition still looks balanced by
+  # script count while one shard carries far more real work than another and
+  # reaches its CI job cap. The coverage guard therefore reports the unmeasured
+  # share and refuses past its bound; assert that contract is live rather than
+  # trusting the hint table to stay fresh on its own.
+  out=$("$RUNNER" --check-coverage)
+  assert_contains "$out" "serial_unhinted=" "coverage guard must report the unmeasured serial share"
+  serial=$(printf '%s\n' "$out" | sed -n 's/.*[^_]serial=\([0-9][0-9]*\).*/\1/p')
+  unhinted=$(printf '%s\n' "$out" | sed -n 's/.*serial_unhinted=\([0-9][0-9]*\).*/\1/p')
+  [ -n "$serial" ] && [ -n "$unhinted" ] \
+    || fail "coverage summary must carry numeric serial counts: $out"
+  [ "$serial" -gt 0 ] || fail "portable serial lane must be non-empty, got $serial"
+  [ "$unhinted" -le "$serial" ] \
+    || fail "unmeasured count $unhinted exceeds the serial lane size $serial"
+  # 15% is the guard's own bound; staying well inside it is what keeps the
+  # balance evidence-based. Refresh from a green run's timing artifacts when
+  # this trips (docs/fm-test-portable-shards.md).
+  [ "$((unhinted * 100))" -le "$((serial * 15))" ] \
+    || fail "$unhinted of $serial portable serial scripts lack a measured hint; refresh them"
+  pass "coverage guard reports and bounds the unmeasured portable serial share"
+}
+
 test_portable_serial_shard_lane_refusals() {
   local tmp count rc other
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-shard-lane.XXXXXX")
@@ -1185,6 +1210,7 @@ test_fail_on_gate_skip_token
 test_exclude_family
 test_portable_shard_union_and_coverage_guard
 test_portable_serial_shards_partition_the_serial_lane
+test_portable_serial_hint_coverage_is_reported_and_bounded
 test_portable_serial_shard_lane_refusals
 test_jobs_requires_proven_isolated
 test_jobs_admits_a_concurrent_safe_family
