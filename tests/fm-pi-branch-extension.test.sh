@@ -486,6 +486,14 @@ const sentToMain = [];
 const mainUserMessages = [];
 const mainTools = [];
 const renderers = new Map();
+const entryRenderers = new Map();
+const mainEntries = [];
+const mainSessionManager = {
+  getSessionFile: () => `${home}/main.jsonl`,
+  getEntries: () => mainEntries,
+};
+const defaultSessionCtx = { model: mainModel, modelRegistry, sessionManager: mainSessionManager };
+let activeMainSession = mainSessionManager;
 const pi = {
   events: bus,
   on(event, handler) {
@@ -500,6 +508,12 @@ const pi = {
   registerMessageRenderer(customType, renderer) {
     renderers.set(customType, renderer);
   },
+  registerEntryRenderer(customType, renderer) {
+    entryRenderers.set(customType, renderer);
+  },
+  appendEntry(customType, data) {
+    activeMainSession.getEntries().push({ type: "custom", customType, data });
+  },
   sendMessage(message, options) {
     sentToMain.push({ message, options: options ?? {} });
   },
@@ -512,7 +526,9 @@ const pi = {
   },
 };
 function fire(event, payload, ctx) {
-  for (const handler of piHandlers.get(event) ?? []) handler(payload, ctx);
+  const eventCtx = ctx;
+  if (eventCtx?.sessionManager) activeMainSession = eventCtx.sessionManager;
+  for (const handler of piHandlers.get(event) ?? []) handler(payload, eventCtx);
 }
 function makeOffer(message, projects = [approvedProject], heartbeat = false, eligible = projects.length > 0 || heartbeat) {
   const offer = {
@@ -567,11 +583,12 @@ test_branch_dispatch_two_stage_filter_and_prefix_contract() {
   PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module > "$TMP_ROOT/node-output" 2>&1 <<'EOF'
 const prelude = process.env.DRIVER_PRELUDE;
-await eval(`(async () => { ${prelude}; globalThis.__t = { pi, fire, dispatch, settle, outcomeScript, sentToMain, mainUserMessages, mainTools, renderers, home, realRoot }; })()`);
-const { pi, fire, dispatch, settle, outcomeScript, sentToMain, mainUserMessages, mainTools, renderers, home, realRoot } = globalThis.__t;
+await eval(`(async () => { ${prelude}; globalThis.__t = { pi, fire, dispatch, settle, outcomeScript, sentToMain, mainUserMessages, mainTools, renderers, entryRenderers, mainEntries, defaultSessionCtx, home, realRoot }; })()`);
+const { pi, fire, dispatch, settle, outcomeScript, sentToMain, mainUserMessages, mainTools, renderers, entryRenderers, mainEntries, defaultSessionCtx, home, realRoot } = globalThis.__t;
 import { readFileSync, writeFileSync } from "node:fs";
 
 writeFileSync(`${home}/state/.lock`, `${process.ppid}\n`);
+fire("session_start", {}, defaultSessionCtx);
 
 // 1. An accepted wake reaches the branch session, never main.
 const offer = dispatch("signal: task-9 done: PR https://example.com/pr/9 checks green");
@@ -621,8 +638,8 @@ console.log(`CACHE_KEY=${rewriteA.prompt_cache_key}`);
 
 // 4. Two-stage filter, stage 2: routine while main is idle appends with no
 // turn; routine while main is busy defers to after the captain's next prompt;
-// captain-relevant appends and triggers exactly one turn. Store rows are
-// written BEFORE the merge note and marked read after it.
+// captain-relevant persists a visible entry with no model turn. Store rows are
+// written before delivery and marked read only after it.
 const report = session.options.customTools.find((tool) => tool.name === "fm_branch_report");
 const r1 = await report.execute("call-1", { task: "task-9", verdict: "routine", summary: "worker healthy, no action needed", wake: "signal: working" }, undefined, undefined, {});
 if (r1.isError) throw new Error(`routine report failed: ${JSON.stringify(r1)}`);
@@ -637,46 +654,44 @@ if (sentToMain[1].options.deliverAs !== "nextTurn" || sentToMain[1].options.trig
 }
 fire("agent_end", {});
 await report.execute("call-3", { task: "task-9", verdict: "captain", summary: "PR https://example.com/pr/9 checks green, ready for review" }, undefined, undefined, {});
-if (sentToMain[2].options.triggerTurn !== true || sentToMain[2].options.deliverAs !== "followUp") {
-  throw new Error(`captain merge must trigger exactly one follow-up turn: ${JSON.stringify(sentToMain[2].options)}`);
+// A captain outcome opens exactly ONE sequence-keyed processing turn: a
+// hidden, typed request that names the sequence and carries the exact stored
+// summary. No unkeyed turn ever opens, and routine delivery is untouched.
+const processingRequests = sentToMain.filter((sent) => sent.message.customType === "fm-branch-process");
+if (processingRequests.length !== 1) throw new Error(`captain delivery opened ${processingRequests.length} processing requests, not exactly one`);
+const processingRequest = processingRequests[0];
+if (processingRequest.options.triggerTurn !== true || processingRequest.options.deliverAs !== "followUp") {
+  throw new Error(`the processing request must open one follow-up turn: ${JSON.stringify(processingRequest.options)}`);
 }
+if (processingRequest.message.display !== false) throw new Error("the processing request must stay hidden: the visible entry is the display");
+if (!processingRequest.message.content.includes("[seq 3] task-9: PR https://example.com/pr/9 checks green, ready for review")) {
+  throw new Error(`the processing request lost its sequence key or exact summary: ${processingRequest.message.content}`);
+}
+if (sentToMain.some((sent) => sent.options.triggerTurn && sent.message.customType !== "fm-branch-process")) {
+  throw new Error("an unkeyed turn opened on main");
+}
+if (sentToMain.length !== 3) throw new Error(`captain delivery changed routine delivery: ${JSON.stringify(sentToMain)}`);
+writeFileSync(`${home}/state/delivered-processing-request`, processingRequest.message.content);
 if (typeof sentToMain[0].message.content !== "string" || !sentToMain[0].message.content.startsWith("⛵ ")) {
   throw new Error(`routine note missing sailboat prefix: ${sentToMain[0].message.content}`);
 }
 if (/branch merged|\[routine\]|\[captain\]/.test(sentToMain[0].message.content)) {
   throw new Error(`routine note still has boilerplate: ${sentToMain[0].message.content}`);
 }
-// A routine note is rendered (display: true); a captain-facing note must
-// never be printed or rendered at all - the follow-up turn triggered above
-// is itself the captain-visible outcome. display: false is the exact flag
-// Pi's own chat renderer and HTML export both gate on before ever calling a
-// customType renderer, so this is the authoritative "never printed" proof.
+// A routine note is rendered as a custom message. A captain outcome is a
+// versioned custom session entry whose exact store summary is its payload.
 if (sentToMain[0].message.display !== true) {
   throw new Error(`routine note must render: display=${sentToMain[0].message.display}`);
 }
-if (sentToMain[2].message.display !== false) {
-  throw new Error(`captain note must never be printed or rendered: display=${sentToMain[2].message.display}`);
-}
-if (typeof sentToMain[2].message.content !== "string" || sentToMain[2].message.content.includes("⚓")) {
-  throw new Error(`captain note must carry no anchor glyph now that it is never rendered: ${sentToMain[2].message.content}`);
-}
-if (!sentToMain[2].message.content.includes("task-9: PR https://example.com/pr/9")) {
-  throw new Error(`captain note lost its outcome: ${sentToMain[2].message.content}`);
-}
-if (/branch merged|\[routine\]|\[captain\]/.test(sentToMain[2].message.content)) {
-  throw new Error(`captain note still has boilerplate: ${sentToMain[2].message.content}`);
-}
-// What main's model actually receives. Pi keeps only `content` when it turns a
-// custom message into a provider message - customType, display, and details are
-// all dropped - so `content` IS the delivered payload, and these two files are
-// the exact bytes main's model would read. The bash side classifies them with
-// the REAL bin/fm-operational-input.sh so the protocol's own executable, not a
-// pattern in this test, decides what was delivered. Pi's half of that contract
-// is proven separately against the real SDK in fm-pi-branch-live-e2e.test.sh.
-writeFileSync(`${home}/state/delivered-captain-note`, sentToMain[2].message.content);
 writeFileSync(`${home}/state/delivered-routine-note`, sentToMain[0].message.content);
-if (sentToMain.filter((sent) => sent.options.triggerTurn).length !== 1) {
-  throw new Error("one captain outcome must open exactly one turn on main");
+const captainEntries = mainEntries.filter((entry) => entry.customType === "fm-branch-visible-outcome");
+if (captainEntries.length !== 1) throw new Error(`captain delivery count was ${captainEntries.length}, not 1`);
+const captainRecord = captainEntries[0].data;
+if (captainRecord.version !== 1 || captainRecord.seq !== 3 || captainRecord.task !== "task-9" || captainRecord.verdict !== "captain") {
+  throw new Error(`captain entry lost its identity: ${JSON.stringify(captainRecord)}`);
+}
+if (captainRecord.summary !== "PR https://example.com/pr/9 checks green, ready for review") {
+  throw new Error(`captain entry changed the exact summary: ${captainRecord.summary}`);
 }
 
 // The store (the owned durable contract) holds all three outcomes in order,
@@ -755,6 +770,7 @@ if (listedText.split("\n").length !== 2 || !listedText.includes("checks green"))
   throw new Error(`fm_branch_outcomes did not read the store: ${listedText}`);
 }
 if (!renderers.has("fm-branch-merge")) throw new Error("merge-note renderer missing");
+if (!entryRenderers.has("fm-branch-visible-outcome")) throw new Error("visible captain-outcome renderer missing");
 const assertRenderedNote = (note, glyph) => {
   const fgCalls = [];
   const rendered = renderers.get("fm-branch-merge")(
@@ -787,6 +803,14 @@ const assertRenderedNote = (note, glyph) => {
   }
 };
 assertRenderedNote(sentToMain[0].message.content, "⛵");
+const captainRendered = entryRenderers.get("fm-branch-visible-outcome")(
+  captainEntries[0],
+  { expanded: false },
+  renderTheme,
+);
+if (captainRendered.text !== "⚓ [seq 3] task-9: PR https://example.com/pr/9 checks green, ready for review") {
+  throw new Error(`captain renderer changed the exact visible outcome: ${captainRendered.text}`);
+}
 process.exit(0);
 EOF
   status=$?
@@ -796,46 +820,31 @@ EOF
     CACHE_KEY=fm-branch-*) ;;
     *) fail "cache key line missing from driver output: $out" ;;
   esac
-  pass "branch owns accepted wakes with a stable prefix contract and verdict-driven merge delivery"
+  pass "branch owns accepted wakes with a stable prefix and deterministic verdict-driven delivery"
 
-  # The delivered captain payload must identify itself to main's model. When it
-  # did not, main could not tell an incoming outcome from its own earlier answer
-  # and re-emitted that answer instead of relaying the outcome, silently losing
-  # it. The real protocol executable is the oracle here: it decides the kind and
-  # extracts the body, so this asserts delivered behavior rather than a shape
-  # this test already knows.
+  # The processing request must identify itself to main's model through the
+  # real protocol executable: it is typed branch-outcome input whose body names
+  # the sequence, the exact outcome, the acknowledgement tool, and the fact
+  # that nothing but that acknowledgement closes it. Routine notes remain
+  # plain rendered text rather than typed operational input.
   local kind body
-  kind=$(./bin/fm-operational-input.sh kind < "$home/state/delivered-captain-note") \
-    || fail "captain outcome reaches main's model as unattributed text the model cannot tell from its own answer"
-  [ "$kind" = branch-outcome ] \
-    || fail "captain outcome delivered as kind '$kind', not branch-outcome"
-  body=$(./bin/fm-operational-input.sh body < "$home/state/delivered-captain-note") \
-    || fail "captain outcome envelope carries no readable body"
+  kind=$(./bin/fm-operational-input.sh kind < "$home/state/delivered-processing-request") \
+    || fail "the processing request reaches main's model as unattributed text"
+  [ "$kind" = branch-outcome ] || fail "the processing request was delivered as kind '$kind', not branch-outcome"
+  body=$(./bin/fm-operational-input.sh body < "$home/state/delivered-processing-request") \
+    || fail "the processing request envelope carries no readable body"
   case "$body" in
-    *"This is a supervision outcome delivered automatically by the supervision branch."*"It was not typed by the captain."*"task-9: PR https://example.com/pr/9"*) ;;
-    *) fail "captain outcome body lost its self-description or the outcome itself: $body" ;;
-  esac
-  # Event ownership and conversational judgment are separate contracts. The
-  # delivered instruction forbids reprocessing the fleet event but leaves main
-  # free to decide how the outcome belongs in the captain conversation.
-  case "$body" in
-    *"The fleet event is already handled: do not re-drain, re-run, or acknowledge it."*) ;;
-    *) fail "captain outcome body lost the event-ownership boundary: $body" ;;
+    *"delivered automatically by the supervision branch."*"It was not typed by the captain."*"[seq 3] task-9: PR https://example.com/pr/9 checks green, ready for review"*) ;;
+    *) fail "the processing request body lost its self-description or the outcome itself: $body" ;;
   esac
   case "$body" in
-    *"This outcome is captain-facing: give the captain a visible response now."*"Use your judgment over the wording and how to incorporate it, not whether to surface it."*) ;;
-    *) fail "captain outcome body made visibility optional or removed wording judgment: $body" ;;
+    *"do not re-drain, re-run, or acknowledge the wake."*"call fm_branch_processed with through=3 exactly once."*"never counts as processing."*) ;;
+    *) fail "the processing request body lost the event-ownership boundary or the sequence-bound acknowledgement duty: $body" ;;
   esac
-  case "$body" in
-    *"An outcome that directly answers an explicit captain request is captain-facing"*"regardless of whether it is healthy, routine, measured, actionable, or requires a decision."*) ;;
-    *) fail "captain outcome body lost the unconditional explicit-request rule: $body" ;;
-  esac
-  # The routine note is rendered in the TUI, and its renderer reads the glyph off
-  # the front of this same string, so it must stay plain text.
   if ./bin/fm-operational-input.sh kind < "$home/state/delivered-routine-note" >/dev/null 2>&1; then
     fail "routine note must stay plain rendered text, not typed operational input"
   fi
-  pass "a captain outcome reaches main's model as typed, self-describing input while routine notes stay plain"
+  pass "a captain outcome reaches main's model as one typed, sequence-keyed processing request while routine notes stay plain"
 }
 
 test_requested_healthy_outcome_and_unsolicited_routine_outcome_delivery() {
@@ -847,8 +856,8 @@ test_requested_healthy_outcome_and_unsolicited_routine_outcome_delivery() {
   PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module > "$TMP_ROOT/node-output" 2>&1 <<'EOF'
 const prelude = process.env.DRIVER_PRELUDE;
-await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, settle, sentToMain, outcomeScript, mainTools, home, realRoot }; })()`);
-const { fire, dispatch, settle, sentToMain, outcomeScript, mainTools, home, realRoot } = globalThis.__t;
+await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, settle, sentToMain, mainEntries, outcomeScript, mainTools, home, realRoot }; })()`);
+const { fire, dispatch, settle, sentToMain, mainEntries, outcomeScript, mainTools, home, realRoot } = globalThis.__t;
 import { existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
@@ -994,9 +1003,9 @@ for (let index = 0; index < requestedPrompts.length; index += 1) {
   if (deliveredRequestMirror !== `[captain] ${content}`) {
     throw new Error(`pre-turn-end mirror changed long captain request ${index}`);
   }
-  const turns = sentToMain.filter((sent) => sent.options.triggerTurn === true);
-  if (turns.length !== index + 1 || turns.at(-1).options.deliverAs !== "followUp") {
-    throw new Error(`requested result ${index} did not open exactly one main turn: ${JSON.stringify(sentToMain)}`);
+  const visible = entries.filter((entry) => entry.customType === "fm-branch-visible-outcome");
+  if (visible.length !== index + 1 || visible.at(-1).data.summary !== "healthy resource report: CPU 12%, memory 41%") {
+    throw new Error(`requested result ${index} did not persist one exact visible outcome: ${JSON.stringify(visible)}`);
   }
 }
 const mirroredCaptainText = globalThis.__fmSessions[0].ops
@@ -1012,7 +1021,26 @@ if (mirroredCaptainText.some((text) =>
   throw new Error("canonical current or legacy operational input entered captain mirror context");
 }
 if ((globalThis.__fmPrompts ?? []).length !== 5) throw new Error("a handled fleet wake was rerun");
-if (sentToMain.length !== 5) throw new Error(`one result was reprocessed into ${sentToMain.length} main messages`);
+let processingRequests = sentToMain.filter((sent) => sent.message.customType === "fm-branch-process");
+if (sentToMain.length !== 1 + processingRequests.length) {
+  throw new Error(`captain results entered model delivery as unkeyed messages: ${JSON.stringify(sentToMain)}`);
+}
+if (processingRequests.length !== 1 || processingRequests[0].options.triggerTurn !== true) {
+  throw new Error(`captain results re-sent while the first keyed request was pending: ${JSON.stringify(processingRequests)}`);
+}
+fire("agent_settled", {}, mainCtx);
+processingRequests = sentToMain.filter((sent) => sent.message.customType === "fm-branch-process");
+if (processingRequests.length !== 2 || processingRequests[1].options.triggerTurn !== true) {
+  throw new Error(`the widened captain sequence set did not open one keyed turn at the run boundary: ${JSON.stringify(processingRequests)}`);
+}
+for (let seq = 2; seq <= 5; seq += 1) {
+  if (!processingRequests[1].message.content.includes(`[seq ${seq}] task-resource: healthy resource report: CPU 12%, memory 41%`)) {
+    throw new Error(`the widened processing request lost seq ${seq}: ${processingRequests[1].message.content}`);
+  }
+}
+if (!processingRequests[1].message.content.includes("through=5")) {
+  throw new Error(`the widened processing request lost its highest acknowledgement key: ${processingRequests[1].message.content}`);
+}
 if (fleetOperations.length !== 10 || fleetOperations.some((operation) => operation.status !== 0)) {
   throw new Error(`fleet event ownership repeated or failed work: ${JSON.stringify(fleetOperations)}`);
 }
@@ -1035,54 +1063,265 @@ EOF
   pass "requested and unsolicited healthy outcomes keep distinct delivery and event ownership"
 }
 
-test_captain_outcome_encoding_failure_delivers_plain_instruction() {
+test_captain_outcome_is_exactly_once_across_crash_reload_and_unrelated_response() {
   local repo home out status
-  repo="$TMP_ROOT/encoding-fallback-root"
-  home="$TMP_ROOT/encoding-fallback-home"
+  repo="$TMP_ROOT/visible-outcome-recovery-root"
+  home="$TMP_ROOT/visible-outcome-recovery-home"
   mkdir -p "$home/state" "$home/config"
   install_pi_branch_extension_fixture "$repo"
   PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
-    FM_OPERATIONAL_INPUT_SCRIPT="$repo/bin/missing-operational-input" \
     DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module > "$TMP_ROOT/node-output" 2>&1 <<'EOF'
 const prelude = process.env.DRIVER_PRELUDE;
-await eval(`(async () => { ${prelude}; globalThis.__t = { dispatch, settle, sentToMain }; })()`);
-const { dispatch, settle, sentToMain } = globalThis.__t;
+await eval(`(async () => { ${prelude}; globalThis.__t = { fire, sentToMain, mainEntries, entryRenderers, outcomeScript, defaultSessionCtx }; })()`);
+const { fire, sentToMain, mainEntries, entryRenderers, outcomeScript, defaultSessionCtx } = globalThis.__t;
 
-if (!dispatch("signal: encoding fallback probe").accepted) {
-  throw new Error("branch did not accept the encoding-fallback wake");
-}
-await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "encoding-fallback branch prompt");
-const session = globalThis.__fmSessions[0];
-const report = session.options.customTools.find((tool) => tool.name === "fm_branch_report");
-const result = await report.execute(
-  "encoding-fallback",
-  { task: "task-fallback", verdict: "captain", summary: "PR https://example.com/pr/fallback is ready" },
-  undefined,
-  undefined,
-  {},
+// Incident topology: compaction leaves stale framing, then the immediately
+// preceding assistant repeats an unrelated retry update. Neither can satisfy
+// or alter a completed branch outcome because no model response is delivery.
+mainEntries.push(
+  { type: "compaction", summary: "Last user request: retry Gmail intake." },
+  { type: "message", message: { role: "assistant", content: "The retry safe-stopped; diagnosis is underway." } },
 );
-if (result.isError) throw new Error(`fallback report failed: ${JSON.stringify(result)}`);
-if (sentToMain.length !== 1) throw new Error(`fallback delivered ${sentToMain.length} notes instead of one`);
-const delivered = sentToMain[0];
-if (delivered.message.display !== false) throw new Error("fallback captain note became visible");
-if (delivered.options.triggerTurn !== true || delivered.options.deliverAs !== "followUp") {
-  throw new Error(`fallback changed turn delivery: ${JSON.stringify(delivered.options)}`);
+const summary1 = "Completed diagnosis: the cursor trusted an unrelated assistant response.";
+const seq1 = Number(outcomeScript(["append", "--task", "email-intake", "--verdict", "captain", "--summary", summary1]));
+// Crash boundary: appendEntry persisted, but mark-read did not happen.
+mainEntries.push({
+  type: "custom",
+  customType: "fm-branch-visible-outcome",
+  data: { version: 1, seq: seq1, task: "email-intake", verdict: "captain", summary: summary1, silent: false },
+});
+fire("session_start", {}, defaultSessionCtx);
+if (outcomeScript(["unread"]) !== "") throw new Error("reload did not advance the cursor after finding the persisted entry");
+
+const summary2 = "Second completed request stayed exact while main was streaming.";
+const seq2 = Number(outcomeScript(["append", "--task", "task-busy", "--verdict", "captain", "--summary", summary2]));
+fire("agent_start", {});
+fire("session_shutdown", {});
+fire("session_start", {}, defaultSessionCtx);
+fire("agent_end", {});
+const visible = mainEntries.filter((entry) => entry.customType === "fm-branch-visible-outcome");
+if (visible.length !== 2 || visible[0].data.seq !== seq1 || visible[1].data.seq !== seq2) {
+  throw new Error(`reload recovery was not sequence-keyed and exactly once: ${JSON.stringify(visible)}`);
 }
-if (delivered.message.content.includes("FIRSTMATE_OP:")) {
-  throw new Error(`fallback unexpectedly carried an envelope: ${delivered.message.content}`);
+if (visible[0].data.summary !== summary1 || visible[1].data.summary !== summary2) {
+  throw new Error(`visible delivery changed an exact stored summary: ${JSON.stringify(visible)}`);
 }
-if (!delivered.message.content.includes("The fleet event is already handled: do not re-drain, re-run, or acknowledge it.") ||
-    !delivered.message.content.includes("This outcome is captain-facing: give the captain a visible response now.") ||
-    !delivered.message.content.includes("Use your judgment over the wording and how to incorporate it, not whether to surface it.") ||
-    !delivered.message.content.includes("task-fallback: PR https://example.com/pr/fallback is ready")) {
-  throw new Error(`fallback lost its instruction or outcome: ${delivered.message.content}`);
+if (sentToMain.some((sent) => sent.message.customType !== "fm-branch-process")) {
+  throw new Error(`captain recovery queued an unkeyed model message: ${JSON.stringify(sentToMain)}`);
+}
+// Recovery re-presents every still-unprocessed sequence in one keyed request.
+const recovered = sentToMain.at(-1)?.message.content ?? "";
+if (!recovered.includes(`[seq ${seq1}] email-intake: ${summary1}`) || !recovered.includes(`[seq ${seq2}] task-busy: ${summary2}`)) {
+  throw new Error(`reload did not re-present the unprocessed outcomes for processing: ${recovered}`);
+}
+
+// A second reload sees the cursor and must stay idempotent.
+fire("session_shutdown", {});
+fire("session_start", {}, defaultSessionCtx);
+if (mainEntries.filter((entry) => entry.customType === "fm-branch-visible-outcome").length !== 2) {
+  throw new Error("a second reload duplicated a visible captain outcome");
+}
+const rendered = entryRenderers.get("fm-branch-visible-outcome")(
+  visible[0],
+  { expanded: false },
+  { fg: (_color, text) => text },
+);
+if (rendered.text !== `⚓ [seq ${seq1}] email-intake: ${summary1}`) {
+  throw new Error(`renderer did not preserve exact outcome text: ${rendered.text}`);
+}
+
+// A reused sequence with different content cannot be treated as delivery.
+const seq3 = Number(outcomeScript(["append", "--task", "task-conflict", "--verdict", "captain", "--summary", "authoritative summary"]));
+mainEntries.push({
+  type: "custom",
+  customType: "fm-branch-visible-outcome",
+  data: { version: 1, seq: seq3, task: "task-conflict", verdict: "captain", summary: "different summary", silent: false },
+});
+fire("session_shutdown", {});
+fire("session_start", {}, defaultSessionCtx);
+if (!outcomeScript(["unread"]).includes('"seq":3')) {
+  throw new Error("conflicting sequence content advanced the cursor instead of failing closed");
+}
+if (mainEntries.filter((entry) => entry.customType === "fm-branch-visible-outcome" && entry.data.seq === seq3).length !== 1) {
+  throw new Error("conflicting sequence content caused another entry to be appended");
 }
 process.exit(0);
 EOF
   status=$?
   out=$(cat "$TMP_ROOT/node-output")
-  expect_code 0 "$status" "captain outcome encoding failure must degrade to plain instructed delivery: $out"
-  pass "a broken operational encoder still delivers one invisible instructed captain outcome as a follow-up"
+  expect_code 0 "$status" "captain outcome recovery must be deterministic across crash, reload, and stale assistant context: $out"
+  pass "captain outcomes are exact and exactly once across crash, reload, busy main, compaction, and an unrelated assistant response"
+}
+
+test_captain_outcome_processing_turn_is_sequence_keyed_and_re_presented() {
+  local repo home out status
+  repo="$TMP_ROOT/processing-turn-root"
+  home="$TMP_ROOT/processing-turn-home"
+  mkdir -p "$home/state" "$home/config"
+  install_pi_branch_extension_fixture "$repo"
+  PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module > "$TMP_ROOT/node-output" 2>&1 <<'EOF'
+const prelude = process.env.DRIVER_PRELUDE;
+await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, settle, sentToMain, mainEntries, mainTools, outcomeScript, defaultSessionCtx, home }; })()`);
+const { fire, dispatch, settle, sentToMain, mainEntries, mainTools, outcomeScript, defaultSessionCtx, home } = globalThis.__t;
+import { readFileSync, writeFileSync } from "node:fs";
+
+const requests = () => sentToMain.filter((sent) => sent.message.customType === "fm-branch-process");
+const unprocessedSeqs = () => outcomeScript(["unprocessed"]).split("\n").filter(Boolean).map((line) => JSON.parse(line).seq);
+const runOf = (fn) => { fire("agent_start", {}); fn?.(); fire("agent_end", {}); fire("agent_settled", {}); };
+
+// A home upgraded with outcomes that were delivered before the processed
+// marker existed treats them as processed once, at the first reconciliation:
+// its history is not re-presented to the captain.
+const legacy = Number(outcomeScript(["append", "--task", "legacy", "--verdict", "captain", "--summary", "delivered before processing existed"]));
+outcomeScript(["mark-read", "--through", String(legacy)]);
+mainEntries.push({ type: "custom", customType: "fm-branch-visible-outcome", data: { version: 1, seq: legacy, task: "legacy", verdict: "captain", summary: "delivered before processing existed", silent: false } });
+fire("session_start", {}, defaultSessionCtx);
+if (requests().length !== 0) throw new Error(`the upgrade migration re-presented already-delivered history: ${JSON.stringify(sentToMain)}`);
+if (readFileSync(`${home}/state/.branch-outcomes-processed`, "utf8").trim() !== String(legacy)) {
+  throw new Error("the processed marker was not initialized at the read cursor on first reconciliation");
+}
+
+// A routine outcome never opens a processing turn.
+if (!dispatch("signal: routine wake").accepted) throw new Error("branch refused the routine wake");
+await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "routine branch prompt");
+const session = globalThis.__fmSessions[0];
+const report = session.options.customTools.find((tool) => tool.name === "fm_branch_report");
+await report.execute("routine", { task: "task-r", verdict: "routine", summary: "worker healthy" }, undefined, undefined, {});
+const routineSeq = JSON.parse(outcomeScript(["list", "--recent", "1"])).seq;
+runOf();
+if (requests().length !== 0) throw new Error("a routine outcome opened a processing turn");
+
+// An actionable (captain) outcome: exactly one keyed request while main is idle.
+const decision = "worker needs a scope decision: option A skip the stage, option B re-implement it";
+const first = await report.execute("captain-1", { task: "task-d", verdict: "captain", summary: decision }, undefined, undefined, {});
+if (first.isError) throw new Error(`captain report failed: ${JSON.stringify(first)}`);
+const seq = JSON.parse(outcomeScript(["list", "--recent", "1"])).seq;
+if (requests().length !== 1) throw new Error(`captain delivery opened ${requests().length} requests, not 1`);
+const request = requests()[0];
+if (request.options.triggerTurn !== true || request.options.deliverAs !== "followUp" || request.message.display !== false) {
+  throw new Error(`the processing request must be one hidden follow-up turn: ${JSON.stringify(request)}`);
+}
+if (!request.message.content.includes(`[seq ${seq}] task-d: ${decision}`)) throw new Error(`the request lost its key or summary: ${request.message.content}`);
+if (JSON.stringify(unprocessedSeqs()) !== JSON.stringify([seq])) throw new Error(`delivery did not leave seq ${seq} unprocessed: ${unprocessedSeqs()}`);
+
+// Case A (timeline report 2026-08-31): the turn returns an EMPTY assistant
+// message. The processed marker must not move, and the same sequence is
+// presented again at the run boundary.
+runOf(() => mainEntries.push({ type: "message", message: { role: "assistant", content: [] } }));
+if (JSON.stringify(unprocessedSeqs()) !== JSON.stringify([seq])) throw new Error("an empty answer advanced the processed marker");
+if (requests().length !== 2) throw new Error(`an empty answer did not re-present the outcome: ${requests().length} requests`);
+if (requests()[1].options.triggerTurn !== true) throw new Error("the first re-presentation must open its own turn");
+if (!requests()[1].message.content.includes(`[seq ${seq}] task-d: ${decision}`)) throw new Error("the re-presentation changed the outcome");
+
+// Case B: the turn repeats an unrelated prior answer. Same result: the marker
+// holds, and the request is presented again - now riding the captain's next
+// prompt because the triggered budget for this sequence set is spent.
+runOf(() => mainEntries.push({ type: "message", message: { role: "assistant", content: "The retry safe-stopped; diagnosis is underway." } }));
+if (JSON.stringify(unprocessedSeqs()) !== JSON.stringify([seq])) throw new Error("an unrelated answer advanced the processed marker");
+if (requests().length !== 3) throw new Error(`an unrelated answer did not re-present the outcome: ${requests().length} requests`);
+if (requests()[2].options.deliverAs !== "nextTurn" || requests()[2].options.triggerTurn) {
+  throw new Error(`after the triggered budget the request must ride the next prompt: ${JSON.stringify(requests()[2].options)}`);
+}
+// A quiet settle with the copy still queued does not queue a duplicate.
+fire("agent_settled", {});
+if (requests().length !== 3) throw new Error("a duplicate next-turn copy was queued");
+// The captain's next prompt consumes that copy; settling unacknowledged queues one more.
+runOf(() => mainEntries.push({ type: "message", message: { role: "assistant", content: "Captain, shipshape." } }));
+if (requests().length !== 4 || requests()[3].options.deliverAs !== "nextTurn") throw new Error("the outcome stopped being re-presented on later prompts");
+if (JSON.stringify(unprocessedSeqs()) !== JSON.stringify([seq])) throw new Error("a paraphrase advanced the processed marker");
+
+// A session replacement re-presents with a fresh triggered budget.
+fire("session_shutdown", {});
+fire("session_start", {}, defaultSessionCtx);
+if (requests().length !== 5 || requests()[4].options.triggerTurn !== true) throw new Error("session start did not re-present the unprocessed outcome with its own turn");
+if (mainEntries.filter((entry) => entry.customType === "fm-branch-visible-outcome" && entry.data.seq === seq).length !== 1) {
+  throw new Error("re-presentation duplicated the visible entry");
+}
+
+// Only the sequence-bound acknowledgement closes it.
+const processed = mainTools.find((tool) => tool.name === "fm_branch_processed");
+if (!processed) throw new Error("main did not receive its acknowledgement tool");
+const routineAck = await processed.execute("ack-routine", { through: routineSeq }, undefined, undefined, {});
+if (!routineAck.isError || !routineAck.content.some((item) => item.type === "text" && item.text.includes("not an unprocessed captain outcome"))) {
+  throw new Error(`a routine-sequence acknowledgement was not clearly refused: ${JSON.stringify(routineAck)}`);
+}
+if (JSON.stringify(unprocessedSeqs()) !== JSON.stringify([seq])) throw new Error("a routine-sequence acknowledgement closed the open captain sequence");
+const tooFar = await processed.execute("ack-too-far", { through: seq + 100 }, undefined, undefined, {});
+if (!tooFar.isError) throw new Error("an acknowledgement beyond the read cursor was accepted");
+if (JSON.stringify(unprocessedSeqs()) !== JSON.stringify([seq])) throw new Error("a refused acknowledgement moved the marker");
+const ack = await processed.execute("ack", { through: seq }, undefined, undefined, {});
+if (ack.isError) throw new Error(`acknowledgement failed: ${JSON.stringify(ack)}`);
+if (unprocessedSeqs().length !== 0) throw new Error("the acknowledgement did not close the sequence");
+const before = requests().length;
+runOf();
+if (requests().length !== before) throw new Error("an acknowledged outcome was presented again");
+
+// Two newer captain outcomes in a row: the second does not overlap a request
+// still pending its run boundary, and the widened request appears at that
+// boundary. A partial acknowledgement keeps the newer sequence open.
+// The replacement session rebuilt the branch, so its report tool is the new
+// session's; the old session's tool is generation-refused by design.
+const stale = await report.execute("captain-stale", { task: "task-e", verdict: "captain", summary: "must be refused" }, undefined, undefined, {});
+if (!stale.isError) throw new Error("a replaced branch session's report tool was accepted");
+if (!dispatch("signal: after replacement").accepted) throw new Error("branch refused a wake after the replacement");
+await settle(() => (globalThis.__fmSessions ?? []).length === 2, "replacement branch session");
+const report2 = globalThis.__fmSessions[1].options.customTools.find((tool) => tool.name === "fm_branch_report");
+const beforePair = requests().length;
+const second = await report2.execute("captain-2", { task: "task-e", verdict: "captain", summary: "PR https://example.com/pr/e is ready for review" }, undefined, undefined, {});
+if (second.isError) throw new Error(`second captain report failed: ${JSON.stringify(second)}`);
+const seqE = seq + 1;
+const seqF = seq + 2;
+if (requests().length !== beforePair + 1 || !requests().at(-1).message.content.includes(`[seq ${seqE}] task-e:`)) {
+  throw new Error("the first newer captain outcome did not open its processing request");
+}
+const third = await report2.execute("captain-3", { task: "task-f", verdict: "captain", summary: "worker blocked on a missing credential" }, undefined, undefined, {});
+if (third.isError) throw new Error(`third captain report failed: ${JSON.stringify(third)}`);
+if (requests().length !== beforePair + 1) throw new Error("a widened sequence re-sent while the earlier request was pending");
+const unlisted = await processed.execute("ack-unlisted", { through: seqF }, undefined, undefined, {});
+if (!unlisted.isError || !unlisted.content.some((item) => item.type === "text" && item.text.includes("not listed in the active processing request"))) {
+  throw new Error(`an unlisted newer sequence was not clearly refused: ${JSON.stringify(unlisted)}`);
+}
+if (JSON.stringify(unprocessedSeqs()) !== JSON.stringify([seqE, seqF])) {
+  throw new Error(`an unlisted acknowledgement closed outcomes: ${unprocessedSeqs()}`);
+}
+runOf();
+if (requests().length !== beforePair + 2) throw new Error("the widened sequence was not presented at the run boundary");
+const latest = requests().at(-1).message.content;
+if (!latest.includes(`[seq ${seqE}] task-e:`) || !latest.includes(`[seq ${seqF}] task-f:`) || !latest.includes(`through=${seqF}`)) {
+  throw new Error(`the widened request did not cover every unprocessed sequence with the highest key: ${latest}`);
+}
+const beforePairRepeat = requests().length;
+runOf();
+if (requests().length !== beforePairRepeat + 1 || requests().at(-1).options.triggerTurn !== true) {
+  throw new Error("the second presentation of the widened sequence set did not open its own turn");
+}
+const partial = await processed.execute("ack-partial", { through: seqE }, undefined, undefined, {});
+if (partial.isError) throw new Error(`partial acknowledgement failed: ${JSON.stringify(partial)}`);
+if (JSON.stringify(unprocessedSeqs()) !== JSON.stringify([seqF])) throw new Error(`a partial acknowledgement did not keep the newer sequence open: ${unprocessedSeqs()}`);
+const beforeF = requests().length;
+runOf();
+if (
+  requests().length !== beforeF + 1 ||
+  requests().at(-1).options.triggerTurn !== true ||
+  requests().at(-1).options.deliverAs !== "followUp" ||
+  !requests().at(-1).message.content.includes(`[seq ${seqF}] task-f:`)
+) {
+  throw new Error("the changed remaining sequence set did not restart its triggered presentation budget");
+}
+const done = await processed.execute("ack-final", { through: seqF }, undefined, undefined, {});
+if (done.isError || unprocessedSeqs().length !== 0) throw new Error("the final acknowledgement did not close the newer sequence");
+
+// A session that does not own the fleet lock cannot acknowledge anything.
+writeFileSync(`${home}/state/.lock`, "1\n");
+const foreign = await processed.execute("ack-foreign", { through: seqF }, undefined, undefined, {});
+if (!foreign.isError) throw new Error("a session without lock ownership acknowledged an outcome");
+process.exit(0);
+EOF
+  status=$?
+  out=$(cat "$TMP_ROOT/node-output")
+  expect_code 0 "$status" "captain outcomes must be processed through a sequence-bound acknowledgement and re-presented until then: $out"
+  pass "a captain outcome opens one sequence-keyed processing turn, survives empty and unrelated answers, is re-presented at run end and session start, and closes only on its acknowledgement"
 }
 
 test_branch_cache_key_is_per_home_stable() {
@@ -1125,7 +1364,8 @@ test_branch_default_on_heartbeat_afk_and_fallback() {
   home="$TMP_ROOT/gating-home"
   mkdir -p "$home/state" "$home/config" "$broken/bin"
   install_pi_branch_extension_fixture "$repo"
-  cp "$ROOT/bin/fm-lease.sh" "$ROOT/bin/fm-lease-lib.sh" "$ROOT/bin/fm-wake-lib.sh" "$ROOT/bin/fm-wake-grant.sh" "$broken/bin/"
+  cp "$ROOT/bin/fm-branch-outcome.sh" "$ROOT/bin/fm-lease.sh" "$ROOT/bin/fm-lease-lib.sh" \
+    "$ROOT/bin/fm-wake-lib.sh" "$ROOT/bin/fm-wake-grant.sh" "$broken/bin/"
   cat > "$broken/bin/fm-branch-prompt.sh" <<'SH'
 #!/usr/bin/env bash
 echo "synthetic generator failure" >&2
@@ -1135,8 +1375,8 @@ SH
   PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module > "$TMP_ROOT/node-output" 2>&1 <<'EOF'
 const prelude = process.env.DRIVER_PRELUDE;
-await eval(`(async () => { ${prelude}; globalThis.__t = { dispatch, fire, settle, home, sentToMain }; })()`);
-const { dispatch, fire, settle, home, sentToMain } = globalThis.__t;
+await eval(`(async () => { ${prelude}; globalThis.__t = { dispatch, fire, settle, home, sentToMain, mainEntries, defaultSessionCtx }; })()`);
+const { dispatch, fire, settle, home, sentToMain, mainEntries, defaultSessionCtx } = globalThis.__t;
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
 // Default-on: with no config/pi-supervision-branch grant file present at
@@ -1145,7 +1385,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 if (existsSync(`${home}/config/pi-supervision-branch`)) {
   throw new Error("test fixture unexpectedly wrote a grant file");
 }
-fire("session_start", {});
+fire("session_start", {}, defaultSessionCtx);
 if (!dispatch("signal: default-on task wake").accepted) {
   throw new Error("a task-scoped wake was refused with no grant file present");
 }
@@ -1218,9 +1458,16 @@ await heartbeatReport.execute(
   undefined,
   {},
 );
-const captainMerge = sentToMain[sentToMain.length - 1];
-if (captainMerge.options.triggerTurn !== true) throw new Error("a captain-worthy heartbeat finding must open a main turn");
-if (captainMerge.message.display !== false) throw new Error("the heartbeat captain-facing note must not be printed");
+const captainEntries = mainEntries.filter((entry) => entry.customType === "fm-branch-visible-outcome");
+if (captainEntries.length !== 1 || captainEntries[0].data.summary !== "task-2 has been stuck for an hour") {
+  throw new Error(`captain-worthy heartbeat finding was not persisted visibly: ${JSON.stringify(captainEntries)}`);
+}
+if (sentToMain.some((sent) => sent.options.triggerTurn && sent.message.customType !== "fm-branch-process")) {
+  throw new Error("heartbeat outcome delivery opened an unkeyed model turn");
+}
+if (!sentToMain.some((sent) => sent.message.customType === "fm-branch-process" && sent.message.content.includes("task-2 has been stuck for an hour"))) {
+  throw new Error("a captain-worthy heartbeat finding did not open its keyed processing turn");
+}
 
 // Every other fleet-wide or unresolvable wake (empty projects, not a
 // heartbeat) still keeps the wake-to-main path.
@@ -2503,18 +2750,27 @@ test_cold_start_activates_after_lock_acquisition() {
   PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     FM_TEST_SKIP_LOCK=1 DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module > "$TMP_ROOT/node-output" 2>&1 <<'EOF'
 const prelude = process.env.DRIVER_PRELUDE;
-await eval(`(async () => { ${prelude}; globalThis.__t = { dispatch, settle, home }; })()`);
-const { dispatch, settle, home } = globalThis.__t;
+await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, settle, home, mainEntries, outcomeScript, defaultSessionCtx }; })()`);
+const { fire, dispatch, settle, home, mainEntries, outcomeScript, defaultSessionCtx } = globalThis.__t;
 import { existsSync, writeFileSync } from "node:fs";
 
-// An ordinary cold Pi start: session_start fires BEFORE the session acquires
-// the fleet lock (fm-sessionstart-run.sh acquires it later). Ownership must
-// be evaluated lazily per action, never latched at session_start.
+const summary = "Recovered the stored captain result after cold startup.";
+const seq = Number(outcomeScript(["append", "--task", "cold-result", "--verdict", "captain", "--summary", summary]));
+fire("session_start", {}, defaultSessionCtx);
+if (mainEntries.some((entry) => entry.customType === "fm-branch-visible-outcome")) {
+  throw new Error("captain outcome was delivered before lock ownership");
+}
 if (dispatch("signal: before lock").accepted) throw new Error("branch accepted a wake before the lock existed");
 if (existsSync(`${home}/state/.pi-branch-extension-loaded`)) {
   throw new Error("branch wrote its marker before owning the lock");
 }
 writeFileSync(`${home}/state/.lock`, `${process.pid}\n`);
+fire("turn_end", {}, defaultSessionCtx);
+const visible = mainEntries.filter((entry) => entry.customType === "fm-branch-visible-outcome");
+if (visible.length !== 1 || visible[0].data.seq !== seq || visible[0].data.summary !== summary) {
+  throw new Error(`post-lock turn_end did not recover the exact captain outcome: ${JSON.stringify(visible)}`);
+}
+if (outcomeScript(["unread"]) !== "") throw new Error("post-lock turn_end did not advance the outcome cursor");
 if (!dispatch("signal: after lock").accepted) throw new Error("branch refused a wake after the lock was acquired");
 await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "post-lock branch wake prompt");
 if (!existsSync(`${home}/state/.pi-branch-extension-loaded`)) {
@@ -3154,7 +3410,8 @@ test_outcomes_tool_uses_stock_execution_and_export_consumers
 test_real_pi_picker_primitives_stay_bounded_and_searchable
 test_branch_dispatch_two_stage_filter_and_prefix_contract
 test_requested_healthy_outcome_and_unsolicited_routine_outcome_delivery
-test_captain_outcome_encoding_failure_delivers_plain_instruction
+test_captain_outcome_is_exactly_once_across_crash_reload_and_unrelated_response
+test_captain_outcome_processing_turn_is_sequence_keyed_and_re_presented
 test_branch_dispatch_classifies_main_only_rows_and_writes_the_eligible_snapshot
 test_branch_cache_key_is_per_home_stable
 test_branch_default_on_heartbeat_afk_and_fallback

@@ -458,70 +458,107 @@ if [ "$status" -ne 0 ] || [ "$out" != "EFFORT_OK" ]; then
 fi
 pass "real Pi SDK $PI_VERSION reports its own supported effort levels and applies an explicit branch effort over a reopened session's recorded level"
 
-# Fourth probe: the vendor contract the captain-outcome envelope rests on. Pi
-# keeps ONLY `content` when it converts a custom message for the provider, so
-# `content` is the entire payload main's model receives and is the only place a
-# captain outcome can carry its own identity. When it carried none, main could
-# not tell an incoming outcome from its own earlier answer and re-emitted that
-# answer instead of relaying the outcome. This runs the real SDK's own
-# convertToLlm over bytes the REAL protocol encoder produced, then hands the
-# model-visible text back to the real parser, proving the delivery path end to
-# end instead of assuming it.
-captain_payload=$(printf 'relay this\n\ntask-9: PR ready' \
-  | "$ROOT/bin/fm-operational-input.sh" encode branch-outcome) \
-  || fail "the operational-input owner does not encode the branch-outcome kind"
-CAPTAIN_PAYLOAD="$captain_payload" ROUTINE_PAYLOAD="⛵ task-9: worker healthy" \
-  DELIVERY_DIR="$TMP_ROOT" PI_PACKAGE_DIR="$PI_PACKAGE_DIR" \
+# Fourth probe: the real SDK contract deterministic captain delivery rests on.
+# ExtensionAPI.appendEntry must synchronously insert the registered custom entry
+# into an active InteractiveMode transcript, persist it across SessionManager
+# reopen, and keep it out of model context. No model is selected or prompted.
+PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" DELIVERY_DIR="$TMP_ROOT/delivery-sessions" \
+  DELIVERY_AGENT_DIR="$TMP_ROOT/delivery-agent-dir" PI_PACKAGE_DIR="$PI_PACKAGE_DIR" \
   node --input-type=module > "$TMP_ROOT/delivery-output" 2>&1 <<'EOF'
-import { writeFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const pkg = resolve(process.env.PI_PACKAGE_DIR);
-const { convertToLlm } = await import(pathToFileURL(`${pkg}/dist/index.js`).href);
-if (typeof convertToLlm !== "function") {
-  throw new Error("this Pi no longer exports convertToLlm: the delivery contract is unproven");
+const {
+  DefaultResourceLoader,
+  InteractiveMode,
+  SessionManager,
+  SettingsManager,
+  createAgentSession,
+  initTheme,
+} = await import(
+  pathToFileURL(`${pkg}/dist/index.js`).href
+);
+initTheme("dark");
+const sessions = resolve(process.env.DELIVERY_DIR);
+const agentDir = resolve(process.env.DELIVERY_AGENT_DIR);
+mkdirSync(sessions, { recursive: true });
+mkdirSync(agentDir, { recursive: true });
+const manager = SessionManager.create(process.cwd(), sessions);
+manager.appendMessage({
+  role: "assistant",
+  content: [{ type: "text", text: "The retry safe-stopped; diagnosis is underway." }],
+  api: "openai-completions",
+  provider: "local-none",
+  model: "no-provider-call",
+  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  stopReason: "stop",
+});
+const settings = SettingsManager.create(process.cwd(), agentDir);
+let capturedApi;
+const loader = new DefaultResourceLoader({
+  cwd: process.cwd(),
+  agentDir,
+  settingsManager: settings,
+  additionalExtensionPaths: [process.env.PLUGIN],
+  extensionFactories: [{ name: "append-entry-probe", factory: (pi) => { capturedApi = pi; } }],
+  noSkills: true,
+  noPromptTemplates: true,
+  noThemes: true,
+  noContextFiles: true,
+});
+await loader.reload();
+const created = await createAgentSession({
+  cwd: process.cwd(),
+  sessionManager: manager,
+  settingsManager: settings,
+  resourceLoader: loader,
+  tools: [],
+});
+const runtimeHost = {
+  session: created.session,
+  setBeforeSessionInvalidate() {},
+  setRebindSession() {},
+};
+const interactive = new InteractiveMode(runtimeHost, { tuiMode: "alt-screen" });
+interactive.isInitialized = true;
+interactive.subscribeToAgent();
+const record = {
+  version: 1,
+  seq: 234,
+  task: "email-intake-canary-next-page-diagnosis-v1",
+  verdict: "captain",
+  summary: "Completed diagnosis proves the prior assistant response was unrelated.",
+  silent: false,
+};
+capturedApi.appendEntry("fm-branch-visible-outcome", record);
+
+const rendered = interactive.chatContainer.render(240).join("\n");
+if (!rendered.includes("⚓") || !rendered.includes(`[seq ${record.seq}]`) || !rendered.includes(record.task) || !rendered.includes(record.summary)) {
+  throw new Error(`active Pi transcript did not immediately render the exact outcome: ${rendered}`);
+}
+if (rendered.split(record.summary).length !== 2) {
+  throw new Error(`active Pi transcript rendered the outcome more than once: ${rendered}`);
 }
 
-const captainContent = process.env.CAPTAIN_PAYLOAD;
-const routineContent = process.env.ROUTINE_PAYLOAD;
-const converted = convertToLlm([
-  { role: "custom", customType: "fm-branch-merge", content: captainContent, display: false, timestamp: 1 },
-  { role: "custom", customType: "fm-branch-merge", content: routineContent, display: true, timestamp: 2 },
-]);
-if (converted.length !== 2) {
-  throw new Error(`Pi no longer delivers one provider message per custom message: ${converted.length}`);
+const reopened = SessionManager.open(manager.getSessionFile(), sessions);
+const entries = reopened.getEntries();
+const entry = entries.find((candidate) => candidate.type === "custom" && candidate.customType === "fm-branch-visible-outcome");
+if (!entry || JSON.stringify(entry.data) !== JSON.stringify(record)) {
+  throw new Error(`appendEntry did not persist the exact record across reopen: ${JSON.stringify(entry)}`);
 }
-for (const message of converted) {
-  if (message.role !== "user") {
-    throw new Error(`Pi delivers a custom message as role ${message.role}, not user`);
-  }
-  if ("customType" in message || "display" in message) {
-    throw new Error("Pi now forwards customType or display, so content is no longer the whole payload");
-  }
+if (reopened.buildSessionContext().messages.some((message) => JSON.stringify(message).includes(record.summary))) {
+  throw new Error("a custom session entry entered model context");
 }
-const textOf = (message) =>
-  typeof message.content === "string"
-    ? message.content
-    : message.content.map((block) => block.text ?? "").join("");
-if (textOf(converted[0]) !== captainContent || textOf(converted[1]) !== routineContent) {
-  throw new Error("Pi altered custom-message content on the way to the provider");
-}
-writeFileSync(`${process.env.DELIVERY_DIR}/live-delivered-captain`, textOf(converted[0]));
-writeFileSync(`${process.env.DELIVERY_DIR}/live-delivered-routine`, textOf(converted[1]));
+interactive.unsubscribe();
+await created.session.dispose();
 console.log("DELIVERY_OK");
 process.exit(0);
 EOF
 status=$?
 out=$(cat "$TMP_ROOT/delivery-output")
 if [ "$status" -ne 0 ] || [ "$out" != "DELIVERY_OK" ]; then
-  fail "real-SDK custom-message delivery guard failed against pi-coding-agent $PI_VERSION: $out"
+  fail "real-SDK visible outcome delivery guard failed against pi-coding-agent $PI_VERSION: $out"
 fi
-delivered_kind=$("$ROOT/bin/fm-operational-input.sh" kind < "$TMP_ROOT/live-delivered-captain") \
-  || fail "pi-coding-agent $PI_VERSION delivered the captain outcome as text the protocol cannot type"
-[ "$delivered_kind" = branch-outcome ] \
-  || fail "pi-coding-agent $PI_VERSION delivered the captain outcome as kind '$delivered_kind'"
-if "$ROOT/bin/fm-operational-input.sh" kind < "$TMP_ROOT/live-delivered-routine" >/dev/null 2>&1; then
-  fail "a routine note survived Pi conversion as typed operational input"
-fi
-pass "real Pi SDK $PI_VERSION delivers a custom message to the provider as user text carrying only content, so the captain outcome's typed envelope is what reaches the model"
+pass "real Pi SDK $PI_VERSION immediately renders appendEntry in the active transcript, persists it across reopen, and excludes it from model context"
