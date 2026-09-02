@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Behavioral coverage for per-home summary publication through the real
-# producer, writer, watcher-carried status trigger, and unchanged snapshot path.
+# producer, writer, watcher-carried status trigger, and snapshot ledger consumer.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -59,6 +59,7 @@ chmod +x "$FAKEBIN/tmux" "$FAKEBIN/no-mistakes"
 
 mkdir -p "$HOME_DIR/state" "$HOME_DIR/data" "$HOME_DIR/config" \
   "$HOME_DIR/projects/task" "$HOME_DIR/bin"
+HOME_DIR=$(cd "$HOME_DIR" && pwd -P)
 printf '# Seeded Firstmate home\n' > "$HOME_DIR/AGENTS.md"
 printf 'mate\n' > "$HOME_DIR/.fm-secondmate-home"
 fm_git_init_commit "$HOME_DIR/projects/task"
@@ -209,9 +210,11 @@ wait "$WATCH_PID" >/dev/null 2>&1 || true
 WATCH_PID=
 pass "live watcher cadence bounds publication staleness without signals"
 
-# Publication-only boundary: poison the ledger with a structurally complete but
-# semantically false state, then prove the current parent snapshot still computes
-# the home summary from the owning home instead of consuming this file.
+# Consumer boundary: first serialize behind any watcher-started publication,
+# then replace the ledger with a structurally complete but semantically false
+# state. The default parent snapshot must consume that publication rather than
+# silently recomputing a different view of the owning home.
+run_writer "$NOW_TWO" "$EPOCH_TWO" || fail "could not settle the ledger before the consumer check"
 jq '.state = "no_active_work" | .active_children = [] | .holds = []
     | .counts.active_children = 0 | .counts.holds = 0' \
   "$HOME_DIR/state/home-summary.json" > "$HOME_DIR/state/home-summary.poisoned"
@@ -235,11 +238,13 @@ PATH="$FAKEBIN:$PATH" \
   || fail "parent fleet snapshot failed"
 jq -e '
   .secondmate_current.records[0].provenance.selected == "structured-home"
-  and .secondmate_current.records[0].current.state == "externally_held"
-  and any(.secondmate_current.records[0].holds[]; .id == "ledger-task")
+  and .secondmate_current.records[0].provenance.summary_source == "local-ledger"
+  and .secondmate_current.records[0].current.state == "no_active_work"
+  and (.secondmate_current.records[0].active_children | length) == 0
+  and (.secondmate_current.records[0].holds | length) == 0
 ' "$TMP_ROOT/parent-snapshot.json" >/dev/null \
-  || fail "fleet snapshot consumed the poisoned publication instead of recomputing its established path"
-pass "fleet snapshot remains a non-consumer of the ledger"
+  || fail "fleet snapshot did not consume the published local ledger: $(jq -c '.secondmate_current.records[0]' "$TMP_ROOT/parent-snapshot.json")"
+pass "fleet snapshot consumes the published local ledger by default"
 
 # Restore the established ledger, then stop a real writer while its real producer
 # is blocked in a current-state read. The prior ledger must remain byte-identical
