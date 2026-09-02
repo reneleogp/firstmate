@@ -5,10 +5,9 @@
 # divergence, then assert liveness.
 #
 # Keep sequence-bound row consumption independent from generation-bound episode
-# retirement; docs/watcher-continuity.md owns the recovery contract. Before
-# removing rows, acknowledgement persists their sequence identities in
-# state/.wake-queue.acknowledged so an interrupted pause publication can prove
-# that its exact queue delivery was handled.
+# retirement; docs/watcher-continuity.md owns the recovery contract.
+# FM_STATUS_PRESENTATION_LOCK_TIMEOUT sets the positive whole-second wait for
+# presentation-path locks (default 10); queue mutation locks remain blocking.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,6 +34,8 @@ ACK_THROUGH=
 ACK_GENERATION=
 ACK_FINGERPRINTS=
 ACK_NOTICE_FINGERPRINTS=
+PRESENTATION_LOCK_TIMEOUT=${FM_STATUS_PRESENTATION_LOCK_TIMEOUT:-10}
+case "$PRESENTATION_LOCK_TIMEOUT" in ''|*[!0-9]*|0) PRESENTATION_LOCK_TIMEOUT=10 ;; esac
 
 # --- per-actor consume (docs/watcher-continuity.md "Per-actor acknowledgement") --
 # main (FM_SUPERVISION_ACTOR unset or "main", via fm-lease-lib.sh's fm_lease_actor
@@ -365,7 +366,20 @@ print_status_sections() {
 
 print_status_presentation() {  # [<deduped-raw-rows>]
   local rows=${1:-} lock="$STATE/.status-presentation-lock" snapshot annotation_manifest fully_presented='' rc=0
-  fm_lock_acquire_wait "$lock" || return 1
+  local lock_rc holder_pid
+  if fm_lock_acquire_wait_bounded "$lock" "$PRESENTATION_LOCK_TIMEOUT"; then
+    :
+  else
+    lock_rc=$?
+    if [ "$lock_rc" -eq 124 ]; then
+      holder_pid=${FM_LOCK_HELD_PID:-unknown}
+      printf 'STATUS PRESENTATION SKIPPED: lock remains held by live pid %s after %ss; retry on the next drain.\n' \
+        "$holder_pid" "$PRESENTATION_LOCK_TIMEOUT"
+    else
+      printf 'wake drain: status presentation lock could not be acquired safely\n' >&2
+    fi
+    return 1
+  fi
   snapshot=$(status_presentation_snapshot "$STATE") || {
     printf 'STATUS PRESENTATION INCOMPLETE: status snapshot could not be read.\n'
     rc=1
@@ -397,9 +411,21 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+if [ -n "$ACK_THROUGH" ]; then
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+elif fm_lock_acquire_wait_bounded "$FM_WAKE_QUEUE_LOCK" "$PRESENTATION_LOCK_TIMEOUT"; then
+  :
+else
+  lock_rc=$?
+  if [ "$lock_rc" -eq 124 ]; then
+    printf 'WAKE DRAIN SKIPPED: queue lock remains held by live pid %s after %ss; retry on the next drain.\n' \
+      "${FM_LOCK_HELD_PID:-unknown}" "$PRESENTATION_LOCK_TIMEOUT"
+    exit 0
+  fi
+  printf 'wake drain: queue lock could not be acquired safely\n' >&2
+  exit 1
+fi
 DRAIN_LOCK_HELD=true
-fm_pause_ack_prune "$STATE" "$FM_WAKE_QUEUE" || exit 1
 reclaim_stale_branch_grant_locked || exit 1
 [ "$ACTOR" != branch ] || require_branch_eligible_rows || exit 1
 
@@ -477,10 +503,6 @@ if [ -n "$ACK_THROUGH" ]; then
       RECOVERY_ACK_MOVED=true
     fi
   fi
-  fm_pause_ack_write "$STATE" "$ACK_THROUGH" "$FM_WAKE_QUEUE" || {
-    echo "wake drain: acknowledgement receipt could not be recorded safely" >&2
-    exit 1
-  }
   if ! _fm_atomic_replace "$DRAIN_TMP" "$FM_WAKE_QUEUE"; then
     echo "wake drain: acknowledged wakes could not be consumed safely" >&2
     exit 1
