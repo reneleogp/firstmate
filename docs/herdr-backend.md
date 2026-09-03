@@ -44,7 +44,7 @@ A secondmate launched by the primary receives a narrowly scoped home override du
 Attach to the selected named Herdr session and switch to the relevant home workspace to watch its task tabs.
 Routine supervision uses `bin/fm-peek.sh <id>` and `FM_HOME=<home> bin/fm-send.sh <id> '<text>'` without attaching.
 
-Workspace and tab creation use `--no-focus`.
+Workspace and tab creation use a clean Bash environment so broken captain-owned shell completion files cannot print startup errors in Herdr panes, and use `--no-focus`.
 The first workspace in a completely empty Herdr session must become focused because no prior target exists, but later task creation does not intentionally steal focus.
 
 Herdr does not enforce workspace or tab label uniqueness, so a label can never decide where a worker goes.

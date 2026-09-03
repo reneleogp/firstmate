@@ -1813,7 +1813,8 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd> [<launcher-relationship
     printf '%s' "$wsid"
     return 0
   fi
-  out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$cwd" --label "$label" --no-focus 2>/dev/null) || return 1
+  # Herdr starts a login shell before the task command; use a clean system shell so broken captain-owned completion files cannot print startup errors.
+  out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$cwd" --label "$label" --env SHELL=/bin/bash --env BASH_SILENCE_DEPRECATION_WARNING=1 --no-focus 2>/dev/null) || return 1
   wsid=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null)
   [ -n "$wsid" ] || return 1
   FM_BACKEND_HERDR_WS_ID=$wsid
@@ -2050,7 +2051,7 @@ fm_backend_herdr_create_task() {  # <container> <label> <cwd> <seeded_default_ta
 $dup_tabs
 EOF
   fi
-  out=$(fm_backend_herdr_cli "$session" tab create --workspace "$wsid" --cwd "$cwd" --label "$label" --no-focus 2>/dev/null) || return 1
+  out=$(fm_backend_herdr_cli "$session" tab create --workspace "$wsid" --cwd "$cwd" --label "$label" --env SHELL=/bin/bash --env BASH_SILENCE_DEPRECATION_WARNING=1 --no-focus 2>/dev/null) || return 1
   tab_id=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
   pane_id=$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)
   if [ -z "$tab_id" ] || [ -z "$pane_id" ]; then
@@ -2116,7 +2117,7 @@ fm_backend_herdr_projection_create_task() {  # <cwd> <workspace-label> <task-lab
     echo "error: herdr presentation workspace create could not capture exact active workspace and tab; refusing a focus-unsafe projection" >&2
     return 1
   }
-  if out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$cwd" --label "$workspace_label" --no-focus 2>/dev/null); then
+  if out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$cwd" --label "$workspace_label" --env SHELL=/bin/bash --env BASH_SILENCE_DEPRECATION_WARNING=1 --no-focus 2>/dev/null); then
     :
   else
     fm_backend_herdr_projection_focus_restore "$session" "$focus_before" "workspace create" || true
@@ -2145,7 +2146,7 @@ fm_backend_herdr_projection_create_task() {  # <cwd> <workspace-label> <task-lab
   }
   if out=$(fm_backend_herdr_cli "$session" tab create \
     --workspace "$FM_BACKEND_HERDR_PROJECTION_WORKSPACE_ID" \
-    --cwd "$cwd" --label "$task_label" --no-focus 2>/dev/null); then
+    --cwd "$cwd" --label "$task_label" --env SHELL=/bin/bash --env BASH_SILENCE_DEPRECATION_WARNING=1 --no-focus 2>/dev/null); then
     :
   else
     fm_backend_herdr_projection_focus_restore "$session" "$focus_before" "task-tab create" || true
@@ -2365,7 +2366,7 @@ fm_backend_herdr_projection_reclaim_task() {  # <session> <journal> <task-id> <h
     return 2
   fi
   if ! out=$(fm_backend_herdr_cli "$session" tab create \
-    --workspace "$meta_workspace" --cwd "$cwd" --label "$task_label" --no-focus 2>/dev/null); then
+    --workspace "$meta_workspace" --cwd "$cwd" --label "$task_label" --env SHELL=/bin/bash --env BASH_SILENCE_DEPRECATION_WARNING=1 --no-focus 2>/dev/null); then
     fm_backend_herdr_projection_focus_restore "$session" "$focus_before" "husk replacement create" || return 1
     echo "warning: herdr presentation reclaim for $id could not create an exact replacement; spawning flat" >&2
     return 2

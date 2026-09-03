@@ -795,7 +795,7 @@ test_container_ensure_creates_with_no_focus_flag() {
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_SCRIPT_STATUS=1 HERDR_SESSION=fmtest \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_container_ensure /tmp' "$ROOT" )
   [ "$out" = $'fmtest:w1\tw1:t1' ] || fail "container_ensure should still echo '<session>:<workspace_id>\\t<seeded_default_tab_id>', got '$out'"
-  assert_contains "$(cat "$log")" $'\x1f''workspace'$'\x1f''create'$'\x1f''--cwd'$'\x1f''/tmp'$'\x1f''--label'$'\x1f''firstmate'$'\x1f''--no-focus' \
+  assert_contains "$(cat "$log")" $'\x1f''workspace'$'\x1f''create'$'\x1f''--cwd'$'\x1f''/tmp'$'\x1f''--label'$'\x1f''firstmate'$'\x1f''--env'$'\x1f''SHELL=/bin/bash'$'\x1f''--env'$'\x1f''BASH_SILENCE_DEPRECATION_WARNING=1'$'\x1f''--no-focus' \
     "container_ensure's workspace create did not pass --no-focus (focus-safety: never steal the captain's attention on spawn)"
   pass "fm_backend_herdr_container_ensure: workspace create passes --no-focus"
 }
@@ -826,7 +826,7 @@ test_create_task_creates_with_no_focus_flag() {
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_create_task fmtest:w1 fm-newtask /tmp/proj' "$ROOT" )
   [ "$out" = "w1:t2 w1:p2" ] || fail "create_task should still echo '<tab_id> <pane_id>', got '$out'"
-  assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''create'$'\x1f''--workspace'$'\x1f''w1'$'\x1f''--cwd'$'\x1f''/tmp/proj'$'\x1f''--label'$'\x1f''fm-newtask'$'\x1f''--no-focus' \
+  assert_contains "$(cat "$log")" $'\x1f''tab'$'\x1f''create'$'\x1f''--workspace'$'\x1f''w1'$'\x1f''--cwd'$'\x1f''/tmp/proj'$'\x1f''--label'$'\x1f''fm-newtask'$'\x1f''--env'$'\x1f''SHELL=/bin/bash'$'\x1f''--env'$'\x1f''BASH_SILENCE_DEPRECATION_WARNING=1'$'\x1f''--no-focus' \
     "create_task's tab create did not pass --no-focus"
   pass "fm_backend_herdr_create_task: tab create passes --no-focus"
 }
@@ -1278,9 +1278,9 @@ test_projection_create_uses_exact_response_ids_and_leaves_one_task_pane() {
   journal="$state/task-p2.herdr-presentation"
   token=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_projection_journal_token "$1" task-p2' "$ROOT" "$journal") \
     || fail "projection journal was not readable"
-  assert_contains "$(cat "$log")" $'workspace\x1fcreate\x1f--cwd\x1f/tmp/proj\x1f--label\x1f└ task-p2 · p:'"$token"$'\x1f--no-focus' \
+  assert_contains "$(cat "$log")" $'workspace\x1fcreate\x1f--cwd\x1f/tmp/proj\x1f--label\x1f└ task-p2 · p:'"$token"$'\x1f--env\x1fSHELL=/bin/bash\x1f--env\x1fBASH_SILENCE_DEPRECATION_WARNING=1\x1f--no-focus' \
     "projection workspace create did not use the corner label, full token, and --no-focus"
-  assert_contains "$(cat "$log")" $'tab\x1fcreate\x1f--workspace\x1fw9\x1f--cwd\x1f/tmp/proj\x1f--label\x1ffm-task-p2\x1f--no-focus' \
+  assert_contains "$(cat "$log")" $'tab\x1fcreate\x1f--workspace\x1fw9\x1f--cwd\x1f/tmp/proj\x1f--label\x1ffm-task-p2\x1f--env\x1fSHELL=/bin/bash\x1f--env\x1fBASH_SILENCE_DEPRECATION_WARNING=1\x1f--no-focus' \
     "projection task tab did not target the exact new workspace"
   assert_contains "$(cat "$log")" $'pane\x1fclose\x1fw9:p1' \
     "projection create did not prune the exact seeded root pane"
