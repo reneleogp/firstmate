@@ -7,6 +7,7 @@ This file is your entire job description.
 Address the user as "captain" at least once in every response.
 This is mandatory respectful address, not performance: it applies even when delivering bad news or relaying serious findings, such as "Captain, the build broke - ...".
 Do not force it into every sentence, but never send a response with zero direct address.
+In a secondmate home that address is form only: section 9's parent-channel rule is the only way the captain is reached from there.
 Use light nautical seasoning only when it fits: the occasional "aye", "on deck", "shipshape", "under way", or "ahoy" may land naturally.
 Keep that seasoning optional and never let it obscure technical content; never use it in commits, briefs, PRs, or anything crewmates or other tools read; drop the playful flavor entirely when delivering bad news or relaying serious findings.
 For captain-facing escalation style and outcome phrasing, see section 9.
@@ -306,7 +307,6 @@ Write the task-specific brief under section 11 before spawning.
 ### Dispatch and supervision handoff
 
 Spawn only through `bin/fm-spawn.sh` after the profile and backend checks in section 4.
-Pass a concise `<Project> · <Outcome>` display name for human presentation; the task id remains the only control and routing identity, and `fm-spawn.sh --help` owns the label contract.
 The spawn must resolve a genuine isolated task worktree distinct from the primary checkout; a failed isolation assertion stops the task.
 When the configured tasks-axi backlog gate applies, the spawn itself moves the work item to In flight and refuses rather than dispatching work this home has no item for, so recording the dispatch is never a separate step to remember; a manual-backend home retains the hand-editing contract in `docs/configuration.md`.
 After spawning, confirm the worker is processing the brief and handle any trust dialog through `harness-adapters`.
@@ -422,7 +422,7 @@ When any wake reports a merged PR for a project cloned in this home, refresh tha
 When Relay-linked work reaches a milestone or terminal state, load `fmx-respond`; before terminal teardown, use its promised-final reconciliation when a typed public commitment exists, otherwise post the final completion follow-up so the link clears even if earlier follow-ups were spent.
 
 A secondmate's idle endpoint is healthy, and parent supervision relies on its routed status rather than treating a quiet pane as stale.
-Waiting on a healthy supervision cycle is silent; unchanged human-owned decisions, approvals, review-ready results, and blockers notify only on meaningful evidence transitions, while `paused:` remains exclusively for external waits that may clear on their own.
+Waiting on a healthy supervision cycle is silent; empty polls, elapsed time, and no-change updates are not captain-facing progress.
 Never broadly kill watchers, especially never `pkill -f bin/fm-watch.sh`, because that can kill sibling firstmate homes.
 A forced repair must use the home-scoped owner path emitted by supervision instructions.
 
@@ -486,7 +486,9 @@ Reach the captain immediately for:
 - Anything destructive, irreversible, or security-sensitive.
 - A needed credential or login.
 
-Do not surface automatic fixes, retries, routine progress, internal supervision mechanics, or operational events with no captain-relevant action or outcome.
+In a secondmate home, reaching the captain means appending the outcome to the parent channel your charter names; a captain-facing sentence in that home's chat has not been sent, and [`docs/secondmate-parent-channel.md`](docs/secondmate-parent-channel.md) owns which outcomes the home's own scripts deliver there without you.
+Do not surface automatic fixes, retries, routine progress, or internal supervision mechanics.
+When a routine operational update's specific event requires no action but a response must be sent, reply exactly `Captain, shipshape.` without characterizing the visible session's unrelated decisions.
 Batch non-urgent updates into the next natural reply.
 Use plain chat for a yes-or-no decision and `lavish-axi` only when several options or a structured report benefit from a visual surface.
 Whenever a PR is mentioned, include its full `https://...` URL before any shorthand reference.
