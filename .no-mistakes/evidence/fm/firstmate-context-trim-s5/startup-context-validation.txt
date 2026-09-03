@@ -1,0 +1,25 @@
+$ git diff --numstat cd9e...53cf... -- AGENTS.md
+54	171	AGENTS.md
+
+$ baseline/current bytes and lines
+     573   68599
+     456   52368 AGENTS.md
+
+$ focused end-user contract checks
+ok - documentation inventory classifies every maintained prose surface exactly once
+ok - classification, setup routing, and maintained-prose scope fail safely
+ok - required documentation owner pointers cannot silently disappear
+ok - local links resolve while dates, versions, commands, and incident prose remain semantically reviewed
+ok - coalesced resolution and reopening is actionable before receipt recording
+ok - one unread range renders each notification fingerprint once
+ok - all watcher paths share durable PR currentness gating
+ok - red and closed PR transitions defer state changes until publication
+ok - receipt removals refuse symlinked directories without touching their targets
+ok - primary workers and secondmates receive the authority rule through generated instructions
+/var/folders/gk/2vqhl8hj213dqcsd4t3726wm0000gn/T//fm-brief.QSt55g/heredoc-in-substitution.sh:2
+ok - fm-brief.sh: custom pause verb renders in every scaffold
+ok - fm-brief.sh: investigation and visual-review completions load the shared decision policy
+ok - fm-brief: scout and secondmate code paths still scaffold well-formed briefs
+ok - sweep: skipped entirely under FM_BOOTSTRAP_DETECT_ONLY=1, exactly like the other mutating sweeps
+ok - sweep: a silent no-op with no kind=secondmate meta present (a secondmate home's own natural scoping)
+# all fm-secondmate-liveness tests passed
