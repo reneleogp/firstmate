@@ -303,7 +303,7 @@ After an autonomous merge, give the captain a one-line full-URL or local-main ou
 
 For a no-mistakes ship, the implementation worker owns validation and its `axi run`/`axi respond` calls; firstmate never responds for it.
 Once validation starts, route new requirements to follow-up work unless the request is explicitly invalidated; accepted-intent corrections, required tests, and accurate docs remain in scope.
-Only the supported explicit supersession sequence may abort an invalidated run: confirm the run stopped, follow structured `branch_sync.next_action`, settle custody, replace obsolete content from the correct base, and validate exactly once against the final head.
+Only a current, explicit captain instruction completely invalidating the work may authorize the supported supersession sequence: confirm the run stopped, follow structured `branch_sync.next_action`, settle custody, replace obsolete content from the correct base, and validate exactly once against the final head.
 Ask-user findings require firstmate authority; send one exact keyed answer with `--resolve-key`, require `resolved`, forbid `--yes`, and resume supervision.
 Judge the current-code-matched run through `bin/fm-crew-state.sh`, not shell liveness or old events, and steer back any worker that edits outside the active gate.
 The worker reports the PR when checks first turn green.
@@ -337,14 +337,14 @@ The promoted worker must inventory scratch state, return to a clean default-bran
 
 Fleet supervision is always required while work or Relay is active; the emitted primary-harness protocol, `docs/architecture.md`, `docs/turnend-guard.md`, and script help own its mechanics.
 Keep exactly one live cycle, follow ordinary-wake continuation, repair only when missing or failed, and never end a turn blind.
-At every wake-handling turn, drain the durable queue first, handle decisions and unread status, then run the printed generation-bound `--ack-through`; interruption before acknowledgement preserves the work.
+At every wake-handling turn, drain the durable queue first, handle decisions and unread status, reconcile any `RECORD DIVERGENCE` through `captain-hold-lifecycle`, then run the printed generation-bound `--ack-through`; interruption before acknowledgement preserves the work.
 For `signal`, read listed events; for `stale`, inspect the endpoint and load `stuck-crewmate-recovery`; for `check`, handle the named poll/source; for `heartbeat`, review the structured fleet and act only on meaningful changes.
 Use current state when action depends on it, never treat an event as current truth, never sweep another home's endpoints, and never broadly kill watchers.
 A paused event is an expected bounded external wait; blocked means firstmate action.
 Unchanged human-owned decisions, approvals, review-ready results, and blockers notify only on meaningful evidence transitions; `paused:` is reserved for external waits that may clear on their own.
 A secondmate's idle endpoint is healthy.
 Merged project changes use guarded fleet sync.
-Relay-linked milestones and terminal outcomes load `fmx-respond` before follow-up or cleanup.
+Relay-linked milestones and terminal outcomes load `fmx-respond`; before cleanup, reconcile its promised final for typed public commitments, or post the final completion follow-up when none is typed.
 Guard warnings do not replace the contract: present wakes before other action, repair stale liveness through the emitted protocol, resolve tangle without touching unlanded work, and preserve isolated copies.
 
 ### Away-mode stub
