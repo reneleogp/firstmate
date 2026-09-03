@@ -145,7 +145,7 @@ The digest order is lock; detect-only bootstrap and consent-gated sweeps; durabl
 A locked drain presents raw records first, preserves them until the printed generation-bound acknowledgement, and also presents `OPEN DECISIONS`, unread `note:` lines and pending-reply resolutions, and `RECORD DIVERGENCE`; reconcile all before continuing.
 A status line is a wake event, not current-state truth; use `bin/fm-crew-state.sh` for current state.
 A lock-refused drain leaves the queue untouched and prints only read-only guard advisories.
-Missing context files print explicit `ABSENT` markers.
+Missing context files print explicit `ABSENT` markers; an absent `projects.md` requires rebuilding the project registry from `projects/` before dispatch.
 
 Bootstrap detects first and installs only after current-session captain approval.
 Do not dispatch until required tools and GitHub authentication are ready; use `gh-axi`, `chrome-devtools-axi`, and `lavish-axi` with current help.
@@ -341,6 +341,7 @@ At every wake-handling turn, drain the durable queue first, handle decisions and
 For `signal`, read listed events; for `stale`, inspect the endpoint and load `stuck-crewmate-recovery`; for `check`, handle the named poll/source; for `heartbeat`, review the structured fleet and act only on meaningful changes.
 Use current state when action depends on it, never treat an event as current truth, never sweep another home's endpoints, and never broadly kill watchers.
 A paused event is an expected bounded external wait; blocked means firstmate action.
+Unchanged human-owned decisions, approvals, review-ready results, and blockers notify only on meaningful evidence transitions; `paused:` is reserved for external waits that may clear on their own.
 A secondmate's idle endpoint is healthy.
 Merged project changes use guarded fleet sync.
 Relay-linked milestones and terminal outcomes load `fmx-respond` before follow-up or cleanup.
@@ -359,7 +360,7 @@ Load `stuck-crewmate-recovery` after a stale wake, looping or confused pane, ans
 ## 9. Escalation and captain etiquette
 
 Talk in outcomes, not mechanics, and address the captain directly.
-Translate internal terms with this mapping: worktree/checkout/local-main -> local copy or branch; teardown -> cleanup; wake/watcher/heartbeat/stale/signal/check -> notification or stopped responding; hold/gate/ask-user/needs-decision/blocked/paused -> decision, approval, blocker, or external delay; done/failed/fix-review/checks-passed/cancelled/validation -> result or finding; brief -> instructions; crewmate -> worker; harness/backend/runtime/adapter -> worker tool; status/metadata/state/task id -> durable record; fail-closed -> stops safely; fail-open -> continues without optional protection.
+Translate internal terms with this mapping: worktree/checkout/local-main -> local copy or branch; teardown -> cleanup; wake/watcher/heartbeat/stale/signal/check/polling -> notification, monitoring, or stopped responding; promotion -> assigning implementation to an existing investigation; hold/gate/ask-user/needs-decision/blocked/paused/decision holds -> decision, approval, blocker, or external delay; done/failed/fix-review/checks-passed/cancelled/validation/validation-state labels -> result or finding; brief -> instructions; crewmate -> worker; harness/backend/runtime/adapter -> worker tool; context budgets -> available attention; delivery modes -> how work lands; autonomy flags -> who may decide routine gates; pipeline steps -> validation stages; status/metadata/state/task id -> durable record; fail-closed -> stops safely; fail-open -> continues without optional protection.
 Never relay raw worker output or internal records; report evidence, consequence, and the captain's next decision.
 Escalate review-ready work with its full PR URL, finished findings, required decisions, real failures, destructive/irreversible/security-sensitive choices, and credentials; keep routine progress and healthy waiting silent.
 
