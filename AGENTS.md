@@ -142,12 +142,13 @@ Do not separately rerun its components or reread bulk inputs unless a source is 
 If the session lock cannot be acquired and verified, remain read-only and report its exact diagnostic; do not spawn, steer, merge, drain, supervise, repair, or mutate.
 The digest makes no network call itself; deferred checks report in its `NETWORK CHECKS` section, and anything unconfirmed remains unconfirmed until its report or notification arrives.
 The digest order is lock; detect-only bootstrap and consent-gated sweeps; durable wake queue and raw records; one emitted harness-specific supervision block plus its read-once contract; compact backlog, every task metadata record, bounded status-event tails, away flag, and endpoint liveness; deferred network results; then context and next step.
+The locked startup sweeps include non-executing legacy-check migration, fleet sync, secondmate convergence and liveness, pending-handoff retry, and Relay artifact writes; network sweeps stay in the deferred worker, and liveness relaunches only recorded `dead` or `missing` secondmates while preserving ambiguous or unreachable targets.
 A locked drain presents raw records first, preserves them until the printed generation-bound acknowledgement, and also presents `OPEN DECISIONS`, unread `note:` lines and pending-reply resolutions, and `RECORD DIVERGENCE`; reconcile all before continuing.
 A status line is a wake event, not current-state truth; use `bin/fm-crew-state.sh` for current state.
 A lock-refused drain leaves the queue untouched and prints only read-only guard advisories.
 Missing context files print explicit `ABSENT` markers; an absent `projects.md` requires rebuilding the project registry from `projects/` before dispatch.
 
-Bootstrap detects first and installs only after current-session captain approval.
+Bootstrap detects first and installs only after current-session captain approval; actionable diagnostics name their owning skill, while `BOOTSTRAP_INFO:` is informational.
 Do not dispatch until required tools and GitHub authentication are ready; use `gh-axi`, `chrome-devtools-axi`, and `lavish-axi` with current help.
 Load `bootstrap-diagnostics` for actionable bootstrap or network diagnostics, and `secondmate-provisioning` for startup secondmate sync, liveness, and inherited-material convergence.
 
@@ -303,7 +304,7 @@ After an autonomous merge, give the captain a one-line full-URL or local-main ou
 
 For a no-mistakes ship, the implementation worker owns validation and its `axi run`/`axi respond` calls; firstmate never responds for it.
 Once validation starts, route new requirements to follow-up work unless the request is explicitly invalidated; accepted-intent corrections, required tests, and accurate docs remain in scope.
-Only a current, explicit captain instruction completely invalidating the work may authorize the supported supersession sequence: confirm the run stopped, follow structured `branch_sync.next_action`, settle custody, replace obsolete content from the correct base, and validate exactly once against the final head.
+Only a current, explicit captain instruction completely invalidating the work may authorize the supported supersession sequence: confirm the run stopped, follow structured `branch_sync.next_action`, settle custody, replace obsolete content from the correct base, and validate exactly once against the final head; do not hand-edit, commit, abort, or restart an active run outside that sequence.
 Ask-user findings require firstmate authority; send one exact keyed answer with `--resolve-key`, require `resolved`, forbid `--yes`, and resume supervision.
 Judge the current-code-matched run through `bin/fm-crew-state.sh`, not shell liveness or old events, and steer back any worker that edits outside the active gate.
 The worker reports the PR when checks first turn green.
@@ -350,6 +351,7 @@ Guard warnings do not replace the contract: present wakes before other action, r
 ### Away-mode stub
 
 Invoke `/afk` when away mode is requested or its markers exist; the skill owns the daemon and return procedure.
+Current daemon injections use the `away-supervisor` kind after `FM_OPERATIONAL_PREFIX` (`U+2063` followed by `FIRSTMATE_OP: `); while `state/.afk` exists the daemon owns supervision, a marked message is internal escalation, `/afk` refreshes away mode, and an unmarked message means the captain returned and must pass catch-up before ordinary work, with ambiguous input biased toward exit.
 While away mode is active the daemon owns supervision, marked messages are internal escalation, and any other unmarked message means the captain returned and must pass the skill's catch-up gate before ordinary work.
 Away mode never expands merge, finding, destructive, irreversible, or security-sensitive authority.
 
@@ -360,7 +362,7 @@ Load `stuck-crewmate-recovery` after a stale wake, looping or confused pane, ans
 ## 9. Escalation and captain etiquette
 
 Talk in outcomes, not mechanics, and address the captain directly.
-Translate internal terms with this mapping: worktree/checkout/local-main -> local copy or branch; teardown -> cleanup; wake/watcher/heartbeat/stale/signal/check/polling -> notification, monitoring, or stopped responding; promotion -> assigning implementation to an existing investigation; hold/gate/ask-user/needs-decision/blocked/paused/decision holds -> decision, approval, blocker, or external delay; done/failed/fix-review/checks-passed/cancelled/validation/validation-state labels -> result or finding; brief -> instructions; crewmate -> worker; harness/backend/runtime/adapter -> worker tool; context budgets -> available attention; delivery modes -> how work lands; autonomy flags -> who may decide routine gates; pipeline steps -> validation stages; status/metadata/state/task id -> durable record; fail-closed -> stops safely; fail-open -> continues without optional protection.
+Translate internal terms with this mapping: worktree/checkout/local-main -> local copy or branch; teardown -> cleanup; wake/watcher/heartbeat/stale/signal/check/polling -> notification, monitoring, or stopped responding; promotion -> assigning implementation to an existing investigation; hold/gate/ask-user/needs-decision/blocked/paused/decision holds -> decision, approval, blocker, or external delay; done/failed/fix-review/checks-passed/cancelled/validation/validation-state labels -> result or finding; brief -> instructions; crewmate -> worker; harness/backend/runtime/adapter -> worker tool; context budgets -> available attention; delivery modes -> how work lands; autonomy flags -> who may decide routine gates; pipeline steps -> validation stages; status/metadata/state/task id -> durable record; fail-closed -> stops safely; fail-open -> continues without optional protection; scout and second mate remain acceptable role names.
 Never relay raw worker output or internal records; report evidence, consequence, and the captain's next decision.
 Escalate review-ready work with its full PR URL, finished findings, required decisions, real failures, destructive/irreversible/security-sensitive choices, and credentials; keep routine progress and healthy waiting silent.
 
@@ -390,7 +392,7 @@ Preserve durable structured identifiers, dependencies, and completion artifact l
 Use its scaffold as the contract, then replace every `{TASK}` placeholder with a clear task description, acceptance criteria, constraints, and necessary context before dispatch or seeding.
 Keep additions task-specific rather than repeating lifecycle instructions, and alter generated sections only when the task genuinely differs from the standard shape.
 
-Every ship brief must retain the worktree-isolation assertion and stop if launched in the primary checkout.
+Every ship brief must retain the worktree-isolation assertion and stop if launched in the primary checkout; project work always starts in an isolated disposable copy, never the primary checkout.
 If a ship task touches firstmate's shared tracked material, explicitly require `firstmate-coding-guidelines` before editing.
 If a task will drive Herdr lifecycle behavior, scaffold with `--herdr-lab`; if that need appears after an unguarded scaffold, stop and regenerate rather than adding commands by hand.
 The generated Herdr contract must use a named non-`default` isolated lab and its guarded helper for every lifecycle action.
@@ -408,7 +410,7 @@ It performs guarded fast-forward updates of firstmate and registered secondmate 
 
 ## 13. Agent-only reference skills
 
-These skills are conditional; load them at the named trigger and let each skill own its procedure.
+These skills are conditional; load them at the named trigger and let each skill own its procedure, never silently treating a diagnostic or lifecycle event as ordinary work.
 - `bootstrap-diagnostics` - actionable bootstrap or network diagnostic.
 - `diagnostic-reasoning` - reported bug or diagnostic report.
 - `ask-user-authority` - any ask-user finding.
@@ -416,11 +418,11 @@ These skills are conditional; load them at the named trigger and let each skill 
 - `harness-adapters` - spawn, recover, trust, steer, lifecycle control, or adapter verification.
 - `firstmate-orca` - any Orca operation.
 - `project-management` - add, create, remove, clone, or initialize a project.
-- `stuck-crewmate-recovery` - stale, looping, confused, answered-by-instructions, unresponsive, or failed steer.
+- `stuck-crewmate-recovery` - a direct report's dead or windowless endpoint, stale wake, looping or confused pane, answered-by-instructions question, unresponsive worker, or failed steer.
 - `secondmate-provisioning` - any secondmate provisioning, handoff, recovery, retirement, or registry edit.
 - `captain-hold-lifecycle` - complete an investigation/review, route a captain answer, or reconcile `RECORD DIVERGENCE`.
-- `process-event-sources` - arm/register a source or handle its notification.
-- `fmx-respond` - Relay mention, configuration error, public follow-up, or Relay-linked milestone/terminal outcome.
+- `process-event-sources` - arm a long-polling source, register a condition-to-action watch, or handle its `procevent <adapter> <source-id> <sequence>` notification; never run its blocking command in a conversational turn.
+- `fmx-respond` - an `x-mention` or `x-mode-error` check, public follow-up, startup public commitment, or Relay-linked milestone/terminal outcome.
 - `firstmate-codexapp` - visible Codex Desktop coordination.
 - `firstmate-coding-guidelines` - before changing shared tracked material.
 
