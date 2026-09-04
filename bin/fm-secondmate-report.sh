@@ -82,23 +82,21 @@ if [ "$DEST_RC" -ne 0 ] || [ -z "$DESTINATION" ]; then
   echo "error: cannot resolve the parent channel from this home (not a seeded secondmate?)" >&2
   exit 1
 fi
-mkdir -p "$(dirname "$DESTINATION")" 2>/dev/null || true
-if [ ! -d "$(dirname "$DESTINATION")" ]; then
-  echo "error: cannot create parent directory for status file '$DESTINATION'" >&2
-  exit 1
-fi
-
 token=$(fm_pending_reply_corr_token "$CORR")
 if [ "$DOC_MODE" = 1 ]; then
   DOC_PATH=$1
   shift
   NOTE=$*
   if [ -n "$NOTE" ]; then
-    printf '%s [%s]: %s (%s via-helper)\n' "$VERB" "$token" "$NOTE" "$DOC_PATH" >> "$DESTINATION"
+    line=$(printf '%s [%s]: %s (%s via-helper)' "$VERB" "$token" "$NOTE" "$DOC_PATH")
   else
-    printf '%s [%s]: %s (via-helper)\n' "$VERB" "$token" "$DOC_PATH" >> "$DESTINATION"
+    line=$(printf '%s [%s]: %s (via-helper)' "$VERB" "$token" "$DOC_PATH")
   fi
 else
   NOTE=$*
-  printf '%s [%s]: %s (via-helper)\n' "$VERB" "$token" "$NOTE" >> "$DESTINATION"
+  line=$(printf '%s [%s]: %s (via-helper)' "$VERB" "$token" "$NOTE")
 fi
+fm_parent_channel_append_once "$DESTINATION" "$line" || {
+  echo "error: cannot write parent channel '$DESTINATION'" >&2
+  exit 1
+}
