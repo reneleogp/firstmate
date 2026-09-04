@@ -139,6 +139,7 @@ fm_parent_channel_append_once() {  # <path> <line>
 import errno
 import fcntl
 import os
+import re
 import stat
 import sys
 
@@ -195,14 +196,13 @@ try:
         def report(message):
             print(f"parent channel migration: {path}: {message}", file=sys.stderr)
 
+        legacy_record_pattern = re.compile(
+            rb"^(?:working|done|failed|blocked|paused|needs-decision|resolved|captain-held)"
+            rb"(?: (?:corr=[0-9a-f]{16} )?(?:\[key=[A-Za-z0-9._-]+\])?)?: [^\x00-\x1f]+$"
+        )
+
         def legacy_record(record):
-            return (
-                record.startswith((b"working", b"done", b"failed", b"blocked",
-                                   b"paused", b"needs-decision", b"resolved",
-                                   b"captain-held"))
-                and b":" in record
-                and not any(byte < 32 and byte not in (9,) for byte in record)
-            )
+            return bool(legacy_record_pattern.fullmatch(record))
 
         if b"\\n" in contents:
             backup_name = os.path.basename(leaf) + ".legacy-backup"
@@ -224,20 +224,31 @@ try:
                         0o600, dir_fd=fd)
                 except FileExistsError:
                     backup_fd = None
-                    existing_backup_fd = os.open(backup_name, os.O_RDONLY | flags, dir_fd=fd)
-                    try:
-                        saved = b""
-                        while True:
-                            chunk = os.read(existing_backup_fd, 65536)
-                            if not chunk:
-                                break
-                            saved += chunk
-                    finally:
-                        os.close(existing_backup_fd)
-                    if saved != contents:
+                    backup_stat = os.lstat(backup_name, dir_fd=fd)
+                    if not stat.S_ISREG(backup_stat.st_mode):
                         valid = False
                         migration_blocked = True
-                        report("backup disagrees with legacy contents; left unchanged")
+                        report("backup is not a regular file; left unchanged")
+                    else:
+                        existing_backup_fd = os.open(
+                            backup_name, os.O_RDONLY | os.O_NONBLOCK | flags, dir_fd=fd)
+                        try:
+                            if not stat.S_ISREG(os.fstat(existing_backup_fd).st_mode):
+                                valid = False
+                                migration_blocked = True
+                                report("backup is not a regular file; left unchanged")
+                            saved = b""
+                            while valid:
+                                chunk = os.read(existing_backup_fd, 65536)
+                                if not chunk:
+                                    break
+                                saved += chunk
+                        finally:
+                            os.close(existing_backup_fd)
+                        if valid and saved != contents:
+                            valid = False
+                            migration_blocked = True
+                            report("backup disagrees with legacy contents; left unchanged")
                 if valid and backup_fd is not None:
                     try:
                         payload = contents
