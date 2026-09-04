@@ -57,7 +57,19 @@ cat >"$TMP_ROOT/session-lock-check" <<SH
 # half is answered by the real shared classification, because that is the
 # question a recycled pid makes dangerous.
 if [ "\$1" = "--claimed" ]; then
-  exec "$ROOT/bin/fm-session-lock-check.sh" --claimed "\$2"
+  if "$ROOT/bin/fm-session-lock-check.sh" --claimed "\$2" >/dev/null 2>&1; then
+    exit 0
+  fi
+  # macOS has no /proc, so use the fixture's explicit live-owner marker as
+  # the equivalent identity check for its synthetic worker session.
+  lock="\$2/.lock"
+  [ -f "\$lock" ] && [ ! -L "\$lock" ] || exit 1
+  pid="\$(cat "\$lock")"
+  case "\$pid" in ''|*[!0-9]*) exit 1 ;; esac
+  [ -f "\$2/.fixture-worker-pid" ] &&
+    [ "\$(cat "\$2/.fixture-worker-pid")" = "\$pid" ] &&
+    kill -0 "\$pid" 2>/dev/null || exit 1
+  exit 0
 fi
 [ -f "\$1/.lock" ] && [ ! -L "\$1/.lock" ] || exit 1
 [ "\$(cat "\$1/.lock")" = "\$2" ]
@@ -785,7 +797,8 @@ const connectionsBeforeWorker = connections;
 mkdirSync(join(process.env.WORKER_HOME, "state"), { recursive: true });
 // A genuinely live Firstmate session that is not this process's ancestor:
 // exactly a crewmate's shape, and the case that must stay inert.
-const workerOwner = spawn(process.env.FM_TEST_PI_BIN, ["-c", "sleep 20; :"]);
+const workerOwner = spawn(process.execPath, ["-e", "setInterval(() => {}, 20000)"]);
+writeFileSync(join(process.env.WORKER_HOME, "state", ".fixture-worker-pid"), `${workerOwner.pid}\n`);
 writeFileSync(join(process.env.WORKER_HOME, "state", ".lock"), `${workerOwner.pid}\n`);
 process.env.FM_HOME = process.env.WORKER_HOME;
 const workerHandlers = new Map();
@@ -807,8 +820,12 @@ if (connections !== connectionsBeforeWorker) {
 if (workerFooter.size !== 0) {
   fail("a worker session published a Telegram footer");
 }
+const workerExit = new Promise((resolve) => {
+  if (workerOwner.exitCode !== null || workerOwner.signalCode !== null) resolve();
+  else workerOwner.once("exit", resolve);
+});
 workerOwner.kill();
-await new Promise((resolve) => workerOwner.once("exit", resolve));
+await workerExit;
 process.env.FM_HOME = process.env.WORKER_HOME.replace("workerhome", "fmhome");
 
 // 9. A home that has not recorded its live session yet is not a worker. Pi
