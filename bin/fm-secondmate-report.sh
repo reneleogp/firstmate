@@ -84,16 +84,16 @@ if [ "$DEST_RC" -ne 0 ] || [ -z "$DESTINATION" ]; then
 fi
 token=$(fm_pending_reply_corr_token "$CORR")
 if [ "$DOC_MODE" = 1 ]; then
-  DOC_PATH=$1
+  DOC_PATH=$(fm_parent_channel_clean_note "$1")
   shift
-  NOTE=$*
+  NOTE=$(fm_parent_channel_clean_note "$*")
   if [ -n "$NOTE" ]; then
     line=$(printf '%s [%s]: %s (%s via-helper)' "$VERB" "$token" "$NOTE" "$DOC_PATH")
   else
     line=$(printf '%s [%s]: %s (via-helper)' "$VERB" "$token" "$DOC_PATH")
   fi
 else
-  NOTE=$*
+  NOTE=$(fm_parent_channel_clean_note "$*")
   line=$(printf '%s [%s]: %s (via-helper)' "$VERB" "$token" "$NOTE")
 fi
 fm_parent_channel_append_once "$DESTINATION" "$line" || {
