@@ -169,7 +169,7 @@ jobs:
         run: |
           set -eu
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3-mistune
+          sudo apt-get install -y --no-install-recommends python3-mistune=3.0.2-1build1
           python3 -c 'import mistune; print(mistune.__version__)'
       - name: Run portable serial shard ${{ matrix.shard }}
         env:
