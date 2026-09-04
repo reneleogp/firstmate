@@ -8,7 +8,8 @@ tracked Pi extension .pi/extensions/fm-telegram-mirror.ts over one local Unix
 socket. The bot contains no model, agent loop, or Firstmate reasoning.
 
 Layout (one private directory, owner-only, default ~/.firstmate-telegram,
-overridden by FM_TELEGRAM_DIR):
+overridden by FM_TELEGRAM_DIR; the directory and every parent component must
+be non-symlink directories except the standard /tmp and /var aliases):
 
   env          KEY=VALUE file holding TELEGRAM_BOT_TOKEN (never in the unit)
   config.json  pairing and local commands:
@@ -24,6 +25,9 @@ overridden by FM_TELEGRAM_DIR):
                and at start and stop
 
 Wire protocol (newline-delimited JSON, both directions):
+
+  Frames are bounded by MAX_FRAME_BYTES; an oversized frame closes the Pi
+  connection rather than leaving unread bytes to be retried indefinitely.
 
   extension -> bot  {"t":"hello","features":["image"]}
                     {"t":"terminal","text":...,"images":[...]} terminal submission
