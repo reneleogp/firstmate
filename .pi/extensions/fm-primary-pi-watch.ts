@@ -974,9 +974,9 @@ export default function (pi: ExtensionAPI) {
     return existsSync(`${state}/.afk`);
   }
 
-  function writeAwayStanddownReceipt(): void {
+  function writeAwayStanddownReceipt(owner: SessionGeneration): void {
     mkdirSync(state, { recursive: true });
-    writeFileSync(`${state}/.pi-watch-away-standdown`, `${extensionVersion}\n${process.pid}\n`);
+    writeFileSync(`${state}/.pi-watch-away-standdown`, `${extensionVersion}\n${process.pid}\n${owner.id}\n`);
   }
 
   function clearAwayStanddownReceipt(): void {
@@ -1014,12 +1014,12 @@ export default function (pi: ExtensionAPI) {
     const child = owner.child;
     if (child) {
       if (!retireWatcherForAway(owner, child)) return;
-      writeAwayStanddownReceipt();
+      writeAwayStanddownReceipt(owner);
       await waitForGenerationChildClose(child);
     }
     if (!generationIsLive(owner) || !awayModeActive()) return;
     if (!owner.child && !owner.restoring && !existsSync(`${state}/.pi-watch-away-standdown`)) {
-      writeAwayStanddownReceipt();
+      writeAwayStanddownReceipt(owner);
     }
   }
 
