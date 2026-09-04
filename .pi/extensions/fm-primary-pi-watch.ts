@@ -23,7 +23,7 @@
 // replacement handoff.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
@@ -91,10 +91,14 @@ type SessionGeneration = {
   stopping: boolean;
   replacement: boolean;
   child: ChildProcess | null;
+  ownershipTimer: ReturnType<typeof setTimeout> | null;
   retryTimer: ReturnType<typeof setTimeout> | null;
   cleanupTimer: ReturnType<typeof setTimeout> | null;
   retryFailures: number;
   restoring: boolean;
+  monitoringStarted: boolean;
+  resumeAfterAway: boolean;
+  awayOwned: boolean;
   seq: number;
   pendingActionables: PendingActionableClose[];
   cleanupFailure: string;
@@ -431,10 +435,14 @@ function createGeneration(): SessionGeneration {
     stopping: false,
     replacement: false,
     child: null,
+    ownershipTimer: null,
     retryTimer: null,
     cleanupTimer: null,
     retryFailures: 0,
     restoring: false,
+    monitoringStarted: false,
+    resumeAfterAway: false,
+    awayOwned: false,
     seq: 0,
     pendingActionables: [],
     cleanupFailure: "",
@@ -453,6 +461,7 @@ function generationIsLive(generation: SessionGeneration): boolean {
 
 function stopGeneration(generation: SessionGeneration): ChildProcess | null {
   generation.stopping = true;
+  if (generation.ownershipTimer) clearTimeout(generation.ownershipTimer);
   if (generation.retryTimer) clearTimeout(generation.retryTimer);
   if (generation.cleanupTimer) clearTimeout(generation.cleanupTimer);
   generation.retryTimer = null;
@@ -574,6 +583,7 @@ export default function (pi: ExtensionAPI) {
     pending: PendingActionableClose,
   ): {
     ok: boolean;
+    superseded: boolean;
     detail: string;
   } {
     try {
@@ -598,16 +608,19 @@ export default function (pi: ExtensionAPI) {
           env: { ...process.env, FM_HOME: fmHome, FM_STATE_OVERRIDE: state, FM_ROOT_OVERRIDE: fmRoot },
         },
       );
-      if (result.status === 0) return { ok: true, detail: "" };
+      if (result.status === 0) return { ok: true, superseded: false, detail: "" };
+      if (result.status === 3) return { ok: false, superseded: true, detail: "" };
       const stderr = (result.stderr || "").trim();
       return {
         ok: false,
+        superseded: false,
         detail: `watcher: FAILED - handling delivery confirmation was rejected (status=${result.status ?? "none"} generation=${recovery.generation} watcherPid=${recovery.watcherPid})${stderr ? `\n${stderr}` : ""}`,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
         ok: false,
+        superseded: false,
         detail: `watcher: FAILED - handling delivery confirmation could not be executed (generation=${recovery.generation} watcherPid=${recovery.watcherPid})\n${message}`,
       };
     }
@@ -623,7 +636,7 @@ export default function (pi: ExtensionAPI) {
       return current ?? recovery;
     };
     const first = confirmHandlingDelivery(snapshot(), pending);
-    if (first.ok) return first;
+    if (first.ok || first.superseded) return first;
     return confirmHandlingDelivery(snapshot(), pending);
   }
 
@@ -656,6 +669,7 @@ export default function (pi: ExtensionAPI) {
     if (!generationIsLive(owner)) return false;
     if (recovery) {
       const confirmed = confirmHandlingDeliveryWithRetry(owner, recovery, pending);
+      if (confirmed.superseded) return true;
       if (!confirmed.ok) {
         const watcherPid = recovery.watcherPid;
         if (!pidAlive(watcherPid)) {
@@ -956,8 +970,91 @@ export default function (pi: ExtensionAPI) {
     owner.retryTimer = timer;
   }
 
+  function awayModeActive(): boolean {
+    return existsSync(`${state}/.afk`);
+  }
+
+  function writeAwayStanddownReceipt(): void {
+    mkdirSync(state, { recursive: true });
+    writeFileSync(`${state}/.pi-watch-away-standdown`, `${extensionVersion}\n${process.pid}\n`);
+  }
+
+  function clearAwayStanddownReceipt(): void {
+    try {
+      unlinkSync(`${state}/.pi-watch-away-standdown`);
+    } catch {
+      // Absence is already the desired ordinary-mode state.
+    }
+  }
+
+  function retireWatcherForAway(owner: SessionGeneration, armChild: ChildProcess): boolean {
+    try {
+      const result = spawnSync(
+        "bash",
+        [armScript, "--retire-away", String(owner.id), "--extension-pid", String(process.pid), "--arm-pid", String(armChild.pid ?? "")],
+        {
+          cwd: fmRoot,
+          encoding: "utf8",
+          env: { ...process.env, FM_HOME: fmHome, FM_STATE_OVERRIDE: state, FM_ROOT_OVERRIDE: fmRoot },
+        },
+      );
+      return result.status === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  async function enterAwayOwnership(owner: SessionGeneration): Promise<void> {
+    if (!generationIsLive(owner) || !awayModeActive()) return;
+    if (owner.awayOwned && !owner.child && existsSync(`${state}/.pi-watch-away-standdown`)) return;
+    owner.awayOwned = true;
+    owner.resumeAfterAway = owner.resumeAfterAway || owner.monitoringStarted;
+    if (owner.retryTimer) clearTimeout(owner.retryTimer);
+    owner.retryTimer = null;
+    const child = owner.child;
+    if (child) {
+      if (!retireWatcherForAway(owner, child)) return;
+      writeAwayStanddownReceipt();
+      await waitForGenerationChildClose(child);
+    }
+    if (!generationIsLive(owner) || !awayModeActive()) return;
+    if (!owner.child && !owner.restoring && !existsSync(`${state}/.pi-watch-away-standdown`)) {
+      writeAwayStanddownReceipt();
+    }
+  }
+
+  function scheduleOwnershipCheck(owner: SessionGeneration): void {
+    if (!generationIsLive(owner) || owner.ownershipTimer) return;
+    const timer = setTimeout(() => {
+      if (owner.ownershipTimer === timer) owner.ownershipTimer = null;
+      if (!generationIsLive(owner)) return;
+      void (async () => {
+        if (awayModeActive()) {
+          await enterAwayOwnership(owner);
+        } else if (owner.awayOwned) {
+          owner.awayOwned = false;
+          clearAwayStanddownReceipt();
+          if (owner.resumeAfterAway && !owner.child && !owner.retryTimer && !owner.restoring) {
+            owner.resumeAfterAway = false;
+            const result = startArm(owner);
+            if (!result.ok) surfaceFailure(owner, result.message);
+          }
+        }
+        scheduleOwnershipCheck(owner);
+      })();
+    }, positiveInteger("FM_PI_OWNERSHIP_POLL_MS", 100));
+    timer.unref();
+    owner.ownershipTimer = timer;
+  }
+
   function startArm(owner: SessionGeneration, predecessorArmPid = ""): ArmResult {
     if (!generationIsLive(owner)) return { ok: false, message: shuttingDownMessage };
+    owner.monitoringStarted = true;
+    if (awayModeActive() || owner.awayOwned) {
+      owner.resumeAfterAway = true;
+      void enterAwayOwnership(owner);
+      return { ok: true, message: "watcher: unchanged - away mode owns supervision" };
+    }
     const ownership = lockOwnership();
     if (ownership === "other") return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
     if (ownership === "missing") {
@@ -1102,6 +1199,7 @@ export default function (pi: ExtensionAPI) {
 
   function activateOwnedWatch(owner: SessionGeneration): ArmResult {
     if (!generationIsLive(owner)) return { ok: false, message: shuttingDownMessage };
+    scheduleOwnershipCheck(owner);
     if (lockOwnership() !== "owned") return startArm(owner);
     replacementCoordinator.receiver = receiveReplacementActionable;
     let pending: PendingActionableClose[] = [];
@@ -1143,6 +1241,7 @@ export default function (pi: ExtensionAPI) {
     activateGeneration(generation);
     markLoaded();
     if (lockOwnership() !== "owned") return;
+    scheduleOwnershipCheck(generation);
     activateOwnedWatch(generation);
   });
   pi.on?.("session_shutdown", async (event) => {

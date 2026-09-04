@@ -432,7 +432,8 @@ test_pi_acknowledged_late_close_does_not_force_turn() {
 if [ "${1:-}" = --handling-delivered ]; then
   awk -F '\t' -v sequence="$8" -v reason="$6" '$2 == sequence && $5 == reason { found=1 } END { exit !found }' \
     "$FM_HOME/state/.wake-queue" 2>/dev/null || exit 3
-  exit 0
+  : > "$FM_HOME/state/.wake-queue"
+  exit 3
 fi
 printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
 count=$(grep -c '^arm=' "$FM_ARM_LOG")
