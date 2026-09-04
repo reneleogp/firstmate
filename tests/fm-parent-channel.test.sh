@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT/bin/fm-parent-channel-lib.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-parent-channel.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
