@@ -94,6 +94,7 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+REARM_RESURFACE_PRESENTATION='check: Fleet supervision recovery: pending durable updates resurfaced after watcher downtime. Action required: inspect and handle the recovered updates.'
 mkdir -p "$STATE"
 
 # The native event fast-path and only its true dependencies have one narrow
@@ -1478,7 +1479,7 @@ watcher_cleanup() {
   if [ "$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)" = "${WATCHER_PID:-}" ]; then
     owns_lock=1
     if [ "${WATCHER_RECOVERY_PENDING:-0}" -eq 1 ] \
-      && [ "${FM_WATCH_DELIVERED_REASON:-}" = "check: rearm-resurface" ]; then
+      && [ "${FM_WATCH_DELIVERED_REASON:-}" = "$REARM_RESURFACE_PRESENTATION" ]; then
       transition=release-lock-existing
     fi
   fi
@@ -1543,7 +1544,7 @@ resurface_after_downtime() {
     fi
     [ "$FM_RECOVERY_MARKER_ACTION" = recover ] || return 0
   fi
-  wake "check: rearm-resurface"
+  wake "$REARM_RESURFACE_PRESENTATION"
 }
 
 while :; do
