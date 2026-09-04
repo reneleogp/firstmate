@@ -232,6 +232,8 @@ def _private_path_components(path: Path, create: bool = False) -> Path:
             trusted_alias = current in (Path("/tmp"), Path("/var"))
             if not trusted_alias or current == absolute:
                 raise TelegramError(f"private path must not contain a symlink: {current}")
+        if current.exists() and not current.is_dir():
+            raise TelegramError(f"private path component must be a directory: {current}")
         if create and not current.exists():
             current.mkdir()
     return absolute
