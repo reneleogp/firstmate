@@ -1,0 +1,6 @@
+$ bash tests/fm-parent-channel.test.sh
+parent-channel migration tests passed
+$ FM_HOME=... bash bin/fm-secondmate-report.sh done ABCDEF0123456789 "audit complete"
+--- persisted parent channel ---
+done [corr=ABCDEF0123456789]: audit complete (via-helper)
+deduplicated physical lines:        1
