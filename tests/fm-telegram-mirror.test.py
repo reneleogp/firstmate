@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import platform
+import plistlib
 import shlex
 import signal
 import socket
@@ -2077,19 +2078,19 @@ class ServiceUnitTestCase(unittest.TestCase):
                 stdout=subprocess.PIPE, text=True, check=True,
             ).stdout
         if platform.system() == "Darwin":
-            self.assertIn("com.firstmate.telegram", unit)
-            self.assertIn("<key>EnvironmentVariables</key>", unit)
+            payload = plistlib.loads(unit.encode("utf-8"))
+            self.assertEqual(payload["Label"], "com.firstmate.telegram")
+            self.assertEqual(payload["ProgramArguments"], [sys.executable, str(BOT), "run"])
+            self.assertEqual(payload["EnvironmentVariables"], {
+                "FM_TELEGRAM_DIR": tmp,
+                "FM_HOME": str(Path(firstmate_home).resolve()),
+            })
+            self.assertTrue(payload["RunAtLoad"])
+            self.assertTrue(payload["KeepAlive"])
+            self.assertEqual(payload["ProcessType"], "Interactive")
         else:
             self.assertIn("WantedBy=default.target", unit)
-        if platform.system() == "Darwin":
-            self.assertIn(f"<string>{BOT}</string>", unit)
-            self.assertIn("<string>run</string>", unit)
-        else:
             self.assertIn(f"{BOT} run", unit)
-        self.assertIn(str(tmp), unit)
-        if platform.system() == "Darwin":
-            self.assertIn(str(firstmate_home), unit)
-        else:
             self.assertIn(f"Environment=FM_HOME={firstmate_home}", unit)
             # The bot's own stop is bounded; the unit must not fall back to the 90s
             # default that killed it in the field.

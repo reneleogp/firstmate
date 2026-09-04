@@ -1923,7 +1923,12 @@ def uninstall_service() -> int:
     require_service_platform()
     target = unit_path()
     if on_macos():
-        launchctl("bootout", mac_service_target())
+        result = launchctl("bootout", mac_service_target())
+        if result.returncode != 0 and not any(
+                phrase in result.stdout.lower()
+                for phrase in ("could not find service", "service not found", "no such process")
+        ):
+            raise TelegramError(f"launchctl bootout failed: {result.stdout.strip()}")
         remove_file(target)
         print(f"removed {target}")
         return 0
