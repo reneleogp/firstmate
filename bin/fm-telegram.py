@@ -240,8 +240,14 @@ def _private_path_components(path: Path, create: bool = False) -> Path:
 
 
 def private_dir(path: Path) -> Path:
-    _private_path_components(path, create=True)
     absolute = Path(os.path.abspath(path))
+    shared_aliases = {Path(absolute.anchor)}
+    for alias in (Path("/tmp"), Path("/var")):
+        shared_aliases.add(alias)
+        shared_aliases.add(Path(os.path.realpath(alias)))
+    if absolute in shared_aliases:
+        raise TelegramError(f"private path must be a dedicated directory: {absolute}")
+    _private_path_components(path, create=True)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
     if not nofollow or not directory or os.open not in os.supports_dir_fd:
