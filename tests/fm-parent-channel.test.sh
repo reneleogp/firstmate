@@ -7,10 +7,10 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-parent-channel.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 valid="$TMP/valid.status"
-printf '%s' 'done [corr=ABCDEF0123456789]: old event\nfailed: old failure\n' > "$valid"
+printf '%s' 'done [corr=ABCDEF0123456789]: old event\ndone: [key=api-shape] old keyed event\nfailed: old failure\n' > "$valid"
 fm_parent_channel_append_once "$valid" 'working: current event'
-[ "$(cat "$valid")" = $'done [corr=ABCDEF0123456789]: old event\nfailed: old failure\nworking: current event' ]
-[ "$(cat "$valid.legacy-backup")" = 'done [corr=ABCDEF0123456789]: old event\nfailed: old failure\n' ]
+[ "$(cat "$valid")" = $'done [corr=ABCDEF0123456789]: old event\ndone: [key=api-shape] old keyed event\nfailed: old failure\nworking: current event' ]
+[ "$(cat "$valid.legacy-backup")" = 'done [corr=ABCDEF0123456789]: old event\ndone: [key=api-shape] old keyed event\nfailed: old failure\n' ]
 fm_parent_channel_append_once "$valid" 'working: current event'
 [ "$(grep -c '^working: current event$' "$valid")" -eq 1 ]
 
