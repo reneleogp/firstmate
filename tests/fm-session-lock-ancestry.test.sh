@@ -220,15 +220,18 @@ SH
   pass "session-lock: a live version-named session holding the lock is not mistaken for a stale owner"
 }
 
+set_mtime_epoch() {  # <epoch> <file>
+  perl -e 'utime($ARGV[0], $ARGV[0], $ARGV[1]) or exit 1' "$1" "$2"
+}
+
 test_telegram_peer_authentication_binds_lock_to_process_start() {
-  local dir pi_bin pi_pid proc_root checker
+  local dir pi_bin pi_pid proc_root checker stale_epoch boundary_epoch current_epoch
   dir="$TMP_ROOT/telegram-process-generation"
   proc_root="$dir/proc"
   checker="$ROOT/bin/fm-session-lock-check.sh"
   mkdir -p "$dir/state" "$proc_root"
   pi_bin="$dir/pi"
-  cp /bin/bash "$pi_bin"
-  chmod +x "$pi_bin"
+  ln -s /bin/bash "$pi_bin"
   "$pi_bin" -c 'sleep 30; :' &
   pi_pid=$!
   printf '%s\n' "$pi_pid" >"$dir/state/.lock"
@@ -236,32 +239,48 @@ test_telegram_peer_authentication_binds_lock_to_process_start() {
   printf 'btime 1000\n' >"$proc_root/stat"
   printf '%s (pi) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1000\n' "$pi_pid" >"$proc_root/$pi_pid/stat"
 
-  touch -d '@1008' "$dir/state/.lock"
+  # Linux uses the deterministic proc fixture above. macOS authenticates from
+  # the real process start reported by ps, so derive equivalent exact epochs.
+  if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
+    current_epoch=$(LC_ALL=C date -j -f "%a %b %d %T %Y" \
+      "$(ps -o lstart= -p "$pi_pid" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')" +%s) \
+      || fail "could not read the fixture process start time"
+    stale_epoch=$((current_epoch - 2))
+    boundary_epoch=$((current_epoch - 1))
+  else
+    stale_epoch=1008
+    boundary_epoch=1009
+    current_epoch=1010
+  fi
+
+  set_mtime_epoch "$stale_epoch" "$dir/state/.lock"
   if FM_TELEGRAM_PROC_ROOT="$proc_root" "$checker" "$dir/state" "$pi_pid"; then
     kill "$pi_pid" 2>/dev/null || true
     wait "$pi_pid" 2>/dev/null || true
     fail "a same-family Pi process started after the stale lock authenticated"
   fi
 
-  touch -d '@1009' "$dir/state/.lock"
+  set_mtime_epoch "$boundary_epoch" "$dir/state/.lock"
   FM_TELEGRAM_PROC_ROOT="$proc_root" "$checker" "$dir/state" "$pi_pid" \
     || { kill "$pi_pid" 2>/dev/null || true; wait "$pi_pid" 2>/dev/null || true; fail "the timestamp precision boundary was refused"; }
 
-  touch -d '@1010' "$dir/state/.lock"
+  set_mtime_epoch "$current_epoch" "$dir/state/.lock"
   FM_TELEGRAM_PROC_ROOT="$proc_root" "$checker" "$dir/state" "$pi_pid" \
     || { kill "$pi_pid" 2>/dev/null || true; wait "$pi_pid" 2>/dev/null || true; fail "the genuine Pi lock owner was refused"; }
 
-  printf '%s (pi) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 malformed\n' "$pi_pid" >"$proc_root/$pi_pid/stat"
-  if FM_TELEGRAM_PROC_ROOT="$proc_root" "$checker" "$dir/state" "$pi_pid"; then
-    kill "$pi_pid" 2>/dev/null || true
-    wait "$pi_pid" 2>/dev/null || true
-    fail "a malformed kernel process start time authenticated"
-  fi
-  rm "$proc_root/$pi_pid/stat"
-  if FM_TELEGRAM_PROC_ROOT="$proc_root" "$checker" "$dir/state" "$pi_pid"; then
-    kill "$pi_pid" 2>/dev/null || true
-    wait "$pi_pid" 2>/dev/null || true
-    fail "an unreadable kernel process start time authenticated"
+  if [ "$(uname -s 2>/dev/null)" != Darwin ]; then
+    printf '%s (pi) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 malformed\n' "$pi_pid" >"$proc_root/$pi_pid/stat"
+    if FM_TELEGRAM_PROC_ROOT="$proc_root" "$checker" "$dir/state" "$pi_pid"; then
+      kill "$pi_pid" 2>/dev/null || true
+      wait "$pi_pid" 2>/dev/null || true
+      fail "a malformed kernel process start time authenticated"
+    fi
+    rm "$proc_root/$pi_pid/stat"
+    if FM_TELEGRAM_PROC_ROOT="$proc_root" "$checker" "$dir/state" "$pi_pid"; then
+      kill "$pi_pid" 2>/dev/null || true
+      wait "$pi_pid" 2>/dev/null || true
+      fail "an unreadable kernel process start time authenticated"
+    fi
   fi
 
   kill "$pi_pid" 2>/dev/null || true
@@ -346,8 +365,7 @@ test_claimed_answers_the_shared_liveness_question() {
   # A genuinely live verified harness: the case that must stay claimed, so a
   # second session can never mirror or overwrite a live session's home.
   pi_bin="$dir/pi"
-  cp /bin/bash "$pi_bin"
-  chmod +x "$pi_bin"
+  ln -s /bin/bash "$pi_bin"
   "$pi_bin" -c 'sleep 30; :' &
   pi_pid=$!
   printf '%s\n' "$pi_pid" >"$state/.lock"
