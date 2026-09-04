@@ -224,7 +224,7 @@ Every button action is bound to the current transcript revision, so a stale or r
 
 - One paired account, one private chat, one Firstmate session; a second session is refused rather than promoted (see Only your own session is mirrored).
 - Firstmate's replies are rendered as Telegram HTML so code, commands, and emphasis stay readable; if Telegram refuses the markup, the same text is sent again as plain text rather than lost.
-  Formatting needs `python3-mistune` (`sudo apt install python3-mistune`); without it every reply is simply sent plain.
+  Formatting needs `mistune`; on WSL install `python3-mistune` with `sudo apt install python3-mistune`, and on macOS install it in the bot's Python environment with `python3 -m pip install mistune`; without it every reply is simply sent plain.
 - Transport statuses, terminal echoes, and voice transcripts are sent as plain text, so they arrive exactly as written.
 - Only the paired chat can send images, and the primary-session rule covers them: a worker session can neither receive nor deliver one.
 - The bot owns mirror mode and delivery confirmations for both surfaces; the terminal only shows and changes what the bot publishes.
