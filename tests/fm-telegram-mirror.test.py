@@ -547,32 +547,24 @@ class MirrorTestCase(unittest.TestCase):
         self.assertIn("Mirror is on", pi.read()["text"])
 
     def processes_matching(self, needle: str) -> list[int]:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True, text=True, check=False,
+        )
         found = []
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                cmdline = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
-            except OSError:
-                continue
-            if needle in cmdline:
-                found.append(int(entry.name))
+        for line in result.stdout.splitlines():
+            fields = line.strip().split(None, 1)
+            if len(fields) == 2 and fields[0].isdigit() and needle in fields[1]:
+                found.append(int(fields[0]))
         return found
 
     def reap_by_cmdline(self, needle: str) -> None:
         """Kill fixture leftovers so a regression fails loudly instead of hanging."""
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
+        for pid in self.processes_matching(needle):
             try:
-                cmdline = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
-            except OSError:
-                continue
-            if needle in cmdline:
-                try:
-                    os.kill(int(entry.name), signal.SIGKILL)
-                except (OSError, ProcessLookupError):
-                    pass
+                os.kill(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
 
     def test_stop_is_bounded_while_a_transcription_is_running(self) -> None:
         # The field failure: a local speech model was still running when the
