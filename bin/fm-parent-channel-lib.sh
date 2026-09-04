@@ -131,16 +131,68 @@ fm_parent_channel_clean_note() {  # <text>
 
 # Append <line> to <path> unless that exact line is already there.
 fm_parent_channel_append_once() {  # <path> <line>
-  local path=$1 line=$2
-  if [ -e "$path" ] || [ -L "$path" ]; then
-    [ -f "$path" ] && [ ! -L "$path" ] || return 1
-  else
-    mkdir -p "$(dirname "$path")" || return 1
-  fi
-  if grep -Fqx -- "$line" "$path" 2>/dev/null; then
-    return 0
-  fi
-  printf '%s\n' "$line" >> "$path"
+  python3 - "$1" "$2" <<'PY'
+import errno
+import fcntl
+import os
+import stat
+import sys
+
+path = os.path.abspath(sys.argv[1])
+for alias in ("/tmp", "/var"):
+    if path == alias or path.startswith(alias + os.sep):
+        path = os.path.realpath(alias) + path[len(alias):]
+        break
+line = os.fsencode(sys.argv[2])
+parts = [part for part in path.split(os.sep) if part]
+flags = getattr(os, "O_NOFOLLOW", 0)
+if not flags:
+    raise OSError(errno.ENOTSUP, "no symlink-safe open available")
+directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | flags
+fd = os.open(os.sep, directory_flags)
+try:
+    for part in parts[:-1]:
+        while True:
+            try:
+                next_fd = os.open(part, directory_flags, dir_fd=fd)
+                break
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    try:
+                        existing = os.lstat(part, dir_fd=fd)
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISLNK(existing.st_mode):
+                        raise OSError(errno.ELOOP, "symlinked parent channel directory")
+        os.close(fd)
+        fd = next_fd
+
+    leaf = parts[-1] if parts else ""
+    file_flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | flags
+    file_fd = os.open(leaf, file_flags, 0o600, dir_fd=fd)
+    try:
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            raise OSError(errno.EINVAL, "parent channel is not a regular file")
+        fcntl.flock(file_fd, fcntl.LOCK_EX)
+        os.lseek(file_fd, 0, os.SEEK_SET)
+        chunks = []
+        while True:
+            chunk = os.read(file_fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        if line not in b"".join(chunks).split(b"\\n"):
+            payload = line + b"\\n"
+            while payload:
+                written = os.write(file_fd, payload)
+                payload = payload[written:]
+    finally:
+        os.close(file_fd)
+finally:
+    os.close(fd)
+PY
 }
 
 # Publish one parent-facing line from <home>. See the return codes above.
