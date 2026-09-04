@@ -173,6 +173,10 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # classification predicates have exactly one definition.
 # shellcheck source=bin/fm-classify-lib.sh
 . "$FM_DAEMON_DIR/fm-classify-lib.sh"
+# Human-owned notification edges share the same currentness and readable
+# presentation rules as the ordinary watcher.
+# shellcheck source=bin/fm-human-notify-lib.sh
+. "$FM_DAEMON_DIR/fm-human-notify-lib.sh"
 
 # Supervisor-pane discovery (FM_SUPERVISOR_TARGET_DEFAULT,
 # FM_SUPERVISOR_BACKEND_DEFAULT, discover_supervisor_target,
@@ -341,6 +345,17 @@ _collapse_newlines() {  # <text>
 # field for "self" is informational (logged); for "escalate" it is the pre-read
 # summary firstmate would otherwise have to re-read.
 
+daemon_window_human_ref() {  # <window> <state>
+  local window=$1 state=$2 task meta
+  task=$(window_to_task "$window" "$state")
+  meta="$state/$task.meta"
+  if [ -f "$meta" ]; then
+    fm_display_name_for_meta "$meta" "$task"
+  else
+    fm_display_name_fallback "$task"
+  fi
+}
+
 classify_signal() {  # <reason-after-colon> <state>
   local reason=$1 state=$2 f last event record rest endpoint ident rc distilled="" rel="" seen_rel="" task sig marker
   for f in $reason; do
@@ -367,6 +382,14 @@ classify_signal() {  # <reason-after-colon> <state>
       && printf '%s\t%s\t%s\n' "$task" "$endpoint" "$ident" >> "$FM_STATUS_SPAN_ENDPOINT_FILE"
     if [ "$rc" -eq 0 ]; then
       event=${rest#*$'\t'}
+      last=$(last_status_line "$f")
+      fm_human_notify_apply_transition "$state" "$task" "$last" || true
+      if fm_human_notify_class "$event" >/dev/null 2>&1; then
+        # A human-owned event is current only while it remains the latest
+        # status condition and its edge has not already been recorded.
+        [ "$last" = "$event" ] || continue
+        fm_human_notify_pending "$state" "$task" "$event" || continue
+      fi
       distilled="${distilled}$(basename "$f"): ${event} | "
       rel=1
       continue
@@ -415,13 +438,13 @@ classify_stale() {  # <window> <state> [<span-record> <span-status>]
     printf 'escalate|stale + actionable status: %s' "$event"
     return
   fi
-  if [ -n "$last" ] && status_is_paused_or_captain_held "$last"; then
-    # A DECLARED external-wait pause or a verified captain-held transfer
-    # (fm-classify-lib.sh owns which declarations qualify): an idle pane is
-    # EXPECTED, so this is not a wedge. The caller records a pause marker (long
-    # re-surface cadence in housekeeping) rather than a wedge stale marker. Cheap:
-    # reuses the status line already read, no fm-crew-state.sh call, mirroring the
-    # daemon's existing status-log classification.
+  if [ -n "$last" ] && status_is_captain_held "$last"; then
+    printf 'humanwait|captain-owned wait: %s' "$last"
+    return
+  fi
+  if [ -n "$last" ] && status_is_paused "$last"; then
+    # A declared external-wait pause leaves the pane expectedly idle, so this is
+    # not a wedge. The caller records a pause marker for the long recheck cadence.
     printf 'pause|paused (awaiting external), rechecked on a long cadence: %s' "$last"
     return
   fi
@@ -438,6 +461,14 @@ classify_stale() {  # <window> <state> [<span-record> <span-status>]
           return
           ;;
       esac
+    fi
+    if fm_human_notify_class "$last" >/dev/null 2>&1; then
+      if fm_human_notify_pending "$state" "$task" "$last"; then
+        printf 'escalate|%s' "$(fm_human_notify_summary "$state" "$task" "$last")"
+      else
+        printf 'self|unchanged human-owned condition'
+      fi
+      return
     fi
     printf 'self|stale + terminal (already escalated by signal): %s' "$last"
     return
@@ -1348,7 +1379,7 @@ handle_wake() {  # <reason> <state>
               # Housekeeping (2b) then owns the re-surface, so the wait is still
               # bounded - by one recheck per PAUSE_RESURFACE_SECS instead.
               case "${decision%%|*}" in
-                pause) : ;;
+                pause|humanwait) : ;;
                 *) case "$stale_detail" in
                      idle\ *s,\ possible\ wedge,\ escalation\ *)
                        last=$(last_status_line "$state/$task.status")
@@ -1383,15 +1414,19 @@ handle_wake() {  # <reason> <state>
       fi
       ;;
     pause)
-      # Declared wait, an external-wait pause or a verified captain-held transfer:
-      # record a pause marker (long re-surface cadence in housekeeping) and drop any
-      # wedge stale marker, so a pane that transitioned working->declared-wait is not
-      # still wedge-aged. Only stale produces this action.
+      # Declared external waits retain their bounded recheck cadence.
       if [ "$kind" = "stale" ]; then
         stale_marker_remove "$arg" "$state"
         pause_marker_record "$arg" "$state"
       fi
       log "self-handle (paused): $reason -> $distilled"
+      ;;
+    humanwait)
+      if [ "$kind" = "stale" ]; then
+        stale_marker_remove "$arg" "$state"
+        pause_marker_remove "$arg" "$state"
+      fi
+      log "self-handle (human-owned wait, no timed reminder): $reason"
       ;;
     *)
       # Transient (non-terminal) stale: record/refresh the wedge marker so

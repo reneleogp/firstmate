@@ -15,6 +15,10 @@ FM_PUSH_TRANSITION_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$FM_PUSH_TRANSITION_LIB_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-transition-lib.sh
 . "$FM_PUSH_TRANSITION_LIB_DIR/fm-transition-lib.sh"
+# Human-owned notification edges and readable worker labels are shared by the
+# native transition path and the ordinary watcher poll.
+# shellcheck source=bin/fm-human-notify-lib.sh
+. "$FM_PUSH_TRANSITION_LIB_DIR/fm-human-notify-lib.sh"
 
 TRIAGE_LOG="$STATE/.watch-triage.log"
 TRIAGE_LOG_MAX_BYTES=${FM_WATCH_TRIAGE_LOG_MAX_BYTES:-262144}
@@ -178,31 +182,94 @@ mark_surface_reported() {  # <status-file> <reported-signature>
   status_presentation_marker_report "$(_hb_surfaced_path "$task")" "$2"
 }
 
+fm_push_transition_apply_status() {  # <state> <window> <backend-status>
+  local state=$1 window=$2 to=$3 task status_file last line class
+  FM_PUSH_TRANSITION_STATUS_LINE=
+  task=$(window_to_task "$window" "$state")
+  [ -n "$task" ] || return 1
+  status_file="$state/$task.status"
+  [ ! -L "$status_file" ] || return 1
+  last=$(last_status_line "$status_file")
+  case "$to" in
+    working)
+      [ "$last" = 'blocked: live supervision reported the worker blocked' ] || return 0
+      line='working: live supervision reported active work'
+      ;;
+    blocked)
+      if class=$(fm_human_notify_class "$last" 2>/dev/null); then
+        [ "$class" = blocker ] || return 0
+      elif status_is_terminal_verb "$last" || status_is_captain_relevant "$last"; then
+        return 0
+      fi
+      if [ "$(status_line_verb "$last")" = blocked ]; then
+        line=$last
+      else
+        line='blocked: live supervision reported the worker blocked'
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  if [ "$last" != "$line" ]; then
+    printf '%s\n' "$line" >> "$status_file" || return 1
+  fi
+  fm_human_notify_apply_transition "$state" "$task" "$line" || true
+  FM_PUSH_TRANSITION_STATUS_LINE=$line
+}
+
 # Act on a fresh actionable transition from a push-capable backend.
 handle_push_transition() {  # <backend> <session> <record>
-  local backend=$1 session=$2 record=$3 pane_id to window task reason span_record rest surface_end='' surface_ident=''
+  local backend=$1 session=$2 record=$3 pane_id to window task reason last display
+  local span_record rest surface_end='' surface_ident=''
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
-  # A declared wait already names the human this transition would report: an
-  # external dependency, or the captain a verified hold transferred the work to.
-  # Either way the wait is durably recorded, so absorb the immediate escalation
-  # and leave the bounded re-surface to the watcher's own pause cadence.
-  if status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")"; then
-    triage_log "absorbed push $to (declared wait, awaiting external or captain): $window"
+  last=$(last_status_line "$STATE/$task.status")
+  if [ -f "$STATE/$task.meta" ]; then
+    display=$(fm_display_name_for_meta "$STATE/$task.meta" "$task")
+  else
+    display=$(fm_display_name_fallback "$task")
+  fi
+  # Declared waits retain their bounded cadence; the immediate transition is not
+  # a new human-owned condition.
+  if status_is_paused "$last" || status_is_captain_held "$last"; then
+    triage_log "absorbed push $to (declared wait): $window"
     fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
     return
+  fi
+  if [ "$to" = blocked ]; then
+    fm_push_transition_apply_status "$STATE" "$window" "$to" || exit 1
+    if [ -z "$FM_PUSH_TRANSITION_STATUS_LINE" ]; then
+      triage_log "absorbed push $to (current human outcome takes precedence): $window"
+      fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
+      return
+    fi
+    last=$FM_PUSH_TRANSITION_STATUS_LINE
   fi
   span_record=$(status_span_first_actionable_record "$STATE/$task.status" \
     "$(hb_surfaced_offset "$task")")
   case $? in
     0|1) surface_end=${span_record%%$'\t'*}; rest=${span_record#*$'\t'}; surface_ident=${rest%%$'\t'*} ;;
   esac
-  reason="stale: $window (herdr: agent $to - waiting on human, escalated immediately, not via wedge timer)"
+  if fm_human_notify_class "$last" >/dev/null 2>&1; then
+    if fm_backend_transition_reopened "$backend" "$STATE" "$session" "$record"; then
+      fm_human_notify_reopen_blocker "$STATE" "$task"
+    fi
+    if ! fm_human_notify_pending "$STATE" "$task" "$last"; then
+      triage_log "absorbed push $to (unchanged human-owned condition): $window"
+      fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
+      return
+    fi
+    reason="stale: $(fm_human_notify_summary "$STATE" "$task" "$last")"
+  else
+    reason="stale: $display: live supervision reported the worker $to without a declared wait. Action required: inspect the worker and choose recovery."
+  fi
   fm_wake_append stale "$window" "$reason" || exit 1
   fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
   mark_surfaced "$STATE/$task.status" "$surface_end" "$surface_ident"
+  fm_human_notify_record "$STATE" "$task" "$last" 2>/dev/null || true
   wake "$reason"
 }
