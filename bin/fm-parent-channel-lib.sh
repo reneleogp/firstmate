@@ -219,12 +219,10 @@ try:
                 report("ambiguous framing; left unchanged")
             if valid:
                 try:
-                    backup_fd = os.open(
-                        backup_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags,
-                        0o600, dir_fd=fd)
-                except FileExistsError:
-                    backup_fd = None
                     backup_stat = os.lstat(backup_name, dir_fd=fd)
+                except FileNotFoundError:
+                    backup_stat = None
+                if backup_stat is not None:
                     if not stat.S_ISREG(backup_stat.st_mode):
                         valid = False
                         migration_blocked = True
@@ -249,7 +247,18 @@ try:
                             valid = False
                             migration_blocked = True
                             report("backup disagrees with legacy contents; left unchanged")
-                if valid and backup_fd is not None:
+                if valid and backup_stat is None:
+                    backup_prefix = f".{backup_name}.migration.{os.getpid()}"
+                    backup_number = 0
+                    while True:
+                        backup_temp_name = f"{backup_prefix}.{backup_number}"
+                        try:
+                            backup_fd = os.open(
+                                backup_temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags,
+                                0o600, dir_fd=fd)
+                            break
+                        except FileExistsError:
+                            backup_number += 1
                     try:
                         payload = contents
                         while payload:
@@ -258,6 +267,7 @@ try:
                         os.fsync(backup_fd)
                     finally:
                         os.close(backup_fd)
+                    os.rename(backup_temp_name, backup_name, src_dir_fd=fd, dst_dir_fd=fd)
                 if valid:
                     converted = b"\n".join(legacy_parts[:-1]) + b"\n"
                     temp_prefix = f".{os.path.basename(leaf)}.legacy-migration.{os.getpid()}"
