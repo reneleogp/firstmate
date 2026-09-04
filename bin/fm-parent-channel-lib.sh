@@ -260,9 +260,17 @@ try:
                         os.close(backup_fd)
                 if valid:
                     converted = b"\n".join(legacy_parts[:-1]) + b"\n"
-                    temp_name = f".{os.path.basename(leaf)}.legacy-migration.{os.getpid()}"
-                    temp_fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags,
-                                      0o600, dir_fd=fd)
+                    temp_prefix = f".{os.path.basename(leaf)}.legacy-migration.{os.getpid()}"
+                    temp_number = 0
+                    while True:
+                        temp_name = f"{temp_prefix}.{temp_number}"
+                        try:
+                            temp_fd = os.open(
+                                temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags,
+                                0o600, dir_fd=fd)
+                            break
+                        except FileExistsError:
+                            temp_number += 1
                     try:
                         payload = converted
                         while payload:

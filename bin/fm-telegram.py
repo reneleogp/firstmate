@@ -241,10 +241,29 @@ def _private_path_components(path: Path, create: bool = False) -> Path:
 
 def private_dir(path: Path) -> Path:
     _private_path_components(path, create=True)
+    absolute = Path(os.path.abspath(path))
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory or os.open not in os.supports_dir_fd:
+        raise TelegramError("private directories require no-follow traversal")
+    flags = os.O_RDONLY | directory | nofollow
+    parent_fd = os.open(absolute.anchor, flags)
     try:
-        path.chmod(0o700)
-    except OSError:
-        pass
+        current = Path(absolute.anchor)
+        for component in absolute.parts[1:]:
+            current /= component
+            component_flags = flags
+            if current in (Path("/tmp"), Path("/var")):
+                component_flags = os.O_RDONLY | directory
+            next_fd = os.open(component, component_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        try:
+            os.fchmod(parent_fd, 0o700)
+        except OSError:
+            pass
+    finally:
+        os.close(parent_fd)
     return path
 
 
