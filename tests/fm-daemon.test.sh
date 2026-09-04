@@ -831,8 +831,8 @@ test_stale_captain_held_classifies_pause() {
   status_is_captain_relevant "$held_reason" && fail "a captain-held transfer line was treated as captain-relevant"
   printf '%s\n' "$held_reason" > "$state/held-w9h.status"
   out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-held-w9h" "$state")
-  case "$out" in pause\|*) ;; *) fail "captain-held transfer did not classify as pause: $out" ;; esac
-  pass "a captain-held transfer classifies as pause, not as a wedge candidate"
+  case "$out" in humanwait\|*) ;; *) fail "captain-held transfer did not classify as human-owned wait: $out" ;; esac
+  pass "a captain-held transfer classifies as a human-owned wait, not as a wedge candidate"
 }
 
 # handle_wake on a paused stale records a pause marker, drops any pre-existing wedge

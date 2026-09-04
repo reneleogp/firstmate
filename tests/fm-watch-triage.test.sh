@@ -3488,7 +3488,8 @@ test_terminal_first_sight_drops_a_finished_write_deferral_chain() {
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   wait_for_exit "$pid" 100 || fail "a first-sight captain-relevant status was not surfaced"
-  grep -F "stale: $window" "$out" >/dev/null || fail "the first-sight surface did not print a stale wake"
+  grep -F "stale:" "$out" >/dev/null || fail "the first-sight surface did not print a stale wake"
+  ! grep -F "$window" "$out" >/dev/null || fail "the first-sight surface leaked the private endpoint"
   [ ! -e "$state/.writing-since-$key" ] \
     || fail "the first-sight surface kept a finished write-deferral chain"
   unset FM_FAKE_CREW_STATE
