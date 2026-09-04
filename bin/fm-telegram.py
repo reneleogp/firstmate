@@ -1885,9 +1885,12 @@ def unit_path() -> Path:
 
 def unit_text(home: Path) -> str:
     script = Path(__file__).resolve()
+    # Preserve the configured spelling. macOS commonly exposes /var as a
+    # symlink to /private/var, and resolving it makes the unit disagree with
+    # the FM_HOME value supplied by the caller.
     firstmate_home = Path(
         os.environ.get("FM_HOME") or Path(__file__).resolve().parents[1]
-    ).resolve()
+    )
     return (
         "[Unit]\n"
         "Description=Firstmate Telegram terminal mirror\n"
