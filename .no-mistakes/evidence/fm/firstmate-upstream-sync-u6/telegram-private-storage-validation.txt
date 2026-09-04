@@ -1,0 +1,33 @@
+$ FM_TELEGRAM_DIR=/ python3 bin/fm-telegram.py service-unit
+fm-telegram: private path must be a dedicated directory: /
+exit=1
+
+$ FM_TELEGRAM_DIR=/ python3 bin/fm-telegram.py service-unit
+fm-telegram: private path must be a dedicated directory: /
+exit=1
+
+$ FM_TELEGRAM_DIR=/tmp python3 bin/fm-telegram.py service-unit
+fm-telegram: private path must be a dedicated directory: /tmp
+exit=1
+
+$ FM_TELEGRAM_DIR=./.tmp-telegram-validation-46171/not-dir python3 bin/fm-telegram.py service-unit
+fm-telegram: private path component must be a directory: <worktree>/.tmp-telegram-validation-46171/not-dir
+exit=1
+
+$ FM_TELEGRAM_DIR=./.tmp-telegram-validation-46171/link/sub python3 bin/fm-telegram.py service-unit
+fm-telegram: private path must not contain a symlink: <worktree>/.tmp-telegram-validation-46171/link
+exit=1
+
+$ FM_TELEGRAM_DIR=<dedicated>/real/sub python3 bin/fm-telegram.py service-unit
+[Unit]
+Description=Firstmate Telegram terminal mirror
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=FM_TELEGRAM_DIR=.tmp-telegram-validation-46171/real/sub
+Environment=FM_HOME=/Users/renegonzalez/.no-mistakes/worktrees/1e84fafc8eb9/01M1QC86PX5A5ZRQZ39AD4T1V8
+ExecStart=/Applications/Xcode.app/Contents/Developer/usr/bin/python3 /Users/renegonzalez/.no-mistakes/worktrees/1e84fafc8eb9/01M1QC86PX5A5ZRQZ39AD4T1V8/bin/fm-telegram.py run
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
