@@ -389,6 +389,37 @@ inbox_steer_check() {  # <window> <task>
   esac
 }
 
+# Check whether one human-owned condition is still the current durable condition.
+# Keyed decisions use the open-decision fold; terminal and review-ready conditions
+# remain current only when they are the latest status line and their PR evidence is
+# still open and green.
+status_human_condition_is_current() {  # <status-file> <status-line>
+  local f=$1 line=$2 class key verb note open okey overb onote task
+  class=$(fm_human_notify_class "$line") || return 1
+  case "$class" in
+    decision|blocker)
+      key=$(_fm_human_notify_key "$line")
+      verb=$(status_line_verb "$line")
+      note=$(status_line_note "$line")
+      open=$(status_open_decisions "$f")
+      while IFS=$(printf '\t') read -r okey overb onote; do
+        [ "$okey" = "$key" ] && [ "$overb" = "$verb" ] && [ "$onote" = "$note" ] && return 0
+      done <<EOF
+$open
+EOF
+      return 1
+      ;;
+    *)
+      [ "$(last_status_line "$f")" = "$line" ] || return 1
+      if [ "$class" = review-ready ]; then
+        task=$(basename "$f"); task=${task%.status}
+        fm_human_notify_review_current "$STATE" "$task" || return 1
+      fi
+      return 0
+      ;;
+  esac
+}
+
 # 0 (benign/absorb) if EVERY task in a no-verb "signal:" wake has positive work
 # evidence; 1 otherwise. Each task may satisfy the authoritative working proof,
 # or an eligible bare turn-end may use the opt-in pane-churn proof below.
@@ -1001,10 +1032,21 @@ pause_state_class() {  # <window> <task>
 # that really fires - a throttle written by the wake it should have prevented, or
 # read after that wake was already appended, bounds nothing.
 surface_nonterminal_stale() {  # <window> <hash>
-  local win=$1 h=$2 key task last declaration='' declared=1 throttled=1
+  local win=$1 h=$2 key task last declaration='' declared=1 throttled=1 reason display summary
   key=$(window_key "$win")
   task=$(window_to_task "$win" "$STATE")
   last=$(last_status_line "$STATE/$task.status")
+  summary=$(fm_human_notify_summary "$STATE" "$task" "$last" 2>/dev/null || true)
+  if [ -n "$summary" ]; then
+    reason="stale: $summary"
+  else
+    if [ -f "$STATE/$task.meta" ]; then
+      display=$(fm_display_name_for_meta "$STATE/$task.meta" "$task")
+    else
+      display=$(fm_display_name_fallback "$task")
+    fi
+    reason="stale: $display: worker state is idle or unclear without a declared wait. Action required: inspect for completion, failure, or a stuck worker."
+  fi
   if status_is_paused_or_captain_held "$last"; then
     declared=0
     declaration="declared:$(fm_wake_signal_sig "$STATE/$task.status" || true)"
@@ -1014,7 +1056,7 @@ surface_nonterminal_stale() {  # <window> <hash>
     fi
   fi
   if [ "$throttled" -ne 0 ]; then
-    fm_wake_append stale "$win" "stale: $win" || exit 1
+    fm_wake_append stale "$win" "$reason" || exit 1
   fi
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key"
@@ -1030,7 +1072,7 @@ surface_nonterminal_stale() {  # <window> <hash>
     triage_log "absorbed non-terminal stale (declared wait already re-surfaced this window): $win"
     return 0
   fi
-  wake "stale: $win"
+  wake "$reason"
 }
 
 # Check and heartbeat cadence must survive actionable exits and restarts: the
@@ -1175,6 +1217,85 @@ fm_active_check_stop() {
   FM_ACTIVE_CHECK_PGID=
 }
 
+# shellcheck disable=SC2034 # Outputs are consumed by the PR observation caller and regression tests.
+PR_OBSERVATION_REASON=
+# shellcheck disable=SC2034 # Outputs are consumed by the PR observation caller and regression tests.
+PR_OBSERVATION_RECORD=0
+# shellcheck disable=SC2034 # Outputs are consumed by the PR observation caller and regression tests.
+PR_OBSERVATION_COMMIT=0
+# shellcheck disable=SC2034 # Outputs are consumed by the PR observation caller and regression tests.
+PR_OBSERVATION_CLEAR_REVIEW=0
+pr_observation_handle() {  # <task> <state> <head> <checks> <conclusion>
+  local task=$1 pr_state=$2 head=$3 checks=$4 conclusion=$5 file old_state='' old_head='' old_checks='' old_conclusion=''
+  local status_line class display red=0 old_red=0 changed_head=0 red_evidence had_observation=0
+  file="$STATE/$task.pr-observation"
+  if [ -f "$file" ] && [ ! -L "$file" ]; then
+    had_observation=1
+    old_state=$(sed -n 's/^state=//p' "$file" | head -1)
+    old_head=$(sed -n 's/^head=//p' "$file" | head -1)
+    old_checks=$(sed -n 's/^checks=//p' "$file" | head -1)
+    old_conclusion=$(sed -n 's/^conclusion=//p' "$file" | head -1)
+  fi
+  if [ -z "$old_head" ]; then
+    old_head=$(grep '^pr_head=' "$STATE/$task.meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  fi
+  [ -z "$old_head" ] || [ "$old_head" = "$head" ] || changed_head=1
+  fm_human_notify_pr_evidence_is_red "$checks" "$conclusion" && red=1
+  fm_human_notify_pr_evidence_is_red "$old_checks" "$old_conclusion" && old_red=1
+  red_evidence=${conclusion:-$checks}
+  status_line=$(last_status_line "$STATE/$task.status")
+  class=$(fm_human_notify_class "$status_line" 2>/dev/null || true)
+  if [ -f "$STATE/$task.meta" ]; then
+    display=$(fm_display_name_for_meta "$STATE/$task.meta" "$task")
+  else
+    display=$(fm_display_name_fallback "$task")
+  fi
+  PR_OBSERVATION_REASON=
+  PR_OBSERVATION_RECORD=0
+  PR_OBSERVATION_COMMIT=0
+  PR_OBSERVATION_CLEAR_REVIEW=0
+  case "$pr_state" in
+    CLOSED|closed)
+      if [ "$old_state" != "$pr_state" ] || [ "$changed_head" -eq 1 ]; then
+        # shellcheck disable=SC2034 # Exported result consumed by the caller.
+        PR_OBSERVATION_CLEAR_REVIEW=1
+        PR_OBSERVATION_REASON="$display: the review target closed or changed head. Action required: inspect the closure and choose whether to reopen or replace it."
+      fi
+      ;;
+    *)
+      if [ "$red" -eq 1 ]; then
+        if [ "$old_checks|$old_conclusion" != "$checks|$conclusion" ] || [ "$changed_head" -eq 1 ]; then
+          # shellcheck disable=SC2034 # Exported result consumed by the caller.
+          PR_OBSERVATION_CLEAR_REVIEW=1
+          PR_OBSERVATION_REASON="$display: review checks turned red - $red_evidence. Action required: inspect and repair the failing checks."
+        fi
+      elif [ "$class" != review-ready ]; then
+        fm_human_notify_pr_observation_record "$STATE" "$task" "$pr_state" "$head" "$checks" "$conclusion" || return 2
+        return 1
+      elif [ "$changed_head" -eq 1 ] || [ "$old_red" -eq 1 ] || { [ "$old_state" = CLOSED ] || [ "$old_state" = closed ]; }; then
+        # shellcheck disable=SC2034 # Exported result consumed by the caller.
+        PR_OBSERVATION_CLEAR_REVIEW=1
+        PR_OBSERVATION_REASON=$(fm_human_notify_summary "$STATE" "$task" "$status_line")
+        # shellcheck disable=SC2034 # Exported result consumed by the caller.
+        PR_OBSERVATION_RECORD=1
+      elif [ "$had_observation" -eq 0 ] && fm_human_notify_pending "$STATE" "$task" "$status_line"; then
+        PR_OBSERVATION_REASON=$(fm_human_notify_summary "$STATE" "$task" "$status_line")
+        # shellcheck disable=SC2034 # Exported result consumed by the caller.
+        PR_OBSERVATION_RECORD=1
+      fi
+      ;;
+  esac
+  if [ -n "$PR_OBSERVATION_REASON" ]; then
+    # shellcheck disable=SC2034 # Exported result consumed by the caller.
+    PR_OBSERVATION_COMMIT=1
+    return 0
+  fi
+  fm_human_notify_pr_observation_record "$STATE" "$task" "$pr_state" "$head" "$checks" "$conclusion" || return 2
+  [ "$class" = review-ready ] || return 1
+  fm_human_notify_record "$STATE" "$task" "$status_line" || return 2
+  return 1
+}
+
 run_check_capture() {
   local pgid
   fm_check_output_cleanup
@@ -1216,7 +1337,7 @@ run_check_capture() {
 # still needs the authoritative working proof or the eligible opt-in bare
 # turn-end pane-churn proof before it is benign.
 signal_files_actionable() {  # <status-file> ...
-  local f task record rest endpoint ident rc found=1
+  local f task record rest endpoint ident rc found=1 line
   FM_SIGNAL_SURFACE_ENDPOINTS=''
   for f in "$@"; do
     case "$f" in *.status) ;; *) continue ;; esac
@@ -1236,9 +1357,55 @@ signal_files_actionable() {  # <status-file> ...
     fi
     endpoint=${record%%$'\t'*}; rest=${record#*$'\t'}; ident=${rest%%$'\t'*}
     FM_SIGNAL_SURFACE_ENDPOINTS="${FM_SIGNAL_SURFACE_ENDPOINTS}${f}"$'\t'"${endpoint}"$'\t'"${ident}"$'\n'
-    [ "$rc" -eq 0 ] && found=0
+    if [ "$rc" -eq 0 ]; then
+      line=$(last_status_line "$f")
+      fm_human_notify_apply_transition "$STATE" "$task" "$line" || true
+      if ! fm_human_notify_class "$line" >/dev/null 2>&1 \
+        || fm_human_notify_pending "$STATE" "$task" "$line"; then
+        found=0
+      fi
+    fi
   done
   return "$found"
+}
+
+# Render a changed status condition without exposing its private endpoint or
+# status text. Human-owned notification fingerprints keep unchanged decisions,
+# blockers, and review results silent while still allowing a genuinely new edge.
+signal_human_reason() {  # <space-separated status files>
+  local f task line summary display
+  for f in $1; do
+    case "$f" in *.status) ;; *) continue ;; esac
+    task=$(basename "$f"); task=${task%.status}
+    line=$(last_status_line "$f")
+    summary=$(fm_human_notify_summary "$STATE" "$task" "$line" 2>/dev/null || true)
+    [ -n "$summary" ] || continue
+    printf 'signal: %s' "$summary"
+    return 0
+  done
+  for f in $1; do
+    case "$f" in *.status) ;; *) continue ;; esac
+    task=$(basename "$f"); task=${task%.status}
+    if [ -f "$STATE/$task.meta" ]; then
+      display=$(fm_display_name_for_meta "$STATE/$task.meta" "$task")
+    else
+      display=$(fm_display_name_fallback "$task")
+    fi
+    printf 'signal: %s: a new actionable update surfaced. Action required: inspect the private task record and respond.' "$display"
+    return 0
+  done
+  printf 'signal:%s' "$1"
+}
+
+apply_signal_human_transitions() {  # <space-separated status files>
+  local f task line
+  for f in $1; do
+    case "$f" in *.status) ;; *) continue ;; esac
+    task=$(basename "$f"); task=${task%.status}
+    while IFS= read -r line || [ -n "$line" ]; do
+      fm_human_notify_apply_transition "$STATE" "$task" "$line" || true
+    done < "$f"
+  done
 }
 
 # Surfaced-marker bookkeeping for the heartbeat backstop is owned by
@@ -1417,6 +1584,54 @@ if [ "${FM_WATCH_HANDLING_SUCCESSOR:-0}" = 1 ]; then
 elif [ "$FM_RECOVERY_MARKER_ACTION" = recover ]; then
   WATCHER_RECOVERY_PENDING=1
 fi
+FM_INTENTIONAL_RETIRE_MARKER=
+intentional_pi_away_retirement() {
+  local marker="$STATE/.pi-watch-away-retire" expected_version marker_version extension_pid generation watcher_pid count
+  [ -e "$STATE/.afk" ] && [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  count=$(wc -l < "$marker" 2>/dev/null | tr -d '[:space:]')
+  [ "$count" = 4 ] || return 1
+  marker_version=$(sed -n '1p' "$marker")
+  extension_pid=$(sed -n '2p' "$marker")
+  generation=$(sed -n '3p' "$marker")
+  watcher_pid=$(sed -n '4p' "$marker")
+  expected_version=$(fm_pi_extension_version "$FM_ROOT/.pi/extensions/fm-primary-pi-watch.ts") || return 1
+  case "$generation" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  [ "$marker_version" = "$expected_version" ] \
+    && [ "$watcher_pid" = "$WATCHER_PID" ] \
+    && fm_pi_extension_loaded "$STATE/.pi-watch-extension-loaded" "$expected_version" "$STATE/.lock" \
+    && [ "$(sed -n '1p' "$STATE/.lock" 2>/dev/null)" = "$extension_pid" ] \
+    && fm_pid_alive "$extension_pid" \
+    || return 1
+  FM_INTENTIONAL_RETIRE_MARKER=$marker
+}
+
+intentional_away_daemon_retirement() {
+  local marker="$STATE/.away-daemon-watcher-retire" schema daemon_pid daemon_identity watcher_pid lock_pid lock_identity current_identity count
+  [ -e "$STATE/.afk" ] && [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  count=$(wc -l < "$marker" 2>/dev/null | tr -d '[:space:]')
+  [ "$count" = 4 ] || return 1
+  schema=$(sed -n '1p' "$marker")
+  daemon_pid=$(sed -n '2p' "$marker")
+  daemon_identity=$(sed -n '3p' "$marker")
+  watcher_pid=$(sed -n '4p' "$marker")
+  lock_pid=$(cat "$STATE/.supervise-daemon.lock/pid" 2>/dev/null || true)
+  lock_identity=$(cat "$STATE/.supervise-daemon.lock/pid-identity" 2>/dev/null || true)
+  current_identity=$(fm_pid_identity "$daemon_pid" 2>/dev/null || true)
+  [ "$schema" = away-daemon-retire-v1 ] \
+    && [ "$watcher_pid" = "$WATCHER_PID" ] \
+    && [ "$daemon_pid" = "$lock_pid" ] \
+    && [ -n "$daemon_identity" ] \
+    && [ "$daemon_identity" = "$lock_identity" ] \
+    && [ "$daemon_identity" = "$current_identity" ] \
+    || return 1
+  FM_INTENTIONAL_RETIRE_MARKER=$marker
+}
+
+intentional_watcher_retirement() {
+  FM_INTENTIONAL_RETIRE_MARKER=
+  intentional_pi_away_retirement || intentional_away_daemon_retirement
+}
+
 # Side-band ledger publication, detached from the poll loop.
 #
 # The poll loop owns the liveness beacon below, and fm-guard.sh reads that
@@ -1475,7 +1690,7 @@ reconcile_requests_detached() {
 }
 
 watcher_cleanup() {
-  local cleanup_status=0 owns_lock=0 transition=release-lock
+  local cleanup_status=0 owns_lock=0 transition=release-lock intentional_away=0
   if [ "$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)" = "${WATCHER_PID:-}" ]; then
     owns_lock=1
     if [ "${WATCHER_RECOVERY_PENDING:-0}" -eq 1 ] \
@@ -1486,10 +1701,19 @@ watcher_cleanup() {
   fm_active_check_stop || cleanup_status=1
   fm_check_output_cleanup
   fm_custom_check_snapshot_cleanup
-  if [ "$owns_lock" -eq 1 ] \
+  if [ "$owns_lock" -eq 1 ] && intentional_watcher_retirement; then
+    intentional_away=1
+    if ! fm_lock_release "$WATCH_LOCK"; then
+      echo "watcher: intentional away retirement could not release its exact lock" >&2
+      cleanup_status=1
+    fi
+  elif [ "$owns_lock" -eq 1 ] \
     && ! fm_recovery_transition "$WATCHER_DOWNTIME_MARKER" "$transition" "$WATCH_LOCK" downtime; then
     echo "watcher: recovery state could not be persisted; retaining stale lock evidence" >&2
     cleanup_status=1
+  fi
+  if [ "$intentional_away" -eq 1 ] && [ "$cleanup_status" -eq 0 ]; then
+    rm -f "$FM_INTENTIONAL_RETIRE_MARKER" 2>/dev/null || true
   fi
   return "$cleanup_status"
 }
@@ -1609,7 +1833,7 @@ while :; do
   if inactive_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
     "$SCRIPT_DIR/fm-inactive-reconcile.sh" scan 2>/dev/null); then
     if [ -n "$inactive_out" ]; then
-      wake "check: inactive-outcome"
+      wake "check: Fleet terminal outcome: live supervision found a newly inactive terminal result. Action required: inspect the queued outcome and record or recover it."
     fi
   else
     triage_log "inactive-outcome reconciliation unavailable"
@@ -1660,7 +1884,16 @@ while :; do
         fi
       fi
       if [ -n "$out" ]; then
-        reason="check: $c: $out"
+        queue_reason="check: $c: $out"
+        check_display=
+        if [ "$(basename "$c")" = x-watch.check.sh ]; then
+          check_display=Relay
+        elif [ -f "$STATE/$id.meta" ]; then
+          check_display=$(fm_display_name_for_meta "$STATE/$id.meta" "$id")
+        else
+          check_display='State check'
+        fi
+        reason="check: $check_display: an authenticated state check produced a new result now. Action required: inspect the result and handle its reported outcome."
         if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
           merge_outcome_rc=0
           fm_merge_outcome_report "$FM_HOME" "$STATE" "$id" "$url" poll \
@@ -1675,9 +1908,9 @@ while :; do
             triage_log "absorbed duplicate merged PR poll result for $id"
             continue
           fi
-          wake "$reason"
+          wake "$queue_reason"
         fi
-        fm_wake_append check "$c" "$reason" || exit 1
+        fm_wake_append check "$c" "$queue_reason" || exit 1
         touch "$STATE/.last-check"
         wake "$reason"
       fi
@@ -1714,6 +1947,7 @@ while :; do
 $pending
 EOF
     reason="signal:$files"
+    apply_signal_human_transitions "$files"
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
     #   - the away-mode daemon owns triage (afk) and wants every wake;
     #   - any status file gained a captain-relevant event since it was last
@@ -1741,12 +1975,15 @@ EOF
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
     signal_files_actionable $files
     signal_actionable=$?
+    if [ "$signal_actionable" -eq 0 ] && ! afk_present; then
+      reason=$(signal_human_reason "$files")
+    fi
     # shellcheck disable=SC2086  # same space-separated status-path list
     if afk_present || [ "$signal_actionable" -eq 0 ] \
       || { ! signal_crew_provably_working $files && ! signal_turnend_panes_churned $files; }; then
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
-        fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
+        fm_wake_append signal "$(basename "$f")" "signal:$files" || exit 1
       done <<EOF
 $pending
 EOF
@@ -1774,6 +2011,16 @@ EOF
       done <<EOF
 $FM_SIGNAL_SURFACE_ENDPOINTS
 EOF
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        case "$f" in *.status)
+          task=$(basename "$f"); task=${task%.status}
+          fm_human_notify_record "$STATE" "$task" "$(last_status_line "$f")" 2>/dev/null || true
+          ;;
+        esac
+      done <<EOF
+$files
+EOF
       wake "$reason"
     else
       while IFS=$(printf '\t') read -r sf sig f; do
@@ -1793,7 +2040,7 @@ EOF
       if [ "$signal_commit_error" -ne 0 ]; then
         while IFS=$(printf '\t') read -r sf sig f; do
           [ -n "$sf" ] || continue
-          fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
+          fm_wake_append signal "$(basename "$f")" "signal:$files" || exit 1
         done <<EOF
 $pending
 EOF
@@ -1884,18 +2131,26 @@ EOF
               clear_write_tracking "$key"
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
             else
-              fm_wake_append stale "$w" "stale: $w" || exit 1
+              stale_status="$STATE/$task.status"
+              stale_line=$(last_status_line "$stale_status")
+              stale_reason=$(fm_human_notify_summary "$STATE" "$task" "$stale_line" 2>/dev/null || true)
+              if [ -n "$stale_reason" ]; then
+                reason="stale: $stale_reason"
+              else
+                reason="stale: $w"
+              fi
+              fm_wake_append stale "$w" "$reason" || exit 1
               printf '%s' "$h" > "$sf"
               rm -f "$ssf"
               clear_write_tracking "$key"
-              stale_status="$STATE/$(window_to_task "$w" "$STATE").status"
               stale_record=$(status_span_first_actionable_record "$stale_status" 0)
               case $? in
                 0|1) stale_end=${stale_record%%$'\t'*}; stale_rest=${stale_record#*$'\t'}; stale_ident=${stale_rest%%$'\t'*} ;;
                 *) stale_end=''; stale_ident='' ;;
               esac
               mark_surfaced "$stale_status" "$stale_end" "$stale_ident"
-              wake "stale: $w"
+              fm_human_notify_record "$STATE" "$task" "$stale_line" 2>/dev/null || true
+              wake "$reason"
             fi
           elif [ -e "$ssf" ]; then
             # This exact hash was already overridden as provably-working (a

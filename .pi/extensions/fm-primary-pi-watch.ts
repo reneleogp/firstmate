@@ -51,6 +51,8 @@ type LockOwnership = "owned" | "missing" | "other";
 type CloseClassification = {
   kind: "actionable" | "failure";
   message: string;
+  sequence?: string;
+  payload?: string;
 };
 
 type PendingActionableClose = {
@@ -58,6 +60,8 @@ type PendingActionableClose = {
   token: string;
   message: string;
   predecessorArmPid: string;
+  sequence?: string;
+  payload?: string;
   delivered?: true;
 };
 
@@ -269,12 +273,19 @@ function nodeErrorCode(error: unknown): string {
     : "";
 }
 
-function createPendingActionable(message: string, predecessorArmPid: string): PendingActionableClose {
+function createPendingActionable(
+  message: string,
+  predecessorArmPid: string,
+  sequence?: string,
+  payload?: string,
+): PendingActionableClose {
   return {
     version: 1,
     token: `${process.pid}-${Date.now()}-${++replacementCoordinator.nextTokenId}`,
     message,
     predecessorArmPid,
+    ...(sequence ? { sequence } : {}),
+    ...(payload ? { payload } : {}),
   };
 }
 
@@ -288,6 +299,11 @@ function validatePendingActionable(value: unknown): PendingActionableClose {
     !actionableLine((value as { message: string }).message) ||
     typeof (value as { predecessorArmPid?: unknown }).predecessorArmPid !== "string" ||
     !/^[0-9]*$/.test((value as { predecessorArmPid: string }).predecessorArmPid) ||
+    ((value as { sequence?: unknown }).sequence !== undefined &&
+      (typeof (value as { sequence?: unknown }).sequence !== "string" ||
+        !/^[0-9]+$/.test((value as { sequence: string }).sequence))) ||
+    ((value as { payload?: unknown }).payload !== undefined &&
+      typeof (value as { payload?: unknown }).payload !== "string") ||
     ((value as { delivered?: unknown }).delivered !== undefined &&
       (value as { delivered?: unknown }).delivered !== true)
   ) {
@@ -379,7 +395,9 @@ function clearReplacementHandoff(pending: PendingActionableClose): void {
 function classifyClose(stdout: string, stderr: string, code: number | null, signal: NodeJS.Signals | null): CloseClassification {
   const combined = `${stdout}\n${stderr}`.trim();
   const reason = actionableLine(combined);
-  if (reason) return { kind: "actionable", message: reason };
+  const sequence = combined.match(/^watcher: delivery-sequence=([0-9]+)$/m)?.[1];
+  const payload = combined.match(/^watcher: delivery-payload=(.*)$/m)?.[1];
+  if (reason) return { kind: "actionable", message: reason, sequence, payload };
   const healthy = combined.split(/\r?\n/).find((line) => /^watcher: healthy\b/.test(line));
   if (healthy) {
     return {
@@ -551,14 +569,29 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function confirmHandlingDelivery(recovery: { generation: string; watcherPid: string }): {
+  function confirmHandlingDelivery(
+    recovery: { generation: string; watcherPid: string },
+    pending: PendingActionableClose,
+  ): {
     ok: boolean;
     detail: string;
   } {
     try {
+      const args = [armScript, "--handling-delivered", recovery.generation, "--watcher-pid", recovery.watcherPid];
+      if (pending.sequence) {
+        let deliveryReason = pending.payload ?? pending.message;
+        try {
+          const queue = readFileSync(`${state}/.wake-queue`, "utf8");
+          const row = queue.split(/\r?\n/).find((candidate) => candidate.split("\t")[1] === pending.sequence);
+          if (row) deliveryReason = row.split("\t").slice(4).join("\t");
+        } catch {
+          // The arm's exact-row check remains authoritative when the queue is unavailable.
+        }
+        args.push("--reason", deliveryReason, "--sequence", pending.sequence);
+      }
       const result = spawnSync(
         "bash",
-        [armScript, "--handling-delivered", recovery.generation, "--watcher-pid", recovery.watcherPid],
+        args,
         {
           cwd: fmRoot,
           encoding: "utf8",
@@ -583,14 +616,15 @@ export default function (pi: ExtensionAPI) {
   function confirmHandlingDeliveryWithRetry(
     owner: SessionGeneration,
     recovery: { generation: string; watcherPid: string },
+    pending: PendingActionableClose,
   ): { ok: boolean; detail: string } {
     const snapshot = (): { generation: string; watcherPid: string } => {
       const current = owner.child ? armRecovery.get(owner.child) : undefined;
       return current ?? recovery;
     };
-    const first = confirmHandlingDelivery(snapshot());
+    const first = confirmHandlingDelivery(snapshot(), pending);
     if (first.ok) return first;
-    return confirmHandlingDelivery(snapshot());
+    return confirmHandlingDelivery(snapshot(), pending);
   }
 
   function offerWakeToBranch(message: string): Promise<void> | null {
@@ -621,7 +655,7 @@ export default function (pi: ExtensionAPI) {
   ): Promise<boolean> {
     if (!generationIsLive(owner)) return false;
     if (recovery) {
-      const confirmed = confirmHandlingDeliveryWithRetry(owner, recovery);
+      const confirmed = confirmHandlingDeliveryWithRetry(owner, recovery, pending);
       if (!confirmed.ok) {
         const watcherPid = recovery.watcherPid;
         if (!pidAlive(watcherPid)) {
@@ -856,6 +890,17 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  async function waitForArmRecovery(
+    armChild: ChildProcess,
+  ): Promise<{ generation: string; watcherPid: string } | undefined> {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const recovery = armRecovery.get(armChild);
+      if (recovery) return recovery;
+      await new Promise((resolveRecovery) => setTimeout(resolveRecovery, 5));
+    }
+    return undefined;
+  }
+
   async function restoreAfterActionableClose(owner: SessionGeneration, predecessorArmPid: string): Promise<{
     failure: string;
     recovery?: { generation: string; watcherPid: string };
@@ -866,7 +911,7 @@ export default function (pi: ExtensionAPI) {
       const replacement = startArm(owner, predecessorArmPid);
       const successorChild = owner.child;
       if (replacement.ok && successorChild && await waitForReadiness(successorChild)) {
-        return { failure: "", recovery: armRecovery.get(successorChild) };
+        return { failure: "", recovery: await waitForArmRecovery(successorChild) };
       }
       if (replacement.ok) {
         failure = "watcher: FAILED - Pi extension could not verify a ready successor watcher";
@@ -978,10 +1023,18 @@ export default function (pi: ExtensionAPI) {
         settleReadiness(true);
       }
       const reason = completedActionableLine(stdout) || completedActionableLine(stderr);
-      if (reason && !armPendingActionable.has(armChild)) {
-        const pending = createPendingActionable(reason, String(armChild.pid ?? ""));
-        armPendingActionable.set(armChild, pending);
-        enqueuePendingActionable(owner, pending);
+      const sequence = combined.match(/^watcher: delivery-sequence=([0-9]+)$/m)?.[1];
+      const payload = combined.match(/^watcher: delivery-payload=(.*)$/m)?.[1];
+      if (reason) {
+        const existing = armPendingActionable.get(armChild);
+        if (existing) {
+          if (sequence) existing.sequence = sequence;
+          if (payload) existing.payload = payload;
+        } else {
+          const pending = createPendingActionable(reason, String(armChild.pid ?? ""), sequence, payload);
+          armPendingActionable.set(armChild, pending);
+          enqueuePendingActionable(owner, pending);
+        }
       }
     };
     const releaseChild = (): void => {
@@ -1004,7 +1057,14 @@ export default function (pi: ExtensionAPI) {
       const classification = classifyClose(stdout, stderr, code, signal);
       const predecessor = String(armChild.pid ?? "");
       if (classification.kind === "actionable") {
-        const pending = armPendingActionable.get(armChild) ?? createPendingActionable(classification.message, predecessor);
+        const pending = armPendingActionable.get(armChild) ?? createPendingActionable(
+          classification.message,
+          predecessor,
+          classification.sequence,
+          classification.payload,
+        );
+        if (classification.sequence) pending.sequence = classification.sequence;
+        if (classification.payload) pending.payload = classification.payload;
         enqueuePendingActionable(owner, pending);
         if (!generationIsLive(owner)) return;
         owner.retryFailures = 0;

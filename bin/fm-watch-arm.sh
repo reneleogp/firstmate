@@ -303,7 +303,10 @@ print_cycle_delivery_identity() {
     ''|*[!0-9]*) ;;
     *)
       printf 'watcher: delivery-sequence=%s\n' "$sequence"
-      printf 'watcher: delivery-payload=%s\n' "$payload"
+      case "$payload" in
+        */*) ;;
+        *) printf 'watcher: delivery-payload=%s\n' "$payload" ;;
+      esac
       ;;
   esac
 }
@@ -337,7 +340,10 @@ close_unobserved_cycle() {
       ''|*[!0-9]*) ;;
       *)
         printf 'watcher: delivery-sequence=%s\n' "$sequence"
-        printf 'watcher: delivery-payload=%s\n' "$payload"
+        case "$payload" in
+          */*) ;;
+          *) printf 'watcher: delivery-payload=%s\n' "$payload" ;;
+        esac
         ;;
     esac
     return 0

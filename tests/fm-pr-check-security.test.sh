@@ -3,6 +3,8 @@
 # private atomic artifacts, authenticated custom checks, and teardown cleanup.
 set -u
 
+CONTROL_CHECK_REASON='check: State check: an authenticated state check produced a new result now. Action required: inspect the result and handle its reported outcome.'
+
 # shellcheck source=tests/lib.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # shellcheck source=/dev/null
@@ -1463,7 +1465,7 @@ test_merged_poll_retires_once() {
   set -e
   [ "$rc" -eq 0 ] || fail "second watcher cycle failed: $(cat "$dir/watch-2.err")"
   second=$(cat "$dir/watch-2.out")
-  case "$second" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "second cycle did not reach the control check: $second" ;; esac
+  case "$second" in "$CONTROL_CHECK_REASON") ;; *) fail "second cycle did not reach the control check: $second" ;; esac
   ! grep -F 'task-a.check.sh: merged' "$dir/watch-2.out" >/dev/null \
     || fail "retired merged poll executed a second time"
   ! grep "$(printf '\tcheck\ttask-a.check.sh\t')" "$state/.wake-queue" >/dev/null 2>&1 \
@@ -1509,7 +1511,7 @@ test_merged_poll_reregistration_after_notification_is_absorbed() {
   set -e
   [ "$rc" -eq 0 ] || fail "second watcher cycle failed: $(cat "$dir/watch-2.err")"
   case "$(cat "$dir/watch-2.out")" in
-    check:*z-stop.check.sh:*stop-cycle) ;;
+    "$CONTROL_CHECK_REASON") ;;
     *) fail "the re-registered duplicate did not fall through to the next check: $(cat "$dir/watch-2.out")" ;;
   esac
   ! grep -F 'task-a.check.sh: merged' "$dir/watch-2.out" >/dev/null \
@@ -1796,7 +1798,7 @@ test_retirement_crash_recovery() {
     || fail "could not seed post-queue crash"
   FM_TEST_GH_STATE=MERGED run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/recovery.out" 2> "$dir/recovery.err" \
     || fail "post-queue crash recovery wake failed: $(cat "$dir/recovery.err")"
-  grep -F 'check: rearm-resurface' "$dir/recovery.out" >/dev/null \
+  grep -F 'check: Fleet supervision recovery:' "$dir/recovery.out" >/dev/null \
     || fail "post-queue crash did not surface its durable recovery first"
   ack_watcher_cycle "$state" || fail "post-queue crash recovery acknowledgement failed"
   set +e
@@ -1841,7 +1843,7 @@ test_retirement_crash_recovery() {
   rc=$?
   set -e
   [ "$rc" -eq 0 ] || fail "post-check-removal restart failed: $(cat "$dir/restart.err")"
-  case "$(cat "$dir/restart.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "post-check-removal restart did not reach the control check" ;; esac
+  case "$(cat "$dir/restart.out")" in "$CONTROL_CHECK_REASON") ;; *) fail "post-check-removal restart did not reach the control check" ;; esac
   assert_poll_absent "$state" task-a
   fm_pr_poll_retirement_recover_one "$state" task-a "$POLL" || fail "completed retirement was not idempotent"
 
@@ -1858,7 +1860,7 @@ test_retirement_crash_recovery() {
   rc=$?
   set -e
   [ "$rc" -eq 0 ] || fail "post-registration-removal restart failed: $(cat "$dir/restart.err")"
-  case "$(cat "$dir/restart.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "post-registration-removal restart did not reach the control check" ;; esac
+  case "$(cat "$dir/restart.out")" in "$CONTROL_CHECK_REASON") ;; *) fail "post-registration-removal restart did not reach the control check" ;; esac
   assert_poll_absent "$state" task-a
 
   dir=$(make_case retirement-before-receipt-removal)
@@ -1874,7 +1876,7 @@ test_retirement_crash_recovery() {
   rc=$?
   set -e
   [ "$rc" -eq 0 ] || fail "receipt-only restart failed: $(cat "$dir/restart.err")"
-  case "$(cat "$dir/restart.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "receipt-only restart did not reach the control check" ;; esac
+  case "$(cat "$dir/restart.out")" in "$CONTROL_CHECK_REASON") ;; *) fail "receipt-only restart did not reach the control check" ;; esac
   assert_poll_absent "$state" task-a
 
   dir=$(make_case retirement-after-template-update)
@@ -1895,7 +1897,7 @@ test_retirement_crash_recovery() {
   add_stop_custom_check "$dir"
   FM_TEST_GH_STATE=MERGED run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/template-recovery.out" 2> "$dir/template-recovery.err" \
     || fail "template-update recovery wake failed: $(cat "$dir/template-recovery.err")"
-  grep -F 'check: rearm-resurface' "$dir/template-recovery.out" >/dev/null \
+  grep -F 'check: Fleet supervision recovery:' "$dir/template-recovery.out" >/dev/null \
     || fail "template-update recovery did not surface its durable wake first"
   ack_watcher_cycle "$state" || fail "template-update recovery acknowledgement failed"
   set +e
@@ -1903,7 +1905,7 @@ test_retirement_crash_recovery() {
   rc=$?
   set -e
   [ "$rc" -eq 0 ] || fail "template-update recovery watcher failed: $(cat "$dir/restart.err")"
-  case "$(cat "$dir/restart.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "template-update recovery did not reach the control check" ;; esac
+  case "$(cat "$dir/restart.out")" in "$CONTROL_CHECK_REASON") ;; *) fail "template-update recovery did not reach the control check" ;; esac
   [ ! -s "$dir/gh.log" ] || fail "template-update migration rebuilt and queried the retired poll"
   ! grep "$(printf '\tcheck\ttask-a.check.sh\t')" "$state/.wake-queue" >/dev/null 2>&1 \
     || fail "template-update recovery left the handled terminal wake queued"
@@ -1940,7 +1942,7 @@ test_external_merge_transition_retires_only_terminal_poll() {
     rc=$?
     set -e
     [ "$rc" -eq 0 ] || fail "$label watcher cycle failed: $(cat "$dir/$label.err")"
-    case "$(cat "$dir/$label.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "$label did not reach the control check" ;; esac
+    case "$(cat "$dir/$label.out")" in "$CONTROL_CHECK_REASON") ;; *) fail "$label did not reach the control check" ;; esac
     [ "$(poll_artifact_snapshot "$state" task-a)" = "$before" ] || fail "$label changed the armed poll"
     ack_watcher_cycle "$state" || fail "$label control wake acknowledgement failed"
   done

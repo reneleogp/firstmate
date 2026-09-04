@@ -2117,7 +2117,7 @@ test_absorbed_replacement_wait_does_not_inherit_the_old_throttle() {
 # successor after firstmate handled a wake, because that is what a supervision
 # turn actually does and it is the only arm that stays in the poll loop instead of
 # re-announcing the previous round's downtime - without it a round exits on
-# `check: rearm-resurface` before it ever reaches the stale path, and every
+# `check: Fleet supervision recovery:` before it ever reaches the stale path, and every
 # absorb assertion below passes vacuously. A live agent (pane_current_command
 # matching the recorded harness) on an idle pane is the exact population
 # pause_state_class answers `none` for.
@@ -3624,7 +3624,7 @@ test_procevent_unacknowledged_result_redrains_until_handled() {
   pid=$!
   wait_for_exit "$pid" 100 \
     || fail "an unacknowledged process-event result was not re-surfaced on re-arm: $(cat "$out")"
-  grep -F 'check: rearm-resurface' "$out" >/dev/null \
+  grep -F 'check: Fleet supervision recovery:' "$out" >/dev/null \
     || fail "the successor did not report recovery for the unacknowledged result: $(cat "$out")"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$replay_out" 2> "$replay_err" \
     || fail "the successor could not re-drain the unacknowledged process-event result"
@@ -3764,7 +3764,7 @@ test_procevent_surface_crash_boundaries() {
   procevent_watch_bg "$dir" "$out.replay"; pid=$!
   wait_for_exit "$pid" 100 \
     || fail "an unacknowledged delivered record was not re-surfaced on re-arm: $(cat "$out.replay")"
-  grep -F 'check: rearm-resurface' "$out.replay" >/dev/null \
+  grep -F 'check: Fleet supervision recovery:' "$out.replay" >/dev/null \
     || fail "the successor did not recover the delivered-but-unacknowledged record: $(cat "$out.replay")"
   replay_err="$out.replay.err"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out.replay.drain" 2> "$replay_err" \
