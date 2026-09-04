@@ -30,7 +30,9 @@ TOKEN = "123:test-token"
 USER_ID = 4242
 CHAT_ID = 9797
 VOICE_BYTES = b"OggS-fake-voice"
-DEADLINE = 10.0
+# Linux CI can briefly queue several isolated bot processes on the shared runner;
+# keep the socket/API wait bounded while allowing that scheduler jitter to settle.
+DEADLINE = 20.0
 
 
 def parse_multipart(body: bytes, boundary: str) -> tuple[dict[str, str],
