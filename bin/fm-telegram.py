@@ -253,15 +253,34 @@ def private_file(path: Path) -> Path:
 
 def write_private(path: Path, content: Union[str, bytes], mode: int) -> None:
     private_file(path)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags, mode)
+    absolute = Path(os.path.abspath(path))
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory or os.open not in os.supports_dir_fd:
+        raise TelegramError("private writes require no-follow directory traversal")
+    flags = os.O_RDONLY | directory | nofollow
+    parent_fd = os.open(absolute.anchor, flags)
+    current = Path(absolute.anchor)
     try:
-        os.fchmod(fd, mode)
-        payload = content if isinstance(content, bytes) else content.encode("utf-8")
-        while payload:
-            payload = payload[os.write(fd, payload):]
+        for component in absolute.parts[1:-1]:
+            current /= component
+            component_flags = flags
+            if current in (Path("/tmp"), Path("/var")):
+                component_flags = os.O_RDONLY | directory
+            next_fd = os.open(component, component_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        file_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow
+        fd = os.open(absolute.parts[-1], file_flags, mode, dir_fd=parent_fd)
+        try:
+            os.fchmod(fd, mode)
+            payload = content if isinstance(content, bytes) else content.encode("utf-8")
+            while payload:
+                payload = payload[os.write(fd, payload):]
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(parent_fd)
 
 
 def home_dir() -> Path:
