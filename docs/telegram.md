@@ -233,7 +233,7 @@ Every button action is bound to the current transcript revision, so a stale or r
 - The service unit holds no token and no message content; the token stays in `~/.firstmate-telegram/env` and pairing stays in `config.json`.
 - Temporary voice audio is owner-only and is deleted after send, cancel, failure, and at bot start and stop; images are never written to disk at all.
 - Transcription memory belongs to the local speech model rather than the bot process, and the service's memory accounting includes the transcriber and its children.
-- `FM_TELEGRAM_DIR` moves the private directory; `bin/fm-telegram.py --help` owns the remaining flags and environment.
+- `FM_TELEGRAM_DIR` moves the private directory, but its directory and parent components must not be symlinks (apart from standard `/tmp` and `/var` aliases), and private files are never followed through symlinks; `bin/fm-telegram.py --help` owns the remaining flags and environment.
 
 The wire protocol between the bot and the Pi extension is stated once in `bin/fm-telegram.py`'s header.
 
