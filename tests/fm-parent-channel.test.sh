@@ -14,6 +14,13 @@ fm_parent_channel_append_once "$valid" 'working: current event'
 fm_parent_channel_append_once "$valid" 'working: current event'
 [ "$(grep -c '^working: current event$' "$valid")" -eq 1 ]
 
+malformed="$TMP/malformed.status"
+printf '%s' 'doneevil: arbitrary\\n' > "$malformed"
+cp "$malformed" "$TMP/malformed.before"
+fm_parent_channel_append_once "$malformed" 'working: ignored' 2>"$TMP/malformed.err"
+cmp -s "$malformed" "$TMP/malformed.before"
+grep -q 'invalid framing' "$TMP/malformed.err"
+
 current="$TMP/current.status"
 printf '%s\n' 'done: current event' > "$current"
 fm_parent_channel_append_once "$current" 'failed: another event'
@@ -34,6 +41,14 @@ cp "$invalid" "$TMP/invalid.before"
 fm_parent_channel_append_once "$invalid" 'working: appended separately' 2>"$TMP/invalid.err"
 cmp -s "$invalid" "$TMP/invalid.before"
 grep -q 'invalid framing' "$TMP/invalid.err"
+
+fifo="$TMP/fifo.status"
+printf '%s' 'done: blocked backup\\n' > "$fifo"
+mkfifo "$fifo.legacy-backup"
+cp "$fifo" "$TMP/fifo.before"
+fm_parent_channel_append_once "$fifo" 'working: ignored' 2>"$TMP/fifo.err"
+cmp -s "$fifo" "$TMP/fifo.before"
+grep -q 'backup is not a regular file' "$TMP/fifo.err"
 
 interrupted="$TMP/interrupted.status"
 printf '%s' 'done: retry me\n' > "$interrupted"
