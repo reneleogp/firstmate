@@ -1,3 +1,1 @@
-$ timeout 180 bash tests/fm-telegram-extension.test.sh
 ok - the Pi mirror bridge mirrors only the live session's terminal submissions and final replies, hides thinking, tools, and operational input, submits queued Telegram text through Pi's own input path in order, toggles with bare /telegram, keeps the footer on the bot's published state, shares Pi's one status line with the status after it, activates when the home records its session instead of waiting for a Pi reload, and stays completely inert in a worker session
-exit=0
