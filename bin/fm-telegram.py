@@ -225,12 +225,22 @@ def log(message: str) -> None:
 # --- configuration ----------------------------------------------------------
 
 
+def _private_path_components(path: Path, create: bool = False) -> Path:
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            trusted_alias = current in (Path("/tmp"), Path("/var"))
+            if not trusted_alias or current == absolute:
+                raise TelegramError(f"private path must not contain a symlink: {current}")
+        if create and not current.exists():
+            current.mkdir()
+    return absolute
+
+
 def private_dir(path: Path) -> Path:
-    if path.is_symlink():
-        raise TelegramError(f"private directory must not be a symlink: {path}")
-    path.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink():
-        raise TelegramError(f"private directory must not be a symlink: {path}")
+    _private_path_components(path, create=True)
     try:
         path.chmod(0o700)
     except OSError:
@@ -239,8 +249,7 @@ def private_dir(path: Path) -> Path:
 
 
 def private_file(path: Path) -> Path:
-    if path.is_symlink():
-        raise TelegramError(f"private file must not be a symlink: {path}")
+    _private_path_components(path)
     return path
 
 
