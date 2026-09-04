@@ -183,8 +183,8 @@ try:
             if not chunk:
                 break
             chunks.append(chunk)
-        if line not in b"".join(chunks).split(b"\\n"):
-            payload = line + b"\\n"
+        if line not in b"".join(chunks).split(b"\n"):
+            payload = line + b"\n"
             while payload:
                 written = os.write(file_fd, payload)
                 payload = payload[written:]
