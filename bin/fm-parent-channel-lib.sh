@@ -43,8 +43,12 @@
 #
 # Lines follow the charter's "<state> [key=<slug>]: <note>" shape and are
 # appended at most once by exact content, so a retried publication cannot
-# duplicate a delivered event. An existing destination must be a regular,
-# non-symlinked file; a missing one is created with its directory.
+# duplicate a delivered event. The append walks every parent component and opens
+# each directory and the destination with no-follow flags while holding an
+# exclusive file lock, so a concurrent replacement cannot redirect the write.
+# An existing destination must be a regular, non-symlinked file; a missing one is
+# created with its directory. The Python append path compares and writes physical
+# newline-delimited records, not a literal backslash-n separator.
 #
 # Return codes, shared by every entry point that resolves the channel:
 #   0  resolved, or appended / already present
