@@ -1,0 +1,4 @@
+regular_write: {"ok":true} 0o600
+final_symlink_refused: TelegramError outside_exists= False
+intermediate_symlink_refused: TelegramError outside_exists= False
+race_attempts: 300 expected_contention_refusals= 208 outside_written= False
