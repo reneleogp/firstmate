@@ -166,11 +166,11 @@ jobs:
           npm install -g tasks-axi
           tasks-axi --version
       - name: Install Python Markdown renderer
-        if: matrix.shard == 1
         run: |
           set -eu
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-mistune
+          python3 -c 'import mistune; print(mistune.__version__)'
       - name: Run portable serial shard ${{ matrix.shard }}
         env:
           # job-total rather than a literal, so shrinking or growing the matrix
