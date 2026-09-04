@@ -385,9 +385,12 @@ classify_signal() {  # <reason-after-colon> <state>
       last=$(last_status_line "$f")
       fm_human_notify_apply_transition "$state" "$task" "$last" || true
       if fm_human_notify_class "$event" >/dev/null 2>&1; then
-        # A human-owned event is current only while it remains the latest
-        # status condition and its edge has not already been recorded.
-        [ "$last" = "$event" ] || continue
+        # Terminal results must remain the latest condition, while a newly
+        # reported decision or blocker remains actionable even if routine work
+        # follows it before the daemon reads the batch.
+        case "$(status_line_verb "$event")" in
+          failed) [ "$last" = "$event" ] || continue ;;
+        esac
         fm_human_notify_pending "$state" "$task" "$event" || continue
       fi
       distilled="${distilled}$(basename "$f"): ${event} | "
@@ -420,7 +423,7 @@ classify_signal() {  # <reason-after-colon> <state>
 # first sight of a non-terminal stale it returns "self" and the caller records a
 # timestamp marker; persistence is escalated by housekeeping's recheck, not here.
 classify_stale() {  # <window> <state> [<span-record> <span-status>]
-  local win=$1 state=$2 record=${3-} rc=${4-} task last event rest
+  local win=$1 state=$2 record=${3-} rc=${4-} task last event rest seen_offset status_size
   task=$(window_to_task "$win" "$state")
   if [ -z "$rc" ]; then
     record=$(status_span_first_actionable_record "$state/$task.status" \
@@ -463,6 +466,12 @@ classify_stale() {  # <window> <state> [<span-record> <span-status>]
       esac
     fi
     if fm_human_notify_class "$last" >/dev/null 2>&1; then
+      seen_offset=$(status_seen_offset "$state" "$task")
+      status_size=$(wc -c < "$state/$task.status" 2>/dev/null | tr -d '[:space:]')
+      if [ "$seen_offset" = "$status_size" ] && [ -n "$status_size" ]; then
+        printf 'self|unchanged human-owned condition'
+        return
+      fi
       if fm_human_notify_pending "$state" "$task" "$last"; then
         printf 'escalate|%s' "$(fm_human_notify_summary "$state" "$task" "$last")"
       else
