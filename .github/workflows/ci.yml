@@ -168,9 +168,10 @@ jobs:
       - name: Install Python Markdown renderer
         run: |
           set -eu
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3-mistune=3.0.2-1build1
-          python3 -c 'import mistune; print(mistune.__version__)'
+          python3 -m venv "$RUNNER_TEMP/mistune"
+          "$RUNNER_TEMP/mistune/bin/python" -m pip install --disable-pip-version-check --no-input 'mistune==3.0.2'
+          echo "$RUNNER_TEMP/mistune/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/mistune/bin/python" -c 'import mistune; print(mistune.__version__)'
       - name: Run portable serial shard ${{ matrix.shard }}
         env:
           # job-total rather than a literal, so shrinking or growing the matrix
