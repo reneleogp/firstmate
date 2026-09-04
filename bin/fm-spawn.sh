@@ -1,17 +1,9 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--display-name <label>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--display-name <label>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> [<firstmate-home>] [--display-name <label>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
-#   --display-name is the task's concise human presentation, normally
-#   "<Project> · <Outcome>". bin/fm-display-name-lib.sh is the single owner of
-#   validation and legacy fallback. Exactly one display_name= is persisted in
-#   task metadata. The immutable task id, endpoint labels and ids, worktree,
-#   routing, control, recovery, cleanup, and incarnation tokens never derive
-#   from it. Duplicate display names are therefore harmless. An omitted value
-#   gets the shared readable fallback. --relaunch preserves the recorded value
-#   unless an explicit --display-name replaces presentation only.
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
 #   per task at intake (AGENTS.md section 7); data/projects.md holds the captain's
@@ -19,12 +11,19 @@
 #   the mode up. A ship spawn additionally reads the brief's recorded
 #   "Delivery contract: mode=<mode>" line and REFUSES a mismatch, so the worker's
 #   instructions and the recorded task delivery cannot drift apart; a brief
-#   scaffolded before that line existed warns once and launches on the flag. When
-#   the explicit mode carries less rigor than the project's standing posture, a
-#   loud one-line deviation notice is printed and the spawn continues.
+#   scaffolded before that line existed warns once and launches on the flag. A
+#   ship or scout spawn also refuses leftover `{TASK}` / `{FIRSTMATE_SPEC}`
+#   placeholders, an empty Task, or an incomplete pair of Task subsections.
+#   For a no-mistakes ship, spawn renders `launch-brief.md` with the current
+#   `--intent` contract and the extracted captain intent. A legacy mixed Task is
+#   accepted there only under bin/fm-dod-lib.sh's provenance-marking rules;
+#   unmarked legacy Tasks stop for migration rather than becoming intent. That
+#   library owns the parsing and intent rules. When the explicit mode carries
+#   less rigor than the project's standing posture, a loud one-line deviation
+#   notice is printed and the spawn continues.
 #   no-mistakes-prod-only is a registry policy rather than a task mode and is
 #   refused as a flag value.
-#        fm-spawn.sh <task-id> --relaunch [--display-name <label>] [--harness <name>] [--model <name>] [--effort <level>]
+#        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>]
 #   --relaunch launches a replacement agent for an EXISTING task into that
 #   task's own recorded endpoint and worktree instead of creating either. It is
 #   the launch half of the control plane (bin/fm-control.sh relaunch), which
@@ -33,10 +32,10 @@
 #   deliberately re-launching an already-stopped task. Every identity axis -
 #   backend, kind, project or home, worktree, endpoint - comes from the task's
 #   validated state/<id>.meta, so --backend, --scout, --secondmate, a project
-#   positional, and batch pairs are all refused alongside it; only the human
-#   display name, harness, model, and effort may change. The display field is
-#   presentation-only, while a harness switch remains one ordinary relaunch.
-#   It refuses unless the recorded endpoint is positively agent-free on a backend with a recovery-grade agent-state classifier (tmux
+#   positional, and batch pairs are all refused alongside it; only harness,
+#   model, and effort may change, which is what makes a harness switch one
+#   ordinary relaunch. It refuses unless the recorded endpoint is positively
+#   agent-free on a backend with a recovery-grade agent-state classifier (tmux
 #   or herdr), refuses unless the endpoint's shell is sitting in the recorded
 #   worktree, and clears the previous harness's per-task wiring before arming
 #   the new incarnation.
@@ -138,23 +137,30 @@
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
 #   see AGENTS.md task lifecycle); --secondmate records kind=secondmate and launches in a
 #   provisioned firstmate home; the default is kind=ship.
-#   Before a secondmate launch, the home is locally fast-forwarded to the primary
-#   default-branch commit when safe; skipped syncs warn and launch unchanged.
+#   Before a secondmate launch, the home is fast-forwarded to the primary's
+#   default-branch commit when safe: directly for a local home, or through the
+#   configured host for a remote home. Skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real
 #   git worktree root distinct from the primary project checkout.
 #   Before a fresh ship or scout worker starts, its clean task worktree fetches
 #   origin, resolves the current remote default branch, and resets to its tip.
 #   An unreachable origin, unresolved default branch, or non-clean worktree
 #   refuses the spawn rather than risking a PR based on stale history.
+#   A slot whose only deviation is a stale submodule gitlink is refused by that
+#   same clean check, but is reported as a stale checkout naming each submodule
+#   and both pins; nothing is converged or removed, and no remedy is suggested.
+#   That report is only reached when each submodule's checked-out commit is
+#   already contained in one of its remotes, so a submodule carrying an unpushed
+#   commit keeps the conservative uncommitted-work refusal instead. That
+#   containment test reads local refs only and never fetches, so this gate stays
+#   usable offline; a stale remote-tracking ref can therefore make an unpushed
+#   commit look contained, which is exactly why no remedy command is printed.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
 #   source of truth; shared --scout/--harness/--model/--effort/--backend/--mode/--yolo
-#   applies to every pair. A shared --display-name also applies to every pair;
-#   duplicate presentations remain mechanically harmless because every child
-#   still owns a distinct immutable id and endpoint. A ship batch therefore
-#   carries one delivery contract, and each pair still checks it against its own
-#   brief; a batch spanning modes is two invocations.
+#   applies to every pair. A ship batch therefore carries one delivery contract, and each
+#   pair still checks it against its own brief; a batch spanning modes is two invocations.
 #   If config/crew-dispatch.json exists, shared --harness is required for crewmate
 #   and scout batches. The loop lives here, in bash, so callers never hand-write a
 #   multi-task shell loop (the tool shell is zsh, which does not word-split unquoted
@@ -187,6 +193,29 @@
 # resolver because `cursor` is not the CLI name. A cursor SECONDMATE instead runs
 # the tracked project-scope .cursor/hooks.json in its own home, whose stop-hook
 # park owns that home's supervision (docs/supervision-protocols/cursor.md).
+# claude is the one harness whose pre-launch setup can REFUSE the spawn: before
+# any per-task state exists, and before its worktree .claude/settings.local.json
+# hooks are written, a non-secondmate claude launch pre-registers the worktree in
+# the launching user's own Claude trust store through bin/fm-claude-trust.sh,
+# because Claude's interactive workspace-trust dialog gates a fresh worktree and
+# firstmate cannot answer it. That helper's header owns the structural scope test
+# and every refusal; a failed registration stops this spawn rather than launching
+# a worker that would wedge on the dialog. A --secondmate launch never runs it,
+# so a claude secondmate home keeps its own one-time trust decision.
+# Publishing the record and moving this home's backlog item to In flight are one
+# step, not two: bin/fm-backlog-transition-lib.sh owns that invariant, and this
+# script performs the transition under the task's own meta lock before it reports
+# success. A ship or scout dispatch therefore REFUSES up front, before any
+# endpoint, worktree, or record exists, unless the home's backlog has an
+# unheld, unblocked Queued or In flight item for the id; a transition that fails
+# after publication removes the record it just wrote rather than leaving a
+# worker the backlog does not own. A relaunch re-reads the row instead of
+# re-running the transition, so an eligible In-flight item is left untouched.
+# The transition is
+# skipped entirely for --secondmate spawns (persistent agents are not work
+# items), on a config/backlog-backend=manual home, and in a home that keeps no
+# data/backlog.md. An automatic-backend home with a backlog but no compatible
+# tasks-axi refuses before creating any lifecycle state.
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> [mode=<mode> yolo=<on|off>] window=<backend-target> worktree=<path>
 # A ship task records the explicit mode/yolo it was passed; a secondmate spawn records
 # mode=secondmate, yolo=off, home=, and projects=; a scout records neither, and both the
@@ -223,8 +252,18 @@ esac
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 
+# shellcheck source=bin/fm-tasks-axi-lib.sh
+. "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
+# shellcheck source=bin/fm-backlog-transition-lib.sh
+. "$SCRIPT_DIR/fm-backlog-transition-lib.sh"
+
 resolve_directory_input() {
-  local name=$1 path=$2 resolved
+  local name=$1 path=$2 resolved raw_bytes
+  raw_bytes=$(fm_backlog_bytes_of_string "$path") || return 1
+  if ! fm_backlog_control_bytes_valid 0 "$raw_bytes"; then
+    echo "error: $name directory contains an invalid control byte" >&2
+    return 1
+  fi
   case "$path" in
     /*) printf '%s\n' "$path"; return 0 ;;
   esac
@@ -247,18 +286,26 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 SUB_HOME_MARKER=".fm-secondmate-home"
+if [ -e "$STATE" ] || [ -L "$STATE" ]; then
+  fm_backlog_directory_present "$STATE" "state directory" || {
+    echo "error: spawn refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
+    exit 1
+  }
+fi
 # shellcheck source=bin/fm-ff-lib.sh
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+fm_backlog_directory_present "$STATE" "state directory" || {
+  echo "error: spawn refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
+  exit 1
+}
 # shellcheck source=bin/fm-secondmate-nudge-lib.sh
 . "$SCRIPT_DIR/fm-secondmate-nudge-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
-# shellcheck source=bin/fm-display-name-lib.sh
-. "$SCRIPT_DIR/fm-display-name-lib.sh"
 # shellcheck source=bin/fm-control-lib.sh
 . "$SCRIPT_DIR/fm-control-lib.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
@@ -269,6 +316,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-cursor-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-dod-lib.sh
+. "$SCRIPT_DIR/fm-dod-lib.sh"
 # shellcheck source=bin/fm-trace-context-lib.sh
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
@@ -288,7 +337,6 @@ BACKEND_ARG=
 MODE=
 YOLO=
 TRACEPARENT_ARG=
-DISPLAY_NAME=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
@@ -296,7 +344,6 @@ BACKEND_SET=0
 MODE_SET=0
 YOLO_SET=0
 TRACEPARENT_SET=0
-DISPLAY_NAME_SET=0
 RELAUNCH=0
 POS=()
 want_value=
@@ -313,7 +360,6 @@ for a in "$@"; do
       mode) MODE=$a; MODE_SET=1 ;;
       yolo) YOLO=$a; YOLO_SET=1 ;;
       traceparent) TRACEPARENT_ARG=$a; TRACEPARENT_SET=1 ;;
-      display-name) DISPLAY_NAME=$a; DISPLAY_NAME_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -337,8 +383,6 @@ for a in "$@"; do
     --yolo=*) YOLO=${a#--yolo=}; YOLO_SET=1 ;;
     --traceparent) want_value=traceparent ;;
     --traceparent=*) TRACEPARENT_ARG=${a#--traceparent=}; TRACEPARENT_SET=1 ;;
-    --display-name) want_value=display-name ;;
-    --display-name=*) DISPLAY_NAME=${a#--display-name=}; DISPLAY_NAME_SET=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -350,7 +394,6 @@ done
 [ "$MODE_SET" -eq 0 ] || [ -n "$MODE" ] || { echo "error: --mode requires a non-empty value" >&2; exit 1; }
 [ "$YOLO_SET" -eq 0 ] || [ -n "$YOLO" ] || { echo "error: --yolo requires a non-empty value" >&2; exit 1; }
 [ "$TRACEPARENT_SET" -eq 0 ] || [ -n "$TRACEPARENT_ARG" ] || { echo "error: --traceparent requires a non-empty value" >&2; exit 1; }
-[ "$DISPLAY_NAME_SET" -eq 0 ] || fm_display_name_validate "$DISPLAY_NAME" || exit 1
 # A parent-delivered carrier replaces this home's own resolution, so it is
 # refused unless it is a secondmate spawn carrying a strictly valid W3C value.
 # Nothing else may reach the pane's TRACEPARENT export.
@@ -389,7 +432,7 @@ else
       exit 1
     }
     [ "$YOLO_SET" -eq 1 ] || {
-      echo "error: ship spawns require --yolo <on|off>; it is this task's routine approval authority, not a project lookup" >&2
+      echo "error: ship spawns require --yolo <on|off>; it is this task's merge authority, not a project lookup" >&2
       exit 1
     }
     case "$MODE" in
@@ -418,7 +461,7 @@ fi
 spawn_remote_secondmate() {
   local id=$1 remote host root home harness positional model effort backend out rc meta tmp
   local remote_backend remote_target remote_harness remote_herdr_session registry_lock remote_lock remote_generation
-  local remote_traceparent remote_recorded_traceparent
+  local remote_traceparent remote_recorded_traceparent sm_primary_head sync_out sync_rc
   local -a launch_args
   id=${POS[0]:-}
   fm_task_id_creation_valid "$id" || { echo "error: invalid task id" >&2; return 2; }
@@ -502,7 +545,7 @@ spawn_remote_secondmate() {
   esac
   meta="$STATE/$id.meta"
   if [ -e "$meta" ] || [ -L "$meta" ]; then
-    if [ ! -f "$meta" ] || [ -L "$meta" ] \
+    if ! fm_backlog_record_present "$meta" "task record" "$STATE" \
       || [ "$(fm_meta_get "$meta" kind)" != secondmate ] \
       || [ "$(fm_meta_get "$meta" remote_host)" != "$host" ] \
       || [ "$(fm_meta_get "$meta" remote_root)" != "$root" ] \
@@ -533,6 +576,21 @@ spawn_remote_secondmate() {
     [ -z "$FM_REMOTE_READINESS_OUT" ] || printf '%s\n' "$FM_REMOTE_READINESS_OUT" >&2
     [ "$rc" -ne 255 ] || return 255
     return 1
+  fi
+  # Pre-launch sync, the remote twin of the local-HEAD sync below: this home
+  # follows THIS primary's default-branch commit, not the Firstmate copy on that
+  # host, so the commit is resolved here and handed over for the host to import
+  # and fast-forward to. A skipped sync warns and launches the home unchanged.
+  if sm_primary_head=$(primary_head_commit "$FM_ROOT"); then
+    if sync_out=$("$SCRIPT_DIR/fm-on.sh" "$id" fm-remote-secondmate-control.sh sync "$id" \
+      "$sm_primary_head" < /dev/null 2>&1); then
+      :
+    else
+      sync_rc=$?
+      echo "warning: remote secondmate $id sync skipped before launch: $(remote_sync_failure_reason "$sync_rc" "$sync_out")" >&2
+    fi
+  else
+    echo "warning: remote secondmate $id sync skipped before launch: primary default-branch commit cannot be resolved" >&2
   fi
   remote_lock=$(fm_remote_inherit_transaction_lock_path "$STATE" "$id")
   if ! fm_lock_acquire_wait "$remote_lock"; then
@@ -574,7 +632,8 @@ spawn_remote_secondmate() {
   if [ "$(fm_trace_context_session_effective "$STATE/.trace-context-effective")" = on ]; then
     remote_traceparent=$(FM_TRACE_CONTEXT=on fm_trace_context_resolve "$CONFIG" "$meta" || true)
   fi
-  launch_args=("$id" "$harness" "$model" "$effort" "$backend" "${remote_traceparent:--}" "$DISPLAY_NAME")
+  launch_args=("$id" "$harness" "$model" "$effort" "$backend")
+  [ -z "$remote_traceparent" ] || launch_args+=("$remote_traceparent")
   if out=$("$SCRIPT_DIR/fm-on.sh" "$id" fm-remote-secondmate-control.sh launch \
     "${launch_args[@]}" < /dev/null 2>&1); then
     rc=0
@@ -595,7 +654,6 @@ spawn_remote_secondmate() {
   remote_target=$(printf '%s\n' "$out" | sed -n 's/^target=//p' | tail -1)
   remote_harness=$(printf '%s\n' "$out" | sed -n 's/^harness=//p' | tail -1)
   remote_herdr_session=$(printf '%s\n' "$out" | sed -n 's/^herdr_session=//p' | tail -1)
-  remote_display_name=$(printf '%s\n' "$out" | sed -n 's/^display_name=//p' | tail -1)
   if [ "$remote_backend" != herdr ]; then
     fm_lock_release "$remote_lock" || true
     fm_lock_release "$registry_lock" || true
@@ -617,14 +675,6 @@ spawn_remote_secondmate() {
     echo "error: remote launch returned Herdr session '${remote_herdr_session:-missing}', expected 'fm-remote'; preserving the remote route for reconciliation" >&2
     return 1
   fi
-  if ! fm_display_name_validate "$remote_display_name" 2>/dev/null; then
-    fm_lock_release "$remote_lock" || true
-    fm_lock_release "$registry_lock" || true
-    fm_lock_release "$SPAWN_TASK_LOCK" || true
-    echo "error: remote launch returned an invalid display name; preserving the remote route for reconciliation" >&2
-    return 1
-  fi
-  DISPLAY_NAME=$remote_display_name
   # Record what the remote endpoint ACTUALLY carries, read back from its own
   # launch, rather than what this side hoped to deliver. That keeps the #995
   # guarantee that the recorded carrier is the identity the child received even
@@ -637,7 +687,6 @@ spawn_remote_secondmate() {
   {
     echo "window=remote:$id"
     echo "endpoint_task_id=$id"
-    echo "display_name=$DISPLAY_NAME"
     echo "worktree=$home"
     echo "project=$root"
     echo "harness=$harness"
@@ -656,7 +705,17 @@ spawn_remote_secondmate() {
     echo "remote_target=$remote_target"
     [ -z "$remote_recorded_traceparent" ] || echo "traceparent=$remote_recorded_traceparent"
   } > "$tmp"
-  mv -f -- "$tmp" "$meta"
+  if ! fm_backlog_atomic_transition publish "$tmp" "$meta" "task record" "$STATE"; then
+    if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
+      SPAWN_TASK_SET_LOCK_HELD=0
+      fm_lock_release "$SPAWN_TASK_SET_LOCK" || true
+    fi
+    fm_lock_release "$remote_lock" || true
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: remote secondmate $id launched, but its task record could not be published ($FM_BACKLOG_TRANSITION_ERROR)" >&2
+    return 1
+  fi
   if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_SET_LOCK_HELD=0
     fm_lock_release "$SPAWN_TASK_SET_LOCK"
@@ -664,6 +723,7 @@ spawn_remote_secondmate() {
   fm_lock_release "$remote_lock" || true
   fm_lock_release "$registry_lock" || true
   fm_lock_release "$SPAWN_TASK_LOCK" || true
+  "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
   if ! "$SCRIPT_DIR/fm-procevent-remote-reply.sh" arm "$id" >/dev/null; then
     echo "error: remote secondmate $id launched, but its reply source could not be armed; endpoint metadata is preserved" >&2
     return 1
@@ -691,6 +751,7 @@ SPAWN_META_TMP=
 SPAWN_META_LOCK=
 SPAWN_META_LOCK_HELD=0
 SPAWN_META_PUBLISH_STARTED=0
+SPAWN_FRESH_COMMIT_PENDING=0
 SPAWN_TASK_SET_LOCK=
 SPAWN_TASK_SET_LOCK_HELD=0
 RELAUNCH_REPLACEMENT_PENDING=0
@@ -700,6 +761,16 @@ RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
+
+spawn_fresh_commit_rollback() {
+  if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
+      "$FM_ROOT/bin/fm-busy-event.sh" "$STATE" "$ID" "${BUSY_GEN:-}"; then
+    SPAWN_FRESH_COMMIT_PENDING=0
+    return 0
+  fi
+  echo "error: $FM_BACKLOG_TRANSITION_ERROR" >&2
+  return 1
+}
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -769,10 +840,19 @@ spawn_abort_cleanup() {
     fi
     if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
       if ! fm_backend_remove_worktree orca "$ORCA_WORKTREE_ID" 2>/dev/null; then
+        if [ "$SPAWN_FRESH_COMMIT_PENDING" = 1 ]; then
+          if ! spawn_fresh_commit_rollback; then
+            status=1
+          fi
+          SPAWN_FRESH_COMMIT_PENDING=0
+        fi
         mkdir -p "$STATE" 2>/dev/null || true
         if [ -d "$STATE" ]; then
+          SPAWN_META_TMP="$STATE/.$ID.meta.orca-recovery.${BASHPID:-$$}"
           {
             echo "window=$W"
+            echo "endpoint_task_id=$ID"
+            echo "cleanup_recovery=orca"
             echo "worktree=${WT:-}"
             echo "project=$PROJ_ABS"
             echo "harness=$HARNESS"
@@ -785,7 +865,9 @@ spawn_abort_cleanup() {
             echo "backend=orca"
             echo "orca_worktree_id=$ORCA_WORKTREE_ID"
             [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
-          } > "$STATE/$ID.meta" 2>/dev/null || true
+          } > "$SPAWN_META_TMP" 2>/dev/null \
+            && fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$STATE/$ID.meta" "task record" "$STATE" \
+            || true
         fi
       fi
     fi
@@ -793,6 +875,11 @@ spawn_abort_cleanup() {
   if [ "$SPAWN_TASK_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_LOCK_HELD=0
     fm_lock_release "$SPAWN_TASK_LOCK" || true
+  fi
+  if [ "$SPAWN_FRESH_COMMIT_PENDING" = 1 ]; then
+    if ! spawn_fresh_commit_rollback; then
+      status=1
+    fi
   fi
   if [ "$SPAWN_META_LOCK_HELD" = 1 ]; then
     SPAWN_META_LOCK_HELD=0
@@ -891,7 +978,6 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
-  [ "$DISPLAY_NAME_SET" -eq 0 ] || shared_args+=(--display-name "$DISPLAY_NAME")
   # One delivery contract applies to every pair in a batch, exactly like the shared
   # harness. Each pair still re-validates it against its own brief, so a batch
   # spanning several modes is two invocations rather than a silent mixed dispatch.
@@ -916,19 +1002,35 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
 fi
 ID=${POS[0]}
 fm_task_id_creation_valid "$ID" || { echo "error: invalid task id" >&2; exit 2; }
-if [ "$RELAUNCH" -eq 0 ] && [ "$DISPLAY_NAME_SET" -eq 0 ]; then
-  DISPLAY_NAME=$(fm_display_name_fallback "$ID")
-  PRIOR_META="$STATE/$ID.meta"
-  if [ -f "$PRIOR_META" ] && [ ! -L "$PRIOR_META" ] \
-    && [ "$(fm_backend_meta_exact_value "$PRIOR_META" endpoint_task_id 2>/dev/null || true)" = "$ID" ]; then
-    DISPLAY_NAME=$(fm_display_name_for_meta "$PRIOR_META" "$ID")
-  fi
+if [ -e "$STATE" ] || [ -L "$STATE" ]; then
+  fm_backlog_directory_present "$STATE" "state directory" || {
+    echo "error: spawn refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
+    exit 1
+  }
+elif [ "$RELAUNCH" -eq 1 ]; then
+  echo "error: spawn refused: state directory does not exist at $STATE" >&2
+  exit 1
+fi
+# Role partition: spawning NEW work is MAIN-owned. A relaunch of an existing
+# task is legitimate branch recovery (fm-control drives it through this same
+# entrypoint), so only a fresh spawn refuses the branch actor (contract:
+# bin/fm-lease-lib.sh; no-op in homes without a branch actor).
+# shellcheck source=bin/fm-lease-lib.sh
+. "$SCRIPT_DIR/fm-lease-lib.sh"
+if [ "$RELAUNCH" -ne 1 ]; then
+  fm_lease_forbid_branch "new-task spawn (fm-spawn)"
 fi
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_CONTROL_LOCK="$STATE/.control-$ID.lock"
   control_owner=$(cat "$SPAWN_CONTROL_LOCK/pid" 2>/dev/null || true)
   if [ "$control_owner" = "$PPID" ] && fm_pid_alive "$control_owner"; then
     SPAWN_CONTROL_PARENT=1
+  elif [ "$(fm_lease_actor)" = branch ]; then
+    # Role partition refinement: branch recovery relaunches only through the
+    # fm-control transaction that owns the control lock, never by invoking
+    # this entrypoint directly (contract: bin/fm-lease-lib.sh).
+    echo "error: relaunch (fm-spawn) refused - the supervision branch must relaunch through fm-control" >&2
+    exit "$FM_LEASE_REFUSE_EXIT"
   elif fm_lock_try_acquire "$SPAWN_CONTROL_LOCK"; then
     SPAWN_CONTROL_LOCK_HELD=1
   else
@@ -939,6 +1041,10 @@ fi
 if [ "$RELAUNCH" -eq 0 ]; then
   mkdir -p "$STATE" || {
     echo "error: could not create parent state directory" >&2
+    exit 1
+  }
+  fm_backlog_directory_present "$STATE" "state directory" || {
+    echo "error: spawn refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
     exit 1
   }
   # A FRESH spawn changes which tasks this home has, so it must not interleave
@@ -980,7 +1086,7 @@ fi
 # non-spawn-capable backends. The resolved value is
 # recorded in meta only when it is NOT tmux (fm-teardown.sh and fm-watch.sh's
 # window_backend/fm_backend_of_meta already treat an absent backend= as tmux),
-# preserving the default path's historical backend-field representation.
+# so the default path's meta stays byte-identical.
 if [ "$RELAUNCH" -eq 0 ]; then
   if [ "$BACKEND_SET" -eq 1 ]; then
     BACKEND=$BACKEND_ARG
@@ -1023,14 +1129,22 @@ if [ "$RELAUNCH" -eq 1 ]; then
     exit 1
   }
   RELAUNCH_META="$STATE/$ID.meta"
-  [ -f "$RELAUNCH_META" ] || {
+  if [ ! -e "$RELAUNCH_META" ] && [ ! -L "$RELAUNCH_META" ]; then
     echo "error: --relaunch needs an existing task record; no $RELAUNCH_META" >&2
+    exit 1
+  fi
+  fm_backlog_record_present "$RELAUNCH_META" "task record" "$STATE" || {
+    echo "error: --relaunch refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
+    exit 1
+  }
+  SPAWN_META_LOCK=$(fm_meta_lock_path "$RELAUNCH_META") || exit 1
+  fm_lock_acquire_wait "$SPAWN_META_LOCK"
+  SPAWN_META_LOCK_HELD=1
+  fm_backlog_record_present "$RELAUNCH_META" "task record" "$STATE" || {
+    echo "error: --relaunch refused after locking: $FM_BACKLOG_TRANSITION_ERROR" >&2
     exit 1
   }
   fm_backend_validate_task_endpoint "$RELAUNCH_META" "$ID" || exit 1
-  if [ "$DISPLAY_NAME_SET" -eq 0 ]; then
-    DISPLAY_NAME=$(fm_display_name_for_meta "$RELAUNCH_META" "$ID")
-  fi
   BACKEND=$FM_BACKEND_VALIDATED_BACKEND
   RELAUNCH_TARGET=$FM_BACKEND_VALIDATED_TARGET
   fm_backend_validate_spawn "$BACKEND" || exit 1
@@ -1151,7 +1265,17 @@ launch_template() {
     # does NOT suppress the interactive ghost text (verified empirically), so the env
     # var is the correct control. The dim-aware composer reader in fm-tmux-lib.sh is
     # the defense-in-depth backstop for any pane this flag cannot reach.
-    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    # Two independent controls disable claude's `/bug`/`/feedback` model-drafted
+    # feedback flow (the SendFeedback tool), deliberately layered so a fleet-launched
+    # agent never queues or submits a bug-report draft on the captain's behalf even
+    # under a managed Claude settings policy: CLAUDE_CODE_SEND_FEEDBACK=0 is read
+    # directly and is not subject to managed-settings precedence, while --settings
+    # '{"feedbackDrafts":"off"}' sets the documented settings key (Claude Code
+    # changelog 2.1.247) that a managed policy CAN override back on. Either control
+    # alone disables the feature; keep both so a managed override of one still
+    # leaves the other in force. Both are per-launch, scoped to this invocation only,
+    # and never touch the captain's global ~/.claude/settings.json.
+    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude --dangerously-skip-permissions --settings '\''{"feedbackDrafts":"off"}'\'' __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     codex)
       if [ "$kind" = secondmate ]; then
         printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
@@ -1612,7 +1736,11 @@ validate_firstmate_operational_dirs() {
 }
 
 if [ "$KIND" = secondmate ]; then
-  if [ -z "$FIRSTMATE_HOME" ] && [ -f "$STATE/$ID.meta" ]; then
+  if [ -z "$FIRSTMATE_HOME" ] && { [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; }; then
+    fm_backlog_record_present "$STATE/$ID.meta" "task record" "$STATE" || {
+      echo "error: secondmate task record is unsafe: $FM_BACKLOG_TRANSITION_ERROR" >&2
+      exit 1
+    }
     FIRSTMATE_HOME=$(grep '^home=' "$STATE/$ID.meta" | cut -d= -f2- || true)
   fi
   if [ -z "$FIRSTMATE_HOME" ]; then
@@ -1638,7 +1766,13 @@ if [ "$KIND" = secondmate ]; then
   # repo and already holds the commit. ff-only and guarded; a dirty, diverged, or
   # wrong-branch home is left untouched and launches as-is. The agent re-reads
   # AGENTS.md fresh on launch, so no nudge is needed here.
-  if sm_primary_head=$(primary_head_commit "$FM_ROOT"); then
+  # On a remote host this spawn is the host-local leg of a launch whose parent has
+  # already synced the home to ITS primary commit, and $FM_ROOT here is only that
+  # host's own Firstmate copy; syncing again would target the wrong checkout, so
+  # the caller turns this step off (bin/fm-remote-secondmate-control.sh).
+  if [ "${FM_SKIP_SECONDMATE_SYNC:-0}" = 1 ]; then
+    :
+  elif sm_primary_head=$(primary_head_commit "$FM_ROOT"); then
     sm_ff_out=$(ff_target "$PROJ_ABS" "secondmate $ID" "$sm_primary_head" yes yes 2>&1 || true)
     case "$sm_ff_out" in
       *': skipped:'*)
@@ -1681,7 +1815,41 @@ else
   WT=""
   BRIEF="$DATA/$ID/brief.md"
 fi
-[ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+[ -f "$BRIEF" ] || { echo "error: task $ID has no brief at inaccessible data path $BRIEF" >&2; exit 1; }
+if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
+  if fm_brief_task_placeholders_present "$BRIEF"; then
+    echo "error: $BRIEF still contains {TASK} or {FIRSTMATE_SPEC}; fill ## Captain's intent and ## Firstmate spec before spawn" >&2
+    exit 1
+  fi
+  if ! fm_brief_task_content_valid "$BRIEF"; then
+    echo "error: $BRIEF must contain nonempty ## Captain's intent and ## Firstmate spec subsections (or a nonempty legacy # Task body) before spawn" >&2
+    exit 1
+  fi
+  if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ]; then
+    if fm_brief_task_heading_present "$BRIEF" "## Captain's intent"; then
+      CAPTAIN_INTENT=$(fm_brief_task_heading_body "$BRIEF" "## Captain's intent")
+    else
+      LEGACY_TASK_BODY=$(fm_brief_heading_body "$BRIEF" "# Task")
+      CAPTAIN_INTENT=$(fm_brief_marked_captain_words "$LEGACY_TASK_BODY")
+      if [ -z "$(printf '%s' "$CAPTAIN_INTENT" | tr -d '[:space:]')" ]; then
+        echo "error: legacy mixed # Task brief has no provenance-marked captain words for no-mistakes --intent; add Captain: lines or migrate to ## Captain's intent and ## Firstmate spec" >&2
+        exit 1
+      fi
+    fi
+    SOURCE_BRIEF=$BRIEF
+    BRIEF="$DATA/$ID/launch-brief.md"
+    BRIEF_TMP="$DATA/$ID/.launch-brief.md.${BASHPID:-$$}"
+    {
+      cat "$SOURCE_BRIEF"
+      fm_brief_intent_overlay "$CAPTAIN_INTENT"
+    } > "$BRIEF_TMP" || { rm -f -- "$BRIEF_TMP"; echo "error: could not render current intent contract for $SOURCE_BRIEF" >&2; exit 1; }
+    if ! mv "$BRIEF_TMP" "$BRIEF"; then
+      rm -f -- "$BRIEF_TMP"
+      echo "error: could not publish current intent contract for $SOURCE_BRIEF" >&2
+      exit 1
+    fi
+  fi
+fi
 
 delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
   case "$1" in
@@ -1767,6 +1935,47 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
+# A pooled slot whose only deviation is a submodule gitlink is stale, not dirty:
+# an earlier refresh moved the superproject and left the submodule checkout on
+# the pin the previous base recorded. The refusal still stands and this gate
+# never touches the slot; it only names the cause, because "is not clean" while
+# the operator's own `git status` reads clean gives neither a cause nor a remedy.
+# A pin is only reported as stale when the commit the slot holds is already
+# contained in one of the submodule's remotes. Anything that cannot be proven
+# contained - an unpushed commit, a submodule with no remote, a git error - falls
+# through to the conservative uncommitted-work refusal, as does any entry that is
+# not exactly a clean submodule sitting on a different pin. The diagnosis is
+# buffered and only emitted once every entry qualifies, so it can never
+# contradict the verdict.
+#
+# No remedy command is printed, deliberately. That containment check reads local
+# refs only and never fetches, because this gate has to stay usable offline. A
+# remote-tracking ref that has gone stale - its upstream branch deleted or
+# force-pushed, and never pruned - therefore still reads as containment, so a
+# commit that is really unpushed can look contained. Naming the submodule and both
+# pins is what the operator actually needs; printing a checkout command on a
+# judgement that can be fooled could cost them that commit, so the remedy is left
+# to the operator, who can see the whole picture.
+describe_stale_submodule_pins() {  # <worktree> <status>
+  local worktree=$1 status=$2 line path want have unpushed lines=
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case $line in ' M '*) path=${line#' M '} ;; *) return 1 ;; esac
+    [ "$(git -C "$worktree" ls-files --stage -- "$path" 2>/dev/null | cut -c1-6)" = 160000 ] || return 1
+    [ -z "$(git -C "$worktree/$path" status --porcelain 2>/dev/null)" ] || return 1
+    want=$(git -C "$worktree" rev-parse --verify --quiet "HEAD:$path" 2>/dev/null) || return 1
+    have=$(git -C "$worktree/$path" rev-parse --verify --quiet HEAD 2>/dev/null) || return 1
+    [ "$want" != "$have" ] || return 1
+    unpushed=$(git -C "$worktree/$path" log --format=%H --max-count=1 "$have" --not --remotes -- 2>/dev/null) || return 1
+    [ -z "$unpushed" ] || return 1
+    lines+="error: submodule '$path' is checked out at $have, but this base records $want"$'\n'
+  done <<EOF
+$status
+EOF
+  [ -n "$lines" ] || return 1
+  printf '%s' "$lines" >&2
+}
+
 freshen_spawn_worktree_base() {  # <worktree>
   local worktree=$1 default target expected actual status
   if ! git -C "$worktree" fetch --quiet origin; then
@@ -1790,12 +1999,16 @@ freshen_spawn_worktree_base() {  # <worktree>
     echo "error: '$target' is not a commit for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
     return 1
   }
-  status=$(git -C "$worktree" status --porcelain) || {
+  status=$(git -C "$worktree" -c core.quotePath=false status --porcelain) || {
     echo "error: could not inspect pooled worktree '$worktree' before refreshing its base" >&2
     return 1
   }
   if [ -n "$status" ]; then
-    echo "error: pooled worktree '$worktree' is not clean; refusing to discard uncommitted work while refreshing its base" >&2
+    if describe_stale_submodule_pins "$worktree" "$status"; then
+      echo "error: pooled worktree '$worktree' has a stale submodule checkout, not uncommitted work; refusing to launch and leaving it untouched" >&2
+    else
+      echo "error: pooled worktree '$worktree' is not clean; refusing to discard uncommitted work while refreshing its base" >&2
+    fi
     return 1
   fi
   if ! git -C "$worktree" reset --hard "$target" >/dev/null; then
@@ -1884,6 +2097,46 @@ herdr_projection_existing_meta_allows_flat() {  # <meta>
       ;;
   esac
 }
+
+# Backlog preflight (bin/fm-backlog-transition-lib.sh). This spawn is about to
+# become the sole owner of the row's In-flight transition, so prove the row is
+# transitionable BEFORE any endpoint, worktree, or record exists: a refusal here
+# costs nothing to unwind, while the same refusal after publication would strand
+# a live pane. The authoritative mutation still runs under the meta lock below.
+BACKLOG_TRANSITION=0
+BACKLOG_ROW_STATE=
+if fm_backlog_transition_applies "$CONFIG" "$DATA" "$KIND"; then
+  BACKLOG_TRANSITION=1
+  if fm_backlog_row_probe "$DATA" "$ID"; then
+    BACKLOG_ROW_STATE=$FM_BACKLOG_ROW_STATE
+  elif [ "$FM_BACKLOG_ROW_RESULT" = not_found ]; then
+    echo "error: task $ID has no backlog item in this home, so dispatching it would leave a worker no record owns; add it first (tasks-axi add $ID '<title>' --kind $KIND) and re-run" >&2
+    exit 1
+  else
+    echo "error: task $ID's backlog item could not be read before dispatch ($FM_BACKLOG_ROW_ERROR)" >&2
+    exit 1
+  fi
+  if ! fm_backlog_row_dispatchable "$BACKLOG_ROW_STATE"; then
+    echo "error: this home's backlog item $ID is not dispatchable in state $BACKLOG_ROW_STATE; refusing before creating its endpoint or local copy" >&2
+    exit 1
+  fi
+else
+  BACKLOG_GATE_STATUS=$?
+  if [ "$BACKLOG_GATE_STATUS" -eq 2 ]; then
+    echo "error: task $ID cannot be dispatched because its backlog data directory is inaccessible: $DATA ($FM_BACKLOG_TRANSITION_ERROR)" >&2
+    exit 1
+  fi
+fi
+
+if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
+  SPAWN_META_LOCK=$(fm_meta_lock_path "$STATE/$ID.meta") || exit 1
+  fm_lock_acquire_wait "$SPAWN_META_LOCK"
+  SPAWN_META_LOCK_HELD=1
+fi
+if [ -e "$STATE/$ID.backlog-close" ] || [ -L "$STATE/$ID.backlog-close" ]; then
+  echo "error: task $ID has a pending authoritative backlog close at $STATE/$ID.backlog-close; finish or repair that close before dispatching a new worker" >&2
+  exit 1
+fi
 
 W="fm-$ID"
 if [ "$RELAUNCH" -eq 1 ]; then
@@ -2012,8 +2265,7 @@ case "$BACKEND" in
             spawn_herdr_presentation_order_lock_release
           else
             HERDR_PROJECTION_ID=$(fm_backend_herdr_projection_journal_create "$STATE" "$ID") || exit 1
-            HERDR_PROJECTION_LABEL=$(fm_backend_herdr_projection_workspace_label \
-              "$ID" "$HERDR_PROJECTION_ID" "$DISPLAY_NAME")
+            HERDR_PROJECTION_LABEL=$(fm_backend_herdr_projection_workspace_label "$ID" "$HERDR_PROJECTION_ID")
             if ! FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_projection_create_task \
               "$PROJ_ABS" "$HERDR_PROJECTION_LABEL" "$W"; then
               if [ "${FM_BACKEND_HERDR_PROJECTION_CLEANUP_SAFE:-0}" = 1 ]; then
@@ -2303,6 +2555,28 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   freshen_spawn_worktree_base "$WT" || exit 1
+fi
+
+# Pre-register Claude's workspace trust for the worktree, at the first point the
+# worktree is known and before any per-task state is created below. The dialog
+# gates the pane before the brief is ever read, and it also gates loading the
+# project settings written further down, so nothing armed below takes effect
+# without it. bin/fm-claude-trust.sh owns the structural scope test and refuses
+# any path that is not this project's own isolated worktree; a refusal blocks the
+# spawn rather than launching a worker that would wedge on a dialog firstmate
+# cannot answer. Refusing here rather than beside the arm keeps this in the same
+# class as the two worktree refusals just above: no temp root, no retired
+# relaunch wiring and no busy record exists yet to strand, so the refusal names
+# the endpoint the same way they do and leaves nothing else behind.
+if [ "$KIND" != secondmate ]; then
+  case "$HARNESS" in
+    claude*)
+      if ! "$FM_ROOT/bin/fm-claude-trust.sh" "$WT" "$PROJ_ABS" >/dev/null; then
+        echo "error: could not pre-register Claude workspace trust for $WT; refusing to launch a claude worker that would wedge on the trust dialog; inspect window $T" >&2
+        exit 1
+      fi
+      ;;
+  esac
 fi
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
@@ -2663,17 +2937,22 @@ META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
 SPAWN_GEN="s$(date +%s).${BASHPID:-$$}.$RANDOM"
 SPAWN_META_PATH="$STATE/$ID.meta"
-if [ "$RELAUNCH" -eq 1 ]; then
+if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
   SPAWN_META_LOCK=$(fm_meta_lock_path "$STATE/$ID.meta") || exit 1
   fm_lock_acquire_wait "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=1
-  SPAWN_META_TMP="$STATE/.$ID.meta.relaunch.${BASHPID:-$$}"
-  SPAWN_META_PATH=$SPAWN_META_TMP
 fi
+if [ "$RELAUNCH" -eq 1 ]; then
+  SPAWN_META_TMP="$STATE/.$ID.meta.relaunch.${BASHPID:-$$}"
+else
+  SPAWN_META_TMP="$STATE/.$ID.meta.spawn.${BASHPID:-$$}"
+  SPAWN_FRESH_COMMIT_PENDING=1
+fi
+SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id display_name worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -2682,7 +2961,6 @@ preserve_relaunch_meta() {
 {
   echo "window=$META_WINDOW"
   echo "endpoint_task_id=$ID"
-  echo "display_name=$DISPLAY_NAME"
   echo "worktree=$WT"
   echo "project=$PROJ_ABS"
   echo "harness=$HARNESS"
@@ -2695,9 +2973,9 @@ preserve_relaunch_meta() {
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
   # Default-off writes no traceparent= line.
-  # backend= is written only for a non-default (non-tmux) backend, preserving
-  # the default path's absent backend field (data/fm-backend-design-d7's P1
-  # compatibility contract).
+  # backend= is written only for a non-default (non-tmux) backend, so the
+  # default path's meta stays byte-identical (absent backend= means tmux;
+  # data/fm-backend-design-d7's P1 compatibility contract).
   [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
   if [ "$BACKEND" = herdr ]; then
     echo "herdr_session=$HERDR_SES"
@@ -2728,16 +3006,44 @@ preserve_relaunch_meta() {
   if [ "$SPAWN_CONTROL_PARENT" = 1 ] && [ -n "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
     echo "control_relaunch_tx=$FM_CONTROL_RELAUNCH_TX"
   fi
-} > "$SPAWN_META_PATH"
+} > "$SPAWN_META_PATH" || {
+  echo "error: task record for $ID could not be prepared at $SPAWN_META_PATH" >&2
+  exit 1
+}
+if [ "$RELAUNCH" -eq 0 ]; then
+  if ! fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$STATE/$ID.meta" "task record" "$STATE"; then
+    echo "error: task record for $ID could not be published ($FM_BACKLOG_TRANSITION_ERROR)" >&2
+    exit 1
+  fi
+  SPAWN_META_TMP=
+fi
+
+# Fuse the backlog In-flight transition into the publication that just created
+# the record (bin/fm-backlog-transition-lib.sh owns the invariant). It runs under
+# this task's own meta lock, so a steer or teardown racing the same id stays
+# serialized exactly as before. The call itself is deferred to the final commit
+# point below so every earlier launch-delivery failure remains unwindable.
+spawn_commit_backlog_transition() {
+  [ "$BACKLOG_TRANSITION" = 1 ] || return 0
+  fm_backlog_atomic_transition dispatch "$STATE/$ID.meta" "$DATA" "$ID" "$STATE"
+}
+
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_PUBLISH_STARTED=1
-  mv -f "$SPAWN_META_TMP" "$STATE/$ID.meta"
+  if ! fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$STATE/$ID.meta" "task record" "$STATE"; then
+    echo "error: replacement task record for $ID could not be published ($FM_BACKLOG_TRANSITION_ERROR)" >&2
+    exit 1
+  fi
   RELAUNCH_REPLACEMENT_PENDING=0
   SPAWN_META_PUBLISH_STARTED=0
   SPAWN_META_TMP=
-  fm_lock_release "$SPAWN_META_LOCK"
-  SPAWN_META_LOCK_HELD=0
 fi
+# A dispatch or relaunch keeps the per-task meta lock through launch delivery.
+# The backlog mutation is deliberately the final fallible commit below, so
+# teardown cannot remove a relaunched record while its replacement worker is
+# still being delivered, cannot observe or complete a fresh provisional record
+# between its state check and `tasks-axi start`, and a delivery failure cannot
+# follow a committed In-flight transition.
 if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
   # The record is published, so this task is now part of the set a teardown
   # enumerates and locks per task. The set lock is only needed across that
@@ -2745,6 +3051,7 @@ if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
   SPAWN_TASK_SET_LOCK_HELD=0
   fm_lock_release "$SPAWN_TASK_SET_LOCK"
 fi
+"$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
 sq_brief=$(shell_quote "$BRIEF")
@@ -2808,21 +3115,28 @@ if [ -z "$SPAWN_TRACEPARENT" ] && [ "$RELAUNCH" -eq 1 ]; then
 fi
 
 spawn_record_traceparent() {
-  local meta="$STATE/$ID.meta" tmp status=0
-  SPAWN_META_LOCK=$(fm_meta_lock_path "$meta") || return 1
-  fm_lock_acquire_wait "$SPAWN_META_LOCK"
-  SPAWN_META_LOCK_HELD=1
+  local meta="$STATE/$ID.meta" status=0 acquired=0
+  # Fresh publication still owns the lock. Relaunch deliberately uses a short
+  # independent critical section so other metadata interfaces can serialize.
+  if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
+    SPAWN_META_LOCK=$(fm_meta_lock_path "$meta") || return 1
+    fm_lock_acquire_wait "$SPAWN_META_LOCK"
+    SPAWN_META_LOCK_HELD=1
+    acquired=1
+  fi
   SPAWN_META_TMP="$STATE/.$ID.meta.trace.${BASHPID:-$$}"
   if [ ! -f "$meta" ] || [ ! -w "$meta" ] \
      || ! awk -F= '$1 != "traceparent"' "$meta" > "$SPAWN_META_TMP" \
      || ! printf 'traceparent=%s\n' "$SPAWN_TRACEPARENT" >> "$SPAWN_META_TMP" \
-     || ! mv -f "$SPAWN_META_TMP" "$meta"; then
+     || ! fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$meta" "task record" "$STATE"; then
     status=1
     rm -f "$SPAWN_META_TMP" 2>/dev/null || true
   fi
   SPAWN_META_TMP=
-  fm_lock_release "$SPAWN_META_LOCK" || status=1
-  SPAWN_META_LOCK_HELD=0
+  if [ "$acquired" = 1 ]; then
+    fm_lock_release "$SPAWN_META_LOCK" || status=1
+    SPAWN_META_LOCK_HELD=0
+  fi
   return "$status"
 }
 
@@ -2864,12 +3178,12 @@ if [ "$HARNESS" = kimi ]; then
   KIMI_SUBMIT_RETRIES=${FM_KIMI_SUBMIT_RETRIES:-3}
   KIMI_SUBMIT_SLEEP=${FM_KIMI_SUBMIT_SLEEP:-${FM_KIMI_POLL_INTERVAL:-0.5}}
   KIMI_SUBMIT_SETTLE=${FM_KIMI_SUBMIT_SETTLE:-0}
-  KIMI_SUBMIT_VERDICT=$(fm_backend_send_text_submit \
-    "$BACKEND" "$T" "$KIMI_POINTER" "$KIMI_SUBMIT_RETRIES" \
-    "$KIMI_SUBMIT_SLEEP" "$KIMI_SUBMIT_SETTLE" "$W") || {
+  if ! KIMI_SUBMIT_VERDICT=$(fm_backend_send_text_submit \
+      "$BACKEND" "$T" "$KIMI_POINTER" "$KIMI_SUBMIT_RETRIES" \
+      "$KIMI_SUBMIT_SLEEP" "$KIMI_SUBMIT_SETTLE" "$W"); then
     kimi_spawn_fail "kimi brief pointer could not be submitted"
     exit 1
-  }
+  fi
   if [ "$KIMI_SUBMIT_VERDICT" = send-failed ]; then
     kimi_spawn_fail "kimi brief pointer could not be submitted"
     exit 1
@@ -2879,12 +3193,6 @@ if [ "$HARNESS" = kimi ]; then
     exit 1
   fi
 fi
-# Presentation is deliberately late and best-effort: endpoint creation,
-# metadata publication, routing, and launch all completed against machine
-# identity first. A renderer failure cannot strand or retarget the worker.
-if ! fm_backend_present_task "$BACKEND" "$T" "$DISPLAY_NAME" "$W"; then
-  echo "warning: task $ID launched, but the $BACKEND display name could not be rendered" >&2
-fi
 if [ "$KIND" = secondmate ] && [ "${FM_SKIP_SECONDMATE_INHERIT:-0}" != 1 ]; then
   if ! fm_config_reread_discard_pending "$PROJ_ABS" "$ID" "$FM_HOME"; then
     if fm_config_reread_quarantine_pending "$PROJ_ABS" "$ID" "$FM_HOME"; then
@@ -2893,6 +3201,57 @@ if [ "$KIND" = secondmate ] && [ "${FM_SKIP_SECONDMATE_INHERIT:-0}" != 1 ]; then
       echo "CONFIG_REREAD: secondmate $ID: cleanup failed; pre-relaunch generations were force-cleared where possible (destination=$PROJ_ABS source=$FM_HOME)" >&2
     fi
   fi
+fi
+
+# This is the commit point: all endpoint and harness delivery that can reject
+# the spawn has succeeded. Re-read and transition while holding the same
+# per-task lock as metadata publication, then and only then report success.
+if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
+  SPAWN_META_LOCK=$(fm_meta_lock_path "$STATE/$ID.meta") || exit 1
+  fm_lock_acquire_wait "$SPAWN_META_LOCK"
+  SPAWN_META_LOCK_HELD=1
+fi
+SPAWN_DEFERRED_SIGNAL=
+if [ "$BACKLOG_TRANSITION" = 1 ]; then
+  trap 'SPAWN_DEFERRED_SIGNAL=HUP' HUP
+  trap 'SPAWN_DEFERRED_SIGNAL=INT' INT
+  trap 'SPAWN_DEFERRED_SIGNAL=TERM' TERM
+fi
+SPAWN_BACKLOG_COMMIT_STATUS=0
+if spawn_commit_backlog_transition; then
+  SPAWN_FRESH_COMMIT_PENDING=0
+else
+  SPAWN_BACKLOG_COMMIT_STATUS=$?
+  if spawn_commit_backlog_transition; then
+    SPAWN_BACKLOG_COMMIT_STATUS=0
+    SPAWN_FRESH_COMMIT_PENDING=0
+  fi
+fi
+if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
+  if [ "$RELAUNCH" -eq 0 ]; then
+    if spawn_fresh_commit_rollback; then
+      echo "error: task $ID's backlog item could not be moved to In flight ($FM_BACKLOG_TRANSITION_ERROR); its record was removed so no worker is left that the backlog does not own - close out endpoint $T and local copy $WT by hand, then re-run the spawn" >&2
+    else
+      echo "error: task $ID's backlog item could not be moved to In flight ($FM_BACKLOG_TRANSITION_ERROR), and failed-dispatch cleanup is incomplete; the provisional record may remain at $STATE/$ID.meta - close out endpoint $T and local copy $WT by hand, then remove the record and busy state before retrying" >&2
+    fi
+  else
+    echo "error: task $ID was republished but its backlog item could not be moved to In flight ($FM_BACKLOG_TRANSITION_ERROR); fix the backlog and re-run the relaunch" >&2
+  fi
+fi
+trap - HUP INT TERM
+if [ "$SPAWN_BACKLOG_COMMIT_STATUS" -ne 0 ]; then
+  exit "$SPAWN_BACKLOG_COMMIT_STATUS"
+fi
+fm_lock_release "$SPAWN_META_LOCK"
+SPAWN_META_LOCK_HELD=0
+if [ -n "$SPAWN_DEFERRED_SIGNAL" ]; then
+  case "$SPAWN_DEFERRED_SIGNAL" in
+    HUP) SPAWN_DEFERRED_SIGNAL_STATUS=129 ;;
+    INT) SPAWN_DEFERRED_SIGNAL_STATUS=130 ;;
+    TERM) SPAWN_DEFERRED_SIGNAL_STATUS=143 ;;
+  esac
+  echo "error: spawn of $ID was interrupted after launch delivery began; its paired task record and In-flight backlog state were preserved" >&2
+  exit "$SPAWN_DEFERRED_SIGNAL_STATUS"
 fi
 
 SPAWN_DELIVERY=
