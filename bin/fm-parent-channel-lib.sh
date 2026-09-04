@@ -174,12 +174,14 @@ try:
         fd = next_fd
 
     leaf = parts[-1] if parts else ""
-    file_flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | flags
-    file_fd = os.open(leaf, file_flags, 0o600, dir_fd=fd)
+    lock_name = leaf + ".lock"
+    lock_fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | flags, 0o600, dir_fd=fd)
     try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        file_flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | flags
+        file_fd = os.open(leaf, file_flags, 0o600, dir_fd=fd)
         if not stat.S_ISREG(os.fstat(file_fd).st_mode):
             raise OSError(errno.EINVAL, "parent channel is not a regular file")
-        fcntl.flock(file_fd, fcntl.LOCK_EX)
         os.lseek(file_fd, 0, os.SEEK_SET)
         chunks = []
         while True:
@@ -187,13 +189,93 @@ try:
             if not chunk:
                 break
             chunks.append(chunk)
-        if line not in b"".join(chunks).split(b"\n"):
+        contents = b"".join(chunks)
+        migration_blocked = False
+
+        def report(message):
+            print(f"parent channel migration: {path}: {message}", file=sys.stderr)
+
+        def legacy_record(record):
+            return (
+                record.startswith((b"working", b"done", b"failed", b"blocked",
+                                   b"paused", b"needs-decision", b"resolved",
+                                   b"captain-held"))
+                and b":" in record
+                and not any(byte < 32 and byte not in (9,) for byte in record)
+            )
+
+        if b"\\n" in contents:
+            backup_name = os.path.basename(leaf) + ".legacy-backup"
+            legacy_parts = contents.split(b"\\n")
+            valid = (
+                b"\\n" not in legacy_parts[-1]
+                and legacy_parts[-1] == b""
+                and len(legacy_parts) > 1
+                and all(legacy_record(record) for record in legacy_parts[:-1])
+            )
+            if b"\n" in contents:
+                valid = False
+                migration_blocked = True
+                report("ambiguous framing; left unchanged")
+            if valid:
+                try:
+                    backup_fd = os.open(
+                        backup_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags,
+                        0o600, dir_fd=fd)
+                except FileExistsError:
+                    backup_fd = None
+                    existing_backup_fd = os.open(backup_name, os.O_RDONLY | flags, dir_fd=fd)
+                    try:
+                        saved = b""
+                        while True:
+                            chunk = os.read(existing_backup_fd, 65536)
+                            if not chunk:
+                                break
+                            saved += chunk
+                    finally:
+                        os.close(existing_backup_fd)
+                    if saved != contents:
+                        valid = False
+                        migration_blocked = True
+                        report("backup disagrees with legacy contents; left unchanged")
+                if valid and backup_fd is not None:
+                    try:
+                        payload = contents
+                        while payload:
+                            written = os.write(backup_fd, payload)
+                            payload = payload[written:]
+                        os.fsync(backup_fd)
+                    finally:
+                        os.close(backup_fd)
+                if valid:
+                    converted = b"\n".join(legacy_parts[:-1]) + b"\n"
+                    temp_name = f".{os.path.basename(leaf)}.legacy-migration.{os.getpid()}"
+                    temp_fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags,
+                                      0o600, dir_fd=fd)
+                    try:
+                        payload = converted
+                        while payload:
+                            written = os.write(temp_fd, payload)
+                            payload = payload[written:]
+                        os.fsync(temp_fd)
+                    finally:
+                        os.close(temp_fd)
+                    os.rename(temp_name, leaf, src_dir_fd=fd, dst_dir_fd=fd)
+                    os.close(file_fd)
+                    file_fd = os.open(leaf, file_flags, 0o600, dir_fd=fd)
+                    contents = converted
+            elif not (b"\n" in contents):
+                migration_blocked = True
+                report("invalid framing; left unchanged")
+
+        if not migration_blocked and line not in contents.split(b"\n"):
             payload = line + b"\n"
             while payload:
                 written = os.write(file_fd, payload)
                 payload = payload[written:]
-    finally:
         os.close(file_fd)
+    finally:
+        os.close(lock_fd)
 finally:
     os.close(fd)
 PY
