@@ -198,7 +198,7 @@ try:
 
         legacy_record_pattern = re.compile(
             rb"^(?:working|done|failed|blocked|paused|needs-decision|resolved|captain-held)"
-            rb"(?: (?:corr=[0-9a-f]{16} )?(?:\[key=[A-Za-z0-9._-]+\])?)?: [^\x00-\x1f]+$"
+            rb"(?: \[(?:corr=[A-Fa-f0-9]{16}|key=[A-Za-z0-9._-]+)\])*: [^\x00-\x1f]+$"
         )
 
         def legacy_record(record):
