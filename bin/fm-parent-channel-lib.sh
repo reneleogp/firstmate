@@ -298,7 +298,10 @@ try:
                 migration_blocked = True
                 report("invalid framing; left unchanged")
 
-        if not migration_blocked and line not in contents.split(b"\n"):
+        if migration_blocked:
+            raise OSError(errno.EINVAL, "parent channel migration blocked")
+
+        if line not in contents.split(b"\n"):
             payload = line + b"\n"
             while payload:
                 written = os.write(file_fd, payload)

@@ -17,7 +17,10 @@ fm_parent_channel_append_once "$valid" 'working: current event'
 malformed="$TMP/malformed.status"
 printf '%s' 'doneevil: arbitrary\\n' > "$malformed"
 cp "$malformed" "$TMP/malformed.before"
-fm_parent_channel_append_once "$malformed" 'working: ignored' 2>"$TMP/malformed.err"
+if fm_parent_channel_append_once "$malformed" 'working: ignored' 2>"$TMP/malformed.err"; then
+  printf '%s\n' 'malformed framing unexpectedly succeeded' >&2
+  exit 1
+fi
 cmp -s "$malformed" "$TMP/malformed.before"
 grep -q 'invalid framing' "$TMP/malformed.err"
 
@@ -30,7 +33,9 @@ ambiguous="$TMP/ambiguous.status"
 printf '%s\n' 'done: one\nfailed: two' > "$ambiguous"
 cp "$ambiguous" "$TMP/ambiguous.before"
 if fm_parent_channel_append_once "$ambiguous" 'working: ignored' 2>"$TMP/ambiguous.err"; then
-  :
+  fail='ambiguous framing unexpectedly succeeded'
+  printf '%s\n' "$fail" >&2
+  exit 1
 fi
 cmp -s "$ambiguous" "$TMP/ambiguous.before"
 grep -q 'ambiguous framing' "$TMP/ambiguous.err"
@@ -38,7 +43,10 @@ grep -q 'ambiguous framing' "$TMP/ambiguous.err"
 invalid="$TMP/invalid.status"
 printf '%s' 'not-a-record\n' > "$invalid"
 cp "$invalid" "$TMP/invalid.before"
-fm_parent_channel_append_once "$invalid" 'working: appended separately' 2>"$TMP/invalid.err"
+if fm_parent_channel_append_once "$invalid" 'working: appended separately' 2>"$TMP/invalid.err"; then
+  printf '%s\n' 'invalid framing unexpectedly succeeded' >&2
+  exit 1
+fi
 cmp -s "$invalid" "$TMP/invalid.before"
 grep -q 'invalid framing' "$TMP/invalid.err"
 
@@ -46,7 +54,10 @@ fifo="$TMP/fifo.status"
 printf '%s' 'done: blocked backup\\n' > "$fifo"
 mkfifo "$fifo.legacy-backup"
 cp "$fifo" "$TMP/fifo.before"
-fm_parent_channel_append_once "$fifo" 'working: ignored' 2>"$TMP/fifo.err"
+if fm_parent_channel_append_once "$fifo" 'working: ignored' 2>"$TMP/fifo.err"; then
+  printf '%s\n' 'FIFO backup unexpectedly succeeded' >&2
+  exit 1
+fi
 cmp -s "$fifo" "$TMP/fifo.before"
 grep -q 'backup is not a regular file' "$TMP/fifo.err"
 
