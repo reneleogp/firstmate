@@ -221,7 +221,7 @@ fm_push_transition_apply_status() {  # <state> <window> <backend-status>
 # Act on a fresh actionable transition from a push-capable backend.
 handle_push_transition() {  # <backend> <session> <record>
   local backend=$1 session=$2 record=$3 pane_id to window task reason last display
-  local span_record rest surface_end='' surface_ident=''
+  local span_record rest surface_end='' surface_ident='' queue_reason
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
@@ -267,7 +267,8 @@ handle_push_transition() {  # <backend> <session> <record>
   else
     reason="stale: $display: live supervision reported the worker $to without a declared wait. Action required: inspect the worker and choose recovery."
   fi
-  fm_wake_append stale "$window" "$reason" || exit 1
+  queue_reason="$reason (herdr: agent $to)"
+  fm_wake_append stale "$window" "$queue_reason" || exit 1
   fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
   mark_surfaced "$STATE/$task.status" "$surface_end" "$surface_ident"
   fm_human_notify_record "$STATE" "$task" "$last" 2>/dev/null || true
