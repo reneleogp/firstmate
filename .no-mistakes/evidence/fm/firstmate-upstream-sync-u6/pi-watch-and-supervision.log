@@ -1,0 +1,23 @@
+$ bash tests/fm-pi-watch-extension.test.sh
+ok - Pi extension reports external healthy watcher output
+ok - Pi redundant tool call returns ownership guidance and spawns no second child
+ok - Pi acknowledged late close is absorbed before model invocation
+ok - Pi away takeover retires an in-flight ordinary cycle and return restores exactly one
+ok - Pi late unretired closes resume classified supervision
+ok - Pi close handler verifies session-lock ownership before successor launch
+ok - Pi watcher arm distinguishes all session lock ownership states
+ok - Pi replacement replays a streaming follow-up before consumption
+ok - Pi streaming-time wake delivery keeps the successor chain and replays only unconsumed wakes
+ok - OpenCode watcher plugin requires session lock ownership
+ok - OpenCode late unretired closes resume classified supervision
+ok - OpenCode close handler verifies session-lock ownership before successor launch
+
+$ bash tests/fm-daemon.test.sh
+ok - captain signal escalate marks seen so the catch-all scan does not re-fire
+ok - an actionable event is escalated to an away captain despite later routine appends
+ok - the daemon commits exactly the endpoint captured by classification
+ok - the away-mode catch-all scan surfaces a masked event once
+ok - classify_stale dedupes against the signal path seen marker
+
+$ bash tests/fm-telegram-extension.test.sh
+ok - the Pi mirror bridge mirrors only the live session's terminal submissions and final replies, hides thinking, tools, and operational input, submits queued Telegram text through Pi's own input path in order, toggles with bare /telegram, keeps the footer on the bot's published state, shares Pi's one status line with the status after it, activates when the home records its session instead of waiting for a Pi reload, and stays completely inert in a worker session

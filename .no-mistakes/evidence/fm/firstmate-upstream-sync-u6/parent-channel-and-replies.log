@@ -1,0 +1,10 @@
+$ bash tests/fm-parent-channel.test.sh
+parent-channel migration tests passed
+
+$ bash tests/fm-pending-reply.test.sh
+ok - concurrent escalation yields to a late correlated reply
+ok - undelivered records remain immutable across scan paths
+ok - delivery confirmation fallback reconciles durably
+ok - delivery confirmation serializes with reconciliation
+ok - tick end-to-end: miss -> one recovery -> escalate -> durable
+ok - same-basename reply resolves at the recovery failure boundary
