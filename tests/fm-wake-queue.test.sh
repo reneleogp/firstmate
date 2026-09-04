@@ -546,8 +546,14 @@ test_enrichment_preserves_all_unread_lines_and_status_file_failures() {
   [ "$raw_count" -eq 13 ] || fail "missing, unreadable, malformed, empty, or oversized status input hid a raw row"
 
   expected="wake annotation: latest wake-EVENT observed at drain, not current state: huge.status: $(cat "$state/huge.status")"
-  grep -Fx "$expected" "$out" >/dev/null \
-    || fail "the oversized unread status line was truncated or omitted"
+  # Do not pass the 20KB expected line as grep's command-line pattern.  The
+  # macOS grep used by portable validation can report "out of memory" for that
+  # otherwise valid invocation; compare the executable output line-by-line.
+  found=false
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$line" = "$expected" ]; then found=true; break; fi
+  done < "$out"
+  [ "$found" = true ] || fail "the oversized unread status line was truncated or omitted"
   i=1
   while [ "$i" -le 8 ]; do
     expected="wake annotation: latest wake-EVENT observed at drain, not current state: many-$i.status: $(cat "$state/many-$i.status")"
