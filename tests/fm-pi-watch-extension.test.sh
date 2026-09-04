@@ -397,6 +397,13 @@ await waitFor(
   () => existsSync(`${process.env.FM_HOME}/state/.pi-watch-away-standdown`),
   "generation-bound away standdown receipt",
 );
+const standdownReceipt = readFileSync(
+  `${process.env.FM_HOME}/state/.pi-watch-away-standdown`,
+  "utf8",
+).split("\n");
+if (!standdownReceipt[2] || standdownReceipt[3] !== "") {
+  throw new Error(`away standdown receipt did not carry exactly one owner generation: ${JSON.stringify(standdownReceipt)}`);
+}
 await new Promise((resolve) => setTimeout(resolve, 100));
 if (rows().length !== 1) throw new Error(`away takeover launched an ordinary successor: ${rows().join(" | ")}`);
 if (prompts.length !== 0) throw new Error(`away takeover delivered the retiring turn-end: ${prompts.join(" | ")}`);
