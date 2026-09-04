@@ -37,6 +37,24 @@ VOICE_BYTES = b"OggS-fake-voice"
 DEADLINE = 10.0
 
 
+def parse_systemd_unit(unit: str) -> dict[str, dict[str, list[str]]]:
+    """Parse the generated unit into its section/key/value model."""
+    sections: dict[str, dict[str, list[str]]] = {}
+    section: Optional[dict[str, list[str]]] = None
+    for line in unit.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = sections.setdefault(line[1:-1], {})
+            continue
+        if section is None or "=" not in line:
+            raise ValueError(f"invalid systemd unit line: {line}")
+        key, value = line.split("=", 1)
+        section.setdefault(key, []).append(value)
+    return sections
+
+
 def parse_multipart(body: bytes, boundary: str) -> tuple[dict[str, str],
                                                          list[tuple[str, str, bytes]]]:
     """Minimal reader for exactly the shape the bot uploads."""
@@ -2089,12 +2107,23 @@ class ServiceUnitTestCase(unittest.TestCase):
             self.assertTrue(payload["KeepAlive"])
             self.assertEqual(payload["ProcessType"], "Interactive")
         else:
-            self.assertIn("WantedBy=default.target", unit)
-            self.assertIn(f"{BOT} run", unit)
-            self.assertIn(f"Environment=FM_HOME={firstmate_home}", unit)
+            sections = parse_systemd_unit(unit)
+            self.assertEqual(sections["Install"]["WantedBy"], ["default.target"])
+            service = sections["Service"]
+            self.assertEqual(service["Type"], ["simple"])
+            self.assertEqual(service["ExecStart"], [
+                f"{sys.executable} {shlex.quote(str(BOT))} run",
+            ])
+            self.assertEqual(
+                {entry.split("=", 1)[0]: entry.split("=", 1)[1]
+                 for entry in service["Environment"]},
+                {"FM_TELEGRAM_DIR": tmp, "FM_HOME": firstmate_home},
+            )
+            self.assertEqual(service["Restart"], ["always"])
+            self.assertEqual(service["RestartSec"], ["5"])
             # The bot's own stop is bounded; the unit must not fall back to the 90s
             # default that killed it in the field.
-            self.assertIn("TimeoutStopSec=20", unit)
+            self.assertEqual(service["TimeoutStopSec"], ["20"])
         self.assertNotIn(TOKEN, unit)
 
     def test_service_install_refuses_outside_wsl(self) -> None:
