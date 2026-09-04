@@ -1,0 +1,8 @@
+$ ruby semantic workflow validation
+workflow semantics: shared Markdown install and mistune import verification precede the serial test step for matrix shards 1..4
+$ PATH=/tmp/fm-test-venv/bin:$PATH /bin/bash tests/fm-telegram-mirror.test.sh
+result: FAIL on macOS host: 59 failures/1 error from Unix peer-authentication or path-format assumptions; formatted cases reached the real bot but suite could not complete.
+$ bin/fm-test-run.sh --check-coverage
+FM_TEST_COVERAGE ok total=185 parallel=24 serial=148 serial_shards=4 serial_unhinted=9 herdr=13
+$ /bin/bash tests/fm-lint-workflows.test.sh
+result: PASS (current workflow YAML parses)
