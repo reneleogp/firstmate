@@ -108,7 +108,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 try:  # Debian/Ubuntu: python3-mistune
     import mistune
@@ -220,12 +220,35 @@ def log(message: str) -> None:
 
 
 def private_dir(path: Path) -> Path:
+    if path.is_symlink():
+        raise TelegramError(f"private directory must not be a symlink: {path}")
     path.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise TelegramError(f"private directory must not be a symlink: {path}")
     try:
         path.chmod(0o700)
     except OSError:
         pass
     return path
+
+
+def private_file(path: Path) -> Path:
+    if path.is_symlink():
+        raise TelegramError(f"private file must not be a symlink: {path}")
+    return path
+
+
+def write_private(path: Path, content: Union[str, bytes], mode: int) -> None:
+    private_file(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, mode)
+    try:
+        os.fchmod(fd, mode)
+        payload = content if isinstance(content, bytes) else content.encode("utf-8")
+        while payload:
+            payload = payload[os.write(fd, payload):]
+    finally:
+        os.close(fd)
 
 
 def home_dir() -> Path:
@@ -276,9 +299,11 @@ def read_config(home: Path) -> dict[str, Any]:
 
 def write_config(home: Path, data: dict[str, Any]) -> None:
     private_dir(home)
-    target = config_file(home)
-    target.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    target.chmod(0o600)
+    write_private(
+        config_file(home),
+        json.dumps(data, indent=2, sort_keys=True) + "\n",
+        0o600,
+    )
 
 
 @dataclass
@@ -401,8 +426,7 @@ class TelegramApi:
         return await asyncio.to_thread(self.request_sync, method, params or {}, timeout)
 
     def _download(self, file_path: str, target: Path, timeout: float) -> None:
-        target.write_bytes(self._fetch(file_path, MAX_VOICE_BYTES, timeout))
-        target.chmod(0o600)
+        write_private(target, self._fetch(file_path, MAX_VOICE_BYTES, timeout), 0o600)
 
     def _fetch(self, file_path: str, limit: int, timeout: float) -> bytes:
         url = f"{self._base}/file/bot{self._token}/{file_path}"
@@ -1032,10 +1056,8 @@ class MirrorBot:
                 try:
                     line = await reader.readline()
                 except (ValueError, asyncio.LimitOverrunError):
-                    # A frame past the bound is refused without tearing the
-                    # session down for every later message.
-                    log("ignored an oversized frame from the Firstmate session")
-                    continue
+                    log("closing the Firstmate session after an oversized frame")
+                    break
                 if not line:
                     break
                 try:
