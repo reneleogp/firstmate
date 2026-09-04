@@ -205,8 +205,8 @@ test_handling_successor_does_not_go_blind() {
     wait "$child" 2>/dev/null || true
     fail "handling successor did not surface the crew event within the bounded startup-and-poll budget (waited $(( $(date +%s) - event_start ))s): $(cat "$out")"
   fi
-  grep -F 'crew.status' "$out" >/dev/null \
-    || { kill -TERM "$child" 2>/dev/null || true; fail "handling successor did not name the crew status file: $(cat "$out")"; }
+  grep -F 'signal: Crew: a new result surfaced.' "$out" >/dev/null \
+    || { kill -TERM "$child" 2>/dev/null || true; fail "handling successor did not render the crew result readably: $(cat "$out")"; }
   grep "$(printf '\tsignal\tcrew.status\t')" "$state/.wake-queue" >/dev/null \
     || { kill -TERM "$child" 2>/dev/null || true; fail "handling successor did not enqueue a durable row for the crew event"; }
   ! grep -F 'check: Fleet supervision recovery:' "$out" >/dev/null \

@@ -1056,7 +1056,7 @@ surface_nonterminal_stale() {  # <window> <hash>
     fi
   fi
   if [ "$throttled" -ne 0 ]; then
-    fm_wake_append stale "$win" "$reason" || exit 1
+    fm_wake_append stale "$win" "stale: $win" || exit 1
   fi
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key"
@@ -1893,7 +1893,7 @@ while :; do
         else
           check_display='State check'
         fi
-        reason="check: $check_display: an authenticated state check produced a new result now. Action required: inspect the result and handle its reported outcome."
+        reason="check: $check_display: an authenticated state check produced a new result now. Action required: inspect the result and handle its reported outcome. $out"
         if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
           merge_outcome_rc=0
           fm_merge_outcome_report "$FM_HOME" "$STATE" "$id" "$url" poll \
