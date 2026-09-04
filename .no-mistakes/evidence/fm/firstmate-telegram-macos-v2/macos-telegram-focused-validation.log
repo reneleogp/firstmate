@@ -1,0 +1,5 @@
+installed /var/folders/gk/2vqhl8hj213dqcsd4t3726wm0000gn/T/tmp0q20wzxu/com.firstmate.telegram.plist and started com.firstmate.telegram
+removed /var/folders/gk/2vqhl8hj213dqcsd4t3726wm0000gn/T/tmp0q20wzxu/com.firstmate.telegram.plist
+focused Darwin identity/service checks: PASS
+python compile: PASS
+actual macOS socketpair peer identity: {'pid_matches': True, 'uid_matches': True}

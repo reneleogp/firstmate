@@ -1,0 +1,12 @@
+test_an_unverified_first_client_is_refused (__main__.MirrorTestCase) ... ok
+test_a_second_session_cannot_take_over_or_leak_into_the_chat (__main__.MirrorTestCase) ... ok
+test_telegram_text_reaches_pi_unchanged_and_is_confirmed (__main__.MirrorTestCase) ... ok
+test_darwin_peer_identity_uses_kernel_pid_and_getpeereid (__main__.PeerIdentityTestCase) ... ok
+test_macos_unit_and_lifecycle_carry_no_secret (__main__.ServiceUnitTestCase) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 5.061s
+
+OK
+installed /var/folders/gk/2vqhl8hj213dqcsd4t3726wm0000gn/T/tmpgynq4wnu/com.firstmate.telegram.plist and started com.firstmate.telegram
+removed /var/folders/gk/2vqhl8hj213dqcsd4t3726wm0000gn/T/tmpgynq4wnu/com.firstmate.telegram.plist
