@@ -1214,6 +1214,50 @@ run_check_capture() {
 # no verb) are skipped. A 1 here is NOT "benign" on its own: a no-verb signal
 # still needs the authoritative working proof or the eligible opt-in bare
 # turn-end pane-churn proof before it is benign.
+# Convert actionable status signals to the human-facing reason while keeping
+# routing paths in the durable queue.  A missing or non-actionable summary falls
+# back to the machine reason so unknown signals remain observable.
+signal_human_reason() {  # <pending-scan-output>
+  local pending=$1 sf sig f task line summary reason='' seen=''
+  while IFS=$(printf '\t') read -r sf sig f; do
+    [ -n "$f" ] || continue
+    case " $seen " in *" $f "*) continue ;; esac
+    seen="$seen $f"
+    case "$f" in
+      *.status)
+        task=$(basename "$f"); task=${task%.status}
+        line=$(last_status_line "$f" 2>/dev/null || true)
+        summary=$(fm_human_notify_summary "$STATE" "$task" "$line" 2>/dev/null || true)
+        [ -n "$summary" ] || continue
+        reason="${reason}${reason:+ | }$summary"
+        ;;
+    esac
+  done <<EOF
+$pending
+EOF
+  if [ -n "$reason" ]; then
+    printf 'signal: %s' "$reason"
+  else
+    printf 'signal: A worker update changed. Action required: inspect the durable fleet status.'
+  fi
+}
+
+stale_human_reason() {  # <window> <fallback-reason>
+  local window=$1 fallback=$2 task line summary
+  task=$(window_to_task "$window" "$STATE")
+  [ -n "$task" ] || { printf '%s' "$fallback"; return; }
+  line=$(last_status_line "$STATE/$task.status" 2>/dev/null || true)
+  case "$(fm_human_notify_class "$line" 2>/dev/null || true)" in
+    review-ready) summary=$(fm_human_notify_summary "$STATE" "$task" "$line" 2>/dev/null || true) ;;
+    *) summary= ;;
+  esac
+  if [ -n "$summary" ]; then
+    printf 'stale: %s' "$summary"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
 signal_files_actionable() {  # <status-file> ...
   local f task record rest endpoint ident rc found=1
   FM_SIGNAL_SURFACE_ENDPOINTS=''
@@ -1673,7 +1717,11 @@ while :; do
         fi
       fi
       if [ -n "$out" ]; then
-        reason="check: $c: $out"
+        if [ "$is_pr_poll" -eq 0 ] && [ "$(basename "$c")" = task.check.sh ]; then
+          reason="check: State check: an authenticated state check produced a new result now. Action required: inspect the result and handle its reported outcome."
+        else
+          reason="check: $c: $out"
+        fi
         if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
           merge_outcome_rc=0
           fm_merge_outcome_report "$FM_HOME" "$STATE" "$id" "$url" poll \
@@ -1727,6 +1775,8 @@ while :; do
 $pending
 EOF
     reason="signal:$files"
+    human_reason=$(signal_human_reason "$pending")
+    [ -z "$human_reason" ] || reason="$human_reason"
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
     #   - the away-mode daemon owns triage (afk) and wants every wake;
     #   - any status file gained a captain-relevant event since it was last
@@ -1873,7 +1923,7 @@ EOF
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             fm_wake_append stale "$w" "stale: $w" || exit 1
             printf '%s' "$h" > "$sf"
-            wake "stale: $w"
+            wake "$(stale_human_reason "$w" "stale: $w")"
           fi
         elif stale_is_terminal "$w" "$STATE"; then
           # The log's last line is captain-relevant - but that alone is not
@@ -1908,7 +1958,7 @@ EOF
                 *) stale_end=''; stale_ident='' ;;
               esac
               mark_surfaced "$stale_status" "$stale_end" "$stale_ident"
-              wake "stale: $w"
+              wake "$(stale_human_reason "$w" "stale: $w")"
             fi
           elif [ -e "$ssf" ]; then
             # This exact hash was already overridden as provably-working (a
