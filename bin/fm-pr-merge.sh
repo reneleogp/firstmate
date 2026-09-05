@@ -404,7 +404,8 @@ github_read_outcome() {
     FM_PR_GITHUB_QUEUE_OBSERVED=false
     printf 'error: GitHub merge outcome was not successful: state=unknown, merged=false, isInMergeQueue=unknown\n' >&2
     printf 'error: the merge queue could not be observed for %s because the queue-aware read was unavailable; re-check the pull request'"'"'s merge queue state before retrying\n' "$URL" >&2
-    return 0
+    printf 'error: could not read the GitHub pull request outcome after the merge attempt: the gh-axi view could not prove the outcome either; PR metadata and merge poll remain recorded\n' >&2
+    return 1
   fi
   # Only a failed gh read falls back. A gh read that completes and reports the
   # pull request as neither merged nor queued is a concrete outcome, not a
@@ -589,10 +590,13 @@ github_report_queue_rules() {
 github_report_unmerged_outcome() {
   printf 'error: GitHub merge outcome was not successful: state=%s, merged=%s, isInMergeQueue=%s\n' \
     "$FM_PR_GITHUB_STATE" "$FM_PR_GITHUB_MERGED" "$FM_PR_GITHUB_QUEUED" >&2
-  if ! github_state_is_open || [ "$FM_PR_GITHUB_MERGED" != false ] \
-    || [ "$FM_PR_GITHUB_QUEUED" = true ]; then
+  if [ "$FM_PR_GITHUB_MERGED" != false ] || [ "$FM_PR_GITHUB_QUEUED" = true ]; then
     return 0
   fi
+  case "$FM_PR_GITHUB_STATE" in
+    [oO][pP][eE][nN]|unknown) ;;
+    *) return 0 ;;
+  esac
   if [ "$FM_PR_GITHUB_AUTO_REQUESTED" = true ]; then
     if github_merge_command_succeeded; then
       printf 'error: auto-merge was requested and armed for %s, but nothing is merged or in the merge queue yet, so this run refuses instead of reporting an unproved merge\n' \

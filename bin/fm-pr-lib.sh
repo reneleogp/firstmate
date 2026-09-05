@@ -254,10 +254,16 @@ fm_pr_file_identity() {
 }
 
 fm_pr_sha256() {
-  if command -v shasum >/dev/null 2>&1; then
+  if [ -x /usr/bin/shasum ]; then
+    /usr/bin/shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
   elif command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" 2>/dev/null | awk -F'= ' '{print $2}'
+  elif command -v perl >/dev/null 2>&1; then
+    perl -MDigest::SHA=sha256_hex -e 'print sha256_hex(do { local $/; open my $f, "<", $ARGV[0] or exit 1; <$f> })' "$1"
   else
     return 1
   fi

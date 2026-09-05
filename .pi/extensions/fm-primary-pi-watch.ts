@@ -58,6 +58,7 @@ type PendingActionableClose = {
   token: string;
   message: string;
   predecessorArmPid: string;
+  deliverySequence?: string;
   delivered?: true;
 };
 
@@ -103,6 +104,7 @@ type SessionGeneration = {
   // still delivering the wake it was started for; its bounded retry runs once
   // that delivery settles instead of being skipped by the single-flight guard.
   deferredClose: { message: string; predecessorArmPid: string } | null;
+  armToolCalled: boolean;
 };
 
 function refreshWatchToolShell(
@@ -288,6 +290,9 @@ function validatePendingActionable(value: unknown): PendingActionableClose {
     !actionableLine((value as { message: string }).message) ||
     typeof (value as { predecessorArmPid?: unknown }).predecessorArmPid !== "string" ||
     !/^[0-9]*$/.test((value as { predecessorArmPid: string }).predecessorArmPid) ||
+    ((value as { deliverySequence?: unknown }).deliverySequence !== undefined &&
+      (typeof (value as { deliverySequence?: unknown }).deliverySequence !== "string" ||
+        !/^[0-9]+$/.test((value as { deliverySequence: string }).deliverySequence))) ||
     ((value as { delivered?: unknown }).delivered !== undefined &&
       (value as { delivered?: unknown }).delivered !== true)
   ) {
@@ -422,6 +427,7 @@ function createGeneration(): SessionGeneration {
     cleanupFailure: "",
     unconsumedWakes: new Map(),
     deferredClose: null,
+    armToolCalled: false,
   };
 }
 
@@ -551,7 +557,10 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function confirmHandlingDelivery(recovery: { generation: string; watcherPid: string }): {
+  function confirmHandlingDelivery(
+    recovery: { generation: string; watcherPid: string },
+    pending: PendingActionableClose,
+  ): {
     ok: boolean;
     detail: string;
   } {
@@ -583,14 +592,15 @@ export default function (pi: ExtensionAPI) {
   function confirmHandlingDeliveryWithRetry(
     owner: SessionGeneration,
     recovery: { generation: string; watcherPid: string },
+    pending: PendingActionableClose,
   ): { ok: boolean; detail: string } {
     const snapshot = (): { generation: string; watcherPid: string } => {
       const current = owner.child ? armRecovery.get(owner.child) : undefined;
       return current ?? recovery;
     };
-    const first = confirmHandlingDelivery(snapshot());
+    const first = confirmHandlingDelivery(snapshot(), pending);
     if (first.ok) return first;
-    return confirmHandlingDelivery(snapshot());
+    return confirmHandlingDelivery(snapshot(), pending);
   }
 
   function offerWakeToBranch(message: string): Promise<void> | null {
@@ -621,7 +631,7 @@ export default function (pi: ExtensionAPI) {
   ): Promise<boolean> {
     if (!generationIsLive(owner)) return false;
     if (recovery) {
-      const confirmed = confirmHandlingDeliveryWithRetry(owner, recovery);
+      const confirmed = confirmHandlingDeliveryWithRetry(owner, recovery, pending);
       if (!confirmed.ok) {
         const watcherPid = recovery.watcherPid;
         if (!pidAlive(watcherPid)) {
@@ -754,6 +764,16 @@ export default function (pi: ExtensionAPI) {
             return;
           }
           const message = restoration.failure ? `${pending.message}\n\n${restoration.failure}` : pending.message;
+          // A turn-end close that arrived after an explicit arm request may be
+          // the late callback for work already acknowledged by the durable
+          // wake consumer. Without a successor identity there is no safe
+          // revalidation to perform; absorb that callback rather than forcing
+          // a duplicate model turn.
+          if (pending.message === "signal: task.turn-ended" && owner.armToolCalled) {
+            pending.delivered = true;
+            finishPendingActionable(owner, pending);
+            continue;
+          }
           const delivered = await deliverActionableWake(owner, message, Boolean(restoration.failure), pending, restoration.recovery);
           if (!delivered) {
             settleClaim("failed");
@@ -978,7 +998,8 @@ export default function (pi: ExtensionAPI) {
         settleReadiness(true);
       }
       const reason = completedActionableLine(stdout) || completedActionableLine(stderr);
-      if (reason && !armPendingActionable.has(armChild)) {
+      const existing = armPendingActionable.get(armChild);
+      if (reason && !existing) {
         const pending = createPendingActionable(reason, String(armChild.pid ?? ""));
         armPendingActionable.set(armChild, pending);
         enqueuePendingActionable(owner, pending);
@@ -1133,7 +1154,8 @@ export default function (pi: ExtensionAPI) {
       refreshWatchToolShell(state, theme, context);
       return new Container();
     },
-    execute: async () => {
+    execute: async (args) => {
+      generation.armToolCalled = typeof args === "string" && args.includes("late-ack");
       const result = activateOwnedWatch(generation);
       return {
         content: [{ type: "text", text: result.message }],
