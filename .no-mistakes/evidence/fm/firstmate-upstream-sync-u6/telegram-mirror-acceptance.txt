@@ -1,0 +1,71 @@
+test_a_burst_never_threads_replies_but_keeps_every_status_attached (__main__.MirrorTestCase) ... ok
+test_a_failed_terminal_edit_falls_back_to_a_plain_message (__main__.MirrorTestCase) ... ok
+test_a_failed_transcription_replaces_its_own_placeholder (__main__.MirrorTestCase) ... ok
+test_a_fresh_start_mirrors_without_being_switched_on (__main__.MirrorTestCase) ... ok
+test_a_fresh_start_still_refuses_unpaired_traffic (__main__.MirrorTestCase)
+Starting on is not a pairing bypass: only the paired sender is heard. ... ok
+test_a_long_reply_ending_in_a_list_chunks_cleanly (__main__.MirrorTestCase) ... ok
+test_a_long_reply_is_split_before_conversion (__main__.MirrorTestCase) ... ok
+test_a_nested_list_keeps_its_items_apart (__main__.MirrorTestCase) ... ok
+test_a_rejected_terminal_image_reports_without_duplicating (__main__.MirrorTestCase) ... ok
+test_a_restart_loses_the_in_memory_queue_and_returns_to_mirroring (__main__.MirrorTestCase) ... ok
+test_a_screenshot_reaches_pi_as_an_image_with_its_caption (__main__.MirrorTestCase) ... ok
+test_a_screenshot_while_firstmate_is_away_waits_in_memory (__main__.MirrorTestCase) ... ok
+test_a_second_session_cannot_take_over_or_leak_into_the_chat (__main__.MirrorTestCase) ... ok
+test_a_terminal_image_is_mirrored_as_real_media (__main__.MirrorTestCase) ... ok
+test_a_terminal_image_without_text_still_reaches_telegram (__main__.MirrorTestCase) ... ok
+test_a_voice_note_uses_one_message_from_placeholder_to_card (__main__.MirrorTestCase) ... ok
+test_abandoned_transcripts_do_not_accumulate (__main__.MirrorTestCase) ... ok
+test_an_image_document_is_accepted_and_other_documents_are_refused (__main__.MirrorTestCase) ... ok
+test_an_image_document_with_mismatched_bytes_is_refused (__main__.MirrorTestCase) ... ok
+test_an_image_is_refused_when_the_session_cannot_render_one (__main__.MirrorTestCase) ... ok
+test_an_oversized_image_is_refused_without_downloading (__main__.MirrorTestCase) ... ok
+test_an_unverified_first_client_is_refused (__main__.MirrorTestCase) ... ok
+test_back_to_back_messages_keep_arrival_order (__main__.MirrorTestCase) ... ok
+test_commands_work_from_telegram_and_from_pi (__main__.MirrorTestCase) ... ok
+test_confirmation_commands_switch_the_setting_for_both_surfaces (__main__.MirrorTestCase) ... ok
+test_edit_then_back_retires_the_reply_prompt (__main__.MirrorTestCase)
+Back must leave no live instruction message a reply could still feed. ... ok
+test_firstmate_replies_are_never_threaded_while_statuses_are (__main__.MirrorTestCase) ... ok
+test_full_aggregate_terminal_images_fit_the_wire_frame (__main__.MirrorTestCase) ... ok
+test_images_keep_their_place_in_the_queue (__main__.MirrorTestCase) ... ok
+test_lists_and_prose_render_as_telegram_html (__main__.MirrorTestCase) ... ok
+test_long_indivisible_markdown_preserves_every_character (__main__.MirrorTestCase) ... ok
+test_long_transcripts_never_create_multi_message_cards (__main__.MirrorTestCase) ... ok
+test_many_inline_constructs_split_at_formatting_boundaries (__main__.MirrorTestCase) ... ok
+test_menu_aliases_are_published_and_switch_the_mirror (__main__.MirrorTestCase) ... ok
+test_mirror_off_names_a_real_telegram_command (__main__.MirrorTestCase) ... ok
+test_mirror_off_refuses_ordinary_text (__main__.MirrorTestCase) ... ok
+test_offline_messages_queue_in_memory_and_drain_on_connect (__main__.MirrorTestCase) ... ok
+test_only_one_voice_note_transcribes_at_a_time (__main__.MirrorTestCase) ... ok
+test_other_senders_and_chats_are_ignored (__main__.MirrorTestCase) ... ok
+test_oversized_fence_opener_falls_back_without_duplication (__main__.MirrorTestCase) ... ok
+test_queued_image_limit_counts_decoded_bytes_and_incoming_image (__main__.MirrorTestCase) ... ok
+test_rejected_formatting_falls_back_to_plain_text_once (__main__.MirrorTestCase) ... ok
+test_rejected_split_fence_falls_back_to_owned_source (__main__.MirrorTestCase) ... ok
+test_replies_are_formatted_as_telegram_html (__main__.MirrorTestCase) ... ok
+test_several_terminal_images_keep_their_order_in_one_album (__main__.MirrorTestCase) ... ok
+test_stop_is_bounded_while_a_long_poll_is_open (__main__.MirrorTestCase) ... ok
+test_stop_is_bounded_while_a_transcription_is_running (__main__.MirrorTestCase) ... ok
+test_telegram_text_reaches_pi_unchanged_and_is_confirmed (__main__.MirrorTestCase) ... ok
+test_terminal_and_reply_mirroring_follows_mirror_mode (__main__.MirrorTestCase) ... ok
+test_terminal_images_are_not_mirrored_while_the_mirror_is_off (__main__.MirrorTestCase) ... ok
+test_terminal_images_respect_the_size_and_type_bounds (__main__.MirrorTestCase) ... ok
+test_transport_statuses_stay_plain (__main__.MirrorTestCase) ... ok
+test_unicode_limits_use_telegram_utf16_units (__main__.MirrorTestCase) ... ok
+test_unicode_terminal_caption_uses_telegram_utf16_units (__main__.MirrorTestCase) ... ok
+test_voice_note_cancel_sends_nothing (__main__.MirrorTestCase) ... ok
+test_voice_note_edit_then_send (__main__.MirrorTestCase) ... ok
+test_voice_send_waits_for_mirroring_to_be_enabled (__main__.MirrorTestCase) ... ok
+test_without_the_markdown_parser_replies_are_sent_plain (__main__.MirrorTestCase) ... ok
+test_darwin_peer_identity_uses_kernel_pid_and_getpeereid (__main__.PeerIdentityTestCase) ... ok
+test_macos_unit_and_lifecycle_carry_no_secret (__main__.ServiceUnitTestCase) ... ok
+test_service_install_refuses_outside_wsl (__main__.ServiceUnitTestCase) ... skipped 'macOS has a supported LaunchAgent service'
+test_unit_starts_the_bot_and_carries_no_secret (__main__.ServiceUnitTestCase) ... ok
+
+----------------------------------------------------------------------
+Ran 62 tests in 108.316s
+
+OK (skipped=1)
+installed /var/folders/gk/2vqhl8hj213dqcsd4t3726wm0000gn/T/tmpup4gkjk9/com.firstmate.telegram.plist and started com.firstmate.telegram
+removed /var/folders/gk/2vqhl8hj213dqcsd4t3726wm0000gn/T/tmpup4gkjk9/com.firstmate.telegram.plist
