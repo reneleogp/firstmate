@@ -373,10 +373,7 @@ github_read_outcome_with_gh_axi() {
   if ! output=$(gh-axi pr view "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" 2>/dev/null); then
     return 1
   fi
-  if ! state=$(printf '%s\n' "$output" | awk '
-    $1 == "state:" { count++; value=$2 }
-    END { if (count == 1 && value != "") print value; else exit 1 }
-  '); then
+  if ! state=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*state:[[:space:]]*//p' | head -1) || [ -z "$state" ]; then
     return 1
   fi
   case "$state" in
@@ -397,16 +394,24 @@ github_read_outcome_with_gh_axi() {
 
 github_read_outcome() {
   if ! command -v gh >/dev/null 2>&1; then
-    github_read_outcome_with_gh_axi && return 0
-    echo "error: could not read the GitHub pull request outcome after the merge attempt; PR metadata and merge poll remain recorded" >&2
-    return 1
+    if github_read_outcome_with_gh_axi; then
+      return 0
+    fi
+    FM_PR_GITHUB_STATE=unknown
+    FM_PR_GITHUB_MERGED=false
+    FM_PR_GITHUB_QUEUED=unknown
+    FM_PR_GITHUB_BASE=
+    FM_PR_GITHUB_QUEUE_OBSERVED=false
+    printf 'error: GitHub merge outcome was not successful: state=unknown, merged=false, isInMergeQueue=unknown\n' >&2
+    printf 'error: the merge queue could not be observed for %s because the queue-aware read was unavailable; re-check the pull request'"'"'s merge queue state before retrying\n' "$URL" >&2
+    return 0
   fi
   # Only a failed gh read falls back. A gh read that completes and reports the
   # pull request as neither merged nor queued is a concrete outcome, not a
   # missing one, so it keeps its own refusal. The gh-axi view cannot observe the
   # merge queue, so it can only turn this into a proved merge or into a refusal.
   github_read_outcome_with_gh && return 0
-  if github_read_outcome_with_gh_axi && [ "$FM_PR_GITHUB_MERGED" = true ]; then
+  if github_read_outcome_with_gh_axi; then
     return 0
   fi
   echo "error: could not read the GitHub pull request outcome after the merge attempt: the gh read failed and the gh-axi view could not prove the outcome either; PR metadata and merge poll remain recorded" >&2

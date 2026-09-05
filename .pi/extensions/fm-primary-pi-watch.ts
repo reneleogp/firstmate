@@ -1121,8 +1121,7 @@ export default function (pi: ExtensionAPI) {
     renderResult: (result, _options, theme, context) => {
       if (calmHides("tool-result")) return new Container();
       const output = result.content
-        .filter((item) => item.type === "text")
-        .map((item) => item.text)
+        .flatMap((item) => (item.type === "text" ? [item.text] : []))
         .join("\n");
       if (calmPresentation.stockExportRendering) {
         return new Text(theme.fg("toolOutput", output), 0, 0);

@@ -1838,8 +1838,7 @@ ${context.command}
       if (calmPresentation.stockExportRendering) throw new Error("Use Pi stock export rendering");
       if (calmHides("tool-result")) return new Container();
       const output = result.content
-        .filter((item) => item.type === "text")
-        .map((item) => normalizeOutcomesToolOutput(item.text))
+        .flatMap((item) => (item.type === "text" ? [normalizeOutcomesToolOutput(item.text)] : []))
         .join("\n");
       const shellState = context.state as OutcomesToolShellState;
       // Keep each line's ANSI scope independent, matching Pi's stock fallback.
@@ -1900,8 +1899,7 @@ ${context.command}
       if (calmPresentation.stockExportRendering) throw new Error("Use Pi stock export rendering");
       if (calmHides("tool-result")) return new Container();
       const output = result.content
-        .filter((item) => item.type === "text")
-        .map((item) => normalizeOutcomesToolOutput(item.text))
+        .flatMap((item) => (item.type === "text" ? [normalizeOutcomesToolOutput(item.text)] : []))
         .join("\n");
       const shellState = context.state as OutcomesToolShellState;
       shellState.result = output ? new Text(theme.fg("toolOutput", output), 0, 0) : new Container();
