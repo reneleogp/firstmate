@@ -1,0 +1,11 @@
+Targeted validation on 0e741e1
+
+PASS: bash tests/fm-pr-check-security.test.sh (completed within 300s; all exercised checks emitted ok)
+PASS: bash tests/fm-pi-primary-types.test.sh
+FAIL: bash tests/fm-pi-watch-extension.test.sh
+  not ok - Pi away takeover must retire the ordinary owner and restore one cycle on return: expected exit 0, got 1
+  Error: timeout waiting for ordinary arm retirement after away takeover
+FAIL: bash tests/fm-watch-arm.test.sh
+  not ok - re-arm did not report the durable recovery wake: watcher: started pid=39968 (beacon fresh)\ncheck: rearm-resurface
+
+The Pi watcher failure was reproduced twice; the watch-arm failure was reproduced twice. Worktree remained clean.

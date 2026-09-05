@@ -1,0 +1,13 @@
+synchronized HEAD a06611d4 (herdr 0.8.2)
+ok - real herdr (herdr 0.8.2): events.subscribe capability gate passes (protocol >= 16, events surface present in api schema)
+ok - real herdr (herdr 0.8.2): a driven idle->blocked transition returns the blocked record in 0.153s (pane w1:p2)
+not ok - the stale payload must name the herdr-blocked cause
+fm-herdr-lab: missing fleet-state tripwire for 'fm-lab-eventwait-smoke-6798'; refusing destructive calls
+exit=1
+
+unchanged origin/main (herdr 0.8.2)
+ok - real herdr (herdr 0.8.2): events.subscribe capability gate passes (protocol >= 16, events surface present in api schema)
+ok - real herdr (herdr 0.8.2): a driven idle->blocked transition returns the blocked record in 0.148s (pane w1:p2)
+not ok - the stale payload must name the herdr-blocked cause
+fm-herdr-lab: missing fleet-state tripwire for 'fm-lab-eventwait-smoke-10544'; refusing destructive calls
+exit=1
