@@ -15,8 +15,6 @@ FM_PUSH_TRANSITION_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$FM_PUSH_TRANSITION_LIB_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-transition-lib.sh
 . "$FM_PUSH_TRANSITION_LIB_DIR/fm-transition-lib.sh"
-# shellcheck source=bin/fm-human-notify-lib.sh
-. "$FM_PUSH_TRANSITION_LIB_DIR/fm-human-notify-lib.sh"
 
 TRIAGE_LOG="$STATE/.watch-triage.log"
 TRIAGE_LOG_MAX_BYTES=${FM_WATCH_TRIAGE_LOG_MAX_BYTES:-262144}
@@ -42,12 +40,8 @@ watch_delivery_clean_reason() {
   printf '%s' "$1" | tr '\t\r\n' '   ' | cut -c1-4096
 }
 
-watch_delivery_clean_payload() {
-  printf '%s' "$1" | tr '\t\r\n' '   '
-}
-
 watch_delivery_publish() {
-  local reason=$1 sequence=$2 payload=$3 i size tmp raw
+  local reason=$1 i size tmp raw
   [ -n "$FM_WATCH_DELIVERY_PID" ] || return 0
   [ -n "$FM_WATCH_DELIVERY_IDENTITY" ] || return 0
   i=0
@@ -56,12 +50,10 @@ watch_delivery_publish() {
     sleep 0.02
     i=$((i + 1))
   done
-  printf '%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\n' \
     "$FM_WATCH_DELIVERY_PID" \
     "$(watch_delivery_clean_identity "$FM_WATCH_DELIVERY_IDENTITY")" \
-    "$(watch_delivery_clean_reason "$reason")" \
-    "$sequence" \
-    "$(watch_delivery_clean_payload "$payload")" >> "$WATCH_DELIVERY_LOG" 2>/dev/null || true
+    "$(watch_delivery_clean_reason "$reason")" >> "$WATCH_DELIVERY_LOG" 2>/dev/null || true
   size=$(wc -c < "$WATCH_DELIVERY_LOG" 2>/dev/null | tr -d '[:space:]')
   case "$size" in
     ''|*[!0-9]*) ;;
@@ -92,37 +84,6 @@ triage_log() {
   fi
 }
 
-FM_WATCH_DELIVERY_SEQUENCE=
-FM_WATCH_DELIVERY_PAYLOAD=
-FM_WATCH_DELIVERY_PRESELECTED=
-watch_delivery_preselect() {
-  case "$1" in ''|*[!0-9]*) return 1 ;; esac
-  FM_WATCH_DELIVERY_SEQUENCE=$1
-  FM_WATCH_DELIVERY_PAYLOAD=$2
-  FM_WATCH_DELIVERY_PRESELECTED=1
-}
-
-watch_delivery_select() {
-  local requested=${FM_WAKE_APPENDED_SEQUENCE:-} selected
-  FM_WATCH_DELIVERY_SEQUENCE=
-  FM_WATCH_DELIVERY_PAYLOAD=
-  FM_WATCH_DELIVERY_PRESELECTED=
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || return 1
-  if [ -n "$requested" ]; then
-    selected=$(awk -F '\t' -v sequence="$requested" 'NF >= 5 && $2 == sequence { print $2 "\t" $5; exit }' "$FM_WAKE_QUEUE" 2>/dev/null)
-  else
-    selected=$(awk -F '\t' 'NF >= 5 && $2 ~ /^[0-9]+$/ { value=$2 "\t" $5 } END { print value }' "$FM_WAKE_QUEUE" 2>/dev/null)
-  fi
-  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
-  if [ -z "$selected" ] && [ -n "$requested" ]; then
-    selected="$requested$(printf '\t')$FM_WAKE_APPENDED_PAYLOAD"
-  fi
-  FM_WATCH_DELIVERY_SEQUENCE=${selected%%"$(printf '\t')"*}
-  [ "$FM_WATCH_DELIVERY_SEQUENCE" != "$selected" ] || FM_WATCH_DELIVERY_SEQUENCE=
-  FM_WATCH_DELIVERY_PAYLOAD=${selected#*"$(printf '\t')"}
-  case "$FM_WATCH_DELIVERY_SEQUENCE" in ''|*[!0-9]*) return 1 ;; esac
-}
-
 # Exit after reporting one actionable wake. Tests override this callback.
 wake() {
   local output_status=0
@@ -132,12 +93,9 @@ wake() {
   esac
   trap '' HUP INT TERM
   [ -z "$FM_WAKE_POST_OUTPUT_ACTION" ] || trap '' PIPE
-  if [ "$FM_WATCH_DELIVERY_PRESELECTED" != 1 ]; then
-    watch_delivery_select || true
-  fi
   if echo "$1"; then
     output_status=0
-    watch_delivery_publish "$1" "$FM_WATCH_DELIVERY_SEQUENCE" "$FM_WATCH_DELIVERY_PAYLOAD" || true
+    watch_delivery_publish "$1" || true
     # shellcheck disable=SC2034 # Read by bin/fm-watch.sh's EXIT cleanup.
     FM_WATCH_DELIVERED_REASON=$1
   else
@@ -151,101 +109,60 @@ wake() {
 }
 
 _hb_surfaced_path() {
-  printf '%s/.hb-surfaced-%s' "$STATE" "$(printf '%s' "$1" | tr ':/.' '___')"
+  status_heartbeat_seen_marker_path "$STATE" "$1"
 }
 
-# Record a captain-relevant status after its durable wake has been enqueued.
-mark_surfaced() {  # <status-file>
-  local f=$1 task last
+# The byte offset in <task>'s status log that the heartbeat backstop has already
+# classified, or 0 when it has no usable position. A position rather than an
+# event line lets the backstop catch an event the per-wake path missed,
+# and comparing the last line cannot see an event a later routine append moved
+# past - exactly the masking fm-classify-lib.sh's span read exists to stop. An
+# absent or malformed marker (including one an older watcher wrote as a status
+# line) reads 0, so the log is re-classified and the backstop errs toward
+# surfacing rather than swallowing.
+hb_surfaced_offset() {  # <task>
+  status_presentation_marker_offset "$(_hb_surfaced_path "$1")" "$STATE/$1.status"
+}
+
+# Record a status log as successfully classified through the captured endpoint.
+mark_surfaced() {  # <status-file> <captured-end-offset> <captured-identity>
+  local f=$1 task
+  case "$f" in *.status) ;; *) return 0 ;; esac
   task=$(basename "$f"); task="${task%.status}"
-  last=$(last_status_line "$f")
-  [ -n "$last" ] || return 0
-  status_is_captain_relevant "$last" || return 0
-  printf '%s' "$last" > "$(_hb_surfaced_path "$task")"
+  status_presentation_marker_commit "$(_hb_surfaced_path "$task")" "$f" "$2" "$3"
 }
 
-fm_push_transition_apply_status() {  # <state> <window> <backend-status>
-  local state=$1 window=$2 to=$3 task status_file last line class
-  FM_PUSH_TRANSITION_STATUS_LINE=
-  task=$(window_to_task "$window" "$state")
-  [ -n "$task" ] || return 1
-  status_file="$state/$task.status"
-  [ ! -L "$status_file" ] || return 1
-  last=$(last_status_line "$status_file")
-  case "$to" in
-    working)
-      [ "$last" = 'blocked: live supervision reported the worker blocked' ] || return 0
-      line='working: live supervision reported active work'
-      ;;
-    blocked)
-      if class=$(fm_human_notify_class "$last" 2>/dev/null); then
-        [ "$class" = blocker ] || return 0
-      elif status_is_terminal_verb "$last" || status_is_captain_relevant "$last"; then
-        return 0
-      fi
-      if [ "$(status_line_verb "$last")" = blocked ]; then
-        line=$last
-      else
-        line='blocked: live supervision reported the worker blocked'
-      fi
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-  if [ "$last" != "$line" ]; then
-    printf '%s\n' "$line" >> "$status_file" || return 1
-  fi
-  fm_human_notify_apply_transition "$state" "$task" "$line" || true
-  FM_PUSH_TRANSITION_STATUS_LINE=$line
+mark_surface_reported() {  # <status-file> <reported-signature>
+  local f=$1 task
+  task=$(basename "$f"); task="${task%.status}"
+  status_presentation_marker_report "$(_hb_surfaced_path "$task")" "$2"
 }
 
 # Act on a fresh actionable transition from a push-capable backend.
 handle_push_transition() {  # <backend> <session> <record>
-  local backend=$1 session=$2 record=$3 pane_id to window task reason last display
+  local backend=$1 session=$2 record=$3 pane_id to window task reason span_record rest surface_end='' surface_ident=''
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
-  last=$(last_status_line "$STATE/$task.status")
-  if [ -f "$STATE/$task.meta" ]; then
-    display=$(fm_display_name_for_meta "$STATE/$task.meta" "$task")
-  else
-    display=$(fm_display_name_fallback "$task")
-  fi
-  # External waits retain their bounded cadence. Captain-owned waits remain
-  # silent until evidence changes or the captain answers.
-  if status_is_paused "$last" || status_is_captain_held "$last"; then
-    triage_log "absorbed push $to (declared wait): $window"
+  # A declared wait already names the human this transition would report: an
+  # external dependency, or the captain a verified hold transferred the work to.
+  # Either way the wait is durably recorded, so absorb the immediate escalation
+  # and leave the bounded re-surface to the watcher's own pause cadence.
+  if status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")"; then
+    triage_log "absorbed push $to (declared wait, awaiting external or captain): $window"
     fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
     return
   fi
-  if [ "$to" = blocked ]; then
-    fm_push_transition_apply_status "$STATE" "$window" "$to" || exit 1
-    if [ -z "$FM_PUSH_TRANSITION_STATUS_LINE" ]; then
-      triage_log "absorbed push $to (current human outcome takes precedence): $window"
-      fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
-      return
-    fi
-    last=$FM_PUSH_TRANSITION_STATUS_LINE
-  fi
-  if fm_human_notify_class "$last" >/dev/null 2>&1; then
-    if fm_backend_transition_reopened "$backend" "$STATE" "$session" "$record"; then
-      fm_human_notify_reopen_blocker "$STATE" "$task"
-    fi
-    if ! fm_human_notify_pending "$STATE" "$task" "$last"; then
-      triage_log "absorbed push $to (unchanged human-owned condition): $window"
-      fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
-      return
-    fi
-    reason="stale: $(fm_human_notify_summary "$STATE" "$task" "$last")"
-  else
-    reason="stale: $display: live supervision reported the worker $to without a declared wait. Action required: inspect the worker and choose recovery."
-  fi
+  span_record=$(status_span_first_actionable_record "$STATE/$task.status" \
+    "$(hb_surfaced_offset "$task")")
+  case $? in
+    0|1) surface_end=${span_record%%$'\t'*}; rest=${span_record#*$'\t'}; surface_ident=${rest%%$'\t'*} ;;
+  esac
+  reason="stale: $window (herdr: agent $to - waiting on human, escalated immediately, not via wedge timer)"
   fm_wake_append stale "$window" "$reason" || exit 1
   fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
-  mark_surfaced "$STATE/$task.status"
-  fm_human_notify_record "$STATE" "$task" "$last" 2>/dev/null || true
+  mark_surfaced "$STATE/$task.status" "$surface_end" "$surface_ident"
   wake "$reason"
 }

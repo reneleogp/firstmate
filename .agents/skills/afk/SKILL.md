@@ -49,9 +49,8 @@ batched digest rather than per-wake injections.
    The daemon is **presence-gated**: it injects escalations only while
    `state/.afk` exists, and stays quiet otherwise.
 
-3. **Do not separately arm `fm-watch.sh`.** The daemon must be the only watcher
-   owner while away.
-   The Pi launcher enforces the ownership transfer and return ordering defined in [`watcher-continuity.md`](../../../docs/watcher-continuity.md); other primary integrations retain their existing away gates.
+3. **Do not separately arm `fm-watch.sh`.** The daemon manages the watcher as
+   its child; the singleton lock no-ops a stray arm harmlessly.
 
 4. **Acknowledge** in `AGENTS.md` section 9 language: "Captain, away mode is active; I will batch routine updates and surface only decisions, failures, credentials, or review-ready work until you return."
 
@@ -76,7 +75,7 @@ a false exit is self-correcting (the captain re-runs `/afk`).
 
 afk changes how aggressively firstmate surfaces things, **not who approves what**.
 "Away" never means "approves more" or "approves less."
-A PR ready for merge or a needs-decision finding keeps the same configured authority and exceptions from `AGENTS.md` section 7, while anything requiring the captain still waits for the captain's explicit word.
+A PR ready for merge keeps the merge authority from `AGENTS.md` section 7, and a needs-decision finding keeps the `ask-user-authority` policy; anything requiring the captain still waits for the captain's explicit word.
 The daemon only batches the notification.
 
 ## Operational prefix contract
@@ -126,9 +125,7 @@ For tmux that confirmation is normally a proven cleared composer from the shared
 Without that baseline, busy state never converts an `unknown` composer into confirmation.
 For herdr, idle-baseline submits first seek native agent-state showing a real turn started, then use the shared classifier when native state remains idle: a cleared composer confirms delivery, while pending text retries Enter and reaches the shared busy-queue verdict only after the retry budget.
 A bordered-empty or ghost-only composer is recognized as empty where that backend uses composer confirmation, rather than mistaken for a swallowed Enter.
-`fm-send.sh` uses the same primitive and exits non-zero
-when a steer's Enter is positively swallowed, so firstmate learns an instruction
-did not land instead of leaving it unsubmitted.
+`fm-send.sh` uses the same primitive only on its typed plane and exits non-zero when that plane's Enter is positively swallowed; ordinary local text steers use the durable inbox and do not treat doorbell submission as delivery proof.
 
 **Busy-queued Enter exception (opencode 1.18.4).** OpenCode keeps queued text visible while it is mid-turn, so tmux and herdr delegate the final delivery decision to `fm_composer_queued_enter_verdict` in `bin/fm-composer-lib.sh` rather than treating visible text alone as a swallowed Enter.
 The daemon still clears its buffer only on the backend's `empty` success verdict; [`docs/tmux-backend.md`](../../../docs/tmux-backend.md) and [`docs/herdr-backend.md`](../../../docs/herdr-backend.md) own the backend-specific confirmation signals.
@@ -137,29 +134,30 @@ The daemon still clears its buffer only on the backend's `empty` success verdict
 
 The daemon wraps `fm-watch.sh`, runs the watcher as a child, presents every durable wake after each actionable watcher close, classifies each presented record in bash, and acknowledges the presented generation only after routing completes.
 It self-handles the routine majority without consuming a firstmate turn.
-Changed captain-relevant events, plus a bounded recheck of a declared external wait that remains idle, escalate to firstmate's context as one pre-read, single-line, batched digest.
-The status predicates live in `bin/fm-classify-lib.sh`, while `bin/fm-human-notify-lib.sh` owns human-notification identity, evidence, resolution, and readable presentation for both attended and away supervision.
+Captain-relevant events, plus a bounded recheck of a declared wait that is still declared, escalate to firstmate's context as one pre-read, single-line, batched digest.
+The captain-relevant verb set, declared-wait vocabulary, status-span classifier, and presentation-marker contract live in shared `bin/fm-classify-lib.sh`, while each supervisor owns its routing and fleet scan as a consumer of that policy.
 While `state/.afk` exists the daemon owns the watcher, so the watcher reverts to one-shot and lets the daemon do the triage - the two never run their triage at the same time.
 
 Classify each wake this way:
 
-- `signal` with a new terminal captain verb (`done:`, `needs-decision:`, `blocked:`, or `failed:`) -> escalate; an unchanged human-owned decision, blocker, or review-ready result is absorbed before injection.
+- `signal` whose newly classified status span contains captain-relevant events -> escalate every event in source order.
   A nonterminal progress verb remains nonterminal even when its prose contains a legacy free-text token such as `PR ready`, `checks green`, `ready in branch`, or `merged`; only a bare legacy line with such a token escalates.
-  Other signals with no captain-relevant status -> self-handle.
-- `signal` or `stale` for a declared wait -> self-handle it rather than treating it as a wedge; only `paused:` external waits retain bounded timed rechecks, while a verified `captain-held` transfer stays silent until its evidence changes or the captain answers.
-  If an external pause remains declared and idle past `FM_PAUSE_RESURFACE_SECS` (default 3600s), housekeeping sends one recheck and resets the pause window.
-  Each external recheck that finds the wait unchanged widens the next window up to `FM_PAUSE_RESURFACE_MAX_SECS` (default 43200s), and any change in the wait returns it to the base cadence.
-  The external recheck names the dependency and asks whether it still holds; a captain-held decision remains visible in recovery and explicit status views without starting a timed model turn.
+  Other signals with no captain-relevant event in the span -> self-handle.
+- `signal` or `stale` whose latest status declares a wait, either a `paused:` external wait or a verified `captain-held` transfer, tracks the pause rather than a wedge whether its pane reads idle or busy.
+  An unreported captain-relevant event in the newly classified span still escalates immediately while the current declaration independently keeps the pause cadence.
+  With no unreported actionable event, the wake self-handles, and the current declaration outranks an enriched possible-wedge reason so it never escalates on the `FM_STALE_ESCALATE_SECS` cadence.
+  If it is still declared past `FM_PAUSE_RESURFACE_SECS` (default 3600s), housekeeping sends one recheck and resets the pause window.
+  The window ages against the crew's own latest status line, so only a status append that stops declaring the wait ends this routing and restores wedge detection.
+  That recheck names which human the wait is on: the external dependency for `paused:`, and the captain themself for a `captain-held` transfer, who can answer the held decision or release the hold.
 - `check` -> always escalate. Check scripts print only when firstmate should wake.
 - `stale` with a terminal status or bare legacy captain-relevant line -> escalate.
   Nonterminal progress remains transient even when its prose contains a legacy free-text token or its seen-status marker already matches, so record a marker and self-handle.
   If the pane is still idle past `FM_STALE_ESCALATE_SECS` (default 240s), housekeeping escalates it as a possible wedge.
   This bounds wedge-detection latency to the threshold plus a tick: a delay, never a loss.
   Healthy crewmates are autonomous and do not wait on firstmate mid-task.
-- `heartbeat` -> self-handle. The daemon runs its own cheap bash fleet scan
-  every `FM_HEARTBEAT_SCAN_SECS` (default 300s) as the catch-all for a
-  captain-relevant status line the per-wake classifier might miss.
-- Unknown reason, or any uncertainty -> escalate fail-safe.
+- `heartbeat` -> self-handle.
+  The daemon runs its own cheap bash fleet scan every `FM_HEARTBEAT_SCAN_SECS` (default 300s) as the catch-all for captain-relevant events still unread by the per-wake classifier.
+- An unknown wake reason escalates fail-safe, while status-read uncertainty follows the shared one-report-without-position-advance contract referenced under Dedupe below.
 
 Escalations are buffered up to `FM_ESCALATE_BATCH_SECS` (default 90s; 0 =
 immediate) and flushed as one single-line digest prefixed with the current
@@ -201,8 +199,8 @@ the operational prefix lets firstmate distinguish it from a real captain message
   text firstmate sees is clean.
 - **Portable singleton lock** - the daemon uses the repo's portable lock helper
   (`fm-wake-lib.sh`) instead of `flock`, which is absent on macOS.
-- **Dedupe across signal/stale/scan** - `classify_signal` and terminal `classify_stale` paths check the seen-status marker before escalating, so a captain-relevant status escalated by one path is not re-escalated by another in the same digest.
-  The marker does not clear or suppress possible-wedge aging for a nonterminal progress line.
+- **Dedupe across signal/stale/scan** - all three paths use the shared status presentation markers defined by `bin/fm-classify-lib.sh`, so a successfully classified span is not re-escalated by another path in the same digest.
+  Never treat a reported unreadable state as classified; the shared library header owns that marker contract, and the marker does not clear or suppress possible-wedge aging for a nonterminal progress line.
 - **Auto-discovered supervisor pane** - the daemon resolves its own BACKEND
   (tmux vs herdr) and TARGET independently, mirroring
   `bin/fm-backend.sh`'s own runtime auto-detection. Backend: `FM_SUPERVISOR_BACKEND`

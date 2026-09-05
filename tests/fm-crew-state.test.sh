@@ -1388,6 +1388,180 @@ test_local_advanced_past_run_head_invalidates() {
   pass "local work advanced past run head invalidates attribution"
 }
 
+# --- Run-attribution precedence for pipeline-owned lane heads ----------------
+# A live run whose pipeline OWNS the branch (branch_sync.state=pipeline_owned)
+# can report a lane head that is not a git object in the task worktree.
+# Every fixture head is deliberately unresolvable so only the top-level
+# branch_sync exemption - never an accidental nested-field match - attributes
+# the run.
+run_running_pipeline_owned() {  # <branch> <head> [<sync-state>]
+  cat <<EOF
+run:
+  id: "01RUNLIVE"
+  branch: $1
+  status: running
+  head: "$2"
+  pr: ""
+  findings: none
+  steps[2]{step,status,findings,duration_ms}:
+    intent,completed,0,0
+    review,running,0,0
+branch_sync:
+  state: ${3:-pipeline_owned}
+  changed: false
+  local:
+    branch: $1
+    head: "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5"
+    clean: true
+  next_action:
+    code: continue_active_run
+    command: no-mistakes axi status
+EOF
+}
+
+# T1 direction 1: the daemon-attributed ACTIVE pipeline-owned run binds without
+# head equality and wins over the older superseded failed row.
+test_pipeline_owned_active_run_beats_superseded_failed_row() {
+  reset_fakes
+  local d short; d=$(new_case f10-pipeline-owned)
+  make_repo_on_branch "$d/wt" fm/feat-f10
+  short=$(git -C "$d/wt" rev-parse --short=8 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-f10.meta" "window=fm:fm-feat-f10" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_running_pipeline_owned fm/feat-f10 f0f0f0f0)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-f10 f0f0f0f0  2026-08-27 13:53
+  failed     fm/feat-f10 ${short}  2026-08-27 12:09
+EOF
+)"
+  local out; out=$(run_crew_state "$d" feat-f10)
+  assert_contains "$out" "state: working" "pipeline-owned live run -> working"
+  assert_contains "$out" "source: run-step" "pipeline-owned live run -> run-step source"
+  assert_not_contains "$out" "state: failed" "superseded failed row must not surface over the live run"
+  pass "pipeline-owned active run binds without head equality and beats the failed row"
+}
+
+# T1 direction 2: a genuinely-failed run with NO later run on the branch still
+# surfaces as failed - hiding real failures is equally wrong.
+test_failed_run_with_no_later_run_still_surfaces() {
+  reset_fakes
+  local d short; d=$(new_case f10-genuine-failure)
+  make_repo_on_branch "$d/wt" fm/feat-f10b
+  short=$(git -C "$d/wt" rev-parse --short=8 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-f10b.meta" "window=fm:fm-feat-f10b" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-f10b)"
+  FM_FAKE_RUNS_LIST="  failed     fm/feat-f10b ${short}  2026-08-27 12:09"
+  local out; out=$(run_crew_state "$d" feat-f10b)
+  assert_contains "$out" "state: failed" "a genuinely failed run with no later run still reports failed"
+  assert_contains "$out" "source: run-step" "the genuine failure is run-step sourced"
+  pass "a genuinely failed run with no later run is not hidden"
+}
+
+# The coarse runs-list rows: the branch's newest row is ACTIVE at an
+# unresolvable head and the row immediately before it ended at exactly this
+# worktree's head - the ledger proves this is this crew's own pipeline-owned
+# fix round (axi status answers another branch here, so attribution can only
+# go through the coarse list). The anchored active run answers via the
+# run-step, and the older failed row never surfaces.
+test_coarse_unresolvable_active_row_never_falls_to_older_row() {
+  reset_fakes
+  local d short; d=$(new_case f10-coarse-guard)
+  make_repo_on_branch "$d/wt" fm/feat-f10c
+  short=$(git -C "$d/wt" rev-parse --short=8 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-f10c.meta" "window=fm:fm-feat-f10c" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/other-crew aaaaaaa  2026-08-27 14:00
+  running    fm/feat-f10c f0f0f0f0  2026-08-27 13:53
+  failed     fm/feat-f10c ${short}  2026-08-27 12:09
+EOF
+)"
+  FM_FAKE_BUSY=1
+  local gen; gen=$("$ROOT/bin/fm-busy-event.sh" arm "$d/state" feat-f10c)
+  "$ROOT/bin/fm-busy-event.sh" apply "$d/state" feat-f10c busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+  local out; out=$(run_crew_state "$d" feat-f10c)
+  assert_not_contains "$out" "state: failed" "an unresolvable active row must not fall to the older failed row"
+  assert_contains "$out" "source: run-step" "the ledger-anchored continuation binds via the runs list"
+  assert_contains "$out" "state: working" "the anchored active fix round reads working"
+  assert_contains "$out" "validating (background run)" "coarse resolution keeps coarse run detail"
+  pass "coarse scan anchors the unresolvable active row instead of falling to an older one"
+}
+
+# Coarse negative control: the anchor must end at EXACTLY this worktree's
+# head. The newest same-branch row is active at an unresolvable head, but the
+# row immediately before it sits at an OLDER local commit, so the ledger
+# proves nothing - unknown attribution stops the scan, never falls to the
+# older failed row, and the busy pane answers instead.
+test_coarse_mismatched_anchor_falls_to_pane_not_older_row() {
+  reset_fakes
+  local d old_short; d=$(new_case f10-coarse-no-anchor)
+  make_repo_on_branch "$d/wt" fm/feat-f10g
+  git -C "$d/wt" commit -q --allow-empty -m 'second local commit'
+  old_short=$(git -C "$d/wt" rev-parse --short=8 HEAD~1)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-f10g.meta" "window=fm:fm-feat-f10g" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/other-crew aaaaaaa  2026-08-27 14:00
+  running    fm/feat-f10g f0f0f0f0  2026-08-27 13:53
+  failed     fm/feat-f10g ${old_short}  2026-08-27 12:09
+EOF
+)"
+  FM_FAKE_BUSY=1
+  local gen; gen=$("$ROOT/bin/fm-busy-event.sh" arm "$d/state" feat-f10g)
+  "$ROOT/bin/fm-busy-event.sh" apply "$d/state" feat-f10g busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+  local out; out=$(run_crew_state "$d" feat-f10g)
+  assert_not_contains "$out" "state: failed" "a mismatched anchor must not fall to the older failed row"
+  assert_not_contains "$out" "source: run-step" "unknown attribution must not bind a run"
+  assert_contains "$out" "state: working" "the busy crew still reads working through the pane fallback"
+  assert_contains "$out" "source: pane" "without an exact anchor the pane answers, not the runs rows"
+  pass "coarse scan with a mismatched anchor stays unknown and lets the pane answer"
+}
+
+# Negative control: the exemption is gated on pipeline_owned specifically - any
+# other branch_sync state keeps the strict head rule.
+test_non_pipeline_owned_unresolvable_head_not_attributed() {
+  reset_fakes
+  local d; d=$(new_case f10-not-owned)
+  make_repo_on_branch "$d/wt" fm/feat-f10d
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-f10d.meta" "window=fm:fm-feat-f10d" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: implementing\n' > "$d/state/feat-f10d.status"
+  FM_FAKE_AXI_STATUS="$(run_running_pipeline_owned fm/feat-f10d f0f0f0f0 synced)"
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" feat-f10d
+  local out; out=$(run_crew_state "$d" feat-f10d)
+  assert_not_contains "$out" "source: run-step" "a non-pipeline-owned unresolvable head must not bind"
+  assert_contains "$out" "source: status-log" "falls back to the status log without the exemption"
+  pass "the exemption requires branch_sync.state=pipeline_owned"
+}
+
+# Negative control: the exemption also requires an ACTIVE run - a terminal run
+# released the branch, so an inconsistent pipeline_owned label must not bind a
+# terminal run by branch name alone.
+test_pipeline_owned_terminal_run_not_exempt() {
+  reset_fakes
+  local d; d=$(new_case f10-terminal-not-exempt)
+  make_repo_on_branch "$d/wt" fm/feat-f10e
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-f10e.meta" "window=fm:fm-feat-f10e" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: stage 2 in progress\n' > "$d/state/feat-f10e.status"
+  FM_FAKE_AXI_STATUS="$(run_running_pipeline_owned fm/feat-f10e f0f0f0f0)
+outcome: failed"
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" feat-f10e
+  local out; out=$(run_crew_state "$d" feat-f10e)
+  assert_not_contains "$out" "source: run-step" "a terminal run must not bind through the exemption"
+  assert_contains "$out" "source: status-log" "falls back to the status log for a terminal unresolvable head"
+  pass "the exemption never applies to a terminal run"
+}
+
 test_missing_run_head_falls_back_to_current_state() {
   reset_fakes
   local d out
@@ -1405,6 +1579,148 @@ test_missing_run_head_falls_back_to_current_state() {
   assert_contains "$out" "source: status-log" "missing run head falls back to current state sources"
   assert_contains "$out" "state: working" "status-log remains current after missing run head"
   pass "missing run head falls back instead of matching by branch"
+}
+
+# Mint a descendant of <repo>'s HEAD in a separate clone, echoing its full sha.
+# The task copy never receives the new object, which is exactly the incident
+# shape: the pipeline committed its fix round in its own checkout, so the run
+# head advanced beyond the submitted head while the task copy lacks the commit.
+mint_unfetched_fix_head() {  # <worktree>
+  local wt=$1 h2
+  rm -rf "$wt.pipe"
+  git clone -q "$wt" "$wt.pipe"
+  git -C "$wt.pipe" commit -q --allow-empty -m 'pipeline fix round commit'
+  h2=$(git -C "$wt.pipe" rev-parse HEAD)
+  if git -C "$wt" cat-file -e "$h2" 2>/dev/null; then
+    fail "fixture broken: fix head object leaked into the task copy"
+  fi
+  printf '%s' "$h2"
+}
+
+# Head-binding regression (model-routing-benchmark-hardening incident): the
+# active run's head advanced beyond the submitted head through a pipeline fix
+# round whose commit object never reached the task copy. The reader must
+# attribute the active run through the pipeline's own ledger - its newest row
+# for the branch is active with a locally unverifiable head, and the row
+# immediately before it ended at exactly this worktree's head - instead of
+# rejecting the active row and letting the older failed row answer.
+test_active_fix_round_unfetched_pipeline_head_reports_current() {
+  reset_fakes
+  local d h1 h2 out
+  d=$(new_case unfetched-fix-head)
+  make_repo_on_branch "$d/wt" fm/feat-unfetched
+  h1=$(git -C "$d/wt" rev-parse HEAD)
+  h2=$(mint_unfetched_fix_head "$d/wt")
+  [ "$h1" != "$h2" ] || fail "fix head did not advance past the submitted head"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/unfetched.meta" "window=fm:fm-unfetched" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_RUN_HEAD="$h2"
+  FM_FAKE_AXI_STATUS="$(run_fixing fm/feat-unfetched)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/other aaaaaaa  2026-07-30 22:10
+  running    fm/feat-unfetched $(git -C "$d/wt.pipe" rev-parse --short=7 HEAD)  2026-07-30 22:05
+  failed     fm/feat-unfetched $(git -C "$d/wt" rev-parse --short=7 HEAD)  2026-07-29 20:00
+EOF
+)"
+  out=$(run_crew_state "$d" unfetched)
+  assert_contains "$out" "source: run-step" "active run with an unfetched pipeline head still attributes"
+  assert_contains "$out" "state: working" "active fix round reads working, not the older failed row"
+  assert_contains "$out" "validating (fixing)" "full run detail survives the unfetched pipeline head"
+  assert_not_contains "$out" "state: failed" "the older failed row must never answer for the active run"
+  pass "active fix round with an unfetched pipeline head reads working"
+}
+
+# Negative control for the ledger continuation rule: without the anchor row
+# ending at exactly this worktree's head, an active row with an unverifiable
+# head is branch-name coincidence and must stay unattributed - the historical
+# status-log fallback answers instead, never the runs rows.
+test_unanchored_unfetched_active_row_does_not_match() {
+  reset_fakes
+  local d h2 out
+  d=$(new_case unfetched-no-anchor)
+  make_repo_on_branch "$d/wt" fm/feat-noanchor
+  # A second commit gives the ledger a resolvable anchor row (HEAD~1) that is
+  # NOT this worktree's head - the exact-equality anchor must fail on it.
+  git -C "$d/wt" commit -q --allow-empty -m 'second local commit'
+  h2=$(mint_unfetched_fix_head "$d/wt")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/noanchor.meta" "window=fm:fm-noanchor" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'failed: earlier stage run\n' > "$d/state/noanchor.status"
+  FM_FAKE_RUN_HEAD="$h2"
+  FM_FAKE_AXI_STATUS="$(run_fixing fm/feat-noanchor)"
+  # The row before the active one is an OLDER commit, not this worktree's
+  # head: the ledger proves nothing about whose run the active row is.
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/other aaaaaaa  2026-07-30 22:10
+  running    fm/feat-noanchor $(git -C "$d/wt.pipe" rev-parse --short=7 HEAD)  2026-07-30 22:05
+  failed     fm/feat-noanchor $(git -C "$d/wt" rev-parse --short=7 HEAD~1)  2026-07-29 20:00
+EOF
+)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" noanchor
+  out=$(run_crew_state "$d" noanchor)
+  assert_not_contains "$out" "source: run-step" "an unanchored unverifiable active row must not match"
+  assert_contains "$out" "source: status-log" "historical fallback preserved when no active run is proven"
+  assert_contains "$out" "state: failed" "status-log answers, not the runs rows"
+  pass "unanchored unverifiable active row is never attributed"
+}
+
+# Negative control: a TERMINAL row whose commit object is gone from the task
+# copy is history even when it is the branch's newest row - an ancient or
+# rewritten run whose commit was pruned must never read as current state.
+test_unresolved_terminal_row_is_history_not_current() {
+  reset_fakes
+  local d h_old out
+  d=$(new_case unresolved-terminal)
+  make_repo_on_branch "$d/wt" fm/feat-hist
+  # Mint the historical run head outside the task copy, then orphan-rewrite
+  # the worktree tip, so the run head can never resolve locally.
+  h_old=$(mint_unfetched_fix_head "$d/wt")
+  git -C "$d/wt" checkout -q --orphan tmp-rewrite
+  git -C "$d/wt" commit -q --allow-empty -m 'rewritten tip'
+  git -C "$d/wt" branch -q -M fm/feat-hist
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/hist.meta" "window=fm:fm-hist" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: stage 2 in progress\n' > "$d/state/hist.status"
+  FM_FAKE_RUN_HEAD="$h_old"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-hist)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  failed     fm/feat-hist $(git -C "$d/wt.pipe" rev-parse --short=7 HEAD)  2026-07-01 20:00
+EOF
+)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" hist
+  out=$(run_crew_state "$d" hist)
+  assert_not_contains "$out" "source: run-step" "an unresolvable terminal row is history, not current state"
+  assert_contains "$out" "source: status-log" "historical fallback answers after an unresolvable terminal row"
+  assert_contains "$out" "state: working" "the rewritten worktree's own log stays current"
+  pass "unresolvable terminal row never reads as current"
+}
+
+# The same continuation recognition must work when bare `axi status` answers
+# with ANOTHER branch's run: this branch's own active run is then visible only
+# in the ledger, with coarse (status-word) detail.
+test_runs_list_continuation_found_when_axi_answers_other_branch() {
+  reset_fakes
+  local d h1 h2 out
+  d=$(new_case unfetched-coarse)
+  make_repo_on_branch "$d/wt" fm/feat-coarsefix
+  h1=$(git -C "$d/wt" rev-parse HEAD)
+  h2=$(mint_unfetched_fix_head "$d/wt")
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/coarsefix.meta" "window=fm:fm-coarsefix" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/other-crew aaaaaaa  2026-07-30 22:10
+  running    fm/feat-coarsefix $(git -C "$d/wt.pipe" rev-parse --short=7 HEAD)  2026-07-30 22:05
+  failed     fm/feat-coarsefix $(git -C "$d/wt" rev-parse --short=7 HEAD)  2026-07-29 20:00
+EOF
+)"
+  out=$(run_crew_state "$d" coarsefix)
+  assert_contains "$out" "source: run-step" "ledger continuation attributes via the runs list too"
+  assert_contains "$out" "state: working" "coarse continuation reads working"
+  assert_contains "$out" "validating (background run)" "coarse resolution keeps coarse detail, not the other branch's run"
+  pass "runs-list continuation attribution works when axi answers another branch"
 }
 
 test_active_run_is_authoritative
@@ -1459,6 +1775,16 @@ test_usage_error
 test_historical_same_branch_rewritten_head_not_current
 test_active_run_descendant_fix_head_remains_current
 test_local_advanced_past_run_head_invalidates
+test_pipeline_owned_active_run_beats_superseded_failed_row
+test_failed_run_with_no_later_run_still_surfaces
+test_coarse_unresolvable_active_row_never_falls_to_older_row
+test_coarse_mismatched_anchor_falls_to_pane_not_older_row
+test_non_pipeline_owned_unresolvable_head_not_attributed
+test_pipeline_owned_terminal_run_not_exempt
 test_missing_run_head_falls_back_to_current_state
+test_active_fix_round_unfetched_pipeline_head_reports_current
+test_unanchored_unfetched_active_row_does_not_match
+test_unresolved_terminal_row_is_history_not_current
+test_runs_list_continuation_found_when_axi_answers_other_branch
 
 echo "all fm-crew-state tests passed"
