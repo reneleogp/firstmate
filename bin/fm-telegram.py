@@ -279,7 +279,9 @@ def private_dir(path: Path) -> Path:
 
 
 def private_file(path: Path) -> Path:
-    _private_path_components(path)
+    # The leaf is a file, not another directory component. Validate the
+    # containing path before the descriptor-relative file operation below.
+    _private_path_components(path.parent)
     return path
 
 

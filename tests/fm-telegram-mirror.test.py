@@ -2095,7 +2095,9 @@ class ServiceUnitTestCase(unittest.TestCase):
             self.assertEqual(payload["ProgramArguments"], [sys.executable, str(BOT), "run"])
             self.assertEqual(payload["EnvironmentVariables"], {
                 "FM_TELEGRAM_DIR": tmp,
-                "FM_HOME": str(Path(firstmate_home).resolve()),
+                # Preserve the configured spelling in the LaunchAgent, just as
+                # the service does for the caller's environment.
+                "FM_HOME": firstmate_home,
             })
             self.assertTrue(payload["RunAtLoad"])
             self.assertTrue(payload["KeepAlive"])

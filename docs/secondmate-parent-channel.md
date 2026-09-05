@@ -31,6 +31,9 @@ Every captain-facing outcome that leaves durable evidence in the mate home is pu
 
 The ledger delivery reads files only: it calls no harness, no forge, and no current-state reader, so it is identical for every harness and runtime backend.
 Each delivery is keyed with the first eight hexadecimal characters of its receipt fingerprint and appended at most once by exact line, and the ledger path reuses the inactive scan's per-fingerprint receipts, so a replayed poll or restart cannot deliver an event twice while a genuinely new terminal event is delivered again.
+The append boundary upgrades a legacy channel containing literal `\\n` separators only when every complete record matches the documented state, key, correlation, and note grammar and the framing is unambiguous.
+It first preserves the exact legacy bytes in an atomically created `.legacy-backup`, then atomically publishes physical newline framing under the channel lock, so an interrupted retry can resume without losing recoverable state.
+An existing non-regular or disagreeing backup, mixed physical and escaped framing, or any invalid or incomplete record blocks migration, leaves the channel untouched, and returns a failure to the publisher rather than claiming delivery.
 A duplicate line is harmless and a missed one is not, so the mate may still append its own judgement about a delivered outcome, and the parent reads the script's line as the fact and the mate's line as commentary.
 For marked replies, the report helper accepts no caller-selected destination and uses the channel resolver for both local and remote homes; its script header owns the exact invocation contract.
 The pending-reply guard may restate only the correlated line from a local mate's `state/<mate-id>.status` onto the parent channel, which repairs the common parent-home versus mate-home mixup without accepting arbitrary mate-home sightings as acknowledgement.
