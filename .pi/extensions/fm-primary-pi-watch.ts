@@ -23,7 +23,7 @@
 // replacement handoff.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
@@ -105,6 +105,8 @@ type SessionGeneration = {
   // that delivery settles instead of being skipped by the single-flight guard.
   deferredClose: { message: string; predecessorArmPid: string } | null;
   armToolCalled: boolean;
+  away: boolean;
+  awayPoll: ReturnType<typeof setInterval> | null;
 };
 
 function refreshWatchToolShell(
@@ -428,6 +430,8 @@ function createGeneration(): SessionGeneration {
     unconsumedWakes: new Map(),
     deferredClose: null,
     armToolCalled: false,
+    away: false,
+    awayPoll: null,
   };
 }
 
@@ -443,8 +447,10 @@ function stopGeneration(generation: SessionGeneration): ChildProcess | null {
   generation.stopping = true;
   if (generation.retryTimer) clearTimeout(generation.retryTimer);
   if (generation.cleanupTimer) clearTimeout(generation.cleanupTimer);
+  if (generation.awayPoll) clearInterval(generation.awayPoll);
   generation.retryTimer = null;
   generation.cleanupTimer = null;
+  generation.awayPoll = null;
   const child = generation.child;
   if (child) child.kill("SIGTERM");
   generation.child = null;
@@ -630,6 +636,7 @@ export default function (pi: ExtensionAPI) {
     recovery?: { generation: string; watcherPid: string },
   ): Promise<boolean> {
     if (!generationIsLive(owner)) return false;
+    if (owner.away) return true;
     if (recovery) {
       const confirmed = confirmHandlingDeliveryWithRetry(owner, recovery, pending);
       if (!confirmed.ok) {
@@ -711,7 +718,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function processPendingActionables(owner: SessionGeneration): Promise<void> {
-    if (!generationIsLive(owner) || owner.restoring || owner.pendingActionables.length === 0) return;
+    if (!generationIsLive(owner) || owner.away || owner.restoring || owner.pendingActionables.length === 0) return;
     owner.restoring = true;
     const attemptedCleanup = new Set<string>();
     try {
@@ -762,6 +769,10 @@ export default function (pi: ExtensionAPI) {
             settleClaim("failed");
             releaseClaim();
             return;
+          }
+          if (owner.away) {
+            finishPendingActionable(owner, pending);
+            continue;
           }
           const message = restoration.failure ? `${pending.message}\n\n${restoration.failure}` : pending.message;
           // A turn-end close that arrived after an explicit arm request may be
@@ -1024,6 +1035,7 @@ export default function (pi: ExtensionAPI) {
       releaseChild();
       const classification = classifyClose(stdout, stderr, code, signal);
       const predecessor = String(armChild.pid ?? "");
+      if (owner.away || existsSync(`${state}/.afk`)) return;
       if (classification.kind === "actionable") {
         const pending = armPendingActionable.get(armChild) ?? createPendingActionable(classification.message, predecessor);
         enqueuePendingActionable(owner, pending);
@@ -1059,6 +1071,49 @@ export default function (pi: ExtensionAPI) {
       ok: true,
       message: `watcher: started Pi extension arm child ${id}; future ordinary re-arms are automatic; ${repairOnlyHint}`,
     };
+  }
+
+  async function retireForAway(owner: SessionGeneration): Promise<void> {
+    const arm = owner.child;
+    owner.away = true;
+    owner.pendingActionables = owner.pendingActionables.filter((pending) => pending.message !== "signal: task.turn-ended");
+    if (!arm) {
+      writeFileSync(`${state}/.pi-watch-away-standdown`, `${extensionVersion}\n${process.pid}\n${owner.id}\n`);
+      return;
+    }
+    armRetired.add(arm);
+    const retirement = spawn("bash", [armScript, "--retire-away", String(owner.id), "--extension-pid", String(process.pid), "--arm-pid", String(arm.pid ?? "")], {
+      cwd: fmRoot,
+      env: { ...process.env, FM_HOME: fmHome, FM_ROOT_OVERRIDE: fmRoot, FM_CONFIG_OVERRIDE: config },
+      stdio: "ignore",
+    });
+    await new Promise<void>((resolveRetirement) => {
+      retirement.once("close", (code) => {
+        if (code === 0 && generationIsLive(owner) && existsSync(`${state}/.afk`)) {
+          writeFileSync(`${state}/.pi-watch-away-standdown`, `${extensionVersion}\n${process.pid}\n${owner.id}\n`);
+        }
+        resolveRetirement();
+      });
+      retirement.once("error", resolveRetirement);
+    });
+  }
+
+  function monitorAwayMode(owner: SessionGeneration): void {
+    if (owner.awayPoll) return;
+    const pollMs = positiveInteger("FM_PI_OWNERSHIP_POLL_MS", 100);
+    owner.awayPoll = setInterval(() => {
+      if (!generationIsLive(owner)) return;
+      const away = existsSync(`${state}/.afk`);
+      if (away && !owner.away) {
+        void retireForAway(owner);
+      } else if (!away && owner.away) {
+        owner.away = false;
+        owner.pendingActionables = [];
+        unlinkSync(`${state}/.pi-watch-away-standdown`);
+        activateOwnedWatch(owner);
+      }
+    }, pollMs);
+    owner.awayPoll.unref();
   }
 
   function activateOwnedWatch(owner: SessionGeneration): ArmResult {
@@ -1102,6 +1157,7 @@ export default function (pi: ExtensionAPI) {
   pi.on?.("session_start", async () => {
     if (generation.stopping) generation = createGeneration();
     activateGeneration(generation);
+    monitorAwayMode(generation);
     markLoaded();
     if (lockOwnership() !== "owned") return;
     activateOwnedWatch(generation);
@@ -1164,5 +1220,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  monitorAwayMode(generation);
   markLoaded();
 }

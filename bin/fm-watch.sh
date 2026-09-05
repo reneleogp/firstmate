@@ -1398,6 +1398,11 @@ if ! fm_lock_try_acquire "$WATCH_LOCK"; then
   exit 0
 fi
 WATCHER_RECOVERY_PENDING=0
+WATCHER_AWAY_RETURN=0
+if [ ! -e "$STATE/.afk" ] && [ -e "$STATE/.pi-watch-away-standdown" ]; then
+  rm -f "$WATCHER_DOWNTIME_MARKER" 2>/dev/null || true
+  WATCHER_AWAY_RETURN=1
+fi
 if [ -n "${FM_LOCK_RECOVERED_PID:-}" ]; then
   WATCHER_RECOVERY_PENDING=1
 fi
@@ -1477,8 +1482,9 @@ watcher_cleanup() {
   local cleanup_status=0 owns_lock=0 transition=release-lock
   if [ "$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)" = "${WATCHER_PID:-}" ]; then
     owns_lock=1
-    if [ "${WATCHER_RECOVERY_PENDING:-0}" -eq 1 ] \
-      && [ "${FM_WATCH_DELIVERED_REASON:-}" = "check: rearm-resurface" ]; then
+    if [ -e "$STATE/.afk" ] \
+      || { [ "${WATCHER_RECOVERY_PENDING:-0}" -eq 1 ] \
+        && [ "${FM_WATCH_DELIVERED_REASON:-}" = "check: rearm-resurface" ]; }; then
       transition=release-lock-existing
     fi
   fi
@@ -1530,6 +1536,14 @@ retire_merged_pr_poll() {  # <id>
 }
 
 resurface_after_downtime() {
+  if [ "${FM_WATCH_AWAY_RETURN:-0}" -eq 1 ]; then
+    rm -f "$STATE/.watcher-down" 2>/dev/null || true
+    return 0
+  fi
+  if [ "$WATCHER_AWAY_RETURN" -eq 1 ]; then
+    WATCHER_AWAY_RETURN=0
+    return 0
+  fi
   # Handling successors already have a predecessor-delivered wake on the way.
   # Re-announcing from this cycle is what turned a lost handshake into an
   # unbounded recovery loop; stay in the poll loop and supervise instead.

@@ -410,7 +410,19 @@ watch_output_reason_type() {
 
 print_watch_output() {
   local out=$1
-  [ -s "$out" ] && cat "$out"
+  [ -s "$out" ] || return 0
+  # An arm's public output identifies a downtime recovery distinctly from the
+  # watcher's internal queue key, while preserving the selected durable payload.
+  if grep -q '^check: rearm-resurface$' "$out" && {
+    [ -s "$STATE/.wake-queue" ] || case "$(cat "$STATE/.watcher-down" 2>/dev/null || true)" in pending:*|announced:*) true ;; *) false ;; esac
+  }; then
+    sed 's/^check: rearm-resurface$/check: Fleet supervision recovery: rearm-resurface/' "$out"
+  else
+    cat "$out"
+  fi
+  if grep -q '^check: rearm-resurface$' "$out" && [ -s "$STATE/.wake-queue" ]; then
+    awk -F '\t' '$3 == "check" && NF >= 5 { payload=$5 } END { if (payload != "") print "watcher: delivery-payload=" payload }' "$STATE/.wake-queue"
+  fi
 }
 
 handling_successor_generation() {
@@ -498,6 +510,7 @@ if [ "$mode" = retire-away ]; then
     sleep 0.05
   done
   rm -f "$away_marker" 2>/dev/null || true
+  printf '%s\n%s\n%s\n' "$expected_version" "$away_extension_pid" "$away_generation" > "$STATE/.pi-watch-away-standdown"
   exit 0
 fi
 
@@ -593,7 +606,11 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
 if [ -n "${FM_WATCH_PREDECESSOR_ARM_PID:-}" ]; then
   FM_WATCH_HANDLING_SUCCESSOR=1 "$WATCH" >"$child_out" &
 else
-  "$WATCH" >"$child_out" &
+  if [ -e "$STATE/.pi-watch-away-standdown" ]; then
+    FM_WATCH_AWAY_RETURN=1 "$WATCH" >"$child_out" &
+  else
+    "$WATCH" >"$child_out" &
+  fi
 fi
 child=$!
 cycle_begin "$child" started "$(fm_pid_identity "$child" 2>/dev/null || true)"
