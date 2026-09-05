@@ -9,6 +9,9 @@ Pi's `.pi/extensions/fm-primary-pi-watch.ts` and OpenCode's `.opencode/plugins/f
 Each adapter starts the next arm before delivering the wake prompt, checks current session-lock ownership at launch, preserves one child or scheduled retry at a time, and applies bounded exponential retry after an unexpected or failed close.
 A failed follow-up never cancels continuity restoration.
 Pi same-process session replacement follows the generation-owner contract in `.pi/extensions/fm-primary-pi-watch.ts`: an owning `session_start` arms the replacement generation without waiting for a model turn, and a state-scoped replacement handoff carries every actionable close whose delivery overlapped `session_shutdown`, including a main follow-up Pi accepted but had not yet consumed, branch handling, and a retiring child that reports after the bounded shutdown wait.
+On a live Pi generation, entering away mode is an authenticated ownership transfer: the extension asks `bin/fm-watch-arm.sh --retire-away` to verify and retire its exact arm, then records a standdown receipt before the away daemon takes the watcher lock.
+The watcher treats that verified retirement as intentional and does not publish downtime, while an unmarked close still publishes recovery and keeps `check: rearm-resurface` actionable.
+The extension polls the away marker and, after away mode clears, starts one ordinary watcher only after the daemon's watcher has retired and the standdown receipt is consumed; redundant arms remain singleton no-ops.
 A main follow-up counts as delivered once Pi accepts it, never once the model reads it, because a follow-up queued while main is streaming joins the running run without a `before_agent_start`; the extension header owns how consumption is observed and why it only decides what a replacement replays.
 Cursor's `.cursor/hooks.json` `stop` hook (`bin/fm-turnend-guard-cursor.sh`) owns routine tokenless re-arm for a Cursor primary by parking that awaited hook on `bin/fm-watch-arm.sh` and returning an actionable close as one follow-up; [`turnend-guard.md`](turnend-guard.md#harness-integrations) owns its Pi-host stand-down, loop bounds, and supersession baton.
 Claude's `.claude/settings.json` Stop `asyncRewake` hook (`bin/fm-claude-stop-autoarm.sh`) owns routine tokenless re-arm.
@@ -36,6 +39,7 @@ Claude's Stop hook starts the successor arm at the next Stop after the handling 
 The durable wake queue preserves actionable events during the residual active-turn window, and the bounded turn-end guard enforces recovery at Stop when no watcher is live and no open generation claim is still deciding, so a finished, hung, or identity-mismatched claim cannot suppress it ([`turnend-guard.md`](turnend-guard.md#harness-integrations) owns that boundary).
 The recovery-episode contract below owns once-per-generation announcement.
 A handling successor does not re-announce; it enters its poll loop immediately and keeps scanning signals, stale panes, and checks.
+An away-mode standdown or return is likewise not a recovery episode: the standdown marker suppresses only the intentional retirement and the first returned cycle clears the stale downtime marker, while an unrelated close still follows the ordinary recovery contract.
 The model no longer re-arms after ordinary wakes.
 No PreToolUse hook denies fleet commands based on watcher status.
 A genuine auto-arm failure describes the automatic mechanism as broken and never directs a routine manual background arm.
