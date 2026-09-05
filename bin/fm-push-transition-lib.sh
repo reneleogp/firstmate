@@ -218,6 +218,9 @@ handle_push_transition() {  # <backend> <session> <record>
     else
       reason="stale: $display: blocker evidence changed. Action required: inspect the private task record and remove the blocker or provide the requested input."
     fi
+    if [ "$backend" = herdr ]; then
+      reason="$reason (herdr: agent blocked - waiting on human, escalated immediately, not via wedge timer)"
+    fi
   else
     reason="stale: $window (herdr: agent $to - waiting on human, escalated immediately, not via wedge timer)"
   fi
