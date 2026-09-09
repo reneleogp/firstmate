@@ -1,0 +1,9 @@
+Lavish end-user launch-behavior check (real lavish-axi 0.1.63)
+
+no-open status: opened
+no-open browser-launcher-calls: 0
+no-open returned review URL: http://127.0.0.1:4387/session/e9b94dbc22c766d4
+explicit-open status: opened-or-resumed
+explicit-open browser-launcher-calls: 1
+
+The check used a temporary `open` launcher shim: `lavish-axi <artifact> --no-open` returned a review URL without invoking the browser launcher, while the explicit plain `lavish-axi <artifact>` path invoked it once. The temporary artifact, server session, and launcher shim were removed after verification.
