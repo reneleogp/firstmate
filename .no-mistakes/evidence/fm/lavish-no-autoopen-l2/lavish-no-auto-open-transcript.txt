@@ -1,0 +1,18 @@
+End-to-end artifact-serving transcript (irrelevant Lavish help text omitted):
+$ bin/fm-bearings-board.sh build <payload.json>
+board: <temp>/.lavish/bearings-board.html
+session:
+  url: "http://127.0.0.1:4387/session/2bb5b001222734a2"
+  status: opened
+session: live
+served: <temp>/.lavish/bearings-board.html
+bound: lavish-2bb5b001222734a2
+armed: lavish-2bb5b001222734a2
+listening: live
+$ lavish-axi <board.html> --no-open
+session:
+  url: "http://127.0.0.1:4387/session/2bb5b001222734a2"
+  status: opened
+$ lavish-axi (session listing, filtered to the board)
+  <temp>/.lavish/bearings-board.html,open,"http://127.0.0.1:4387/session/2bb5b001222734a2",0
+Result: the automated build served and armed the review, returned its URL, and used --no-open; the captain can open that URL explicitly.
